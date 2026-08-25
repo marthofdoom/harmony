@@ -35,7 +35,7 @@ log = logging.getLogger(__name__)
 HIGH_THRESHOLD = 0.88
 LOW_THRESHOLD = 0.70
 
-Confidence = Literal["exact", "high", "low", "none"]
+Confidence = Literal["exact", "high", "low", "manual", "none"]
 
 
 @dataclass(slots=True)
@@ -81,8 +81,9 @@ _NOISE_TERMS = (
     r"clean",
 )
 _NOISE_ANY_RE = re.compile(r"(?i)\b(?:" + "|".join(_NOISE_TERMS) + r")\b")
-_BRACKET_RE = re.compile(r"[\(\[][^\(\)\[\]]*[\)\]]")
+_BRACKET_RE = re.compile(r"[\(\[]([^\(\)\[\]]*)[\)\]]")
 _TRAILING_SUFFIX_RE = re.compile(r"(?i)\s*[-–—]\s*(?:" + "|".join(_NOISE_TERMS) + r")\s*$")
+_BRACKET_JUNK_RE = re.compile(r"[-–—,:;]+")
 
 _FEAT_START_RE = re.compile(r"(?i)[\(\[]?\s*(?:feat\.?|ft\.?|featuring)\s*[:.]?\s+")
 _ARTIST_SPLIT_RE = re.compile(r"(?i)\s*(?:,|/|&|\band\b)\s*")
@@ -100,6 +101,11 @@ _VERSION_MARKERS = {
     "demo": r"\bdemo\b",
     "edit": r"\bedit\b",
 }
+
+
+def _has_version_marker(text: str) -> bool:
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in _VERSION_MARKERS.values())
+
 
 _PUNCT_RE = re.compile(r"[^\w\s']", re.UNICODE)
 _STRAY_APOSTROPHE_RE = re.compile(r"(?<!\w)'|'(?!\w)")
@@ -130,11 +136,37 @@ def split_features(title: str) -> tuple[str, list[str]]:
     return base, artists
 
 
+def _clean_bracket_content(content: str) -> str:
+    """Remove noise phrases from bracket ``content``, tidy leftover punctuation."""
+    cleaned = _NOISE_ANY_RE.sub(" ", content)
+    cleaned = _BRACKET_JUNK_RE.sub(" ", cleaned)
+    return _WHITESPACE_RE.sub(" ", cleaned).strip()
+
+
+def _bracket_sub(m: re.Match[str]) -> str:
+    content = m.group(1)
+    if not _NOISE_ANY_RE.search(content):
+        # No packaging/edition noise in this bracket at all: leave it alone
+        # (it might be a bare version marker like "(Live)", or just be
+        # unrelated text we have no basis for discarding).
+        return m.group(0)
+    cleaned = _clean_bracket_content(content)
+    if cleaned and _has_version_marker(cleaned):
+        # The bracket mixes a real version marker with packaging noise, e.g.
+        # "(Live at Earls Court - 2011 Remaster)". Strip only the noise
+        # phrase(s) so the marker survives into both the title comparison
+        # and _version_markers()'s mismatch penalty below.
+        return f"({cleaned})"
+    # Pure packaging/edition noise (e.g. "(Radio Edit)", "(2011 Remaster)"):
+    # safe to discard the whole bracket, as before.
+    return ""
+
+
 def _strip_noise(title: str) -> str:
     """Drop feature clauses and edition/packaging noise, keep version words."""
     text, _ = split_features(title)
     while True:
-        stripped = _BRACKET_RE.sub(lambda m: "" if _NOISE_ANY_RE.search(m.group(0)) else m.group(0), text)
+        stripped = _BRACKET_RE.sub(_bracket_sub, text)
         if stripped == text:
             break
         text = stripped
@@ -270,21 +302,73 @@ def score(source: Track, cand: Track) -> tuple[float, list[str]]:
     return total, reasons
 
 
-def _confidence(score_value: float) -> Confidence:
-    if score_value >= 1.0:
+def _confidence(
+    score_value: float,
+    *,
+    is_isrc: bool = False,
+    high_threshold: float = HIGH_THRESHOLD,
+    low_threshold: float = LOW_THRESHOLD,
+) -> Confidence:
+    """Map a numeric score to a confidence bucket.
+
+    "exact" is reserved for ISRC-verified identity (``is_isrc=True``) — the UI
+    and sync engine treat it as ground truth, so a merely perfect *fuzzy*
+    score (title/artist/duration all lining up) must top out at "high"
+    instead of impersonating an ISRC match.
+    """
+    if is_isrc:
         return "exact"
-    if score_value >= HIGH_THRESHOLD:
+    if score_value >= high_threshold:
         return "high"
-    if score_value >= LOW_THRESHOLD:
+    if score_value >= low_threshold:
         return "low"
     return "none"
 
 
-def match_track(source: Track, target: MusicProvider, *, limit: int = 8) -> MatchResult:
+def _search_query(source: Track) -> str:
+    """Primary search query: denoised title + primary artist only.
+
+    Edition/platform cruft ("(Official Video)", "(2011 Remaster)", "feat. …")
+    and comma-joining every credited artist confuses provider search engines
+    and yields poor or empty result sets on real catalogs. A single primary
+    artist plus a cleaned-up title reads like what a person would type into
+    a search box, which is exactly what these are.
+    """
+    primary_artist = source.artists[0] if source.artists else ""
+    title = _strip_noise(source.title)
+    return _WHITESPACE_RE.sub(" ", f"{title} {primary_artist}").strip()
+
+
+def _fallback_search_query(source: Track) -> str:
+    """Fallback query: original, unstripped title + primary artist.
+
+    Used only when the primary (denoised) query comes back empty, in case
+    the aggressive cleanup stripped something the target's search index
+    actually needed (e.g. a distinctive live/remix tag).
+    """
+    primary_artist = source.artists[0] if source.artists else ""
+    return _WHITESPACE_RE.sub(" ", f"{source.title} {primary_artist}").strip()
+
+
+def match_track(
+    source: Track,
+    target: MusicProvider,
+    *,
+    limit: int = 8,
+    high_threshold: float = HIGH_THRESHOLD,
+    low_threshold: float = LOW_THRESHOLD,
+) -> MatchResult:
     """Search ``target`` for ``source`` and rank whatever comes back."""
-    query = f"{source.artist_name} {source.title}".strip()
+    query = _search_query(source)
     results = target.search(query, kinds=("tracks",), limit=limit)
     pool = list(results.tracks) if results is not None else []
+
+    if not pool:
+        fallback = _fallback_search_query(source)
+        if fallback and fallback != query:
+            results = target.search(fallback, kinds=("tracks",), limit=limit)
+            pool = list(results.tracks) if results is not None else []
+
     if not pool:
         return MatchResult(source=source, best=None, candidates=[], confidence="none")
 
@@ -294,7 +378,11 @@ def match_track(source: Track, target: MusicProvider, *, limit: int = 8) -> Matc
         candidates.append(MatchCandidate(track=track, score=s, reasons=reasons))
     candidates.sort(key=lambda c: c.score, reverse=True)
     best = candidates[0]
-    return MatchResult(source=source, best=best, candidates=candidates, confidence=_confidence(best.score))
+    is_isrc = bool(
+        source.isrc and best.track.isrc and source.isrc.strip().upper() == best.track.isrc.strip().upper()
+    )
+    confidence = _confidence(best.score, is_isrc=is_isrc, high_threshold=high_threshold, low_threshold=low_threshold)
+    return MatchResult(source=source, best=best, candidates=candidates, confidence=confidence)
 
 
 def match_tracks(
@@ -303,12 +391,17 @@ def match_tracks(
     *,
     progress: Callable[[float, str], None] | None = None,
     db: Database | None = None,
+    high_threshold: float = HIGH_THRESHOLD,
+    low_threshold: float = LOW_THRESHOLD,
 ) -> list[MatchResult]:
     """Match every track in ``sources`` against ``target``.
 
-    When ``db`` is given, a cached link (from a previous exact/high-confidence
-    match) short-circuits the network search entirely, and any newly found
-    exact/high match is written back for next time. The cached candidate's
+    When ``db`` is given, a cached link short-circuits the network search
+    entirely, and any newly found exact/high match is written back for next
+    time. A cached link is authoritative regardless of how it got there: a
+    "manual" link recorded by the sync engine for a user-resolved match is
+    returned as-is (confidence "manual", score 1.0) and is never re-derived
+    or downgraded — a human already made this call. The cached candidate's
     ``Track`` is a stand-in built from the source's own metadata (the db only
     stores the id/score/confidence triple, not a full payload) — good enough
     for callers that only need the id to add/remove tracks.
@@ -316,14 +409,21 @@ def match_tracks(
     results: list[MatchResult] = []
     total = len(sources)
     for i, source in enumerate(sources):
-        result = _match_one(source, target, db=db)
+        result = _match_one(source, target, db=db, high_threshold=high_threshold, low_threshold=low_threshold)
         results.append(result)
         if progress is not None:
             progress((i + 1) / total if total else 1.0, source.title)
     return results
 
 
-def _match_one(source: Track, target: MusicProvider, *, db: Database | None) -> MatchResult:
+def _match_one(
+    source: Track,
+    target: MusicProvider,
+    *,
+    db: Database | None,
+    high_threshold: float = HIGH_THRESHOLD,
+    low_threshold: float = LOW_THRESHOLD,
+) -> MatchResult:
     if db is not None:
         link = db.get_link(source.service, source.id, target.service)
         if link is not None:
@@ -341,7 +441,7 @@ def _match_one(source: Track, target: MusicProvider, *, db: Database | None) -> 
                 source=source, best=candidate, candidates=[candidate], confidence=link["confidence"]
             )
 
-    result = match_track(source, target)
+    result = match_track(source, target, high_threshold=high_threshold, low_threshold=low_threshold)
     if db is not None and result.best is not None and result.confidence in ("exact", "high"):
         db.put_link(
             source.service, source.id, target.service, result.best.track.id, result.best.score, result.confidence
