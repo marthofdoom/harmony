@@ -46,6 +46,7 @@ class DiscoverPage(Gtk.Box):
         self._playlist_choices: list[Playlist] = []
         self._idea = None
         self._resolved_tracks: list[Track] = []
+        self._services_for_ai: list[Service] = []
 
         scroller = Gtk.ScrolledWindow(vexpand=True)
         content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
@@ -57,7 +58,30 @@ class DiscoverPage(Gtk.Box):
         self.append(scroller)
 
         self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_choices())
+        # Providers are built off the main loop, so this page is normally
+        # constructed before any of them exist. Without this the service
+        # pickers would stay stuck on "No services configured" forever.
+        self.state.connect("providers-changed", lambda *_a: self._refresh_service_choices())
         self._refresh_playlist_choices()
+        self._refresh_service_choices()
+
+    def _refresh_service_choices(self) -> None:
+        """Rebuild both service pickers from the providers that are live now."""
+        services = [s for s in Service if s in self.state.providers]
+        self._services_for_ai = services
+        labels = [s.label for s in services] or ["No services configured"]
+        # The AI picker only exists when a planner is configured; without a key
+        # the section renders a banner instead of the builder.
+        dropdowns = [self.target_service_dropdown]
+        ai_dropdown = getattr(self, "ai_target_dropdown", None)
+        if ai_dropdown is not None:
+            dropdowns.append(ai_dropdown)
+        for dropdown in dropdowns:
+            previous = dropdown.get_selected()
+            dropdown.set_model(Gtk.StringList.new(labels))
+            # Keep the user's pick when the list only grew underneath them.
+            if previous != Gtk.INVALID_LIST_POSITION and previous < len(labels):
+                dropdown.set_selected(previous)
 
     # -- section 1: recommendations ------------------------------------------
 

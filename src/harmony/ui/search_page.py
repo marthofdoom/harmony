@@ -19,6 +19,7 @@ from harmony.ui.widgets import (  # noqa: E402
     error_status_page,
     replace_tracks,
     selected_tracks,
+    set_stack_status,
     status_page,
 )
 
@@ -142,13 +143,12 @@ class SearchPage(Gtk.Box):
             return
         providers = self._target_providers()
         if not providers:
-            self.content_stack.set_visible_child_name("empty")
-            self.content_stack.add_named(
+            set_stack_status(
+                self.content_stack,
+                "empty",
                 status_page(icon_name="network-offline-symbolic", title="No services configured",
                             description="Add an account in Preferences to search."),
-                "empty",
             )
-            self.content_stack.set_visible_child_name("empty")
             return
         kind = _KINDS[self.kind_dropdown.get_selected()]
         self.content_stack.set_visible_child_name("empty")
@@ -172,11 +172,12 @@ class SearchPage(Gtk.Box):
     def _on_search_done(self, results: SearchResults) -> None:
         self._last_results = results
         if results.is_empty():
-            self.content_stack.add_named(
-                status_page(icon_name="edit-find-symbolic", title="No results", description="Try a different search."),
+            set_stack_status(
+                self.content_stack,
                 "empty",
+                status_page(icon_name="edit-find-symbolic", title="No results",
+                            description="Try a different search."),
             )
-            self.content_stack.set_visible_child_name("empty")
             return
         kind = _KINDS[self.kind_dropdown.get_selected()]
         if kind == "tracks":
@@ -186,8 +187,7 @@ class SearchPage(Gtk.Box):
             self._show_other_kind(kind, results)
 
     def _on_search_error(self, exc: BaseException) -> None:
-        self.content_stack.add_named(error_status_page(exc, title="Search failed"), "empty")
-        self.content_stack.set_visible_child_name("empty")
+        set_stack_status(self.content_stack, "empty", error_status_page(exc, title="Search failed"))
         self.state.toast(f"Search failed: {exc}")
 
     def _show_other_kind(self, kind: str, results: SearchResults) -> None:

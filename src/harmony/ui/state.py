@@ -42,12 +42,17 @@ class AppState(GObject.Object):
         self.credentials = CredentialStore()
         self.db: Any | None = self._open_db()
         self.providers: dict[Service, Any] = {}
+        self.provider_errors: dict[Service, str] = {}
         self.sync_engine: Any | None = None
         self.recommender: Any | None = None
         self.planner: Any | None = None
 
         self._playlist_cache: dict[Service, list[Playlist]] | None = None
         self._loading_playlists = False
+        self._playlists_refresh_pending = False
+
+        self._loading_providers = False
+        self._providers_reload_pending = False
 
         self.reload_providers()
         self._init_recommender()
@@ -68,30 +73,84 @@ class AppState(GObject.Object):
             log.exception("Failed to open database")
             return None
 
-    def _build_providers(self) -> dict[Service, Any]:
+    def _build_providers(self) -> tuple[dict[Service, Any], dict[Service, str]]:
         """Construct provider instances from settings/credentials.
 
+        Runs on a worker thread (see ``reload_providers``) because provider
+        construction can perform real, blocking network I/O — a fresh Qobuz
+        login scrapes play.qobuz.com plus a multi-MB bundle.js, each request
+        with a 15s timeout. That must never happen on the GTK main loop.
+
+        Returns ``(providers, errors)`` rather than raising, and builds each
+        service independently: one provider failing to construct (e.g. Qobuz
+        unreachable on an offline first launch) must degrade only that
+        service, not wipe out every provider and take YouTube Music search,
+        playlists, and sync down with it. ``errors`` carries a human-readable
+        message per failed service for the UI to surface.
+
         ``build_providers``'s exact signature is still being finalised by the
-        providers layer; we try the documented shape first and fall back to a
-        no-args call rather than crash the whole app on a signature mismatch.
+        providers layer; we try the documented shape first (it constructs all
+        providers atomically, so a single failure there currently loses every
+        provider) and fall back to constructing each provider class ourselves
+        for real isolation.
         """
         try:
             from harmony.providers import build_providers
         except ImportError as exc:
             log.warning("providers layer unavailable: %s", exc)
-            return {}
+            return {}, {}
+
         try:
-            return build_providers(self.settings, self.credentials)
+            return dict(build_providers(self.settings, self.credentials)), {}
         except TypeError:
             log.debug("build_providers(settings, credentials) rejected; retrying bare", exc_info=True)
             try:
-                return build_providers()
+                return dict(build_providers()), {}
             except Exception:
-                log.exception("Failed to build providers")
-                return {}
+                log.exception("build_providers() failed (bare call); falling back to per-service construction")
         except Exception:
-            log.exception("Failed to build providers")
-            return {}
+            log.exception("build_providers() failed; falling back to per-service construction")
+
+        return self._build_providers_per_service()
+
+    def _build_providers_per_service(self) -> tuple[dict[Service, Any], dict[Service, str]]:
+        """Construct each provider class directly so a single failure is isolated."""
+        try:
+            from harmony.providers import QobuzProvider, YTMusicProvider
+        except ImportError as exc:
+            log.warning("providers layer unavailable: %s", exc)
+            return {}, {}
+
+        providers: dict[Service, Any] = {}
+        errors: dict[Service, str] = {}
+        for service, provider_cls in ((Service.YTMUSIC, YTMusicProvider), (Service.QOBUZ, QobuzProvider)):
+            try:
+                providers[service] = provider_cls(self.settings, self.credentials)
+            except Exception as exc:  # noqa: BLE001 - per-provider isolation is the point
+                log.warning("Failed to construct %s provider: %s", service, exc)
+                errors[service] = str(exc) or exc.__class__.__name__
+        self._warm_up(providers, errors)
+        return providers, errors
+
+    @staticmethod
+    def _warm_up(providers: dict[Service, Any], errors: dict[Service, str]) -> None:
+        """Establish sessions so the account rows reflect reality.
+
+        Provider constructors are deliberately pure — no network, no keyring —
+        so ``is_authenticated`` reads False for an already-configured account
+        until something makes the first real call. This runs on the worker
+        thread that built them, so the sign-in happens before the UI asks.
+        A failure here is not fatal: it just means that service shows as
+        disconnected, which is exactly what it is.
+        """
+        for service, provider in providers.items():
+            try:
+                if provider.is_authenticated:
+                    continue
+                provider.authenticate()
+            except Exception as exc:  # noqa: BLE001 - unconfigured is the common case
+                log.debug("Could not warm up %s: %s", service, exc)
+                errors.setdefault(service, str(exc) or exc.__class__.__name__)
 
     def _init_recommender(self) -> None:
         try:
@@ -147,11 +206,47 @@ class AppState(GObject.Object):
     # -- public API ---------------------------------------------------------
 
     def reload_providers(self) -> None:
-        """Rebuild provider instances from current settings and notify pages."""
-        self.providers = self._build_providers()
+        """Rebuild provider instances from current settings and notify pages.
+
+        Construction happens off the main loop (``_build_providers`` can do
+        real network I/O) and results are marshalled back via ``run_async``,
+        which needs a running GLib main loop to deliver its callback — that's
+        satisfied here because ``AppState`` is built during ``do_startup``,
+        before ``Gio.Application.run()`` starts pumping the loop, and
+        ``GLib.idle_add`` sources queued early just fire once it does.
+
+        Concurrent calls (e.g. a debounced Preferences edit firing while the
+        previous reload is still in flight) are coalesced rather than kicking
+        off overlapping builds that could finish out of order and clobber
+        each other's result.
+        """
         self._playlist_cache = None
-        self._rebuild_sync_engine()
-        self.emit("providers-changed")
+        if self._loading_providers:
+            self._providers_reload_pending = True
+            return
+        self._loading_providers = True
+        self._providers_reload_pending = False
+
+        def work() -> tuple[dict[Service, Any], dict[Service, str]]:
+            return self._build_providers()
+
+        def finish(providers: dict[Service, Any], errors: dict[Service, str]) -> None:
+            self._loading_providers = False
+            self.providers = providers
+            self.provider_errors = errors
+            self._rebuild_sync_engine()
+            self.emit("providers-changed")
+            if self._providers_reload_pending:
+                self.reload_providers()
+
+        def done(result: tuple[dict[Service, Any], dict[Service, str]]) -> None:
+            finish(*result)
+
+        def error(exc: BaseException) -> None:
+            log.exception("Failed to build providers: %s", exc)
+            finish({}, {})
+
+        run_async(work, done, error)
 
     def reload_planner(self) -> None:
         """Recreate the AI planner (e.g. after the API key changes in Preferences)."""
@@ -164,31 +259,51 @@ class AppState(GObject.Object):
         should listen for ``playlists-changed`` to redraw once the background
         fetch completes — this keeps the method synchronous and cheap while
         still honouring the "never block the main loop" rule.
+
+        A ``refresh=True`` that arrives while a load is already in flight
+        (e.g. right after a create/rename, whose own ``done`` callback also
+        calls ``all_playlists(refresh=True)``) used to be dropped silently —
+        the guard below just returned the stale cache and never queued
+        another fetch. That's coalesced now: the request is remembered and a
+        fresh load starts as soon as the in-flight one finishes.
         """
-        if (refresh or self._playlist_cache is None) and not self._loading_playlists:
-            self._loading_playlists = True
-
-            def work() -> dict[Service, list[Playlist]]:
-                result: dict[Service, list[Playlist]] = {}
-                for service, provider in self.providers.items():
-                    try:
-                        result[service] = provider.list_playlists()
-                    except Exception as exc:  # noqa: BLE001 - per-provider isolation
-                        log.warning("Failed to list playlists for %s: %s", service, exc)
-                        result[service] = []
-                return result
-
-            def done(result: dict[Service, list[Playlist]]) -> None:
-                self._loading_playlists = False
-                self._playlist_cache = result
-                self.emit("playlists-changed")
-
-            def error(exc: BaseException) -> None:
-                self._loading_playlists = False
-                self.toast(f"Couldn't load playlists: {exc}")
-
-            run_async(work, done, error)
+        if self._loading_playlists:
+            if refresh:
+                self._playlists_refresh_pending = True
+            return self._playlist_cache or {}
+        if refresh or self._playlist_cache is None:
+            self._start_playlist_load()
         return self._playlist_cache or {}
+
+    def _start_playlist_load(self) -> None:
+        self._loading_playlists = True
+        self._playlists_refresh_pending = False
+
+        def work() -> dict[Service, list[Playlist]]:
+            result: dict[Service, list[Playlist]] = {}
+            for service, provider in self.providers.items():
+                try:
+                    result[service] = provider.list_playlists()
+                except Exception as exc:  # noqa: BLE001 - per-provider isolation
+                    log.warning("Failed to list playlists for %s: %s", service, exc)
+                    result[service] = []
+            return result
+
+        def finish() -> None:
+            self._loading_playlists = False
+            if self._playlists_refresh_pending:
+                self._start_playlist_load()
+
+        def done(result: dict[Service, list[Playlist]]) -> None:
+            self._playlist_cache = result
+            self.emit("playlists-changed")
+            finish()
+
+        def error(exc: BaseException) -> None:
+            self.toast(f"Couldn't load playlists: {exc}")
+            finish()
+
+        run_async(work, done, error)
 
     def toast(self, text: str) -> None:
         """Emit a toast. Must be called from the main thread."""
