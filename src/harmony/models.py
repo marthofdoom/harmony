@@ -7,11 +7,11 @@ sync, and the UI never have to care which backend a row came from.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 
-class Service(str, Enum):
+class Service(StrEnum):
     YTMUSIC = "ytmusic"
     QOBUZ = "qobuz"
 

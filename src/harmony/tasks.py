@@ -66,7 +66,10 @@ def run_async(
         except BaseException as exc:  # noqa: BLE001 - surfaced to the caller
             log.exception("Background task failed: %s", fn)
             if on_error is not None:
-                GLib.idle_add(lambda: (on_error(exc), False)[1], priority=GLib.PRIORITY_DEFAULT)
+                # Bind now: Python unbinds `exc` when the except block exits, so a
+                # lambda that closed over the name would fire with it already gone.
+                err = exc
+                GLib.idle_add(lambda: (on_error(err), False)[1], priority=GLib.PRIORITY_DEFAULT)
             return
         if on_done is not None:
             GLib.idle_add(lambda: (on_done(result), False)[1], priority=GLib.PRIORITY_DEFAULT)
