@@ -57,6 +57,32 @@ jobs:
       - name: Run tests
         run: python -m pytest -q --junitxml=junit-${{ matrix.python-version }}.xml
 
+      # The engine has to serve both the GTK desktop app and a hosted web
+      # service, so it must import on a box with no GTK at all. This runner has
+      # none installed, which makes the check genuine rather than simulated.
+      - name: Prove the engine imports without GTK
+        run: |
+          python - <<'PY'
+          import sys
+
+          class Blocked:
+              def __getattr__(self, name):
+                  raise ImportError("gi is deliberately unavailable in this check")
+
+          sys.modules["gi"] = Blocked()
+
+          import harmony.ai.claude          # noqa: F401
+          import harmony.db                 # noqa: F401
+          import harmony.enrich.recommender # noqa: F401
+          import harmony.io_formats         # noqa: F401
+          import harmony.matching           # noqa: F401
+          import harmony.models             # noqa: F401
+          import harmony.providers          # noqa: F401
+          import harmony.sync               # noqa: F401
+          import harmony.tasks              # noqa: F401
+          print("engine imports cleanly with no GTK present")
+          PY
+
       - name: Upload test results
         if: always()
         uses: actions/upload-artifact@v4
