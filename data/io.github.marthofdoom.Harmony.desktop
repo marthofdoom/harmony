@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Harmony
+GenericName=Music Playlist Manager
+Comment=Create and sync playlists across YouTube Music and Qobuz
+Exec=harmony
+Icon=io.github.marthofdoom.Harmony
+Terminal=false
+Categories=AudioVideo;Audio;Music;GTK;
+Keywords=music;playlist;sync;youtube;qobuz;streaming;
+StartupNotify=true
