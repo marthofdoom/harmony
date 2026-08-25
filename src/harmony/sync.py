@@ -16,8 +16,9 @@ from typing import TYPE_CHECKING
 
 from . import io_formats
 from .errors import ProviderError
-from .matching import MatchResult, match_tracks
+from .matching import HIGH_THRESHOLD, LOW_THRESHOLD, MatchResult, match_tracks
 from .models import Playlist, Service, Track
+from .providers.base import _chunked
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -34,6 +35,14 @@ log = logging.getLogger(__name__)
 # "none" must never drive an add or suppress a remove on their own — that is
 # precisely the data-loss bug this module guards against.
 _CONFIDENT_ENOUGH = {"exact", "high", "manual"}
+
+# Sync-level sub-chunking for apply()'s per-group provider calls. This is
+# deliberately independent of whatever chunk size a provider uses internally
+# for its own network requests (YT 100 / Qobuz 50) — it exists purely so a
+# large group has more than one cancellation checkpoint and more than one
+# progress tick, without regressing all the way back to one provider call per
+# track. See ``SyncEngine.apply``.
+_APPLY_CHUNK_SIZE = 20
 
 
 class SyncDirection(Enum):
@@ -145,9 +154,36 @@ def _split_progress(
 
 
 class SyncEngine:
-    def __init__(self, providers: dict[Service, MusicProvider], db: Database) -> None:
+    def __init__(
+        self,
+        providers: dict[Service, MusicProvider],
+        db: Database,
+        *,
+        high_threshold: float = HIGH_THRESHOLD,
+        low_threshold: float = LOW_THRESHOLD,
+        auto_accept_high: bool = True,
+    ) -> None:
+        """``high_threshold``/``low_threshold``/``auto_accept_high`` come from
+        ``Settings``; they are passed in rather than read here so the engine
+        stays independent of ``harmony.config`` (see docs/ARCHITECTURE.md).
+
+        ``auto_accept_high`` False means only ISRC-verified (``exact``) and
+        user-resolved (``manual``) matches are applied without asking. A
+        ``high`` fuzzy match is then surfaced for confirmation instead, which
+        is the conservative choice for anyone who has been bitten by a
+        confident-looking wrong match.
+        """
         self.providers = providers
         self.db = db
+        self.high_threshold = high_threshold
+        self.low_threshold = low_threshold
+        self.auto_accept_high = auto_accept_high
+
+    @property
+    def _confident_enough(self) -> set[str]:
+        if self.auto_accept_high:
+            return _CONFIDENT_ENOUGH
+        return _CONFIDENT_ENOUGH - {"high"}
 
     def _provider_for(self, service: Service) -> MusicProvider:
         provider = self.providers.get(service)
@@ -211,26 +247,37 @@ class SyncEngine:
         dst_ids = {t.id for t in dst_tracks}
 
         results = match_tracks(
-            src_tracks, dst_provider, progress=_wrap_progress(progress, cancel), db=self.db
+            src_tracks,
+            dst_provider,
+            progress=_wrap_progress(progress, cancel),
+            db=self.db,
+            high_threshold=self.high_threshold,
+            low_threshold=self.low_threshold,
         )
 
         actions: list[SyncAction] = []
-        # Tracks whose id is safe to skip when looking for removal candidates:
-        # ``matched_dst_ids`` are dst tracks a source track matched with
-        # enough confidence to act on; ``accounted_dst_ids`` is the wider set
-        # of "some source track's best guess landed here", used only as a
-        # belt-and-braces guard below — see the removal loop.
+        # Dst tracks that are "accounted for" by some source track and must
+        # not be treated as orphans by the removal loop below.
         matched_dst_ids: set[str] = set()
-        accounted_dst_ids: set[str] = set()
         has_unmatched = False
         for result in results:
             best = result.best
-            if best is not None:
-                accounted_dst_ids.add(best.track.id)
-            if best is not None and result.confidence in _CONFIDENT_ENOUGH:
+            # Already-present short-circuit: if the best candidate is a real
+            # (non-"none") guess and it already sits in the target playlist,
+            # there is nothing to add regardless of confidence, and no reason
+            # to bother the user with an "unmatched" prompt either — doing so
+            # let the sync UI's default "use top candidate" resolution issue
+            # a literal duplicate add for a track that was already correctly
+            # in the target (e.g. a "low"-confidence cross-service duration
+            # mismatch on an otherwise-correct match, like "Creep" scoring
+            # 0.850 because of a 22s master-length difference). A "none"
+            # confidence best guess is excluded: with no real candidate found,
+            # a coincidental id match isn't trustworthy evidence of anything.
+            if best is not None and result.confidence != "none" and best.track.id in dst_ids:
                 matched_dst_ids.add(best.track.id)
-                if best.track.id in dst_ids:
-                    continue  # already present on the target: no action needed
+                continue
+            if best is not None and result.confidence in self._confident_enough:
+                matched_dst_ids.add(best.track.id)
                 actions.append(
                     SyncAction(
                         kind="add",
@@ -275,11 +322,13 @@ class SyncEngine:
                 )
             else:
                 for track in dst_tracks:
-                    # Per-track guard, redundant with the branch above today
-                    # but kept as defense in depth: never remove a target
-                    # track that any source track's match — confident or
-                    # not — pointed at.
-                    if track.id in matched_dst_ids or track.id in accounted_dst_ids:
+                    # Never remove a target track that some source track's
+                    # match — confident add, or the already-present
+                    # short-circuit above — accounted for. (This loop only
+                    # runs when ``has_unmatched`` is False, i.e. every result
+                    # landed in one of those two cases or matched nothing at
+                    # all, so ``matched_dst_ids`` alone is the complete set.)
+                    if track.id in matched_dst_ids:
                         continue
                     actions.append(
                         SyncAction(
@@ -334,11 +383,27 @@ class SyncEngine:
                 for action in batch:
                     log.warning("Sync action %s(%s) failed: %s", action.kind, action.track.title, message)
                     report.failed.append((action, message))
-            else:
-                self._apply_batch(kind, service, playlist, batch, report)
-            done_count += len(batch)
-            if progress is not None:
-                progress(done_count / total, batch[-1].track.title)
+                done_count += len(batch)
+                if progress is not None:
+                    progress(done_count / total, batch[-1].track.title)
+                continue
+
+            # Sub-chunk each group so cancellation is honoured and progress
+            # moves in more than one jump. A single provider call per whole
+            # group (potentially hundreds of tracks) used to mean at most one
+            # cancel check and one progress tick per group — a 50-track plan
+            # cancelled right after it started ran to completion because
+            # nothing between "start" and "done" ever looked at the token.
+            # This is independent of whatever chunk size the provider itself
+            # uses for its network requests (YT 100 / Qobuz 50): it exists so
+            # *this* loop has checkpoints, not to optimise request counts.
+            for sub in _chunked(batch, _APPLY_CHUNK_SIZE):
+                if cancel is not None:
+                    cancel.raise_if_cancelled()
+                self._apply_batch(kind, service, playlist, sub, report, cancel=cancel)
+                done_count += len(sub)
+                if progress is not None:
+                    progress(done_count / total, sub[-1].track.title)
 
         report.skipped.extend(a for a in plan.actions if a.kind == "unmatched")
         return report
@@ -350,15 +415,23 @@ class SyncEngine:
         playlist: Playlist,
         batch: list[SyncAction],
         report: SyncReport,
+        *,
+        cancel: CancelToken | None = None,
     ) -> None:
-        """Apply one (service, playlist, kind) group as a single provider call.
+        """Apply one (service, playlist, kind) sub-batch as a single provider call.
 
         Batching lets the provider's own chunking do its job instead of
         issuing one network round-trip (and, for providers like YouTube Music
         whose ``remove_tracks`` re-fetches the whole playlist, one full
-        re-fetch) per track. If the batched call fails, fall back to calling
-        each action individually so one bad id can't fail the whole group —
-        each failure is still recorded precisely in ``report.failed``.
+        re-fetch) per track. Real providers chunk internally and are *not*
+        transactional (``providers/ytmusic.py`` loops chunks of 100,
+        ``providers/qobuz.py`` chunks of 50): if chunk *k* of an
+        ``add_tracks``/``remove_tracks`` call fails, chunks ``1..k-1`` have
+        already landed on the server before the exception reaches us. Blindly
+        retrying every action in the batch individually — the old
+        behaviour — would re-add tracks that already made it through,
+        duplicating them in the user's playlist while ``report.added`` kept
+        reporting the correct count. See ``_apply_batch_fallback``.
         """
         provider = self._provider_for(service)
         track_ids = [action.track.id for action in batch]
@@ -372,8 +445,7 @@ class SyncEngine:
                 "Batched %s of %d track(s) on %s failed (%s); retrying individually",
                 kind, len(batch), playlist.id, exc,
             )
-            for action in batch:
-                self._apply_one(action, provider, playlist, report)
+            self._apply_batch_fallback(kind, provider, playlist, batch, report, exc, cancel=cancel)
             return
 
         for action in batch:
@@ -382,6 +454,65 @@ class SyncEngine:
                 self._record_link(action)
             else:
                 report.removed.append(action.track)
+
+    def _apply_batch_fallback(
+        self,
+        kind: str,
+        provider: MusicProvider,
+        playlist: Playlist,
+        batch: list[SyncAction],
+        report: SyncReport,
+        exc: Exception,
+        *,
+        cancel: CancelToken | None = None,
+    ) -> None:
+        """Retry a failed batch without risking duplicate writes.
+
+        A failed batched call may have partially landed (see
+        ``_apply_batch``'s docstring), so before retrying anything we re-read
+        the target playlist's *current* track ids — one extra fetch, only on
+        this error path — and use it to retry only what genuinely still needs
+        doing: for "add", skip ids that are already present (they landed as
+        part of the failed batch, or were already there) instead of adding
+        them a second time; for "remove", skip ids that are already gone.
+
+        If the playlist can't be re-read, we have no way to tell what already
+        landed, so retrying blind would risk exactly the duplication this
+        exists to prevent. In that case every action in the batch is recorded
+        as failed instead — a recorded failure the user can retry beats a
+        silently corrupted playlist.
+        """
+        try:
+            current_ids = {t.id for t in provider.get_playlist_tracks(playlist.id)}
+        except Exception as read_exc:  # noqa: BLE001 - see docstring: fail closed
+            message = (
+                f"batched {kind} failed ({exc}) and the playlist could not be re-read "
+                f"to retry safely ({read_exc})"
+            )
+            log.error(
+                "Batched %s of %d track(s) on %s failed and could not be verified; "
+                "recording as failed rather than risking duplication: %s",
+                kind, len(batch), playlist.id, read_exc,
+            )
+            for action in batch:
+                report.failed.append((action, message))
+            return
+
+        for action in batch:
+            if cancel is not None:
+                cancel.raise_if_cancelled()
+            already_present = action.track.id in current_ids
+            if kind == "add" and already_present:
+                # Already landed (from the partially-failed batch, or from
+                # before) — count it without writing it again.
+                report.added.append(action.track)
+                self._record_link(action)
+                continue
+            if kind == "remove" and not already_present:
+                # Already gone — nothing left to do.
+                report.removed.append(action.track)
+                continue
+            self._apply_one(action, provider, playlist, report)
 
     def _apply_one(
         self,
@@ -413,18 +544,32 @@ class SyncEngine:
         ``kind``/``track`` in place without touching ``match``). That is
         stronger evidence than any fuzzy score, so it is cached as a
         "manual" link at score 1.0 rather than mis-attributing the top
-        candidate's score to the track the user actually picked. The same
-        applies if the ids happen to coincide but the original match
-        confidence was "none": a link is never cached with confidence
-        "none", since ``matching._match_one`` treats any cached link as
-        authoritative and would otherwise short-circuit every future match
-        to "no match", which rule 1's removal guard would then treat as
-        unmatched forever.
+        candidate's score to the track the user actually picked.
+
+        The same applies whenever the *accepted* match's own confidence is
+        not "exact" or "high" — not just "none" — even if the applied id
+        happens to equal ``best``'s id. "low" is an entirely ordinary
+        cross-service scoring outcome (e.g. a 22s master-length difference),
+        and the sync UI's natural click is the top-ranked candidate, which
+        *is* ``match.best``. If a "low" link were cached verbatim at its
+        original confidence, ``matching._match_one`` would keep returning it
+        as authoritative forever, "low" is not in ``_CONFIDENT_ENOUGH``, so
+        the action would be "unmatched" again on every subsequent sync —
+        which rule 1's removal guard then treats as permanently unmatched,
+        suppressing all removals for that direction forever, on top of
+        re-prompting the user for the same track every single time. Treating
+        the user's acceptance (of any confidence below "high") as "manual"
+        is what breaks that loop: once cached as "manual", it lands in the
+        confident branch of ``_plan_one_direction`` next time, where the
+        already-present check applies and no duplicate add is generated.
         """
         if action.match is None or action.match.best is None:
             return
         src = action.match.source
-        if action.track.id != action.match.best.track.id or action.match.confidence == "none":
+        if action.track.id != action.match.best.track.id or action.match.confidence not in (
+            "exact",
+            "high",
+        ):
             confidence, score_value = "manual", 1.0
         else:
             confidence, score_value = action.match.confidence, action.match.best.score
