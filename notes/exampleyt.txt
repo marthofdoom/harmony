@@ -1,0 +1,100 @@
+import time
+from ytmusicapi import YTMusic
+
+# 1. Initialize API with your local OAuth credentials
+yt = YTMusic("oauth.json")
+
+# 2. Setup
+playlist_id = "YOUR_PLAYLIST_ID_HERE" # Paste your playlist ID from the URL (after 'list=')
+bands = [
+    "Red", "Pillar", "Three Days Grace",
+    "Thousand Foot Krutch", "Breaking Benjamin",
+    "Linkin Park", "Skillet"
+]
+
+all_tracks = []
+
+print("Gathering discographies...")
+
+# 3. Process each band
+for band in bands:
+    print(f"\nSearching for: {band}")
+    search_results = yt.search(band, filter="artists")
+
+    if not search_results:
+        print(f"Could not find {band}. Skipping...")
+        continue
+
+    artist_id = search_results[0]['browseId']
+    artist = yt.get_artist(artist_id)
+
+    browse_ids = []
+
+    # Helper to extract album/single IDs safely
+    def extract_ids(category):
+        if category in artist:
+            # If there's a "See All" button, fetch the full list
+            if 'browseId' in artist[category] and 'params' in artist[category]:
+                results = yt.get_artist_albums(artist[category]['browseId'], artist[category]['params'])
+                return [item['browseId'] for item in results]
+            # Otherwise, take the top results shown
+            elif 'results' in artist[category]:
+                return [item['browseId'] for item in artist[category]['results']]
+        return []
+
+    browse_ids.extend(extract_ids('albums'))
+    browse_ids.extend(extract_ids('singles'))
+
+    # 4. Fetch tracks and play counts for each album/single
+    for b_id in set(browse_ids):
+        try:
+            album = yt.get_album(b_id)
+            for track in album.get('tracks', []):
+                vid = track.get('videoId')
+                if vid:
+                    # Clean the playCount string (e.g., "12,345,678" -> 12345678)
+                    pc_raw = track.get('playCount')
+                    if isinstance(pc_raw, str):
+                        pc = int(pc_raw.replace(',', '')) if pc_raw.replace(',', '').isdigit() else 0
+                    else:
+                        pc = pc_raw or 0
+
+                    all_tracks.append({
+                        'videoId': vid,
+                        'playCount': pc,
+                        'title': track.get('title'),
+                        'artist': band
+                    })
+        except Exception as e:
+            print(f"  Error fetching album {b_id}: {e}")
+
+        # Respect API rate limits
+        time.sleep(0.5)
+
+# 5. Sort the massive list by play count (Popularity)
+print("\nSorting tracks by play count...")
+sorted_tracks = sorted(all_tracks, key=lambda x: x['playCount'], reverse=True)
+
+# 6. Deduplicate (keeping the most popular version of a track if there are duplicates)
+seen_titles = set()
+unique_video_ids = []
+
+for track in sorted_tracks:
+    # Use lowercase title + artist as a unique key to catch singles vs album versions
+    track_key = f"{track['title'].lower()}_{track['artist']}"
+    if track_key not in seen_titles:
+        unique_video_ids.append(track['videoId'])
+        seen_titles.add(track_key)
+
+print(f"Found {len(unique_video_ids)} unique tracks.")
+
+# 7. Add to playlist in batches of 100 to avoid API timeouts
+print("\nAdding tracks to playlist...")
+chunk_size = 100
+for i in range(0, len(unique_video_ids), chunk_size):
+    chunk = unique_video_ids[i:i + chunk_size]
+    yt.add_playlist_items(playlist_id, chunk)
+    print(f"Added {len(chunk)} tracks... ({i + len(chunk)}/{len(unique_video_ids)})")
+    time.sleep(1)
+
+print("\nSuccess! Ultimate Rock Discography Anthology is ready.")

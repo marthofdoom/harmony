@@ -1,0 +1,12 @@
+Category,Available Methods
+Setup & Auth,"setup(), setup_oauth()"
+Search,"search(), get_search_suggestions(), remove_search_suggestions()"
+Browsing (Artists & Albums),"get_artist(), get_artist_albums(), get_album(), get_album_browse_id()"
+Browsing (Songs & Lyrics),"get_song(), get_song_related(), get_lyrics(), get_song_credits(), get_tasteprofile(), set_tasteprofile()"
+Playlists,"get_playlist(), create_playlist(), edit_playlist(), delete_playlist(), add_playlist_items(), remove_playlist_items(), join_collaborative_playlist()"
+Library Management,"get_library_songs(), get_library_albums(), get_library_artists(), get_library_playlists(), get_liked_songs(), get_history(), add_history_item(), remove_history_items()"
+Interactions,"rate_song(), rate_playlist(), edit_song_library_status(), subscribe_artists(), unsubscribe_artists()"
+Explore & Watch,"get_home(), get_mood_categories(), get_mood_playlists(), get_charts(), get_watch_playlist()"
+Personal Uploads,"upload_song(), delete_upload_entity(), get_library_upload_songs(), get_library_upload_albums(), get_library_upload_artists(), get_library_upload_album(), get_library_upload_artist()"
+Podcasts & Channels,"get_channel(), get_channel_episodes(), get_podcast(), get_episode(), get_episodes_playlist(), get_library_podcasts(), get_library_channels(), get_saved_episodes()"
+Account Info,"get_user(), get_user_playlists(), get_user_videos(), get_account_info(), get_library_subscriptions()"

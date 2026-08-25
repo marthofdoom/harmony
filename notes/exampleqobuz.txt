@@ -1,0 +1,54 @@
+# Note: This uses the 'minim' library (pip install minim)
+from minim.api.qobuz import QobuzAPI
+
+# 1. Authenticate
+# You will need your App ID, Secret, and your Qobuz user credentials.
+# (Some libraries allow password/email login which generates a temporary token)
+client = QobuzAPI(
+    app_id="YOUR_APP_ID",
+    app_secret="YOUR_APP_SECRET",
+    username="your_email@domain.com",
+    password="your_password"
+)
+
+bands = ["Red", "Pillar", "Three Days Grace", "Breaking Benjamin"]
+track_ids = []
+
+# 2. Create the Playlist
+print("Creating Qobuz Playlist...")
+playlist = client.create_playlist(
+    name="Ultimate Rock Discography Anthology",
+    description="Generated via Python API"
+)
+playlist_id = playlist["id"]
+
+# 3. Search for bands and pull their tracks
+for band in bands:
+    print(f"Searching for {band}...")
+
+    # Search for the artist specifically
+    search_results = client.search(band, type="artist", limit=1)
+
+    if search_results["artists"]["items"]:
+        artist_id = search_results["artists"]["items"][0]["id"]
+
+        # Pull the artist's albums
+        albums = client.get_artist_albums(artist_id, limit=50)
+
+        for album in albums["items"]:
+            # Pull the tracks for each album
+            album_data = client.get_album(album["id"])
+            for track in album_data["tracks"]["items"]:
+                track_ids.append(track["id"])
+
+# 4. Add Tracks to the Playlist
+# Qobuz API usually accepts comma-separated track IDs or lists
+print(f"Adding {len(track_ids)} tracks to the playlist...")
+
+# Batching to avoid rate limits
+chunk_size = 50
+for i in range(0, len(track_ids), chunk_size):
+    chunk = track_ids[i:i + chunk_size]
+    client.add_playlist_tracks(playlist_id, chunk)
+
+print("Success! Qobuz playlist is ready.")
