@@ -46,12 +46,17 @@ def run_async(
     on_done: Callable[[T], Any] | None = None,
     on_error: Callable[[BaseException], Any] | None = None,
     *args: Any,
+    on_cancelled: Callable[[], Any] | None = None,
     **kwargs: Any,
 ) -> Future:
     """Run ``fn`` off the main loop; deliver the result back on the main loop.
 
-    ``on_done`` / ``on_error`` are invoked via ``GLib.idle_add`` so they are safe
-    to touch widgets from. Cancellation is silent by design.
+    ``on_done`` / ``on_error`` / ``on_cancelled`` are all invoked via
+    ``GLib.idle_add`` so they are safe to touch widgets from. A cancelled task
+    never counts as an error (it's not logged as one) but callers that put up
+    UI while the task runs — a ``ProgressDialog``, say — need a callback to
+    tear that UI down; that's what ``on_cancelled`` is for. It's optional so
+    fire-and-forget callers don't need to care.
     """
     from gi.repository import GLib
 
@@ -62,6 +67,8 @@ def run_async(
         try:
             result = fut.result()
         except Cancelled:
+            if on_cancelled is not None:
+                GLib.idle_add(lambda: (on_cancelled(), False)[1], priority=GLib.PRIORITY_DEFAULT)
             return
         except BaseException as exc:  # noqa: BLE001 - surfaced to the caller
             log.exception("Background task failed: %s", fn)

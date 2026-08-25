@@ -16,7 +16,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gio, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Track  # noqa: E402
 
@@ -164,6 +164,23 @@ def error_status_page(exc: BaseException, *, title: str = "Something went wrong"
     )
 
 
+def set_stack_status(stack: Gtk.Stack, name: str, widget: Gtk.Widget) -> None:
+    """Show ``widget`` as the page named ``name`` in ``stack``, replacing it and
+    making it visible.
+
+    ``Gtk.Stack.add_named`` warns and does nothing if ``name`` is already
+    registered — it keeps showing whatever was added first under that name.
+    Status pages that get rebuilt on every load/error (e.g. "Couldn't load
+    tracks") must call this instead of ``add_named`` directly, or the new
+    content silently never appears.
+    """
+    existing = stack.get_child_by_name(name)
+    if existing is not None:
+        stack.remove(existing)
+    stack.add_named(widget, name)
+    stack.set_visible_child_name(name)
+
+
 def missing_layer_status_page(layer_name: str) -> Adw.StatusPage:
     """Placeholder shown when a backend module hasn't landed yet.
 
@@ -182,8 +199,21 @@ class ProgressDialog(Adw.Window):
     """Modal progress indicator for long-running sync/match operations.
 
     Backed by a ``CancelToken`` so the Cancel button can cooperatively stop
-    the worker thread per the threading contract in ``tasks.py``.
+    the worker thread per the threading contract in ``tasks.py``. The normal
+    path is: caller wires ``harmony.tasks.run_async(..., on_cancelled=dialog.close)``
+    so the dialog closes itself the moment the worker actually unwinds.
+
+    That normal path depends on the caller wiring ``on_cancelled`` correctly,
+    which is easy to get wrong or forget — and this dialog is modal with
+    ``deletable=False``, so a caller bug here means an unkillable window, not
+    just a stale spinner. As a second line of defence, if "Cancelling…" sits
+    for more than a few seconds with nobody having closed us, this dialog
+    frees itself: it becomes deletable and the button turns into a plain
+    "Close" the user can act on. This dialog must never be the only thing
+    standing between the user and a usable window.
     """
+
+    _CANCEL_GRACE_SECONDS = 5
 
     def __init__(self, parent: Gtk.Window, title: str, cancel_token: Any) -> None:
         super().__init__(
@@ -196,6 +226,7 @@ class ProgressDialog(Adw.Window):
             deletable=False,
         )
         self._cancel_token = cancel_token
+        self._grace_source_id: int | None = None
         toolbar_view = Adw.ToolbarView()
         header = Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False)
         toolbar_view.add_top_bar(header)
@@ -217,11 +248,38 @@ class ProgressDialog(Adw.Window):
         box.append(self._cancel_button)
         toolbar_view.set_content(box)
         self.set_content(toolbar_view)
+        self.connect("close-request", lambda *_a: self._clear_grace_timeout() and False)
 
     def _on_cancel_clicked(self, _button: Gtk.Button) -> None:
+        if self._cancel_token.cancelled:
+            # Cancel was already requested and we're still open past the grace
+            # period — this click is the "Close" fallback, not a real cancel.
+            self.close()
+            return
         self._cancel_token.cancel()
         self._cancel_button.set_sensitive(False)
         self._label.set_label("Cancelling…")
+        self._grace_source_id = GLib.timeout_add_seconds(
+            self._CANCEL_GRACE_SECONDS, self._on_cancel_grace_elapsed
+        )
+
+    def _on_cancel_grace_elapsed(self) -> bool:
+        self._grace_source_id = None
+        self.set_deletable(True)
+        self._cancel_button.set_sensitive(True)
+        self._cancel_button.set_label("Close")
+        self._label.set_label("Still cancelling… you can close this window now.")
+        return GLib.SOURCE_REMOVE
+
+    def _clear_grace_timeout(self) -> bool:
+        if self._grace_source_id is not None:
+            GLib.source_remove(self._grace_source_id)
+            self._grace_source_id = None
+        return True
+
+    def close(self) -> bool:
+        self._clear_grace_timeout()
+        return super().close()
 
     def update(self, fraction: float, message: str) -> None:
         self._bar.set_fraction(max(0.0, min(1.0, fraction)))

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import gi
@@ -23,12 +24,28 @@ from harmony.ui.widgets import (  # noqa: E402
     missing_layer_status_page,
     replace_tracks,
     selected_tracks,
+    set_stack_status,
     status_page,
 )
 
 log = logging.getLogger(__name__)
 
-_EXPORT_FORMATS = ["m3u", "csv", "json"]
+_SUPPORTED_FORMATS = ["m3u", "csv", "json"]
+
+
+@dataclass
+class _ImportOutcome:
+    """Result of importing a file and resolving it against a live provider."""
+
+    added: int
+    """Tracks actually added to the playlist (resolved + written)."""
+    total_rows: int
+    """Every row the file claimed to contain, parsed or not."""
+    rows_skipped: int
+    """Rows that failed to parse (malformed M3U/CSV/JSON entries)."""
+    unmatched: int
+    """Rows that parsed fine but couldn't be resolved to a catalog track."""
+    warnings: list[str] = field(default_factory=list)
 
 
 def _is_dialog_dismissal(exc: GLib.Error) -> bool:
@@ -162,8 +179,7 @@ class PlaylistsPage(Gtk.Box):
     def _load_tracks(self, playlist: Playlist) -> None:
         provider = self.state.providers.get(playlist.service)
         if provider is None:
-            self.track_stack.add_named(missing_layer_status_page("providers"), "empty")
-            self.track_stack.set_visible_child_name("empty")
+            set_stack_status(self.track_stack, "empty", missing_layer_status_page("providers"))
             return
         self.track_stack.set_visible_child_name("empty")
 
@@ -177,8 +193,9 @@ class PlaylistsPage(Gtk.Box):
             self.track_stack.set_visible_child_name("tracks")
 
         def error(exc: BaseException) -> None:
-            self.track_stack.add_named(error_status_page(exc, title="Couldn't load tracks"), "empty")
-            self.track_stack.set_visible_child_name("empty")
+            if self._selected_playlist is not playlist:
+                return
+            set_stack_status(self.track_stack, "empty", error_status_page(exc, title="Couldn't load tracks"))
 
         run_async(work, done, error)
 
@@ -330,15 +347,23 @@ class PlaylistsPage(Gtk.Box):
         if provider is None:
             return
         suffix = path.suffix.lstrip(".").lower() or "m3u"
+        if suffix not in _SUPPORTED_FORMATS:
+            self.state.toast(f"Unsupported export format: .{suffix}")
+            return
 
         def work() -> None:
             from harmony import io_formats
 
             tracks = provider.get_playlist_tracks(playlist.id)
-            exporter = getattr(io_formats, f"export_{suffix}", None)
-            if exporter is None:
-                raise ValueError(f"Unsupported export format: .{suffix}")
-            exporter(path, playlist, tracks)
+            # The three exporters don't share a signature (export_json also
+            # needs the playlist for its metadata block), so dispatch by hand
+            # rather than pretend they're interchangeable via getattr.
+            if suffix == "m3u":
+                io_formats.export_m3u(tracks, path)
+            elif suffix == "csv":
+                io_formats.export_csv(tracks, path)
+            else:
+                io_formats.export_json(playlist, tracks, path)
 
         def done(_r: None) -> None:
             self.state.toast(f"Exported to {path.name}")
@@ -364,21 +389,50 @@ class PlaylistsPage(Gtk.Box):
         if provider is None:
             return
         suffix = path.suffix.lstrip(".").lower()
+        if suffix not in _SUPPORTED_FORMATS:
+            self.state.toast(f"Unsupported import format: .{suffix}")
+            return
 
-        def work() -> int:
+        def work() -> _ImportOutcome:
             from harmony import io_formats
 
-            importer = getattr(io_formats, f"import_{suffix}", None)
-            if importer is None:
-                raise ValueError(f"Unsupported import format: .{suffix}")
-            tracks = importer(path)
-            track_ids = [t.id for t in tracks if getattr(t, "id", "")]
-            if track_ids:
-                provider.add_tracks(playlist.id, track_ids)
-            return len(track_ids)
+            importer = {"m3u": io_formats.import_m3u, "csv": io_formats.import_csv,
+                        "json": io_formats.import_json}[suffix]
+            # Importers only ever hand back loose descriptor dicts (no stable
+            # cross-service id survives an M3U/CSV/JSON round trip) — they must
+            # be re-resolved against the target provider's real catalog via
+            # matching, same as a hand-typed playlist would be. That's a
+            # network operation, so it has to stay on this worker thread.
+            descriptors, parse_warnings = importer(path)
+            match_results = io_formats.resolve_imported(descriptors, provider)
+            resolved_ids = [r.best.track.id for r in match_results if r.best is not None]
+            if resolved_ids:
+                provider.add_tracks(playlist.id, resolved_ids)
+            match_warnings = [
+                f"could not match {r.source.title!r} ({', '.join(r.source.artists) or 'unknown artist'})"
+                for r in match_results
+                if r.best is None
+            ]
+            return _ImportOutcome(
+                added=len(resolved_ids),
+                total_rows=len(descriptors) + len(parse_warnings),
+                rows_skipped=len(parse_warnings),
+                unmatched=len(match_warnings),
+                warnings=[*parse_warnings, *match_warnings],
+            )
 
-        def done(count: int) -> None:
-            self.state.toast(f"Imported {count} track(s)")
+        def done(outcome: _ImportOutcome) -> None:
+            for warning in outcome.warnings:
+                log.warning("Import %s: %s", path.name, warning)
+            message = f"Imported {outcome.added} of {outcome.total_rows} track(s)"
+            detail = []
+            if outcome.rows_skipped:
+                detail.append(f"{outcome.rows_skipped} row(s) skipped")
+            if outcome.unmatched:
+                detail.append(f"{outcome.unmatched} unmatched")
+            if detail:
+                message += " (" + ", ".join(detail) + ")"
+            self.state.toast(message)
             self._load_tracks(playlist)
 
         run_async(work, done, lambda exc: self.state.toast(f"Import failed: {exc}"))
@@ -421,4 +475,7 @@ class PlaylistsPage(Gtk.Box):
             self.state.toast(f"Clone failed: {exc}")
 
         progress_dialog.present()
-        run_async(work, done, error)
+        # Cancelled runs invoke neither `done` nor `error` (that's the whole
+        # point of cancellation being silent) — without on_cancelled the
+        # modal, undismissable ProgressDialog would just sit there forever.
+        run_async(work, done, error, on_cancelled=progress_dialog.close)
