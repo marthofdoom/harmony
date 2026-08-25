@@ -135,16 +135,19 @@ class SyncDirection(Enum): MIRROR_A_TO_B; MIRROR_B_TO_A; TWO_WAY
 @dataclass
 class SyncAction:  # kind: "add" | "remove" | "unmatched"
     kind: str; target: Service; track: Track; match: MatchResult | None
-    target_playlist_id: str = ""  # which playlist on `target`; see below
+    target_playlist_id: str = ""     # which playlist on `target`; see below
+    needs_confirmation: bool = False # "add" only; see auto_accept_high below
 @dataclass
 class SyncPlan:
     source: Playlist; target: Playlist; actions: list[SyncAction]
     notes: list[str]
+    target_track_ids: dict[tuple[Service, str], frozenset[str]]  # see below
     def summary(self) -> str
     def normalise(self) -> None
 
 class SyncEngine:
-    def __init__(self, providers: dict[Service, MusicProvider], db: Database)
+    def __init__(self, providers: dict[Service, MusicProvider], db: Database,
+                 *, high_threshold=..., low_threshold=..., auto_accept_high=True)
     def plan(self, a: Playlist, b: Playlist, direction, *, progress=None) -> SyncPlan
     def apply(self, plan: SyncPlan, *, progress=None) -> SyncReport
     def clone_playlist(self, src: Playlist, dst_service: Service, *, progress=None) -> SyncPlan
@@ -161,17 +164,65 @@ Plan is pure (no writes). `apply` performs writes, records links in the db, and
 snapshots both playlists first. `progress` is `Callable[[float, str], None]`
 where float is 0..1. Two-way = union of both sides; never deletes on TWO_WAY.
 
+### Classification
+
+`plan()` classifies every source track exactly once into one of three states.
+This is the *only* place classification happens — there is no other bypass or
+special case anywhere else in this file, deliberately, after three prior
+rounds of one-off patches each reopened a data-loss bug the last one had
+closed:
+
+- **RESOLVED_PRESENT** — the counterpart is known (`match.confidence` is one
+  of `"exact" | "high" | "manual"`, the module-level `_CONFIDENT_ENOUGH` set)
+  and it is already in the target playlist. No action is emitted. The target
+  track counts as accounted for, not an orphan.
+- **RESOLVED_MISSING** — the counterpart is known but not in the target.
+  Emits an `"add"` action. Accounted for, same as RESOLVED_PRESENT.
+- **UNDETERMINED** — the counterpart is *not* known: confidence is `"low"` or
+  `"none"`, or there is no candidate at all. Emits an `"unmatched"` action for
+  the UI to resolve.
+
+"Known" is decided purely by `match.confidence in _CONFIDENT_ENOUGH` — never
+by anything derived from `auto_accept_high`. `auto_accept_high` answers a
+different question: whether to *write* a known match without asking, not
+whether it's known. Collapsing the two (e.g. excluding `"high"` from the
+"known" set when `auto_accept_high` is False) demotes an already-mirrored
+`"high"` match to UNDETERMINED, which — via the removal rule below — silently
+suppresses every removal for the direction for as long as the setting stays
+off. `auto_accept_high` False only ever sets
+`SyncAction.needs_confirmation = True` on a RESOLVED_MISSING `"high"` add (never
+on `"exact"`/`"manual"`, which don't need asking, and never on RESOLVED_PRESENT,
+which has nothing to write). `apply()` will not write an action with
+`needs_confirmation` set; a caller clears the flag once it has obtained
+confirmation, the same way the sync UI already flips an `"unmatched"`
+action's `kind` to `"add"` in place after the user resolves it.
+
 For a given direction, if **any** source track's match outcome is
-`"unmatched"` (low-confidence or no candidate found), **all** removals for
-that direction are suppressed — not just removals that a look at the
-unmatched tracks might implicate. A removal means "this target track has no
-counterpart in the source," which is unknowable while any source track's
-match is still undetermined; guessing which removals would have been safe
-risks deleting something that an unresolved match would have accounted for.
-The plan's `notes` explain the suppression and its count so the UI can
-surface it. Once every unmatched row is resolved (or the plan is re-run after
-resolution) and no `"unmatched"` actions remain, removals proceed normally
-for orphaned target tracks.
+UNDETERMINED, **all** removals for that direction are suppressed — not just
+removals that a look at the undetermined tracks might implicate. A removal
+means "this target track has no counterpart in the source," which is
+unknowable while any source track's match is still undetermined; guessing
+which removals would have been safe risks deleting something that an
+unresolved match would have accounted for. The plan's `notes` explain the
+suppression and its count so the UI can surface it. Once every unmatched row
+is resolved (or the plan is re-run after resolution) and no source track is
+UNDETERMINED, removals proceed normally for orphaned target tracks.
+
+### Duplicate adds
+
+Classification never special-cases "the match is already in the target" for
+an UNDETERMINED track — doing so previously meant a low-confidence guess
+whose top candidate happened to coincide with an existing target track was
+dropped from the plan with no action, no note, and no way for the user to
+know it had happened. Instead, `plan()` captures `SyncPlan.target_track_ids`:
+for each `(target service, target playlist id)` touched by the plan, the
+track ids that were already present at plan time. `apply()` treats any
+`"add"` action whose track id is already in that set as a duplicate — it is
+never sent to the provider, and is recorded in `SyncReport.skipped` instead
+of `SyncReport.added`. This is what actually prevents a duplicate write,
+including the case where the UI resolves an `"unmatched"` row onto a
+candidate that turns out to already be in the target, without needing an
+extra provider read at apply time.
 
 ## enrich/
 

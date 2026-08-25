@@ -15,7 +15,7 @@ import pytest
 import requests
 
 from harmony.config import Settings, redact_exception, redact_secrets
-from harmony.errors import NotSupportedError, ProviderError, RateLimitedError
+from harmony.errors import AuthError, NotSupportedError, ProviderError, RateLimitedError
 from harmony.models import Service
 from harmony.providers.base import _chunked, retry_on_rate_limit
 from harmony.providers.qobuz import QobuzProvider, request_sig
@@ -547,6 +547,66 @@ class TestRedactSecrets:
         assert "hyphensecretvalue" not in redacted
         assert "app-secret=REDACTED" in redacted
 
+    # -- suffix-anchored matching (previously prefix-anchored and missed
+    # -- these real secret names) ------------------------------------------
+
+    def test_redacts_access_token_query_param(self) -> None:
+        text = "GET /oauth/callback?access_token=abc123&state=xyz"
+        redacted = redact_secrets(text)
+        assert "abc123" not in redacted
+        assert "access_token=REDACTED" in redacted
+
+    def test_redacts_refresh_token_query_param(self) -> None:
+        text = "?refresh_token=abc123&client_id=harmony"
+        redacted = redact_secrets(text)
+        assert "abc123" not in redacted
+        assert "refresh_token=REDACTED" in redacted
+
+    def test_redacts_client_secret_query_param(self) -> None:
+        text = "?client_secret=abc123&grant_type=password"
+        redacted = redact_secrets(text)
+        assert "abc123" not in redacted
+        assert "client_secret=REDACTED" in redacted
+
+    def test_redacts_x_user_auth_token_header_dict_repr(self) -> None:
+        # This is the header Qobuz actually uses (see qobuz.py's
+        # X-User-Auth-Token) -- no live path puts headers into exception text
+        # today, but the module's own docstring claims this is covered, so it
+        # must actually be.
+        text = "{'X-User-Auth-Token': 'abc', 'X-App-Id': '123456789'}"
+        redacted = redact_secrets(text)
+        assert "'X-User-Auth-Token': 'abc'" not in redacted
+        assert "'X-User-Auth-Token': 'REDACTED'" in redacted
+        assert "'X-App-Id': '123456789'" in redacted  # unrelated header survives
+
+    def test_redacts_x_user_auth_token_bare_header_text(self) -> None:
+        text = "X-User-Auth-Token: abc123topsecret\r\nX-App-Id: 123456789"
+        redacted = redact_secrets(text)
+        assert "abc123topsecret" not in redacted
+        assert "X-App-Id: 123456789" in redacted
+
+    # -- deliberately NOT redacted: suffix anchoring must not over-redact ---
+
+    def test_does_not_redact_token_type_field(self) -> None:
+        # "token_type" has the sensitive word as its *first* component, not
+        # its last -- and its value ("Bearer") isn't a secret at all.
+        text = '{"token_type": "Bearer", "access_token": "abc123"}'
+        redacted = redact_secrets(text)
+        assert '"token_type": "Bearer"' in redacted
+        assert '"access_token": "REDACTED"' in redacted
+
+    def test_does_not_redact_url_path_segment_containing_token(self) -> None:
+        # A path segment that merely contains the word "token" is not a
+        # query-param/JSON-key/header *name* and must be left alone.
+        text = "Max retries exceeded with url: /api/tokens/refresh (Caused by ...)"
+        assert redact_secrets(text) == text
+
+    def test_does_not_redact_word_containing_key_mid_string(self) -> None:
+        # "monkey"/"keyword" contain "key" mid-word with no separator marking
+        # it as a distinct name component -- must not be treated as a secret.
+        text = '{"keyword": "monkey business", "nickname": "Turnkey"}'
+        assert redact_secrets(text) == text
+
 
 class TestRedactException:
     def test_redacted_stand_in_keeps_type_and_scrubs_message(self) -> None:
@@ -741,6 +801,149 @@ class TestQobuzLoginTransport:
         # The URL itself carries no credentials regardless of how it was built.
         assert "hunter2" not in captured["url"]
         assert digest not in captured["url"]
+
+
+class TestQobuzWarmUpCost:
+    """Regression coverage for the startup-cost bug: warm-up used to always
+    perform a full network login (or, for an unconfigured account, a
+    multi-MB web-player scrape) because ``is_authenticated`` can never be
+    True before the first real call, so ``AppState._warm_up``'s
+    ``if provider.is_authenticated: continue`` guard never fired.
+    """
+
+    def test_authenticate_unconfigured_performs_zero_http(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``qobuz_provider`` has no email/password configured (Settings()
+        defaults) -- authenticate() must fail instantly with no scraping and
+        no login attempt."""
+
+        def boom(*a, **kw):
+            raise AssertionError("unconfigured authenticate() must not perform HTTP")
+
+        monkeypatch.setattr(requests.Session, "get", boom)
+        monkeypatch.setattr(requests.Session, "request", boom)
+
+        with pytest.raises(AuthError):
+            qobuz_provider.authenticate()
+
+    def test_has_credentials_false_when_unconfigured_and_io_free(
+        self, qobuz_provider: QobuzProvider, credentials: FakeCredentialStore
+    ) -> None:
+        assert qobuz_provider.has_credentials is False
+        assert credentials.get_calls == []  # in-memory settings check only
+
+    def test_has_credentials_true_once_email_is_set(self, credentials: FakeCredentialStore) -> None:
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_email="alice@example.com")
+        provider = QobuzProvider(settings, credentials)
+        assert provider.has_credentials is True
+        assert credentials.get_calls == []  # still I/O-free -- password isn't checked here
+
+    def test_warm_up_skips_unconfigured_provider_with_zero_http(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harmony.ui.state import AppState
+
+        def boom(*a, **kw):
+            raise AssertionError("warm-up must not attempt authenticate() on an unconfigured provider")
+
+        monkeypatch.setattr(requests.Session, "get", boom)
+        monkeypatch.setattr(requests.Session, "request", boom)
+
+        errors: dict[Service, str] = {}
+        AppState._warm_up({Service.QOBUZ: qobuz_provider}, errors)
+
+        assert qobuz_provider.is_authenticated is False
+        assert Service.QOBUZ not in errors  # skipped cleanly, not "attempted and failed"
+
+    def test_cached_valid_token_skips_login_on_authenticate(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_email="alice@example.com")
+        credentials.set(config_module.QOBUZ_PASSWORD, "hunter2")
+        credentials.set(config_module.QOBUZ_TOKEN, "cached-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        calls: list[str] = []
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            calls.append(path)
+            if path == "user/login":
+                raise AssertionError("a valid cached token must not trigger a fresh login")
+            if path == "user/get":
+                return {"user": {"display_name": "Cached User"}}
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        provider.authenticate()
+
+        assert calls == ["user/get"]  # validated the cached token, nothing else
+        assert provider.is_authenticated is True
+        assert provider.account_name() == "Cached User"
+
+    def test_warm_up_with_cached_token_does_not_issue_login_request(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harmony import config as config_module
+        from harmony.ui.state import AppState
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_email="alice@example.com")
+        credentials.set(config_module.QOBUZ_PASSWORD, "hunter2")
+        credentials.set(config_module.QOBUZ_TOKEN, "cached-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        calls: list[str] = []
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            calls.append(path)
+            if path == "user/login":
+                raise AssertionError("warm-up must not re-login when a cached token is present")
+            if path == "user/get":
+                return {"user": {"display_name": "Cached User"}}
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        errors: dict[Service, str] = {}
+        AppState._warm_up({Service.QOBUZ: provider}, errors)
+
+        assert "user/login" not in calls
+        assert provider.is_authenticated is True
+        assert Service.QOBUZ not in errors
+
+    def test_stale_cached_token_falls_back_to_login(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A cached token must not be trusted forever: if validation reports
+        it's dead, authenticate() still falls back to a real login rather
+        than leaving the provider stuck unauthenticated."""
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_email="alice@example.com")
+        credentials.set(config_module.QOBUZ_PASSWORD, "hunter2")
+        credentials.set(config_module.QOBUZ_TOKEN, "stale-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        calls: list[str] = []
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            calls.append(path)
+            if path == "user/get":
+                raise ProviderError("Qobuz API error 401 on user/get: invalid token")
+            if path == "user/login":
+                return {"user_auth_token": "fresh-tok", "user": {"display_name": "Refreshed"}}
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        provider.authenticate()
+
+        assert calls == ["user/get", "user/login"]
+        assert provider._auth_token == "fresh-tok"
+        assert provider.account_name() == "Refreshed"
 
 
 class TestQobuzLeakProof:

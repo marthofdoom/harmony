@@ -657,17 +657,19 @@ def test_low_confidence_resolution_does_not_re_prompt_or_duplicate_on_next_sync(
     assert plan3.actions == []
 
 
-def test_low_confidence_match_already_present_in_target_needs_no_action(db: Database) -> None:
-    """The already-present early-out must apply to "low"-confidence results
-    too, not just confident ones: if the top candidate is already sitting in
-    the target playlist, there is nothing to add and no reason to prompt the
-    user — prompting here is exactly what let the sync UI's default "use top
-    candidate" resolution silently re-add (duplicate) a track that was
-    already correctly mirrored."""
+def test_low_confidence_match_already_present_becomes_unmatched_not_silently_dropped(db: Database) -> None:
+    """A "low" confidence best guess is UNDETERMINED, never RESOLVED_PRESENT,
+    even when the top candidate happens to already sit in the target
+    playlist: "low" means we do NOT know the counterpart (it isn't in
+    ``_CONFIDENT_ENOUGH``), so classification must never special-case
+    "already present" for it — that was precisely the bypass that caused
+    repro (a)/(b) below. Resolving the row onto the (only, already-present)
+    candidate must not duplicate it either: that's the apply-time duplicate
+    guard (``plan.target_track_ids``), not classification, doing its job."""
     source, candidate = _low_confidence_pair()
 
     provider_yt = FakeProvider(Service.YTMUSIC)
-    provider_qo = FakeProvider(Service.QOBUZ, catalog=[candidate])
+    provider_qo = _CountingProvider(Service.QOBUZ, catalog=[candidate])
     provider_yt.playlists["yt-pl"] = [source]
     # The target already has the (correct) counterpart — e.g. from a manual
     # add, or a previous sync using a different code path.
@@ -678,12 +680,20 @@ def test_low_confidence_match_already_present_in_target_needs_no_action(db: Data
     b = Playlist(id="qo-pl", title="Mix", service=Service.QOBUZ)
 
     plan = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
-    assert plan.actions == []
-    assert not plan.notes
+    assert [act.kind for act in plan.actions] == ["unmatched"]
+    assert plan.actions[0].match.confidence == "low"
+
+    # Simulate the UI resolving the row onto the (only, already-present)
+    # candidate — the natural "use top candidate" click.
+    unmatched = plan.actions[0]
+    unmatched.kind = "add"
+    unmatched.track = candidate
 
     report = engine.apply(plan, snapshot_before_sync=False)
-    assert report.added == []
-    assert report.removed == []
+    assert report.failed == []
+    assert report.added == [], "must not be reported as added -- it was never written"
+    assert [a.track.id for a in report.skipped] == ["q1"]
+    assert provider_qo.add_calls == [], "apply() must never even call add_tracks for a known duplicate"
     assert [t.id for t in provider_qo.playlists["qo-pl"]] == ["q1"], "must not be duplicated"
 
 
@@ -807,3 +817,217 @@ def test_apply_progress_ticks_more_than_once_for_a_large_uncancelled_batch(db: D
     assert len(ticks) >= 2, f"a {n}-track sync must report more than one progress tick: {ticks}"
     assert ticks[-1] == 1.0
     assert ticks == sorted(ticks)
+
+
+# -- three-state classification: RESOLVED_PRESENT / RESOLVED_MISSING / -------
+# -- UNDETERMINED, and the apply-time duplicate guard -------------------------
+#
+# The old classifier had a bypass: "if the best candidate is a real (non-
+# "none") guess and it already sits in the target, there is nothing to add
+# regardless of confidence" — which fired for "low" too, and dropped the
+# source track via `continue` without ever creating an action. Two verified
+# repros of that bug follow, by name.
+
+
+def test_repro_a_low_confidence_match_to_already_present_track_is_not_silently_dropped(db: Database) -> None:
+    """Repro (a): source [y1 "Alpha Song" 200s, y2 "Alpha Song Reprise"-like
+    230s], catalog [q1 "Alpha Song"], target already holds q1. y1<->q1 scores
+    1.0 (RESOLVED_PRESENT, high confidence). y2<->q1 scores 0.85 -- "low"
+    confidence, UNDETERMINED -- because y2's duration is 30s off (>=15s means
+    zero duration credit): title 1.0*0.5 + artist 1.0*0.35 + duration 0 =
+    0.85. The bug: the old bypass fired for y2 too (best is not None,
+    confidence != "none", best.track.id already in the target), so y2 was
+    silently dropped -- no add, no unmatched row, no note -- and the plan's
+    summary claimed "0 to add, 0 unmatched" while y2 never reached the
+    target. A silent drop is worse than the duplicate add the bypass was
+    written to prevent. y2 must surface as "unmatched" instead."""
+    y1 = _track(id="y1", title="Alpha Song", service=Service.YTMUSIC, artists=["Artist"], duration_s=200)
+    y2 = _track(id="y2", title="Alpha Song", service=Service.YTMUSIC, artists=["Artist"], duration_s=230)
+    q1 = _track(id="q1", title="Alpha Song", service=Service.QOBUZ, artists=["Artist"], duration_s=200)
+
+    provider_yt = FakeProvider(Service.YTMUSIC)
+    provider_qo = FakeProvider(Service.QOBUZ, catalog=[q1])
+    provider_yt.playlists["yt-pl"] = [y1, y2]
+    provider_qo.playlists["qo-pl"] = [q1]
+
+    engine = SyncEngine({Service.YTMUSIC: provider_yt, Service.QOBUZ: provider_qo}, db)
+    a = Playlist(id="yt-pl", title="Mix", service=Service.YTMUSIC)
+    b = Playlist(id="qo-pl", title="Mix", service=Service.QOBUZ)
+
+    plan = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
+
+    # y1 is RESOLVED_PRESENT -> no action. y2 must NOT be dropped.
+    assert [act.kind for act in plan.actions] == ["unmatched"]
+    assert plan.actions[0].track.id == "y2"
+    assert plan.actions[0].match.confidence == "low"
+    assert "0 unmatched" not in plan.summary()
+    assert "1 unmatched" in plan.summary()
+
+
+def test_repro_b_orphan_survives_when_a_low_confidence_match_is_undetermined(db: Database) -> None:
+    """Repro (b): repro (a)'s exact setup plus a genuine orphan ``qorph`` in
+    the target. Because the old bypass swallowed y2 without ever setting
+    ``has_unmatched``, ALL removals unlocked and qorph was deleted --
+    ``actions: [('remove', 'qorph')], notes: []`` -- violating the invariant
+    that a removal is unknowable while any source track's match outcome is
+    still undetermined. A "low" guess IS undetermined: it must suppress
+    every removal for this direction, with a note explaining why, exactly
+    like a "none" guess would."""
+    y1 = _track(id="y1", title="Alpha Song", service=Service.YTMUSIC, artists=["Artist"], duration_s=200)
+    y2 = _track(id="y2", title="Alpha Song", service=Service.YTMUSIC, artists=["Artist"], duration_s=230)
+    q1 = _track(id="q1", title="Alpha Song", service=Service.QOBUZ, artists=["Artist"], duration_s=200)
+    qorph = _track(id="qorph", title="Genuinely Orphaned", service=Service.QOBUZ, artists=["Nobody"], duration_s=50)
+
+    provider_yt = FakeProvider(Service.YTMUSIC)
+    provider_qo = FakeProvider(Service.QOBUZ, catalog=[q1])
+    provider_yt.playlists["yt-pl"] = [y1, y2]
+    provider_qo.playlists["qo-pl"] = [q1, qorph]
+
+    engine = SyncEngine({Service.YTMUSIC: provider_yt, Service.QOBUZ: provider_qo}, db)
+    a = Playlist(id="yt-pl", title="Mix", service=Service.YTMUSIC)
+    b = Playlist(id="qo-pl", title="Mix", service=Service.QOBUZ)
+
+    plan = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
+
+    assert [act.kind for act in plan.actions] == ["unmatched"]
+    assert plan.notes, "removals must be suppressed and the plan must explain why"
+
+    report = engine.apply(plan, snapshot_before_sync=False)
+    assert report.removed == []
+    assert {t.id for t in provider_qo.playlists["qo-pl"]} == {"q1", "qorph"}
+
+
+def test_removals_still_work_in_steady_state_with_auto_accept_high_false(db: Database) -> None:
+    """The trap this file must avoid: gating classification on an
+    ``auto_accept_high``-aware "confident enough" set would make an
+    already-mirrored "high" match undetermined whenever ``auto_accept_high``
+    is False, which sets ``has_undetermined`` and suppresses every removal --
+    reintroducing a compounding failure from a previous round of patches. A
+    "high" match that is already present must classify as RESOLVED_PRESENT
+    regardless of ``auto_accept_high`` (consent to WRITE a match is a
+    separate question from whether it's KNOWN), so a genuine orphan
+    alongside it must still be removable in steady state."""
+    yt_common = _track(id="yt1", title="Song One", service=Service.YTMUSIC, artists=["Artist"], duration_s=200)
+    qo_common = _track(id="qo1", title="Song One", service=Service.QOBUZ, artists=["Artist"], duration_s=200)
+    qo_orphan = _track(id="qo-extra", title="Extra Song", service=Service.QOBUZ, artists=["Someone"], duration_s=100)
+
+    provider_yt = FakeProvider(Service.YTMUSIC)
+    provider_qo = FakeProvider(Service.QOBUZ, catalog=[qo_common])
+    provider_yt.playlists["yt-pl"] = [yt_common]
+    provider_qo.playlists["qo-pl"] = [qo_common, qo_orphan]
+
+    engine = SyncEngine(
+        {Service.YTMUSIC: provider_yt, Service.QOBUZ: provider_qo}, db, auto_accept_high=False
+    )
+    a = Playlist(id="yt-pl", title="Mix", service=Service.YTMUSIC)
+    b = Playlist(id="qo-pl", title="Mix", service=Service.QOBUZ)
+
+    plan = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
+
+    assert [act.kind for act in plan.actions] == ["remove"]
+    assert plan.actions[0].track.id == "qo-extra"
+    assert not plan.notes, "a known, already-present match must not suppress removals"
+
+    report = engine.apply(plan, snapshot_before_sync=False)
+    assert report.failed == []
+    assert [t.id for t in report.removed] == ["qo-extra"]
+    assert {t.id for t in provider_qo.playlists["qo-pl"]} == {"qo1"}
+
+
+def test_apply_withholds_unconfirmed_high_add_and_writes_it_once_confirmed(db: Database) -> None:
+    """``needs_confirmation`` represents consent, not knowledge: with
+    ``auto_accept_high=False``, a fresh "high" match that isn't in the
+    target yet is RESOLVED_MISSING (a real "add" action, not "unmatched")
+    but carries ``needs_confirmation=True``, and ``apply()`` must not write
+    it until a caller clears that flag -- otherwise the setting is silently
+    defeated. Also exercises bug 1's ``_record_link`` fix: once confirmed
+    and applied, the cached link must be recorded at its true "high"
+    confidence (using the shared ``_CONFIDENT_ENOUGH`` constant), not forced
+    to "manual" -- and a follow-up plan() must reach steady state instead of
+    re-prompting forever."""
+    source = _track(id="v1", title="Song One", service=Service.YTMUSIC, artists=["Artist"], duration_s=200)
+    candidate = _track(id="q1", title="Song One", service=Service.QOBUZ, artists=["Artist"], duration_s=200)
+
+    provider_yt = FakeProvider(Service.YTMUSIC)
+    provider_qo = _CountingProvider(Service.QOBUZ, catalog=[candidate])
+    provider_yt.playlists["yt-pl"] = [source]
+    provider_qo.playlists["qo-pl"] = []
+
+    engine = SyncEngine(
+        {Service.YTMUSIC: provider_yt, Service.QOBUZ: provider_qo}, db, auto_accept_high=False
+    )
+    a = Playlist(id="yt-pl", title="Mix", service=Service.YTMUSIC)
+    b = Playlist(id="qo-pl", title="Mix", service=Service.QOBUZ)
+
+    plan = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
+    assert [act.kind for act in plan.actions] == ["add"]
+    action = plan.actions[0]
+    assert action.match.confidence == "high"
+    assert action.needs_confirmation is True
+
+    # Not confirmed yet: apply() must not write it to the *provider*. (A
+    # fresh "high"/"exact" match is auto-cached in the db by
+    # ``matching.match_tracks`` itself, independent of whether sync ever
+    # applies it -- that's matching.py's own contract, unaffected by
+    # confirmation. What must NOT happen without confirmation is the
+    # provider write.)
+    report_unconfirmed = engine.apply(plan, snapshot_before_sync=False)
+    assert report_unconfirmed.added == []
+    assert action in report_unconfirmed.skipped
+    assert provider_qo.add_calls == []
+    assert provider_qo.playlists["qo-pl"] == []
+
+    # A caller that has obtained confirmation clears the flag before
+    # calling apply() again -- mirroring how the sync UI already flips an
+    # "unmatched" action's kind in place after resolution.
+    action.needs_confirmation = False
+    report_confirmed = engine.apply(plan, snapshot_before_sync=False)
+    assert report_confirmed.failed == []
+    assert [t.id for t in report_confirmed.added] == ["q1"]
+
+    link = db.get_link(Service.YTMUSIC, "v1", Service.QOBUZ)
+    assert link is not None
+    assert link["dst_id"] == "q1"
+    assert link["confidence"] == "high", "a genuinely high-confidence confirmed pick is authoritative as-is"
+
+    # Follow-up plan: steady state -- no more prompting, no re-add.
+    plan2 = engine.plan(a, b, SyncDirection.MIRROR_A_TO_B)
+    assert plan2.actions == []
+    assert not plan2.notes
+
+
+def test_record_link_treats_cached_manual_confidence_as_already_authoritative(db: Database) -> None:
+    """Direct unit test of the ``_record_link`` fix: it must check confidence
+    against the shared ``_CONFIDENT_ENOUGH`` module constant, not a locally
+    hardcoded ``("exact", "high")`` tuple that had silently drifted out of
+    sync with it. A "manual" match -- a link previously written because a
+    person confirmed it, see ``_CONFIDENT_ENOUGH``'s own definition -- is
+    *already* authoritative: applying it again, unchanged, must preserve its
+    own confidence and score rather than recomputing a fresh ("manual", 1.0)
+    pair every time. (``matching.py`` itself always stores score 1.0 for
+    links it caches as "manual", so this exact distinction is unreachable
+    through the public matching API -- this fixture constructs the
+    ``MatchResult`` directly to pin down ``_record_link``'s branch on its
+    own merits, independent of that other module's behaviour.)"""
+    from harmony.matching import MatchCandidate, MatchResult
+
+    source = _track(id="v1", title="Some Song", service=Service.YTMUSIC, artists=["Artist"], duration_s=200)
+    candidate = _track(id="q1", title="Some Song", service=Service.QOBUZ, artists=["Artist"], duration_s=200)
+
+    provider_yt = FakeProvider(Service.YTMUSIC)
+    provider_qo = FakeProvider(Service.QOBUZ, catalog=[candidate])
+    provider_yt.playlists["yt-pl"] = [source]
+    provider_qo.playlists["qo-pl"] = []
+
+    engine = SyncEngine({Service.YTMUSIC: provider_yt, Service.QOBUZ: provider_qo}, db)
+
+    cand = MatchCandidate(track=candidate, score=0.42, reasons=["cached link"])
+    match = MatchResult(source=source, best=cand, candidates=[cand], confidence="manual")
+    action = SyncAction(kind="add", target=Service.QOBUZ, track=candidate, match=match, target_playlist_id="qo-pl")
+
+    engine._record_link(action)
+
+    link = db.get_link(Service.YTMUSIC, "v1", Service.QOBUZ)
+    assert link is not None
+    assert link["confidence"] == "manual"
+    assert link["score"] == 0.42, "an already-manual match is authoritative as-is, not recomputed to 1.0"

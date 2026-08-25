@@ -130,10 +130,22 @@ class AppState(GObject.Object):
         thread that built them, so the sign-in happens before the UI asks.
         A failure here is not fatal: it just means that service shows as
         disconnected, which is exactly what it is.
+
+        Skips ``authenticate()`` entirely for a provider that reports no
+        ``has_credentials`` (an I/O-free check) — a user with no account on
+        that service would otherwise pay for a doomed authenticate() call on
+        every launch and every debounced Preferences edit. ``authenticate()``
+        itself still fails instantly with no I/O for an unconfigured
+        provider, so this is belt-and-suspenders: it saves the call (and its
+        log noise) rather than being the only thing preventing I/O.
+        ``getattr(..., True)`` keeps this optional — a provider that doesn't
+        define ``has_credentials`` is just always attempted, as before.
         """
         for service, provider in providers.items():
             try:
                 if provider.is_authenticated:
+                    continue
+                if not getattr(provider, "has_credentials", True):
                     continue
                 provider.authenticate()
             except Exception as exc:  # noqa: BLE001 - unconfigured is the common case
@@ -237,7 +249,6 @@ class AppState(GObject.Object):
             self.providers = providers
             self.provider_errors = errors
             self._rebuild_sync_engine()
-            self.emit("providers-changed")
             # The provider set just changed (most commonly: it went from
             # empty at startup to populated once the worker thread finishes,
             # *after* every page has already been constructed and made its
@@ -245,8 +256,24 @@ class AppState(GObject.Object):
             # ``self.providers``). Nothing else reloads playlists when that
             # happens, so without this the playlist cache — and every page
             # reading it — would stay empty for the rest of the session.
-            # ``all_playlists`` already coalesces with any load in flight.
+            #
+            # This must run *before* the ``providers-changed`` emit below,
+            # not after: that signal is delivered synchronously to every
+            # connected page, and at least one of them (search's
+            # ``_refresh_playlist_choices``) reacts by calling its own
+            # ``all_playlists()`` right there mid-emit. If the refresh below
+            # ran after the emit, that in-emit call would see
+            # ``_loading_playlists`` still False, start its own sweep, and
+            # then this call would land on top of it while it's in flight —
+            # coalesced via ``_playlists_refresh_pending`` rather than
+            # dropped, but still two full ``list_playlists()`` passes across
+            # every provider back to back. Doing it first means the in-emit
+            # call instead finds a load already in flight and just reads the
+            # (stale, soon to be replaced) cache; it still gets fresh data
+            # via the ``playlists-changed`` signal once the single sweep
+            # started here completes.
             self.all_playlists(refresh=True)
+            self.emit("providers-changed")
             if self._providers_reload_pending:
                 self.reload_providers()
 

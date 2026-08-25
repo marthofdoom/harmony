@@ -27,6 +27,37 @@ log = logging.getLogger(__name__)
 #: reasonable staleness bound, and it keeps us well within API etiquette.
 CACHE_TTL_S = 7 * 24 * 3600
 
+#: Lazily-resolved, process-wide cache for ``config.user_agent()``'s return
+#: value. ``_get_json`` runs on worker threads (never the GTK main loop), so
+#: the disk read behind a no-arg ``user_agent()`` call was never a main-loop
+#: violation -- but every enrichment HTTP call re-reading settings.json just
+#: to rebuild the same header string is still needless I/O per request.
+#: Populated on first use rather than at import time (an import-time disk
+#: read would run before ``AppState`` has even loaded ``Settings``, and could
+#: fire in contexts — like a future headless/web port — that never touch the
+#: user's config dir at all). ``reset_user_agent_cache()`` invalidates it
+#: after a settings change so a new contact email takes effect on the next
+#: call rather than being stuck at whatever was cached first.
+_user_agent_cache: str | None = None
+
+
+def _cached_user_agent() -> str:
+    global _user_agent_cache
+    if _user_agent_cache is None:
+        _user_agent_cache = config.user_agent()
+    return _user_agent_cache
+
+
+def reset_user_agent_cache() -> None:
+    """Invalidate the cached User-Agent so the next request rebuilds it.
+
+    Call after anything that changes ``Settings.contact_email`` (e.g.
+    Preferences saving a new one) so enrichment requests pick up the new
+    value instead of the one resolved on first use.
+    """
+    global _user_agent_cache
+    _user_agent_cache = None
+
 
 def _get_json(
     url: str,
@@ -44,7 +75,7 @@ def _get_json(
     """
     if rate_limiter is not None:
         rate_limiter.wait()
-    merged_headers = {"User-Agent": config.user_agent()}
+    merged_headers = {"User-Agent": _cached_user_agent()}
     if headers:
         merged_headers.update(headers)
     try:

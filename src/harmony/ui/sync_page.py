@@ -191,12 +191,23 @@ class SyncPage(Gtk.Box):
         self.plan_box.append(Gtk.Label(label=summary, xalign=0.0, css_classes=["heading"]))
 
         actions = list(getattr(plan, "actions", []))
-        adds = [a for a in actions if a.kind == "add"]
+        # An add flagged needs_confirmation is a match the engine KNOWS but is
+        # not allowed to write unattended, because "Auto-accept high-confidence
+        # matches" is off. apply() refuses to send it until the flag is
+        # cleared, so it must be surfaced as its own reviewable group —
+        # otherwise turning that safety setting on would silently mean nothing
+        # ever syncs.
+        adds = [a for a in actions if a.kind == "add" and not getattr(a, "needs_confirmation", False)]
+        pending = [a for a in actions if a.kind == "add" and getattr(a, "needs_confirmation", False)]
         removes = [a for a in actions if a.kind == "remove"]
         unmatched = [a for a in actions if a.kind == "unmatched"]
 
         if adds:
             self.plan_box.append(self._build_group("To add", adds, self._add_row))
+        if pending:
+            self.plan_box.append(
+                self._build_group("Needs confirmation before adding", pending, self._confirm_row)
+            )
         if removes:
             self.plan_box.append(self._build_group("To remove", removes, self._remove_row))
         if unmatched:
@@ -218,6 +229,34 @@ class SyncPage(Gtk.Box):
     def _remove_row(self, action) -> Gtk.Widget:  # noqa: ANN001
         track = action.track
         return Adw.ActionRow(title=track.title, subtitle=f"{track.artist_name} · {track.service.label}")
+
+    def _confirm_row(self, action) -> Gtk.Widget:  # noqa: ANN001
+        """A known-but-unconfirmed add: show the score and let the user accept it."""
+        track = action.track
+        best = getattr(action.match, "best", None)
+        score = f" · score {best.score:.2f}" if best is not None else ""
+        row = Adw.ActionRow(
+            title=track.title,
+            subtitle=f"{track.artist_name} · {track.service.label}{score}",
+        )
+        accept = Gtk.Button(label="Confirm", valign=Gtk.Align.CENTER, css_classes=["suggested-action"])
+        accept.connect("clicked", lambda *_a: self._confirm_action(action, row, accept))
+        row.add_suffix(accept)
+        return row
+
+    def _confirm_action(self, action, row: Adw.ActionRow, button: Gtk.Button) -> None:  # noqa: ANN001
+        """Clear the flag in place so apply() will write this add.
+
+        Mutating the action mirrors how an unmatched row is resolved; the plan
+        is plain data and apply() re-reads these fields, so no re-plan is
+        needed. Apply stays enabled because there is now something to write.
+        """
+        action.needs_confirmation = False
+        row.set_subtitle(f"Confirmed · {action.track.artist_name}")
+        button.set_sensitive(False)
+        button.set_label("Confirmed")
+        self.apply_button.set_sensitive(True)
+        self.state.toast(f"Will add “{action.track.title}” on apply.")
 
     def _unmatched_row(self, action) -> Gtk.Widget:  # noqa: ANN001
         track = action.track

@@ -31,47 +31,63 @@ KEYRING_SERVICE = "io.github.marthofdoom.Harmony"
 # Secret redaction
 # --------------------------------------------------------------------------
 
-#: Name *fragments* (regex, not literal strings) for credentials that must
-#: never appear in an exception message or log line. Covers every credential
-#: this app ever puts on a URL, in a JSON/dict-shaped body, or in a header:
-#: Qobuz's login (``password``/``username``/``email``/``app_secret``), its
-#: session token (``user_auth_token``), Last.fm's ``api_key``, and generic
-#: ``token``/``secret``/``Authorization`` values a future integration might
-#: add. Each fragment tolerates the separator conventions actually in use —
-#: underscore (``app_secret``), hyphen (``app-secret``), and none
-#: (``apikey``) — via ``[_-]?``, and matches only from the start of the
-#: name (never as a substring of an unrelated, longer name).
-_SENSITIVE_NAME_FRAGMENTS = (
+#: Name *atoms* (regex, not literal strings) for the last underscore/hyphen
+#: separated component of a credential-bearing field/header name. Matching is
+#: deliberately *suffix*-anchored, not a bare substring test: a name matches
+#: only when one of these atoms is its final component (optionally preceded
+#: by an arbitrary ``prefix_`` / ``prefix-`` — see ``_SENSITIVE_NAME_RE``
+#: below), never when the atom merely appears somewhere inside a longer name.
+#: That's what lets ``access_token``, ``refresh_token``, ``client_secret``,
+#: ``app-secret``, and header names like ``X-User-Auth-Token`` all get caught
+#: by a single ``token``/``secret``/``key`` atom, while a name like
+#: ``token_type`` (atom appears as the *first* component, not the last) or
+#: ``monkey``/``keyword`` (atom appears mid-word, with no separator marking
+#: it as a distinct component) is left alone — the value of a ``token_type``
+#: field (e.g. ``"Bearer"``) isn't a secret, and redacting it on top of the
+#: real token would just make the redacted output harder to debug for no
+#: safety benefit.
+_SENSITIVE_NAME_ATOMS = (
     r"password",
-    r"api[_-]?key",
     r"username",
     r"email",
-    r"user[_-]?auth[_-]?token",
-    r"auth[_-]?token",
-    r"app[_-]?secret",
-    r"secret",
-    r"token",
     r"authorization",
+    r"token",
+    r"secret",
+    r"key",
 )
-_SENSITIVE_NAMES_ALT = "|".join(_SENSITIVE_NAME_FRAGMENTS)
 
-# Matches "?name=value" / "&name=value" for any of the names above, up to the
+# A full sensitive name: an optional run of word/dot/hyphen characters ending
+# in "_" or "-" (the prefix, e.g. "access_", "x-user-auth-"), followed by one
+# of the atoms above. Reused by all three shapes below (query param, JSON/
+# dict-repr key, bare "Name: value" text) so they agree on what counts as a
+# sensitive name.
+_SENSITIVE_NAME_RE = r"(?:[\w.-]*[_-])?(?:" + "|".join(_SENSITIVE_NAME_ATOMS) + r")"
+
+# Matches "?name=value" / "&name=value" for any sensitive name, up to the
 # next delimiter. Deliberately loose about what a "value" looks like (it may
 # be percent-encoded, e.g. "alice%40example.com") since the point is to strip
-# it, not parse it.
-_SECRET_PARAM_RE = re.compile(r"(?i)([?&](?:" + _SENSITIVE_NAMES_ALT + r")=)[^&\s'\")]*")
+# it, not parse it. Anchored on the left by "?"/"&" and on the right by "=",
+# so a path segment that merely contains a sensitive word (not followed
+# immediately by "=") is never touched.
+_SECRET_PARAM_RE = re.compile(r"(?i)([?&]" + _SENSITIVE_NAME_RE + r"=)[^&\s'\")]*")
 
-# Matches a JSON-object or Python-dict-repr key/value pair for any of the
-# names above, e.g. '"api_key": "abc123"' or "'password': 'hunter2'" —
-# response bodies and repr()'d request payloads carry secrets this way
-# rather than as a URL query string.
+# Matches a JSON-object or Python-dict-repr key/value pair for any sensitive
+# name, e.g. '"api_key": "abc123"' or "'password': 'hunter2'" or
+# "'X-User-Auth-Token': 'abc'" — response bodies, repr()'d request payloads,
+# and dumped headers dicts all carry secrets this way rather than as a URL
+# query string. Anchored by the surrounding quotes, so this can't match a
+# sensitive word appearing mid-value rather than as the key.
 _SECRET_JSON_RE = re.compile(
-    r"(?i)(['\"](?:" + _SENSITIVE_NAMES_ALT + r")['\"]\s*:\s*)(['\"])[^'\"]*\2"
+    r"(?i)(['\"]" + _SENSITIVE_NAME_RE + r"['\"]\s*:\s*)(['\"])[^'\"]*\2"
 )
 
-# Matches an "Authorization: <value>" header rendered into free text (a
-# dumped headers dict, urllib3's own debug logging, etc).
-_SECRET_AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*)[^\r\n'\")]+")
+# Matches a bare (unquoted) "Name: value" header rendered into free text —
+# urllib3's own debug logging, a raw header dump, etc. The negative lookbehind
+# requires the name to start at a non-word/dot/hyphen boundary (start of
+# string/line, a space, a brace, ...) so this can't match a sensitive atom
+# appearing mid-identifier (e.g. it must not fire on "operationalsecret:"
+# just because it ends in "secret:").
+_SECRET_HEADER_RE = re.compile(r"(?i)(?<![\w.-])(" + _SENSITIVE_NAME_RE + r"\s*:\s*)[^\r\n'\")]+")
 
 
 def redact_secrets(text: str) -> str:
@@ -91,7 +107,7 @@ def redact_secrets(text: str) -> str:
         return text
     text = _SECRET_PARAM_RE.sub(lambda m: m.group(1) + "REDACTED", text)
     text = _SECRET_JSON_RE.sub(lambda m: m.group(1) + m.group(2) + "REDACTED" + m.group(2), text)
-    text = _SECRET_AUTH_HEADER_RE.sub(lambda m: m.group(1) + "REDACTED", text)
+    text = _SECRET_HEADER_RE.sub(lambda m: m.group(1) + "REDACTED", text)
     return text
 
 

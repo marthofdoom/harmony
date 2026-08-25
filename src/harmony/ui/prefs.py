@@ -39,6 +39,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.settings = state.settings
         self.credentials = state.credentials
         self._debounce: dict[str, tuple[int, Callable[[], None]]] = {}
+        self._syncing_thresholds = False
 
         self.add(self._build_accounts_page())
         self.add(self._build_integrations_page())
@@ -266,7 +267,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         mb_group.add(lb_row)
         contact_row = Adw.EntryRow(title="Contact email (MusicBrainz User-Agent)", text=self.settings.contact_email)
         contact_row.connect(
-            "notify::text", lambda r, _p: self._schedule("contact_email", lambda: self._set_setting("contact_email", r.get_text()))
+            "notify::text", lambda r, _p: self._schedule("contact_email", lambda: self._set_contact_email(r.get_text()))
         )
         mb_group.add(contact_row)
         page.add(mb_group)
@@ -283,6 +284,17 @@ class PreferencesDialog(Adw.PreferencesDialog):
         ai_group.add(ai_model_row)
         page.add(ai_group)
         return page
+
+    def _set_contact_email(self, value: str) -> None:
+        self._set_setting("contact_email", value)
+        # enrich._get_json caches the resolved User-Agent (config.user_agent())
+        # for the life of the process to avoid a Settings.load() disk read on
+        # every enrichment HTTP call; invalidate it here so a new contact
+        # email actually reaches MusicBrainz/ListenBrainz's User-Agent header
+        # instead of silently sticking at whatever was first resolved.
+        from harmony.enrich import reset_user_agent_cache
+
+        reset_user_agent_cache()
 
     def _on_ai_key_changed(self, value: str) -> None:
         self.credentials.set(config.ANTHROPIC_API_KEY, value)
@@ -317,23 +329,77 @@ class PreferencesDialog(Adw.PreferencesDialog):
         auto_accept_row = Adw.SwitchRow(
             title="Auto-accept high-confidence matches", active=self.settings.auto_accept_high
         )
-        auto_accept_row.connect("notify::active", lambda r, _p: self._set_matching_setting("auto_accept_high", r.get_active()))
+        auto_accept_row.connect(
+            "notify::active",
+            lambda r, _p: self._schedule(
+                "auto_accept_high", lambda: self._set_matching_setting("auto_accept_high", r.get_active())
+            ),
+        )
         group.add(auto_accept_row)
         page.add(group)
 
         threshold_group = Adw.PreferencesGroup(
             title="Match Thresholds", description="How similar two tracks must be before Harmony treats them as the same recording."
         )
-        high_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
-        high_row.set_title("High-confidence threshold")
-        high_row.set_value(self.settings.match_high_threshold)
-        high_row.connect("notify::value", lambda r, _p: self._set_matching_setting("match_high_threshold", r.get_value()))
-        threshold_group.add(high_row)
+        self.high_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
+        self.high_row.set_title("High-confidence threshold")
+        self.high_row.set_value(self.settings.match_high_threshold)
+        self.high_row.connect("notify::value", lambda r, _p: self._on_threshold_row_changed("match_high_threshold", r))
+        threshold_group.add(self.high_row)
 
-        low_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
-        low_row.set_title("Low-confidence threshold")
-        low_row.set_value(self.settings.match_low_threshold)
-        low_row.connect("notify::value", lambda r, _p: self._set_matching_setting("match_low_threshold", r.get_value()))
-        threshold_group.add(low_row)
+        self.low_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
+        self.low_row.set_title("Low-confidence threshold")
+        self.low_row.set_value(self.settings.match_low_threshold)
+        self.low_row.connect("notify::value", lambda r, _p: self._on_threshold_row_changed("match_low_threshold", r))
+        threshold_group.add(self.low_row)
         page.add(threshold_group)
         return page
+
+    def _on_threshold_row_changed(self, name: str, row: Adw.SpinRow) -> None:
+        # Holding a SpinRow's +/- button fires "notify::value" once per tick;
+        # route it through the same debounce every other row uses instead of
+        # writing settings.json (and rebuilding the sync engine) synchronously
+        # on the main loop for every tick. Skipped while we're the ones
+        # programmatically setting a row's value (see _apply_threshold_change)
+        # so clamping the *other* row doesn't schedule a redundant write.
+        if self._syncing_thresholds:
+            return
+        self._schedule(name, lambda: self._apply_threshold_change(name, row.get_value()))
+
+    def _apply_threshold_change(self, name: str, value: float) -> None:
+        """Persist a match threshold, keeping ``low <= high`` coherent.
+
+        An inverted pair (low > high) makes matching return "high" for scores
+        below the low threshold, which is nonsensical. If this edit would
+        invert the pair, clamp the *other* threshold to meet it rather than
+        silently persisting garbage, and push the clamped value back into
+        that row so the UI reflects what actually took effect.
+        """
+        value = max(0.0, min(1.0, value))
+        high = value if name == "match_high_threshold" else self.settings.match_high_threshold
+        low = value if name == "match_low_threshold" else self.settings.match_low_threshold
+        if low > high:
+            if name == "match_high_threshold":
+                low = high
+            else:
+                high = low
+
+        changed = False
+        if high != self.settings.match_high_threshold:
+            self.settings.match_high_threshold = high
+            changed = True
+        if low != self.settings.match_low_threshold:
+            self.settings.match_low_threshold = low
+            changed = True
+        if not changed:
+            return
+        self.settings.save()
+
+        self._syncing_thresholds = True
+        try:
+            self.high_row.set_value(high)
+            self.low_row.set_value(low)
+        finally:
+            self._syncing_thresholds = False
+
+        self.state.apply_matching_settings()

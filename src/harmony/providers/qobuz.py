@@ -185,13 +185,70 @@ class QobuzProvider(MusicProvider):
     def is_authenticated(self) -> bool:
         return bool(self._auth_token)
 
+    @property
+    def has_credentials(self) -> bool:
+        """Cheap, I/O-free signal for "would authenticating be worth attempting?"
+
+        Only inspects the in-memory ``Settings`` object already held since
+        construction -- no keyring read, no network -- so callers like
+        ``AppState._warm_up`` can skip an unconfigured account entirely
+        instead of calling ``authenticate()`` and paying for (and logging)
+        its failure. ``authenticate()`` itself still checks the password too
+        and still fails fast with zero I/O either way; this just lets a
+        caller avoid the call altogether for the common "never set up
+        Qobuz" case. Deliberately does not check the keyring-stored
+        password: that would make this property I/O, defeating the point.
+        """
+        return bool(self._settings.qobuz_email)
+
     def authenticate(self) -> None:
-        self._ensure_ready()
+        # Check for configured credentials *before* any scraping or network
+        # work: _ensure_ready() may scrape play.qobuz.com plus a multi-MB
+        # bundle.js (two 15s-timeout requests) to auto-detect app_id/secret
+        # when none is pasted in Preferences, and an unconfigured account has
+        # no use for those credentials anyway. This ordering is what makes
+        # "no Qobuz account configured" fail instantly with zero I/O rather
+        # than scraping the web player only to be told the same thing.
         email = self._settings.qobuz_email
-        password = self._credentials.get(config.QOBUZ_PASSWORD)
-        if not email or not password:
+        if not email:
             raise AuthError("Qobuz email/password are not configured in Preferences.")
+        password = self._credentials.get(config.QOBUZ_PASSWORD)
+        if not password:
+            raise AuthError("Qobuz email/password are not configured in Preferences.")
+
+        self._ensure_ready()
+        # A cached token from a previous run is already loaded into
+        # self._auth_token by _ensure_ready(). Trusting it forever would
+        # mean never noticing a revoked/expired session until some unrelated
+        # call 401s; but re-logging in unconditionally on every warm-up (the
+        # bug this fixes) does a full network POST for an account that's
+        # almost always still signed in. Split the difference: a cheap GET
+        # to confirm the token still works beats both extremes.
+        if self._auth_token and self._token_is_valid():
+            return
         self._login(email, password)
+
+    def _token_is_valid(self) -> bool:
+        """Cheaply confirm ``self._auth_token`` is still accepted by Qobuz.
+
+        Uses ``user/get`` -- the lightest authed endpoint available, a small
+        JSON response with no pagination -- with ``_retry_on_401=False`` so
+        a dead token doesn't recurse back into ``authenticate()`` (the
+        caller we're already inside). Any failure (expired token, network
+        hiccup, rate limit) is treated as "can't confirm it's alive" rather
+        than specifically "it's dead": the caller falls back to a real login
+        attempt either way, which surfaces a clearer error (including a
+        rate-limit one) if that's what's actually going on.
+        """
+        try:
+            data = self._request("GET", "user/get", authed=True, _retry_on_401=False)
+        except Exception:  # noqa: BLE001 - any failure means "not confirmed valid"
+            return False
+        user = data.get("user") if isinstance(data.get("user"), dict) else data
+        display_name = user.get("display_name") if isinstance(user, dict) else None
+        if display_name:
+            self._display_name = display_name
+        return True
 
     def _login(self, email: str, password: str) -> None:
         digest = hashlib.md5(password.encode("utf-8")).hexdigest()
