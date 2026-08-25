@@ -1,0 +1,330 @@
+"""Preferences: accounts, integrations, and sync defaults.
+
+Non-secret values live in ``config.Settings`` and are saved immediately on
+change; secrets go through ``config.CredentialStore`` (keyring-backed, with a
+guarded file fallback the user is warned about if no keyring is available).
+Every row is debounced so a burst of keystrokes doesn't hammer the keyring,
+but pending edits are flushed the moment the dialog closes.
+"""
+
+from __future__ import annotations
+
+import logging
+from collections.abc import Callable
+
+import gi
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Adw", "1")
+
+from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+
+from harmony import config  # noqa: E402
+from harmony.models import Service  # noqa: E402
+from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.state import AppState  # noqa: E402
+
+log = logging.getLogger(__name__)
+
+_YT_AUTH_KINDS = ["browser", "oauth"]
+_DIRECTIONS = ["mirror-a-to-b", "mirror-b-to-a", "two-way"]
+
+
+class PreferencesDialog(Adw.PreferencesDialog):
+    """GNOME HIG preferences window: Accounts / Integrations / Sync pages."""
+
+    def __init__(self, state: AppState) -> None:
+        super().__init__(title="Preferences")
+        self.state = state
+        self.settings = state.settings
+        self.credentials = state.credentials
+        self._debounce: dict[str, tuple[int, Callable[[], None]]] = {}
+
+        self.add(self._build_accounts_page())
+        self.add(self._build_integrations_page())
+        self.add(self._build_sync_page())
+        self.connect("closed", lambda *_a: self._flush_pending())
+
+    # -- debounced persistence -------------------------------------------------
+
+    def _schedule(self, key: str, fn: Callable[[], None], delay: int = 400) -> None:
+        pending = self._debounce.pop(key, None)
+        if pending is not None:
+            GLib.source_remove(pending[0])
+
+        def run() -> bool:
+            self._debounce.pop(key, None)
+            fn()
+            return False
+
+        self._debounce[key] = (GLib.timeout_add(delay, run), fn)
+
+    def _flush_pending(self) -> None:
+        pending = list(self._debounce.items())
+        self._debounce.clear()
+        for _key, (source_id, fn) in pending:
+            GLib.source_remove(source_id)
+            fn()
+
+    def _set_setting(self, name: str, value: object) -> None:
+        setattr(self.settings, name, value)
+        self.settings.save()
+
+    def _set_account_setting(self, name: str, value: object) -> None:
+        self._set_setting(name, value)
+        self.state.reload_providers()
+
+    # -- accounts ---------------------------------------------------------------
+
+    def _build_accounts_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title="Accounts", icon_name="avatar-default-symbolic")
+
+        if not self.credentials.uses_keyring:
+            warn_group = Adw.PreferencesGroup()
+            warn_row = Adw.ActionRow(
+                title="No system keyring found",
+                subtitle=f"Secrets are stored in a local file under {config.config_dir()} instead of "
+                "your keyring. Install gnome-keyring or kwallet for encrypted storage.",
+            )
+            warn_row.add_prefix(Gtk.Image.new_from_icon_name("dialog-warning-symbolic"))
+            warn_group.add(warn_row)
+            page.add(warn_group)
+
+        yt_group = Adw.PreferencesGroup(title="YouTube Music")
+        self.yt_kind_row = Adw.ComboRow(
+            title="Authentication method", model=Gtk.StringList.new(["Browser headers", "OAuth"])
+        )
+        self.yt_kind_row.set_selected(_YT_AUTH_KINDS.index(self.settings.ytmusic_auth_kind)
+                                       if self.settings.ytmusic_auth_kind in _YT_AUTH_KINDS else 0)
+        self.yt_kind_row.connect(
+            "notify::selected",
+            lambda r, _p: self._set_account_setting("ytmusic_auth_kind", _YT_AUTH_KINDS[r.get_selected()]),
+        )
+        yt_group.add(self.yt_kind_row)
+
+        self.yt_file_row = Adw.ActionRow(
+            title="Auth file", subtitle=self.settings.ytmusic_auth_file or "Not set"
+        )
+        choose_button = Gtk.Button(label="Choose File…", valign=Gtk.Align.CENTER)
+        choose_button.connect("clicked", self._on_choose_yt_file)
+        self.yt_file_row.add_suffix(choose_button)
+        yt_group.add(self.yt_file_row)
+
+        paste_row = Adw.ActionRow(
+            title="Paste Browser Headers",
+            subtitle="Set up authentication from headers copied out of your browser's devtools",
+        )
+        paste_button = Gtk.Button(label="Paste…", valign=Gtk.Align.CENTER)
+        paste_button.connect("clicked", self._on_paste_headers)
+        paste_row.add_suffix(paste_button)
+        yt_group.add(paste_row)
+
+        self.yt_status_row = Adw.ActionRow(title="Connection", subtitle="Unknown")
+        yt_test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
+        yt_test_button.connect("clicked", lambda *_a: self._test_provider(Service.YTMUSIC, self.yt_status_row))
+        self.yt_status_row.add_suffix(yt_test_button)
+        yt_group.add(self.yt_status_row)
+        page.add(yt_group)
+
+        qb_group = Adw.PreferencesGroup(title="Qobuz")
+        self.qb_email_row = Adw.EntryRow(title="Email", text=self.settings.qobuz_email)
+        self.qb_email_row.connect(
+            "notify::text", lambda r, _p: self._schedule("qobuz_email", lambda: self._set_account_setting("qobuz_email", r.get_text()))
+        )
+        qb_group.add(self.qb_email_row)
+
+        self.qb_password_row = Adw.PasswordEntryRow(
+            title="Password", text=self.credentials.get(config.QOBUZ_PASSWORD) or ""
+        )
+        self.qb_password_row.connect(
+            "notify::text", lambda r, _p: self._schedule("qobuz_password", lambda: self.credentials.set(config.QOBUZ_PASSWORD, r.get_text()))
+        )
+        qb_group.add(self.qb_password_row)
+
+        self.qb_app_id_row = Adw.EntryRow(title="App ID (optional)", text=self.settings.qobuz_app_id)
+        self.qb_app_id_row.connect(
+            "notify::text", lambda r, _p: self._schedule("qobuz_app_id", lambda: self._set_account_setting("qobuz_app_id", r.get_text()))
+        )
+        qb_group.add(self.qb_app_id_row)
+
+        self.qb_status_row = Adw.ActionRow(title="Connection", subtitle="Unknown")
+        qb_test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
+        qb_test_button.connect("clicked", lambda *_a: self._test_provider(Service.QOBUZ, self.qb_status_row))
+        self.qb_status_row.add_suffix(qb_test_button)
+        qb_group.add(self.qb_status_row)
+        page.add(qb_group)
+        return page
+
+    def _on_choose_yt_file(self, _button: Gtk.Button) -> None:
+        dialog = Gtk.FileDialog(title="Select browser.json / oauth.json")
+        dialog.open(self.get_root(), None, self._on_yt_file_chosen)
+
+    def _on_yt_file_chosen(self, dialog: Gtk.FileDialog, result: Gio.AsyncResult) -> None:
+        try:
+            gfile = dialog.open_finish(result)
+        except GLib.Error as exc:
+            if not (exc.matches(Gtk.DialogError.quark(), Gtk.DialogError.CANCELLED)
+                    or exc.matches(Gtk.DialogError.quark(), Gtk.DialogError.DISMISSED)):
+                self.state.toast(f"Couldn't select file: {exc.message}")
+            return
+        path = gfile.get_path()
+        self.yt_file_row.set_subtitle(path)
+        self._set_account_setting("ytmusic_auth_file", path)
+
+    def _on_paste_headers(self, _button: Gtk.Button) -> None:
+        if not self.settings.ytmusic_auth_file:
+            self.state.toast("Choose an auth file location first.")
+            return
+        dialog = Adw.AlertDialog(
+            heading="Paste Browser Headers",
+            body="Paste the raw request headers copied from your browser's network inspector "
+            "(a request to music.youtube.com, \"Copy as cURL\" headers or raw header text).",
+        )
+        frame = Gtk.Frame()
+        text_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD, height_request=160,
+                                  top_margin=6, bottom_margin=6, left_margin=6, right_margin=6)
+        frame.set_child(text_view)
+        dialog.set_extra_child(frame)
+        dialog.add_response("cancel", "Cancel")
+        dialog.add_response("save", "Save")
+        dialog.set_response_appearance("save", Adw.ResponseAppearance.SUGGESTED)
+        dialog.set_close_response("cancel")
+
+        def on_response(_dlg: Adw.AlertDialog, response: str) -> None:
+            if response != "save":
+                return
+            buf = text_view.get_buffer()
+            headers_raw = buf.get_text(buf.get_start_iter(), buf.get_end_iter(), False).strip()
+            if not headers_raw:
+                return
+            path = self.settings.ytmusic_auth_file
+
+            def work() -> str:
+                import ytmusicapi
+
+                return ytmusicapi.setup(filepath=path, headers_raw=headers_raw)
+
+            def done(_headers: str) -> None:
+                self.state.toast("YouTube Music headers saved.")
+                self.state.reload_providers()
+
+            run_async(work, done, lambda exc: self.state.toast(f"Couldn't set up headers: {exc}"))
+
+        dialog.connect("response", on_response)
+        dialog.present(self)
+
+    def _test_provider(self, service: Service, status_row: Adw.ActionRow) -> None:
+        provider = self.state.providers.get(service)
+        if provider is None:
+            status_row.set_subtitle("Not configured")
+            return
+        status_row.set_subtitle("Testing…")
+
+        def work() -> str | None:
+            provider.authenticate()
+            return provider.account_name()
+
+        def done(name: str | None) -> None:
+            status_row.set_subtitle(f"Connected as {name}" if name else "Connected")
+
+        def error(exc: BaseException) -> None:
+            status_row.set_subtitle(f"Failed: {exc}")
+
+        run_async(work, done, error)
+
+    # -- integrations ---------------------------------------------------------
+
+    def _build_integrations_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title="Integrations", icon_name="applications-internet-symbolic")
+
+        lastfm_group = Adw.PreferencesGroup(title="Last.fm")
+        enabled_row = Adw.SwitchRow(title="Enabled", active=self.settings.lastfm_enabled)
+        enabled_row.connect("notify::active", lambda r, _p: self._set_setting("lastfm_enabled", r.get_active()))
+        lastfm_group.add(enabled_row)
+        key_row = Adw.PasswordEntryRow(title="API Key", text=self.credentials.get(config.LASTFM_API_KEY) or "")
+        key_row.connect(
+            "notify::text", lambda r, _p: self._schedule("lastfm_key", lambda: self.credentials.set(config.LASTFM_API_KEY, r.get_text()))
+        )
+        lastfm_group.add(key_row)
+        page.add(lastfm_group)
+
+        mb_group = Adw.PreferencesGroup(title="MusicBrainz / ListenBrainz")
+        mb_row = Adw.SwitchRow(title="MusicBrainz enabled", active=self.settings.musicbrainz_enabled)
+        mb_row.connect("notify::active", lambda r, _p: self._set_setting("musicbrainz_enabled", r.get_active()))
+        mb_group.add(mb_row)
+        lb_row = Adw.SwitchRow(title="ListenBrainz enabled", active=self.settings.listenbrainz_enabled)
+        lb_row.connect("notify::active", lambda r, _p: self._set_setting("listenbrainz_enabled", r.get_active()))
+        mb_group.add(lb_row)
+        contact_row = Adw.EntryRow(title="Contact email (MusicBrainz User-Agent)", text=self.settings.contact_email)
+        contact_row.connect(
+            "notify::text", lambda r, _p: self._schedule("contact_email", lambda: self._set_setting("contact_email", r.get_text()))
+        )
+        mb_group.add(contact_row)
+        page.add(mb_group)
+
+        ai_group = Adw.PreferencesGroup(title="AI Playlist Builder")
+        ai_enabled_row = Adw.SwitchRow(title="Enabled", active=self.settings.ai_enabled)
+        ai_enabled_row.connect("notify::active", lambda r, _p: self._set_setting("ai_enabled", r.get_active()))
+        ai_group.add(ai_enabled_row)
+        ai_key_row = Adw.PasswordEntryRow(title="Anthropic API Key", text=self.credentials.get(config.ANTHROPIC_API_KEY) or "")
+        ai_key_row.connect("notify::text", lambda r, _p: self._schedule("ai_key", lambda: self._on_ai_key_changed(r.get_text())))
+        ai_group.add(ai_key_row)
+        ai_model_row = Adw.EntryRow(title="Model", text=self.settings.ai_model)
+        ai_model_row.connect("notify::text", lambda r, _p: self._schedule("ai_model", lambda: self._on_ai_model_changed(r.get_text())))
+        ai_group.add(ai_model_row)
+        page.add(ai_group)
+        return page
+
+    def _on_ai_key_changed(self, value: str) -> None:
+        self.credentials.set(config.ANTHROPIC_API_KEY, value)
+        self.state.reload_planner()
+
+    def _on_ai_model_changed(self, value: str) -> None:
+        self._set_setting("ai_model", value)
+        self.state.reload_planner()
+
+    # -- sync ---------------------------------------------------------------------
+
+    def _build_sync_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title="Sync", icon_name="emblem-synchronizing-symbolic")
+
+        group = Adw.PreferencesGroup(title="Defaults")
+        direction_row = Adw.ComboRow(
+            title="Default direction",
+            model=Gtk.StringList.new(["Mirror source → target", "Mirror target → source", "Two-way"]),
+        )
+        direction_row.set_selected(
+            _DIRECTIONS.index(self.settings.default_direction) if self.settings.default_direction in _DIRECTIONS else 2
+        )
+        direction_row.connect(
+            "notify::selected", lambda r, _p: self._set_setting("default_direction", _DIRECTIONS[r.get_selected()])
+        )
+        group.add(direction_row)
+
+        snapshot_row = Adw.SwitchRow(title="Snapshot playlists before syncing", active=self.settings.snapshot_before_sync)
+        snapshot_row.connect("notify::active", lambda r, _p: self._set_setting("snapshot_before_sync", r.get_active()))
+        group.add(snapshot_row)
+
+        auto_accept_row = Adw.SwitchRow(
+            title="Auto-accept high-confidence matches", active=self.settings.auto_accept_high
+        )
+        auto_accept_row.connect("notify::active", lambda r, _p: self._set_setting("auto_accept_high", r.get_active()))
+        group.add(auto_accept_row)
+        page.add(group)
+
+        threshold_group = Adw.PreferencesGroup(
+            title="Match Thresholds", description="How similar two tracks must be before Harmony treats them as the same recording."
+        )
+        high_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
+        high_row.set_title("High-confidence threshold")
+        high_row.set_value(self.settings.match_high_threshold)
+        high_row.connect("notify::value", lambda r, _p: self._set_setting("match_high_threshold", r.get_value()))
+        threshold_group.add(high_row)
+
+        low_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
+        low_row.set_title("Low-confidence threshold")
+        low_row.set_value(self.settings.match_low_threshold)
+        low_row.connect("notify::value", lambda r, _p: self._set_setting("match_low_threshold", r.get_value()))
+        threshold_group.add(low_row)
+        page.add(threshold_group)
+        return page
