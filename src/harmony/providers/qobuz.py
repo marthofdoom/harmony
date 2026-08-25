@@ -128,7 +128,11 @@ class QobuzProvider(MusicProvider):
         self._settings = settings
         self._credentials = credentials
         self._session = requests.Session()
-        self._session.headers["User-Agent"] = user_agent()
+        # Pass contact_email through explicitly rather than letting
+        # user_agent() load Settings off disk itself: construction must stay
+        # I/O-free (see the comment below), and `settings` is already the
+        # in-memory object the caller loaded at startup.
+        self._session.headers["User-Agent"] = user_agent(settings.contact_email)
         self._app_id = ""
         self._app_secret = ""
         self._auth_token: str | None = None
@@ -244,8 +248,13 @@ class QobuzProvider(MusicProvider):
             # this message is both logged (with a traceback, by
             # tasks.run_async) and shown directly in the Preferences UI
             # (prefs.py's "Failed: {exc}"). Redact defensively regardless of
-            # which HTTP method was used.
-            raise ProviderError(f"Qobuz request to {path} failed: {config.redact_secrets(str(exc))}") from exc
+            # which HTTP method was used. Chaining "from exc" itself would
+            # still leak: tasks.run_async's log.exception() renders the full
+            # cause chain via exc_info, and the raw `exc` carries the
+            # unredacted original text as __cause__ even though our own
+            # message here is clean. Chain from a redacted stand-in instead.
+            redacted = config.redact_secrets(str(exc))
+            raise ProviderError(f"Qobuz request to {path} failed: {redacted}") from config.redact_exception(exc)
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")

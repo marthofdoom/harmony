@@ -31,34 +31,52 @@ KEYRING_SERVICE = "io.github.marthofdoom.Harmony"
 # Secret redaction
 # --------------------------------------------------------------------------
 
-#: Query-param names whose values must never appear in an exception message
-#: or log line. Covers every credential this app ever puts on a URL: Qobuz's
-#: login (``password``/``username``/``email``/``app_secret``), its session
-#: token (``user_auth_token``), and Last.fm's ``api_key``.
-_SENSITIVE_PARAM_NAMES = (
-    "password",
-    "api_key",
-    "apikey",
-    "username",
-    "email",
-    "user_auth_token",
-    "auth_token",
-    "app_secret",
-    "secret",
-    "token",
+#: Name *fragments* (regex, not literal strings) for credentials that must
+#: never appear in an exception message or log line. Covers every credential
+#: this app ever puts on a URL, in a JSON/dict-shaped body, or in a header:
+#: Qobuz's login (``password``/``username``/``email``/``app_secret``), its
+#: session token (``user_auth_token``), Last.fm's ``api_key``, and generic
+#: ``token``/``secret``/``Authorization`` values a future integration might
+#: add. Each fragment tolerates the separator conventions actually in use —
+#: underscore (``app_secret``), hyphen (``app-secret``), and none
+#: (``apikey``) — via ``[_-]?``, and matches only from the start of the
+#: name (never as a substring of an unrelated, longer name).
+_SENSITIVE_NAME_FRAGMENTS = (
+    r"password",
+    r"api[_-]?key",
+    r"username",
+    r"email",
+    r"user[_-]?auth[_-]?token",
+    r"auth[_-]?token",
+    r"app[_-]?secret",
+    r"secret",
+    r"token",
+    r"authorization",
 )
+_SENSITIVE_NAMES_ALT = "|".join(_SENSITIVE_NAME_FRAGMENTS)
 
 # Matches "?name=value" / "&name=value" for any of the names above, up to the
 # next delimiter. Deliberately loose about what a "value" looks like (it may
 # be percent-encoded, e.g. "alice%40example.com") since the point is to strip
 # it, not parse it.
-_SECRET_PARAM_RE = re.compile(
-    r"(?i)([?&](?:" + "|".join(_SENSITIVE_PARAM_NAMES) + r")=)[^&\s'\")]*"
+_SECRET_PARAM_RE = re.compile(r"(?i)([?&](?:" + _SENSITIVE_NAMES_ALT + r")=)[^&\s'\")]*")
+
+# Matches a JSON-object or Python-dict-repr key/value pair for any of the
+# names above, e.g. '"api_key": "abc123"' or "'password': 'hunter2'" —
+# response bodies and repr()'d request payloads carry secrets this way
+# rather than as a URL query string.
+_SECRET_JSON_RE = re.compile(
+    r"(?i)(['\"](?:" + _SENSITIVE_NAMES_ALT + r")['\"]\s*:\s*)(['\"])[^'\"]*\2"
 )
+
+# Matches an "Authorization: <value>" header rendered into free text (a
+# dumped headers dict, urllib3's own debug logging, etc).
+_SECRET_AUTH_HEADER_RE = re.compile(r"(?i)(authorization\s*:\s*)[^\r\n'\")]+")
 
 
 def redact_secrets(text: str) -> str:
-    """Redact secret-bearing query-param values from ``text``.
+    """Redact secret-bearing query-params, JSON/dict fields, and auth headers
+    from ``text``.
 
     ``requests``/``urllib3`` embed the full request URL — including query
     params — in their own exception text (e.g. "Max retries exceeded with
@@ -71,7 +89,31 @@ def redact_secrets(text: str) -> str:
     """
     if not text:
         return text
-    return _SECRET_PARAM_RE.sub(lambda m: m.group(1) + "REDACTED", text)
+    text = _SECRET_PARAM_RE.sub(lambda m: m.group(1) + "REDACTED", text)
+    text = _SECRET_JSON_RE.sub(lambda m: m.group(1) + m.group(2) + "REDACTED" + m.group(2), text)
+    text = _SECRET_AUTH_HEADER_RE.sub(lambda m: m.group(1) + "REDACTED", text)
+    return text
+
+
+def redact_exception(exc: BaseException) -> BaseException:
+    """Build a redaction-safe stand-in for ``exc`` to use as a chained ``__cause__``.
+
+    ``raise ProviderError(redact_secrets(str(exc))) from exc`` still leaves
+    the *original* ``exc`` object — with its unredacted message — reachable
+    as ``__cause__``. Anything that renders the full chain (``log.exception``,
+    ``traceback.format_exception``, an unhandled-exception hook) prints that
+    original message verbatim, defeating the redaction done on the new
+    exception's own message. Chain from this instead: same exception type,
+    same *redacted* message, so the logged chain still shows what kind of
+    transport failure happened without ever holding a live secret. Falls back
+    to a plain ``RuntimeError`` if ``type(exc)`` can't be constructed from a
+    single message string (some exception types need extra args/kwargs).
+    """
+    redacted_msg = redact_secrets(str(exc))
+    try:
+        return type(exc)(redacted_msg)
+    except Exception:  # noqa: BLE001 - constructor shape varies across libs
+        return RuntimeError(redacted_msg)
 
 
 def config_dir() -> Path:
@@ -282,7 +324,28 @@ LASTFM_API_KEY = "lastfm.api_key"
 ANTHROPIC_API_KEY = "anthropic.api_key"
 
 
-def user_agent() -> str:
+def user_agent(contact_email: str | None = None) -> str:
+    """Build the User-Agent every outbound HTTP call identifies itself with.
+
+    MusicBrainz's API etiquette (and ListenBrainz's, which follows the same
+    convention) explicitly asks for a contact address in the User-Agent so
+    they have a way to reach an app's maintainer/user about problematic
+    usage, not just a project URL. When the user has set one in Preferences
+    → Integrations (``Settings.contact_email``), append it; otherwise this is
+    unchanged from before.
+
+    ``contact_email`` lets a caller that already holds a live ``Settings``
+    object (e.g. a provider constructed with one, per the threading rule)
+    pass it straight through with zero I/O. When omitted, this loads
+    ``Settings`` fresh off disk to pick the value up anyway — safe because
+    every call site that omits it (the shared enrich HTTP helper and
+    whatever goes through it) only ever runs on a worker thread already,
+    same as the network call it's building a header for; never at
+    construction/startup on the main loop.
+    """
     from . import __version__
 
-    return f"{APP_NAME}/{__version__} (+https://github.com/marthofdoom/harmony)"
+    base = f"{APP_NAME}/{__version__} (+https://github.com/marthofdoom/harmony)"
+    contact = contact_email if contact_email is not None else Settings.load().contact_email
+    contact = (contact or "").strip()
+    return f"{base} ( {contact} )" if contact else base

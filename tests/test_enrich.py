@@ -168,6 +168,52 @@ def test_lastfm_similar_tracks_connection_error_does_not_leak_api_key(monkeypatc
     assert "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab" not in str(exc_info.value)
 
 
+def test_lastfm_connection_error_does_not_leak_api_key_through_log_exc_info(monkeypatch, caplog):
+    """Full-chain proof for the verified Last.fm leak, through the formatted
+    log output rather than just ``str(exc)``.
+
+    The redacted message on our own ``ProviderError`` was never the problem
+    -- ``raise ProviderError(...) from exc`` still keeps the *original*,
+    unredacted ``requests.ConnectionError`` reachable as ``__cause__``, and
+    anything that renders the full chain (``tasks.run_async``'s
+    ``log.exception()``, which is exactly how an uncaught exception from a
+    background task gets logged) prints it verbatim via ``exc_info``. A test
+    that only checks ``record.getMessage()`` can never catch that, since
+    ``getMessage()`` excludes ``exc_info`` by definition.
+    """
+    import logging
+
+    key = "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab"
+    monkeypatch.setattr(lastfm_mod, "_api_key", lambda: key)
+
+    def raise_connection_error(*a, **k):
+        import requests
+
+        raise requests.ConnectionError(
+            "HTTPSConnectionPool(host='ws.audioscrobbler.com', port=443): Max retries exceeded "
+            f"with url: /2.0/?method=track.getsimilar&format=json&api_key={key}"
+            "&artist=Boards+of+Canada&track=Roygbiv "
+            "(Caused by NewConnectionError('...: Failed to establish a new connection'))"
+        )
+
+    monkeypatch.setattr(enrich_mod.requests, "get", raise_connection_error)
+
+    formatter = logging.Formatter("%(levelname)s %(name)s %(message)s")
+
+    with caplog.at_level("DEBUG"):
+        try:
+            lastfm_mod.similar_tracks("Boards of Canada", "Roygbiv")
+        except ProviderError:
+            # Mirror tasks.run_async._settle(): logs the live exc_info, which
+            # walks the full __cause__ chain.
+            logging.getLogger("harmony.tasks").exception("Background task failed")
+
+    assert caplog.records
+    for record in caplog.records:
+        rendered = formatter.format(record)
+        assert key not in rendered
+
+
 def test_lastfm_missing_credential_raises(monkeypatch):
     monkeypatch.setattr(lastfm_mod.CredentialStore, "get", lambda self, key: None)
     with pytest.raises(MissingCredentialError):

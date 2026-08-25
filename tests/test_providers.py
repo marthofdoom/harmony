@@ -9,11 +9,12 @@ scrapes the web player. Fixture dicts stand in for real API responses.
 from __future__ import annotations
 
 import hashlib
+import logging
 
 import pytest
 import requests
 
-from harmony.config import Settings, redact_secrets
+from harmony.config import Settings, redact_exception, redact_secrets
 from harmony.errors import NotSupportedError, ProviderError, RateLimitedError
 from harmony.models import Service
 from harmony.providers.base import _chunked, retry_on_rate_limit
@@ -519,6 +520,105 @@ class TestRedactSecrets:
         assert "abc123" not in redacted
         assert "topsecretvalue" not in redacted
 
+    def test_redacts_json_body_double_quoted(self) -> None:
+        text = '{"api_key": "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab", "artist": "Boards of Canada"}'
+        redacted = redact_secrets(text)
+        assert "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab" not in redacted
+        assert '"api_key": "REDACTED"' in redacted
+        assert "Boards of Canada" in redacted  # non-secret fields survive
+
+    def test_redacts_python_dict_repr_single_quoted(self) -> None:
+        text = "{'password': 'hunter2', 'username': 'alice'}"
+        redacted = redact_secrets(text)
+        assert "hunter2" not in redacted
+        assert "alice" not in redacted
+        assert "'password': 'REDACTED'" in redacted
+        assert "'username': 'REDACTED'" in redacted
+
+    def test_redacts_authorization_header_value(self) -> None:
+        text = "headers: {'Authorization': 'Bearer sk-abc123topsecret', 'Accept': 'application/json'}"
+        redacted = redact_secrets(text)
+        assert "sk-abc123topsecret" not in redacted
+        assert "Accept" in redacted  # unrelated header survives
+
+    def test_redacts_hyphenated_param_name(self) -> None:
+        text = "url: /endpoint?app-secret=hyphensecretvalue&other=1"
+        redacted = redact_secrets(text)
+        assert "hyphensecretvalue" not in redacted
+        assert "app-secret=REDACTED" in redacted
+
+
+class TestRedactException:
+    def test_redacted_stand_in_keeps_type_and_scrubs_message(self) -> None:
+        original = requests.exceptions.ConnectionError(
+            "Max retries exceeded with url: /login?password=hunter2secret"
+        )
+        stand_in = redact_exception(original)
+        assert isinstance(stand_in, requests.exceptions.ConnectionError)
+        assert "hunter2secret" not in str(stand_in)
+        assert "password=REDACTED" in str(stand_in)
+
+    def test_falls_back_when_type_is_not_reconstructible(self) -> None:
+        class Weird(Exception):
+            def __init__(self, a, b):  # requires two positional args
+                super().__init__(a, b)
+                self.a, self.b = a, b
+
+        # Exception.__str__ with >1 arg renders repr(self.args) -- the query
+        # string is still recognisable to the param regex despite the extra
+        # quoting, so the fallback path still scrubs it.
+        original = Weird("url: /x?password=hunter2secret&y=1", "extra")
+        stand_in = redact_exception(original)
+        assert "hunter2secret" not in str(stand_in)
+        assert isinstance(stand_in, RuntimeError)
+
+
+class TestUserAgentContactEmail:
+    """config.user_agent() ⇐ Settings.contact_email.
+
+    MusicBrainz/ListenBrainz's API etiquette explicitly wants a contact
+    address in the User-Agent. This was a Settings field the Preferences UI
+    let the user edit but that no code ever read — pure dead surface.
+    """
+
+    def test_includes_contact_email_when_set(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from harmony import config as config_module
+
+        monkeypatch.setattr(config_module, "settings_path", lambda: tmp_path / "settings.json")
+        config_module.Settings(contact_email="me@example.com").save()
+
+        ua = config_module.user_agent()
+        assert "me@example.com" in ua
+        assert ua.startswith(f"{config_module.APP_NAME}/")
+
+    def test_explicit_contact_email_param_skips_disk_load(
+        self, tmp_path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """QobuzProvider passes settings.contact_email straight through so
+        construction stays I/O-free; this proves that path never touches
+        Settings.load() at all."""
+        from harmony import config as config_module
+
+        def boom():
+            raise AssertionError("must not read Settings from disk when contact_email is given")
+
+        monkeypatch.setattr(config_module.Settings, "load", staticmethod(boom))
+
+        ua = config_module.user_agent("me@example.com")
+        assert "me@example.com" in ua
+
+    def test_omits_contact_clause_when_blank(self, tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+        from harmony import config as config_module
+
+        monkeypatch.setattr(config_module, "settings_path", lambda: tmp_path / "settings.json")
+        # No settings.json written at all -> Settings.load() falls back to
+        # defaults, where contact_email == "".
+        base_ua = config_module.user_agent()
+        assert "@" not in base_ua
+
+        config_module.Settings(contact_email="   ").save()  # whitespace-only
+        assert config_module.user_agent() == base_ua  # stripped to blank, unchanged
+
 
 # --------------------------------------------------------------------------
 # qobuz.py — constructor purity, lazy credential setup, login transport
@@ -541,6 +641,23 @@ class TestQobuzConstructorIsPure:
         monkeypatch.setattr(requests.Session, "request", boom)
         settings = Settings()  # blank qobuz_app_id -> would normally trigger a scrape
         QobuzProvider(settings, credentials)  # must not raise
+
+    def test_construction_never_reads_settings_from_disk(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """user_agent(settings.contact_email) must be called with the
+        in-memory value construction already has -- not user_agent(), which
+        would fall back to Settings.load() and reintroduce disk I/O into a
+        path that's explicitly documented as I/O-free."""
+        from harmony.config import Settings as SettingsCls
+
+        def boom():
+            raise AssertionError("construction must not read Settings from disk")
+
+        monkeypatch.setattr(SettingsCls, "load", staticmethod(boom))
+        settings = Settings(qobuz_app_id="test_app_id", contact_email="me@example.com")
+        provider = QobuzProvider(settings, credentials)
+        assert "me@example.com" in provider._session.headers["User-Agent"]
 
     def test_is_authenticated_false_and_io_free_before_first_use(
         self, credentials: FakeCredentialStore
@@ -636,7 +753,18 @@ class TestQobuzLeakProof:
     ) -> None:
         """End-to-end proof for the verified leak: force a transport failure
         during login and assert the password digest / email never survive
-        into the raised exception's text or any captured log record."""
+        into the raised exception's text OR the fully formatted log output.
+
+        ``record.getMessage()`` (the previous version of this test) only
+        renders the ``%``-formatted message string -- by definition it never
+        includes ``record.exc_info``, so a leak that only lives in the
+        exception chain (exactly this bug: the redacted message is fine, but
+        ``raise ... from exc`` keeps the unredacted original reachable as
+        ``__cause__``) could never fail this assertion. This formats each
+        record the way a real handler (and ``tasks.run_async``'s
+        ``log.exception``) would, cause chain included, via
+        ``logging.Formatter().format()``.
+        """
         password = "hunter2"
         digest = hashlib.md5(password.encode()).hexdigest()
         email = "alice@example.com"
@@ -658,17 +786,28 @@ class TestQobuzLeakProof:
 
         monkeypatch.setattr(qobuz_provider._session, "request", raise_conn_error)
 
+        formatter = logging.Formatter("%(levelname)s %(name)s %(message)s")
+
         with caplog.at_level("DEBUG"):
             with pytest.raises(ProviderError) as exc_info:
                 qobuz_provider.authenticate()
 
-        exc_text = str(exc_info.value)
-        assert digest not in exc_text
-        assert email not in exc_text
-        assert password not in exc_text
+            exc_text = str(exc_info.value)
+            assert digest not in exc_text
+            assert email not in exc_text
+            assert password not in exc_text
 
+            # Mirror tasks.run_async._settle(): the worker's exception is
+            # caught and rendered with log.exception(), which pulls the live
+            # exc_info (and therefore the full __cause__ chain) implicitly.
+            try:
+                qobuz_provider.authenticate()
+            except ProviderError:
+                logging.getLogger("harmony.tasks").exception("Background task failed")
+
+        assert caplog.records  # sanity: we actually captured something
         for record in caplog.records:
-            rendered = record.getMessage()
+            rendered = formatter.format(record)  # includes exc_info/cause chain
             assert digest not in rendered
             assert email not in rendered
             assert password not in rendered

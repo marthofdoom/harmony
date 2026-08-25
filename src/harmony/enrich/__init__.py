@@ -54,7 +54,13 @@ def _get_json(
         # query params (e.g. Last.fm's api_key) - in their own exception
         # text, which we'd otherwise be re-raising verbatim into a message
         # that gets logged (and shown in the UI, for callers that surface it).
-        raise ProviderError(f"Request to {url} failed: {config.redact_secrets(str(exc))}") from exc
+        # Redacting only *this* message isn't enough: chaining "from exc"
+        # keeps the raw, unredacted exception reachable as __cause__, and
+        # anything that renders the full chain (tasks.run_async's
+        # log.exception, a bare traceback) prints it verbatim regardless of
+        # what our own message says. Chain from a redacted stand-in instead.
+        redacted = config.redact_secrets(str(exc))
+        raise ProviderError(f"Request to {url} failed: {redacted}") from config.redact_exception(exc)
     if response.status_code == 429:
         retry_after = response.headers.get("Retry-After")
         raise RateLimitedError(

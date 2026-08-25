@@ -85,19 +85,33 @@ class MatchResult:
     source: Track
     best: MatchCandidate | None
     candidates: list[MatchCandidate]
-    confidence: Literal["exact", "high", "low", "none"]
+    confidence: Literal["exact", "high", "low", "manual", "none"]
 
 def normalize_title(s: str) -> str      # strips "(Remastered 2011)", "feat. X", etc.
 def normalize_artist(s: str) -> str
 def score(source: Track, cand: Track) -> tuple[float, list[str]]
-def match_track(source: Track, target: MusicProvider, *, limit: int = 8) -> MatchResult
-def match_tracks(sources, target, *, progress=None) -> list[MatchResult]
+def match_track(source: Track, target: MusicProvider, *, limit: int = 8,
+                 high_threshold: float = HIGH_THRESHOLD,
+                 low_threshold: float = LOW_THRESHOLD) -> MatchResult
+def match_tracks(sources, target, *, progress=None, db=None,
+                  high_threshold: float = HIGH_THRESHOLD,
+                  low_threshold: float = LOW_THRESHOLD) -> list[MatchResult]
 ```
 
-Scoring: ISRC equality ⇒ 1.0 `exact`. Otherwise weighted rapidfuzz —
-title 0.5, artist 0.35, duration 0.15 (full credit ≤2s delta, zero ≥15s),
-+0.05 album bonus, penalty when one side is live/remix/karaoke and the other
-is not. Thresholds: ≥0.88 `high`, ≥0.70 `low`, else `none`.
+Scoring: ISRC equality ⇒ 1.0, confidence `exact`. `exact` is reserved for
+ISRC-verified identity — a merely perfect *fuzzy* score (title/artist/duration
+all lining up with no ISRC on one or both sides) tops out at `high`, never
+`exact`. Otherwise weighted rapidfuzz — title 0.5, artist 0.35, duration 0.15
+(full credit ≤2s delta, zero ≥15s), +0.05 album bonus, penalty when one side
+is live/remix/karaoke and the other is not. Thresholds: ≥0.88 `high`, ≥0.70
+`low`, else `none`. `manual` is a fifth, separate confidence: a user-resolved
+match (recorded via the sync UI's "Use this" flow), score 1.0, never
+re-derived or downgraded once cached — a human already made this call and
+`match_tracks`' db-cache lookup returns it as-is. Thresholds are user-facing
+(`Settings.match_high_threshold` / `match_low_threshold`, edited in
+Preferences → Sync) but callers must pass them in explicitly — this module
+never imports `harmony.config`, to keep the scoring engine dependency-light
+and independently testable.
 
 ## db.py — `Database`
 
@@ -121,10 +135,13 @@ class SyncDirection(Enum): MIRROR_A_TO_B; MIRROR_B_TO_A; TWO_WAY
 @dataclass
 class SyncAction:  # kind: "add" | "remove" | "unmatched"
     kind: str; target: Service; track: Track; match: MatchResult | None
+    target_playlist_id: str = ""  # which playlist on `target`; see below
 @dataclass
 class SyncPlan:
     source: Playlist; target: Playlist; actions: list[SyncAction]
+    notes: list[str]
     def summary(self) -> str
+    def normalise(self) -> None
 
 class SyncEngine:
     def __init__(self, providers: dict[Service, MusicProvider], db: Database)
@@ -133,9 +150,28 @@ class SyncEngine:
     def clone_playlist(self, src: Playlist, dst_service: Service, *, progress=None) -> SyncPlan
 ```
 
+`SyncAction.target_playlist_id` disambiguates two actions that share the same
+`target` service but point at two different playlists on it — e.g. a TWO_WAY
+sync between two playlists that both happen to live on the same service.
+Grouping/looking up actions by `target` alone would silently merge them;
+`plan()` always fills this in, and it defaults to `""` only so hand-built
+`SyncAction`s (tests, older callers) don't break.
+
 Plan is pure (no writes). `apply` performs writes, records links in the db, and
 snapshots both playlists first. `progress` is `Callable[[float, str], None]`
 where float is 0..1. Two-way = union of both sides; never deletes on TWO_WAY.
+
+For a given direction, if **any** source track's match outcome is
+`"unmatched"` (low-confidence or no candidate found), **all** removals for
+that direction are suppressed — not just removals that a look at the
+unmatched tracks might implicate. A removal means "this target track has no
+counterpart in the source," which is unknowable while any source track's
+match is still undetermined; guessing which removals would have been safe
+risks deleting something that an unresolved match would have accounted for.
+The plan's `notes` explain the suppression and its count so the UI can
+surface it. Once every unmatched row is resolved (or the plan is re-run after
+resolution) and no `"unmatched"` actions remain, removals proceed normally
+for orphaned target tracks.
 
 ## enrich/
 
