@@ -11,9 +11,10 @@ from __future__ import annotations
 import hashlib
 
 import pytest
+import requests
 
-from harmony.config import Settings
-from harmony.errors import NotSupportedError, RateLimitedError
+from harmony.config import Settings, redact_secrets
+from harmony.errors import NotSupportedError, ProviderError, RateLimitedError
 from harmony.models import Service
 from harmony.providers.base import _chunked, retry_on_rate_limit
 from harmony.providers.qobuz import QobuzProvider, request_sig
@@ -25,8 +26,10 @@ class FakeCredentialStore:
 
     def __init__(self) -> None:
         self._data: dict[str, str] = {}
+        self.get_calls: list[str] = []
 
     def get(self, key: str) -> str | None:
+        self.get_calls.append(key)
         return self._data.get(key)
 
     def set(self, key: str, value: str) -> None:
@@ -463,6 +466,212 @@ class TestQobuzRequestSig:
         sig = request_sig("track", "getFileUrl", {}, 1, "secret")
         assert len(sig) == 32
         int(sig, 16)  # raises ValueError if not hex
+
+
+# --------------------------------------------------------------------------
+# config.redact_secrets — credential-leak fix
+# --------------------------------------------------------------------------
+
+
+class TestRedactSecrets:
+    def test_redacts_verified_qobuz_login_leak(self) -> None:
+        # Exact shape of the verified real output from the bug report: a
+        # urllib3 "Max retries exceeded" message embedding the full request
+        # URL, including username/email/password=<md5>.
+        text = (
+            "HTTPSConnectionPool(host='www.qobuz.com', port=443): Max retries exceeded with "
+            "url: /api.json/0.2/user/login?app_id=123456789&username=alice%40example.com"
+            "&email=alice%40example.com&password=df09b9f54e5db483dc5ecc24dbeb3177 "
+            "(Caused by NewConnectionError('...: Failed to establish a new connection'))"
+        )
+        redacted = redact_secrets(text)
+        assert "df09b9f54e5db483dc5ecc24dbeb3177" not in redacted
+        assert "alice%40example.com" not in redacted
+        assert "alice@example.com" not in redacted
+        # Structure survives — only the values are gone.
+        assert "username=REDACTED" in redacted
+        assert "email=REDACTED" in redacted
+        assert "password=REDACTED" in redacted
+        assert "user/login" in redacted
+
+    def test_redacts_verified_lastfm_api_key_leak(self) -> None:
+        text = (
+            "Request to https://ws.audioscrobbler.com/2.0/ failed: "
+            "HTTPSConnectionPool(host='ws.audioscrobbler.com', port=443): Max retries exceeded "
+            "with url: /2.0/?method=track.getsimilar&format=json&api_key=9f8c2b6a1d4e7f0031bd5c9a44e2f1ab"
+            "&artist=Boards+of+Canada&track=Roygbiv "
+            "(Caused by NewConnectionError('...: Failed to establish a new connection'))"
+        )
+        redacted = redact_secrets(text)
+        assert "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab" not in redacted
+        assert "api_key=REDACTED" in redacted
+
+    def test_leaves_secret_free_text_untouched(self) -> None:
+        text = "Qobuz API error 500 on catalog/search: internal server error"
+        assert redact_secrets(text) == text
+
+    def test_handles_empty_string(self) -> None:
+        assert redact_secrets("") == ""
+
+    def test_redacts_app_secret_and_user_auth_token(self) -> None:
+        text = "url: /track/getFileUrl?user_auth_token=abc123&app_secret=topsecretvalue&track_id=5"
+        redacted = redact_secrets(text)
+        assert "abc123" not in redacted
+        assert "topsecretvalue" not in redacted
+
+
+# --------------------------------------------------------------------------
+# qobuz.py — constructor purity, lazy credential setup, login transport
+# --------------------------------------------------------------------------
+
+
+class TestQobuzConstructorIsPure:
+    def test_construction_never_touches_credential_store(self, credentials: FakeCredentialStore) -> None:
+        settings = Settings(qobuz_app_id="test_app_id")
+        QobuzProvider(settings, credentials)
+        assert credentials.get_calls == []
+
+    def test_construction_never_touches_network(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(*a, **kw):
+            raise AssertionError("construction must not perform network I/O")
+
+        monkeypatch.setattr(requests.Session, "get", boom)
+        monkeypatch.setattr(requests.Session, "request", boom)
+        settings = Settings()  # blank qobuz_app_id -> would normally trigger a scrape
+        QobuzProvider(settings, credentials)  # must not raise
+
+    def test_is_authenticated_false_and_io_free_before_first_use(
+        self, credentials: FakeCredentialStore
+    ) -> None:
+        settings = Settings(qobuz_app_id="test_app_id")
+        provider = QobuzProvider(settings, credentials)
+        assert provider.is_authenticated is False
+        assert credentials.get_calls == []  # the property itself did no I/O either
+
+    def test_app_credentials_loaded_lazily_exactly_once(self, credentials: FakeCredentialStore) -> None:
+        settings = Settings(qobuz_app_id="test_app_id")
+        credentials.set("qobuz.app_secret", "the-secret")
+        provider = QobuzProvider(settings, credentials)
+        assert credentials.get_calls == []  # nothing yet
+
+        provider._ensure_ready()  # what every _request()/authenticate() call triggers first
+        first_call_count = len(credentials.get_calls)
+        assert first_call_count > 0  # app_secret (and token) were fetched on first use
+
+        provider._ensure_ready()
+        assert len(credentials.get_calls) == first_call_count  # not fetched again
+
+    def test_app_id_scrape_deferred_until_first_use(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        scrape_calls = {"n": 0}
+
+        def fake_scrape(session):
+            scrape_calls["n"] += 1
+            return "scraped_app_id", "scraped_secret"
+
+        monkeypatch.setattr("harmony.providers.qobuz._scrape_app_credentials", fake_scrape)
+        settings = Settings()  # blank -> would scrape
+        provider = QobuzProvider(settings, credentials)
+        assert scrape_calls["n"] == 0  # not yet - construction is pure
+
+        provider._ensure_ready()
+        assert scrape_calls["n"] == 1
+        assert provider._app_id == "scraped_app_id"
+
+        provider._ensure_ready()
+        assert scrape_calls["n"] == 1  # cached, not scraped again
+
+    def test_construction_never_raises_when_qobuz_unreachable(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A fresh install (blank app_id) used to scrape play.qobuz.com in
+        __init__; if Qobuz was unreachable that raised AuthError out of
+        construction, which build_providers() propagated, dropping the whole
+        provider set. Construction must never touch the network at all now."""
+        settings = Settings()
+        provider = QobuzProvider(settings, credentials)  # must not raise
+        assert provider._app_id == ""
+
+
+class TestQobuzLoginTransport:
+    def test_login_sends_credentials_as_post_body_not_query_params(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict = {}
+
+        def fake_request(method, url, *, params=None, data=None, headers=None, timeout=None):
+            captured["method"] = method
+            captured["url"] = url
+            captured["params"] = params
+            captured["data"] = data
+            resp = requests.Response()
+            resp.status_code = 200
+            resp._content = b'{"user_auth_token": "tok123"}'
+            return resp
+
+        monkeypatch.setattr(qobuz_provider._session, "request", fake_request)
+
+        qobuz_provider._login("alice@example.com", "hunter2")
+
+        assert captured["method"] == "POST"
+        assert captured["params"] is None  # nothing on the query string
+        assert captured["data"]["email"] == "alice@example.com"
+        digest = hashlib.md5(b"hunter2").hexdigest()
+        assert captured["data"]["password"] == digest
+        # The URL itself carries no credentials regardless of how it was built.
+        assert "hunter2" not in captured["url"]
+        assert digest not in captured["url"]
+
+
+class TestQobuzLeakProof:
+    def test_forced_connection_error_does_not_leak_credentials(
+        self,
+        qobuz_provider: QobuzProvider,
+        credentials: FakeCredentialStore,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """End-to-end proof for the verified leak: force a transport failure
+        during login and assert the password digest / email never survive
+        into the raised exception's text or any captured log record."""
+        password = "hunter2"
+        digest = hashlib.md5(password.encode()).hexdigest()
+        email = "alice@example.com"
+        qobuz_provider._settings.qobuz_email = email
+        credentials.set("qobuz.password", password)
+
+        # Simulate exactly the verified failure mode: urllib3 embeds the full
+        # request URL (with whatever was on it) in its own exception text.
+        def raise_conn_error(method, url, **kw):
+            leaking_url = (
+                f"{url}?app_id=123456789&username={email}&email={email}&password={digest}"
+                if "?" not in url
+                else url
+            )
+            raise requests.exceptions.ConnectionError(
+                f"HTTPSConnectionPool(host='www.qobuz.com', port=443): Max retries exceeded "
+                f"with url: {leaking_url} (Caused by NewConnectionError(...))"
+            )
+
+        monkeypatch.setattr(qobuz_provider._session, "request", raise_conn_error)
+
+        with caplog.at_level("DEBUG"):
+            with pytest.raises(ProviderError) as exc_info:
+                qobuz_provider.authenticate()
+
+        exc_text = str(exc_info.value)
+        assert digest not in exc_text
+        assert email not in exc_text
+        assert password not in exc_text
+
+        for record in caplog.records:
+            rendered = record.getMessage()
+            assert digest not in rendered
+            assert email not in rendered
+            assert password not in rendered
 
 
 # --------------------------------------------------------------------------

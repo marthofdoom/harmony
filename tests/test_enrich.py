@@ -12,6 +12,7 @@ import anthropic
 import httpx2
 import pytest
 
+from harmony import enrich as enrich_mod
 from harmony.ai.claude import (
     DEFAULT_MODEL,
     PlaylistIdea,
@@ -67,8 +68,104 @@ def db() -> Database:
 
 
 # ---------------------------------------------------------------------------
+# enrich/__init__.py — shared _get_json / _cached_call helpers
+# ---------------------------------------------------------------------------
+
+
+def test_get_json_redacts_leaked_api_key_from_connection_error(monkeypatch):
+    """Regression test for the verified Last.fm leak: requests/urllib3 embed
+    the full request URL - including api_key - in their own exception text
+    on a transport failure, and that text used to survive verbatim into the
+    ProviderError we raise (which recommender._gather_lastfm then logs)."""
+
+    def raise_connection_error(*a, **k):
+        import requests
+
+        raise requests.ConnectionError(
+            "HTTPSConnectionPool(host='ws.audioscrobbler.com', port=443): Max retries exceeded "
+            "with url: /2.0/?method=track.getsimilar&api_key=9f8c2b6a1d4e7f0031bd5c9a44e2f1ab "
+            "(Caused by NewConnectionError('...: Failed to establish a new connection'))"
+        )
+
+    monkeypatch.setattr(enrich_mod.requests, "get", raise_connection_error)
+
+    with pytest.raises(ProviderError) as exc_info:
+        enrich_mod._get_json(
+            "https://ws.audioscrobbler.com/2.0/", {"api_key": "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab"}
+        )
+
+    assert "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab" not in str(exc_info.value)
+
+
+def test_cached_call_skips_caching_empty_results_when_disabled(db):
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        return []
+
+    enrich_mod._cached_call(db, "some-key", fetch, cache_empty=False)
+    enrich_mod._cached_call(db, "some-key", fetch, cache_empty=False)
+
+    assert calls["n"] == 2  # never cached, so re-fetched every time
+
+
+def test_cached_call_still_caches_empty_results_by_default(db):
+    """Default behaviour (existing callers like lastfm.py/musicbrainz.py) is
+    unchanged: an empty result is a stable fact worth caching unless a caller
+    opts out with cache_empty=False."""
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        return []
+
+    enrich_mod._cached_call(db, "some-key", fetch)
+    enrich_mod._cached_call(db, "some-key", fetch)
+
+    assert calls["n"] == 1
+
+
+def test_cached_call_always_caches_non_empty_results_even_with_cache_empty_false(db):
+    calls = {"n": 0}
+
+    def fetch():
+        calls["n"] += 1
+        return ["a"]
+
+    enrich_mod._cached_call(db, "some-key", fetch, cache_empty=False)
+    enrich_mod._cached_call(db, "some-key", fetch, cache_empty=False)
+
+    assert calls["n"] == 1
+
+
+# ---------------------------------------------------------------------------
 # lastfm.py
 # ---------------------------------------------------------------------------
+
+
+def test_lastfm_similar_tracks_connection_error_does_not_leak_api_key(monkeypatch):
+    """End-to-end version of the verified leak, through the real call path
+    recommender._gather_lastfm exercises: Last.fm's api_key must not survive
+    into the exception recommender.py logs at WARNING."""
+    monkeypatch.setattr(lastfm_mod, "_api_key", lambda: "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab")
+
+    def raise_connection_error(*a, **k):
+        import requests
+
+        raise requests.ConnectionError(
+            "HTTPSConnectionPool(host='ws.audioscrobbler.com', port=443): Max retries exceeded "
+            "with url: /2.0/?method=track.getsimilar&format=json"
+            "&api_key=9f8c2b6a1d4e7f0031bd5c9a44e2f1ab&artist=Boards+of+Canada&track=Roygbiv "
+            "(Caused by NewConnectionError('...: Failed to establish a new connection'))"
+        )
+
+    monkeypatch.setattr(enrich_mod.requests, "get", raise_connection_error)
+
+    with pytest.raises(ProviderError) as exc_info:
+        lastfm_mod.similar_tracks("Boards of Canada", "Roygbiv")
+
+    assert "9f8c2b6a1d4e7f0031bd5c9a44e2f1ab" not in str(exc_info.value)
 
 
 def test_lastfm_missing_credential_raises(monkeypatch):
@@ -321,6 +418,64 @@ class _FakeResponse:
         return self._payload
 
 
+# Captured live from https://labs.api.listenbrainz.org/similar-recordings/json
+# on 2026-08-25 (recording_mbids=db965fe4-9e56-4fc7-837b-b2a0dcdb3206 [BTS -
+# "Dynamite"], algorithm=session_based_days_7500_session_300_contribution_5_
+# threshold_15_limit_50_skip_30) — trimmed to 2 entries. Note the real field
+# is ``artist_credit_name``, not ``artist_name``.
+_LB_SIMILAR_RECORDINGS_REAL_PAYLOAD = [
+    {
+        "recording_mbid": "957df7c5-9c3a-4dbc-b139-f339f2378986",
+        "recording_name": "Levitating",
+        "artist_credit_name": "Dua Lipa",
+        "artist_credit_mbids": None,
+        "release_name": "Future Nostalgia",
+        "release_mbid": "eb694f4e-ecaa-4a71-8fb6-aa5db59a6291",
+        "caa_id": 25777832070,
+        "caa_release_mbid": "57bc5762-baa9-48d8-93ec-7858d8350880",
+        "score": 389,
+        "reference_mbid": "db965fe4-9e56-4fc7-837b-b2a0dcdb3206",
+    },
+    {
+        "recording_mbid": "1a67e215-a19e-40c9-9b12-732de134bf5f",
+        "recording_name": "Blinding Lights",
+        "artist_credit_name": "The Weeknd",
+        "artist_credit_mbids": None,
+        "release_name": "After Hours",
+        "release_mbid": "fd7ebee8-8c64-4127-a9be-8e31ed6364e3",
+        "caa_id": 25720993837,
+        "caa_release_mbid": "19e4f6cc-ca0c-4897-8dfc-a36914b7f998",
+        "score": 352,
+        "reference_mbid": "db965fe4-9e56-4fc7-837b-b2a0dcdb3206",
+    },
+]
+
+
+def test_listenbrainz_similar_recordings_hits_labs_host_with_valid_algorithm(monkeypatch):
+    """Regression test for the dead-endpoint bug: the old code called
+    ``api.listenbrainz.org/1/similar-recordings/<mbid>/<algorithm>``, which
+    404s (that route doesn't exist), with an algorithm string containing
+    "_filter_True" that isn't in the server's permitted enum either. The real
+    route is on a different host entirely."""
+    captured = {}
+
+    def fake_get(url, params=None, **kwargs):
+        captured["url"] = url
+        captured["params"] = params
+        return _FakeResponse(200, [])
+
+    monkeypatch.setattr(listenbrainz.requests, "get", fake_get)
+
+    listenbrainz.similar_recordings("db965fe4-9e56-4fc7-837b-b2a0dcdb3206")
+
+    assert captured["url"] == "https://labs.api.listenbrainz.org/similar-recordings/json"
+    assert captured["params"]["recording_mbids"] == "db965fe4-9e56-4fc7-837b-b2a0dcdb3206"
+    assert captured["params"]["algorithm"] == listenbrainz.SIMILAR_RECORDINGS_ALGORITHM
+    # The permitted enum (verified live against the real 400 response) has 7
+    # values, none of which contain "filter_True".
+    assert "filter_True" not in listenbrainz.SIMILAR_RECORDINGS_ALGORITHM
+
+
 def test_listenbrainz_similar_recordings_degrades_on_404(monkeypatch):
     monkeypatch.setattr(listenbrainz.requests, "get", lambda *a, **k: _FakeResponse(404))
     assert listenbrainz.similar_recordings("some-mbid") == []
@@ -336,16 +491,24 @@ def test_listenbrainz_similar_recordings_degrades_on_connection_error(monkeypatc
     assert listenbrainz.similar_recordings("some-mbid") == []
 
 
-def test_listenbrainz_similar_recordings_parses_payload(monkeypatch):
-    payload = [
-        {"recording_mbid": "r1", "recording_name": "Track One", "artist_name": "Artist One", "score": 5},
-        {"recording_mbid": "r2", "recording_name": "Track Two", "artist_name": "Artist Two", "score": 3},
-    ]
-    monkeypatch.setattr(listenbrainz.requests, "get", lambda *a, **k: _FakeResponse(200, payload))
+def test_listenbrainz_similar_recordings_parses_real_payload_shape(monkeypatch):
+    monkeypatch.setattr(
+        listenbrainz.requests, "get", lambda *a, **k: _FakeResponse(200, _LB_SIMILAR_RECORDINGS_REAL_PAYLOAD)
+    )
 
     result = listenbrainz.similar_recordings("some-mbid", limit=1)
 
-    assert result == [payload[0]]  # limit applied client-side
+    # artist_credit_name (the real field) is normalised to artist_name (the
+    # shape recommender.py's _gather_listenbrainz already expects).
+    assert result == [
+        {
+            "recording_mbid": "957df7c5-9c3a-4dbc-b139-f339f2378986",
+            "recording_name": "Levitating",
+            "artist_name": "Dua Lipa",
+            "release_name": "Future Nostalgia",
+            "score": 389,
+        }
+    ]  # limit applied client-side
 
 
 def test_listenbrainz_similar_recordings_raises_on_rate_limit(monkeypatch):
@@ -385,7 +548,7 @@ def test_listenbrainz_caches_through_db(monkeypatch, db):
 
     def fake_get(*args, **kwargs):
         calls["n"] += 1
-        return _FakeResponse(200, [{"recording_name": "A", "artist_name": "B", "score": 1}])
+        return _FakeResponse(200, _LB_SIMILAR_RECORDINGS_REAL_PAYLOAD)
 
     monkeypatch.setattr(listenbrainz.requests, "get", fake_get)
 
@@ -393,6 +556,25 @@ def test_listenbrainz_caches_through_db(monkeypatch, db):
     listenbrainz.similar_recordings("mbid", db=db)
 
     assert calls["n"] == 1
+
+
+def test_listenbrainz_empty_similar_recordings_not_cached_for_full_ttl(monkeypatch, db):
+    """Regression test: a 404 (no data for this mbid) used to map to `[]`,
+    which then got written into the 7-day kv cache like any other result —
+    permanently disabling this source for a transient or coverage-gap outage.
+    Empty results must not be pinned in the cache."""
+    calls = {"n": 0}
+
+    def fake_get(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeResponse(404)
+
+    monkeypatch.setattr(listenbrainz.requests, "get", fake_get)
+
+    listenbrainz.similar_recordings("mbid", db=db)
+    listenbrainz.similar_recordings("mbid", db=db)
+
+    assert calls["n"] == 2  # not served from cache the second time
 
 
 # ---------------------------------------------------------------------------

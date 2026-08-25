@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import threading
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -24,6 +25,53 @@ log = logging.getLogger(__name__)
 _dirs = PlatformDirs(appname="harmony", appauthor=False, ensure_exists=True)
 
 KEYRING_SERVICE = "io.github.marthofdoom.Harmony"
+
+
+# --------------------------------------------------------------------------
+# Secret redaction
+# --------------------------------------------------------------------------
+
+#: Query-param names whose values must never appear in an exception message
+#: or log line. Covers every credential this app ever puts on a URL: Qobuz's
+#: login (``password``/``username``/``email``/``app_secret``), its session
+#: token (``user_auth_token``), and Last.fm's ``api_key``.
+_SENSITIVE_PARAM_NAMES = (
+    "password",
+    "api_key",
+    "apikey",
+    "username",
+    "email",
+    "user_auth_token",
+    "auth_token",
+    "app_secret",
+    "secret",
+    "token",
+)
+
+# Matches "?name=value" / "&name=value" for any of the names above, up to the
+# next delimiter. Deliberately loose about what a "value" looks like (it may
+# be percent-encoded, e.g. "alice%40example.com") since the point is to strip
+# it, not parse it.
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)([?&](?:" + "|".join(_SENSITIVE_PARAM_NAMES) + r")=)[^&\s'\")]*"
+)
+
+
+def redact_secrets(text: str) -> str:
+    """Redact secret-bearing query-param values from ``text``.
+
+    ``requests``/``urllib3`` embed the full request URL — including query
+    params — in their own exception text (e.g. "Max retries exceeded with
+    url: /user/login?...&password=..."). Since that text gets wrapped
+    verbatim into our own exceptions and those exceptions get logged (and, in
+    the Qobuz case, shown directly in the Preferences UI), every string that
+    might contain a URL or response body built from credentials must be
+    passed through this before it's used in a message. Safe to call on text
+    with no secrets in it — it's then a no-op.
+    """
+    if not text:
+        return text
+    return _SECRET_PARAM_RE.sub(lambda m: m.group(1) + "REDACTED", text)
 
 
 def config_dir() -> Path:
@@ -204,9 +252,23 @@ class CredentialStore:
                 data.pop(key, None)
             else:
                 data[key] = value
+            payload = json.dumps(data, indent=2).encode("utf-8")
             tmp = path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(data, indent=2), "utf-8")
-            os.chmod(tmp, 0o600)
+            # Create the temp file already restricted to 0600 (via os.open,
+            # not pathlib's write_text -> builtin open(), which defaults to
+            # 0666 and relies on the process umask to narrow it — leaving a
+            # window where a concurrently-running umask-022 process sees a
+            # world-readable secrets file). O_EXCL after an explicit unlink
+            # also avoids following a pre-existing symlink at that path.
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+            try:
+                os.write(fd, payload)
+            finally:
+                os.close(fd)
             tmp.replace(path)
             os.chmod(path, 0o600)
 

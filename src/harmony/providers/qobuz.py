@@ -13,6 +13,7 @@ import binascii
 import hashlib
 import logging
 import re
+import threading
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -133,10 +134,37 @@ class QobuzProvider(MusicProvider):
         self._auth_token: str | None = None
         self._display_name: str | None = None
 
-        self._ensure_app_credentials()
-        self._auth_token = self._credentials.get(config.QOBUZ_TOKEN)
+        # Per docs/ARCHITECTURE.md's threading rule, construction must be
+        # cheap and I/O-free (no network, no keyring) since providers get
+        # built on the main thread at startup. Scraping the web player's
+        # app_id/secret and reading the cached auth token from the keyring
+        # both used to happen right here; they're now deferred to
+        # ``_ensure_ready``, run at most once, lazily, from the first actual
+        # request/authenticate call -- which per the same threading rule
+        # always happens on a worker thread already.
+        self._ready = False
+        self._ready_lock = threading.Lock()
 
     # -- app credentials / auth ---------------------------------------------
+
+    def _ensure_ready(self) -> None:
+        """One-time, lazy setup: app credentials + any cached auth token.
+
+        Never called from ``__init__`` or ``is_authenticated`` -- both must
+        stay synchronous-safe. Everything that actually talks to Qobuz
+        (``_request``) or that needs ``self._app_id`` before it can
+        (``authenticate``/``_login``) calls this first; it's a no-op after
+        the first successful run.
+        """
+        if self._ready:
+            return
+        with self._ready_lock:
+            if self._ready:
+                return
+            self._ensure_app_credentials()
+            if self._auth_token is None:
+                self._auth_token = self._credentials.get(config.QOBUZ_TOKEN)
+            self._ready = True
 
     def _ensure_app_credentials(self) -> None:
         if self._settings.qobuz_app_id:
@@ -154,6 +182,7 @@ class QobuzProvider(MusicProvider):
         return bool(self._auth_token)
 
     def authenticate(self) -> None:
+        self._ensure_ready()
         email = self._settings.qobuz_email
         password = self._credentials.get(config.QOBUZ_PASSWORD)
         if not email or not password:
@@ -163,7 +192,15 @@ class QobuzProvider(MusicProvider):
     def _login(self, email: str, password: str) -> None:
         digest = hashlib.md5(password.encode("utf-8")).hexdigest()
         params = {"app_id": self._app_id, "username": email, "email": email, "password": digest}
-        data = self._request("GET", "user/login", params=params, authed=False)
+        # POSTed as a form body, not GET query params: verified live that
+        # Qobuz's login endpoint accepts POST identically to GET (same
+        # validation, same response shape for a given app_id). Query params
+        # end up embedded verbatim in urllib3's own exception text on any
+        # transport failure (e.g. "Max retries exceeded with url:
+        # /user/login?...&password=<md5>..."), which we then re-raise and log
+        # -- a body isn't included there, so this removes the leak at the
+        # source rather than relying solely on redaction as a backstop.
+        data = self._request("POST", "user/login", data=params, authed=False)
         token = data.get("user_auth_token")
         if not token:
             raise AuthError("Qobuz login failed: no auth token in the response.")
@@ -187,6 +224,7 @@ class QobuzProvider(MusicProvider):
         _retry_on_401: bool = True,
     ) -> dict[str, Any]:
         """The single choke point every Qobuz HTTP call goes through."""
+        self._ensure_ready()
         headers = {"X-App-Id": self._app_id}
         if authed:
             if not self._auth_token:
@@ -198,7 +236,16 @@ class QobuzProvider(MusicProvider):
                 method, BASE_URL + path, params=params, data=data, headers=headers, timeout=20
             )
         except requests.RequestException as exc:
-            raise ProviderError(f"Qobuz request to {path} failed: {exc}") from exc
+            # requests/urllib3 embed the full request URL - including any
+            # query params - in their own exception text. That's normally
+            # harmless, but the (now-former) GET login call put password's
+            # md5 digest and the account email right there in the URL, so any
+            # transport failure leaked them verbatim into this message - and
+            # this message is both logged (with a traceback, by
+            # tasks.run_async) and shown directly in the Preferences UI
+            # (prefs.py's "Failed: {exc}"). Redact defensively regardless of
+            # which HTTP method was used.
+            raise ProviderError(f"Qobuz request to {path} failed: {config.redact_secrets(str(exc))}") from exc
 
         if response.status_code == 429:
             retry_after = response.headers.get("Retry-After")
@@ -210,7 +257,7 @@ class QobuzProvider(MusicProvider):
             self.authenticate()
             return self._request(method, path, params=params, data=data, authed=authed, _retry_on_401=False)
         if not response.ok:
-            excerpt = response.text[:200]
+            excerpt = config.redact_secrets(response.text[:200])
             raise ProviderError(f"Qobuz API error {response.status_code} on {path}: {excerpt}")
         if not response.content:
             return {}

@@ -50,7 +50,11 @@ def _get_json(
     try:
         response = requests.get(url, params=params, headers=merged_headers, timeout=timeout)
     except requests.RequestException as exc:
-        raise ProviderError(f"Request to {url} failed: {exc}") from exc
+        # requests/urllib3 embed the full request URL - including any secret
+        # query params (e.g. Last.fm's api_key) - in their own exception
+        # text, which we'd otherwise be re-raising verbatim into a message
+        # that gets logged (and shown in the UI, for callers that surface it).
+        raise ProviderError(f"Request to {url} failed: {config.redact_secrets(str(exc))}") from exc
     if response.status_code == 429:
         retry_after = response.headers.get("Retry-After")
         raise RateLimitedError(
@@ -58,7 +62,8 @@ def _get_json(
             retry_after=float(retry_after) if retry_after else None,
         )
     if not response.ok:
-        raise ProviderError(f"{url} returned HTTP {response.status_code}: {response.text[:200]}")
+        excerpt = config.redact_secrets(response.text[:200])
+        raise ProviderError(f"{url} returned HTTP {response.status_code}: {excerpt}")
     try:
         return response.json()
     except ValueError as exc:
@@ -70,17 +75,24 @@ def _cache_key(*parts: str) -> str:
     return ":".join(parts)
 
 
-def _cached_call(db: Any | None, key: str, fetch: Any) -> Any:
+def _cached_call(db: Any | None, key: str, fetch: Any, *, cache_empty: bool = True) -> Any:
     """Return ``db.cache_get(key)`` if fresh, else call ``fetch()`` and store it.
 
     ``db`` is duck-typed (``harmony.db.Database`` at runtime) so this module
     never has to import it. ``fetch`` must return a JSON-serialisable value.
+
+    ``cache_empty=False`` skips writing a falsy result (``[]``, ``{}``,
+    ``None``, ...) to the cache. Use it for sources where "no data right now"
+    is a routine, possibly-transient outcome (a coverage gap, a momentary
+    upstream hiccup) rather than a stable fact — otherwise a single empty
+    response gets pinned in the cache for the full :data:`CACHE_TTL_S` and
+    silently disables the source for that long.
     """
     if db is not None:
         cached = db.cache_get(key, max_age_s=CACHE_TTL_S)
         if cached is not None:
             return cached
     value = fetch()
-    if db is not None:
+    if db is not None and (cache_empty or value):
         db.cache_put(key, value)
     return value
