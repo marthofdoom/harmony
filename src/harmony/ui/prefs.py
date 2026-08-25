@@ -74,6 +74,15 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self._set_setting(name, value)
         self.state.reload_providers()
 
+    def _set_matching_setting(self, name: str, value: object) -> None:
+        """Persist a match setting and push it into the running sync engine.
+
+        Without the second step the new threshold would sit in settings.json
+        doing nothing until the app was restarted.
+        """
+        self._set_setting(name, value)
+        self.state.apply_matching_settings()
+
     # -- accounts ---------------------------------------------------------------
 
     def _build_accounts_page(self) -> Adw.PreferencesPage:
@@ -308,7 +317,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         auto_accept_row = Adw.SwitchRow(
             title="Auto-accept high-confidence matches", active=self.settings.auto_accept_high
         )
-        auto_accept_row.connect("notify::active", lambda r, _p: self._set_setting("auto_accept_high", r.get_active()))
+        auto_accept_row.connect("notify::active", lambda r, _p: self._set_matching_setting("auto_accept_high", r.get_active()))
         group.add(auto_accept_row)
         page.add(group)
 
@@ -318,13 +327,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
         high_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
         high_row.set_title("High-confidence threshold")
         high_row.set_value(self.settings.match_high_threshold)
-        high_row.connect("notify::value", lambda r, _p: self._set_setting("match_high_threshold", r.get_value()))
+        high_row.connect("notify::value", lambda r, _p: self._set_matching_setting("match_high_threshold", r.get_value()))
         threshold_group.add(high_row)
 
         low_row = Adw.SpinRow.new_with_range(0.0, 1.0, 0.01)
         low_row.set_title("Low-confidence threshold")
         low_row.set_value(self.settings.match_low_threshold)
-        low_row.connect("notify::value", lambda r, _p: self._set_setting("match_low_threshold", r.get_value()))
+        low_row.connect("notify::value", lambda r, _p: self._set_matching_setting("match_low_threshold", r.get_value()))
         threshold_group.add(low_row)
         page.add(threshold_group)
         return page

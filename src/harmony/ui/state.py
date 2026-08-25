@@ -88,29 +88,17 @@ class AppState(GObject.Object):
         playlists, and sync down with it. ``errors`` carries a human-readable
         message per failed service for the UI to surface.
 
-        ``build_providers``'s exact signature is still being finalised by the
-        providers layer; we try the documented shape first (it constructs all
-        providers atomically, so a single failure there currently loses every
-        provider) and fall back to constructing each provider class ourselves
-        for real isolation.
+        This always goes through ``_build_providers_per_service`` rather than
+        trying ``providers.build_providers()`` first: that documented entry
+        point constructs both provider classes with no per-service try/except
+        of its own, so it offers no real isolation, and it never calls
+        ``_warm_up``. It's also documented to never raise for missing
+        credentials (the common case), so a "try the atomic shape, fall back
+        to per-service on failure" strategy made per-service construction —
+        and the warm-up that lives there — effectively dead code on every
+        normal launch. Going straight to per-service construction is what
+        actually delivers the isolation and warm-up this method promises.
         """
-        try:
-            from harmony.providers import build_providers
-        except ImportError as exc:
-            log.warning("providers layer unavailable: %s", exc)
-            return {}, {}
-
-        try:
-            return dict(build_providers(self.settings, self.credentials)), {}
-        except TypeError:
-            log.debug("build_providers(settings, credentials) rejected; retrying bare", exc_info=True)
-            try:
-                return dict(build_providers()), {}
-            except Exception:
-                log.exception("build_providers() failed (bare call); falling back to per-service construction")
-        except Exception:
-            log.exception("build_providers() failed; falling back to per-service construction")
-
         return self._build_providers_per_service()
 
     def _build_providers_per_service(self) -> tuple[dict[Service, Any], dict[Service, str]]:
@@ -187,6 +175,14 @@ class AppState(GObject.Object):
             log.exception("Failed to construct PlaylistPlanner")
             self.planner = None
 
+    def apply_matching_settings(self) -> None:
+        """Re-read match thresholds and auto-accept into the live sync engine.
+
+        The engine takes these by value at construction, so editing them in
+        Preferences would otherwise not take effect until the next launch.
+        """
+        self._rebuild_sync_engine()
+
     def _rebuild_sync_engine(self) -> None:
         if not self.providers or self.db is None:
             self.sync_engine = None
@@ -198,7 +194,13 @@ class AppState(GObject.Object):
             self.sync_engine = None
             return
         try:
-            self.sync_engine = SyncEngine(self.providers, self.db)
+            self.sync_engine = SyncEngine(
+                self.providers,
+                self.db,
+                high_threshold=self.settings.match_high_threshold,
+                low_threshold=self.settings.match_low_threshold,
+                auto_accept_high=self.settings.auto_accept_high,
+            )
         except Exception:
             log.exception("Failed to construct SyncEngine")
             self.sync_engine = None
@@ -236,6 +238,15 @@ class AppState(GObject.Object):
             self.provider_errors = errors
             self._rebuild_sync_engine()
             self.emit("providers-changed")
+            # The provider set just changed (most commonly: it went from
+            # empty at startup to populated once the worker thread finishes,
+            # *after* every page has already been constructed and made its
+            # own now-stale ``all_playlists()`` call against an empty
+            # ``self.providers``). Nothing else reloads playlists when that
+            # happens, so without this the playlist cache — and every page
+            # reading it — would stay empty for the rest of the session.
+            # ``all_playlists`` already coalesces with any load in flight.
+            self.all_playlists(refresh=True)
             if self._providers_reload_pending:
                 self.reload_providers()
 

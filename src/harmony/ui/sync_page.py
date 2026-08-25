@@ -41,12 +41,32 @@ class SyncPage(Gtk.Box):
         self.state = state
         self._plan: object | None = None
         self._playlist_choices: list[Playlist] = []
+        self._content_built = False
+
+        # Providers (and therefore ``sync_engine``) are built off the main
+        # loop, so this page is normally constructed — during ``do_activate``
+        # — before ``AppState.reload_providers()``'s worker thread has ever
+        # delivered a result. ``do_activate`` always runs before any idle
+        # source queued during ``do_startup`` fires, so ``sync_engine is
+        # None`` here is the common case, not an edge case. Rebuilding this
+        # page's real content in place once the signal arrives (rather than
+        # just toasting) is what makes Sync usable without an app restart.
+        self.state.connect("providers-changed", self._on_providers_changed)
+        self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_choices())
+
+        self._render()
+
+    def _render(self) -> None:
+        """(Re)build this page's content to match current backend availability."""
+        while child := self.get_first_child():
+            self.remove(child)
 
         if self.state.sync_engine is None:
             self.append(missing_layer_status_page("sync"))
-            self.state.connect("providers-changed", self._maybe_recover)
+            self._content_built = False
             return
 
+        self._content_built = True
         self.append(self._build_controls())
         self.plan_stack = Gtk.Stack(vexpand=True)
         self.plan_stack.add_named(
@@ -60,13 +80,13 @@ class SyncPage(Gtk.Box):
         self.plan_stack.add_named(plan_scroller, "plan")
         self.append(self.plan_stack)
 
-        self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_choices())
         self._refresh_playlist_choices()
 
-    def _maybe_recover(self, *_args: object) -> None:
-        """If sync becomes available after providers reload, rebuild this page in place."""
-        if self.state.sync_engine is not None:
-            self.state.toast("Sync is now available — reopen the Sync page.")
+    def _on_providers_changed(self, *_args: object) -> None:
+        """Rebuild (or tear down) this page's content when sync availability flips."""
+        now_available = self.state.sync_engine is not None
+        if now_available != self._content_built:
+            self._render()
 
     # -- controls -------------------------------------------------------------
 
@@ -102,6 +122,10 @@ class SyncPage(Gtk.Box):
         return box
 
     def _refresh_playlist_choices(self) -> None:
+        if not self._content_built:
+            # The dropdowns below don't exist yet (sync isn't available) —
+            # ``_render`` calls this itself once they do.
+            return
         by_service = self.state.all_playlists()
         choices: list[Playlist] = []
         for service in Service:
@@ -153,7 +177,11 @@ class SyncPage(Gtk.Box):
             self.state.toast(f"Couldn't build sync plan: {exc}")
 
         dialog.present()
-        run_async(work, done, error)
+        # Without on_cancelled the modal, undismissable ProgressDialog would
+        # rely on its 5-second grace timer instead of closing the moment the
+        # worker actually unwinds -- this is the longest-running dialog in
+        # the app, so that grace period is the whole point of Cancel.
+        run_async(work, done, error, on_cancelled=dialog.close)
 
     def _render_plan(self, plan: object) -> None:
         while child := self.plan_box.get_first_child():
@@ -258,7 +286,7 @@ class SyncPage(Gtk.Box):
             self.state.toast(f"Sync failed: {exc}")
 
         dialog.present()
-        run_async(work, done, error)
+        run_async(work, done, error, on_cancelled=dialog.close)
 
     def _show_report(self, report: object) -> None:
         added = len(getattr(report, "added", []))

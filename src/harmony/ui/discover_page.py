@@ -68,20 +68,41 @@ class DiscoverPage(Gtk.Box):
     def _refresh_service_choices(self) -> None:
         """Rebuild both service pickers from the providers that are live now."""
         services = [s for s in Service if s in self.state.providers]
-        self._services_for_ai = services
         labels = [s.label for s in services] or ["No services configured"]
-        # The AI picker only exists when a planner is configured; without a key
-        # the section renders a banner instead of the builder.
-        dropdowns = [self.target_service_dropdown]
+        # Both the recommendations picker and the AI picker only exist when
+        # their section built real content (recommender configured / planner
+        # configured with a key); without that, the section rendered a
+        # placeholder or banner instead and the attribute was never set. Must
+        # be checked with getattr, not assumed to exist just because __init__
+        # unconditionally calls this on every "providers-changed" emission.
+        dropdowns = []
+        target_dropdown = getattr(self, "target_service_dropdown", None)
+        if target_dropdown is not None:
+            dropdowns.append(target_dropdown)
         ai_dropdown = getattr(self, "ai_target_dropdown", None)
         if ai_dropdown is not None:
             dropdowns.append(ai_dropdown)
+
+        # Preserve the user's pick by identity (the Service itself), not by
+        # raw index -- an index-based carry-over is only correct when the
+        # provider list purely grows at the end. If it shrinks or reorders
+        # (a provider drops out, or Service enum order interacts with
+        # `providers` differently across a reload) the same index can now
+        # point at a completely different service and silently retarget the
+        # dropdown out from under the user.
+        previous_services = self._services_for_ai
         for dropdown in dropdowns:
-            previous = dropdown.get_selected()
+            previous_index = dropdown.get_selected()
+            previous_service = (
+                previous_services[previous_index]
+                if 0 <= previous_index < len(previous_services)
+                else None
+            )
             dropdown.set_model(Gtk.StringList.new(labels))
-            # Keep the user's pick when the list only grew underneath them.
-            if previous != Gtk.INVALID_LIST_POSITION and previous < len(labels):
-                dropdown.set_selected(previous)
+            if previous_service is not None and previous_service in services:
+                dropdown.set_selected(services.index(previous_service))
+
+        self._services_for_ai = services
 
     # -- section 1: recommendations ------------------------------------------
 

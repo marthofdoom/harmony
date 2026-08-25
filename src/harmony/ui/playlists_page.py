@@ -38,13 +38,16 @@ class _ImportOutcome:
     """Result of importing a file and resolving it against a live provider."""
 
     added: int
-    """Tracks actually added to the playlist (resolved + written)."""
+    """Tracks actually added to the playlist (resolved at high+ confidence and written)."""
     total_rows: int
     """Every row the file claimed to contain, parsed or not."""
     rows_skipped: int
     """Rows that failed to parse (malformed M3U/CSV/JSON entries)."""
     unmatched: int
-    """Rows that parsed fine but couldn't be resolved to a catalog track."""
+    """Rows that parsed fine but found no candidate at all on the target service."""
+    low_confidence: int
+    """Rows that parsed fine and matched *something*, but too weakly to trust
+    unattended — never auto-added, only reported."""
     warnings: list[str] = field(default_factory=list)
 
 
@@ -405,20 +408,53 @@ class PlaylistsPage(Gtk.Box):
             # network operation, so it has to stay on this worker thread.
             descriptors, parse_warnings = importer(path)
             match_results = io_formats.resolve_imported(descriptors, provider)
-            resolved_ids = [r.best.track.id for r in match_results if r.best is not None]
+            # ``resolve_imported`` deliberately returns full MatchResults (not
+            # just the winning Track) so this UI can decide what's confident
+            # enough to add automatically instead of blindly trusting `best`
+            # -- `best` is just the top candidate, however weak, and e.g. a
+            # "none"-confidence guess (a completely unrelated track that
+            # merely scored highest among bad options) must never be
+            # silently added just because *something* was returned.
+            _AUTO_ADD_CONFIDENCE = {"exact", "high", "manual"}
+            confident = [r for r in match_results if r.best is not None and r.confidence in _AUTO_ADD_CONFIDENCE]
+            no_match = [r for r in match_results if r.best is None]
+            low_confidence = [
+                r for r in match_results
+                if r.best is not None and r.confidence not in _AUTO_ADD_CONFIDENCE
+            ]
+            resolved_ids = [r.best.track.id for r in confident]
             if resolved_ids:
                 provider.add_tracks(playlist.id, resolved_ids)
-            match_warnings = [
+
+            unmatched_warnings = [
                 f"could not match {r.source.title!r} ({', '.join(r.source.artists) or 'unknown artist'})"
-                for r in match_results
-                if r.best is None
+                for r in no_match
             ]
+            low_confidence_warnings = [
+                f"low-confidence match skipped: {r.source.title!r} "
+                f"({', '.join(r.source.artists) or 'unknown artist'}) -> "
+                f"{r.best.track.title!r} ({r.confidence}, score {r.best.score:.2f})"
+                for r in low_confidence
+            ]
+
+            # ``parse_warnings`` isn't uniformly "one warning per unparsed
+            # row": the M3U/CSV/JSON per-item loops do emit exactly that
+            # ("line N: ...", "row N: ...", "item N: ..."), but import_json
+            # can also fail on the *whole payload* before any row-by-row walk
+            # even starts (unreadable file, wrong top-level shape) and emit a
+            # single warning that doesn't correspond to any one row. Treating
+            # that as "+1 unparsed row" would misstate the denominator, so
+            # only count warnings that are actually attributable to a row.
+            row_warnings = [w for w in parse_warnings if w.startswith(("line ", "row ", "item "))]
+            payload_warnings = [w for w in parse_warnings if w not in row_warnings]
+
             return _ImportOutcome(
                 added=len(resolved_ids),
-                total_rows=len(descriptors) + len(parse_warnings),
-                rows_skipped=len(parse_warnings),
-                unmatched=len(match_warnings),
-                warnings=[*parse_warnings, *match_warnings],
+                total_rows=len(descriptors) + len(row_warnings),
+                rows_skipped=len(row_warnings),
+                unmatched=len(no_match),
+                low_confidence=len(low_confidence),
+                warnings=[*payload_warnings, *row_warnings, *unmatched_warnings, *low_confidence_warnings],
             )
 
         def done(outcome: _ImportOutcome) -> None:
@@ -430,6 +466,8 @@ class PlaylistsPage(Gtk.Box):
                 detail.append(f"{outcome.rows_skipped} row(s) skipped")
             if outcome.unmatched:
                 detail.append(f"{outcome.unmatched} unmatched")
+            if outcome.low_confidence:
+                detail.append(f"{outcome.low_confidence} low-confidence match(es) skipped")
             if detail:
                 message += " (" + ", ".join(detail) + ")"
             self.state.toast(message)
