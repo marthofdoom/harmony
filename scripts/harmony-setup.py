@@ -1497,19 +1497,30 @@ _ALL_DEPS = ["requests", "ytmusicapi", "cryptography", "keyring", "secretstorage
 
 
 def ensure_dependencies() -> None:
-    """Front-load every dependency once, so no flow prompts for one mid-way.
+    """Front-load a COMPLETE environment once, so no flow ever prompts mid-way.
 
-    Offers to install into the current venv (or a throwaway) and re-execs with
-    them present. Declining is allowed — individual flows still degrade — but
-    the default is a complete environment.
+    Venv-by-default: if anything's missing, install every dependency (into the
+    current venv, or a throwaway one) and re-exec with them present — no
+    per-package prompting.
     """
-    missing = [d for d in _ALL_DEPS if try_import(d) is None]
-    if not missing:
+    if all(try_import(d) is not None for d in _ALL_DEPS):
         return
-    print(f"\nHarmony setup uses: {', '.join(missing)}.")
-    if offer_venv_bootstrap(missing):
-        return  # process is being replaced
-    print("Continuing without them — some options may be unavailable.\n")
+    try:
+        if _in_virtualenv():
+            print(f"Installing dependencies into this environment: {', '.join(_ALL_DEPS)} ...")
+            subprocess.run([sys.executable, "-m", "pip", "install", "-q", *_ALL_DEPS], check=True)
+            _reexec_current_python()
+        else:
+            print(f"Setting up a virtual environment with: {', '.join(_ALL_DEPS)} ...")
+            CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            subprocess.run([sys.executable, "-m", "venv", str(VENV_DIR)], check=True)
+            pip = str(_venv_bin("pip"))
+            subprocess.run([pip, "install", "-q", "--upgrade", "pip"], check=True)
+            subprocess.run([pip, "install", "-q", *_ALL_DEPS], check=True)
+            _reexec_in_venv()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Could not set up dependencies automatically: {exc}")
+        print(f"Install them yourself:  pip install {' '.join(_ALL_DEPS)}\n")
 
 
 def main(argv: list[str] | None = None) -> int:
