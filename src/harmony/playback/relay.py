@@ -22,11 +22,13 @@ from __future__ import annotations
 import logging
 import secrets
 import socket
+import subprocess
 import threading
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import IO
 from urllib.parse import urlsplit
 
 import requests
@@ -86,6 +88,60 @@ def _icy_metadata_block(title: str | None, artist: str | None) -> bytes:
     payload = f"StreamTitle='{text}';".encode("utf-8", "replace")
     payload += b"\x00" * (-len(payload) % 16)
     return bytes([len(payload) // 16]) + payload
+
+
+def _is_aac_mp4(source: StreamSource) -> bool:
+    """True for AAC-in-MP4 (e.g. YouTube itag 140): a file a renderer won't ICY-tag."""
+    return source.container == "m4a" or "mp4" in (source.mime_type or "").lower()
+
+
+def _read_chunks(stream: IO[bytes], size: int = _CHUNK_SIZE) -> Iterator[bytes]:
+    while True:
+        chunk = stream.read(size)
+        if not chunk:
+            return
+        yield chunk
+
+
+def _spawn_adts_remux(source: StreamSource) -> subprocess.Popen[bytes]:
+    """Start ffmpeg rewrapping ``source`` (AAC/MP4) into an ADTS byte stream on stdout.
+
+    A stream copy (``-c:a copy``): no re-encode, no quality loss -- just a
+    container change so a renderer treats the audio as an AAC *stream* (and
+    surfaces ICY metadata) instead of a file. ffmpeg fetches the URL itself and
+    handles the Range/moov seeking a progressive MP4 needs, forwarding whatever
+    request headers the CDN requires. Raises ``FileNotFoundError`` if ffmpeg
+    isn't installed, which the caller treats as "fall back to a plain relay".
+    """
+    args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    user_agent: str | None = None
+    extra_headers: list[str] = []
+    for key, value in source.headers.items():
+        if key.lower() == "user-agent":
+            user_agent = value
+        else:
+            extra_headers.append(f"{key}: {value}")
+    if user_agent:
+        args += ["-user_agent", user_agent]
+    if extra_headers:
+        args += ["-headers", "".join(f"{h}\r\n" for h in extra_headers)]
+    args += ["-i", source.url, "-vn", "-c:a", "copy", "-f", "adts", "pipe:1"]
+    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+
+
+def _stop_process(proc: subprocess.Popen[bytes]) -> None:
+    if proc.stdout is not None:
+        try:
+            proc.stdout.close()
+        except OSError:
+            pass
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
 
 
 class RelayServer:
@@ -235,28 +291,28 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         # Serve ICY in-stream metadata only when the device asks for it and we
-        # have something to show. In that mode the body is streamed from the
-        # start (no Range), so metadata blocks land at fixed offsets.
+        # have something to show. In that mode the body streams from the start
+        # (no Range), so metadata blocks land at fixed offsets.
         wants_icy = self.headers.get("Icy-MetaData") == "1" and bool(entry.title or entry.artist)
+
+        # AAC-in-MP4 (YouTube itag 140) is a file, not a stream: a renderer
+        # reads its title from container tags (which the stream lacks) and
+        # ignores ICY. Rewrap it to ADTS (a bitstream copy, no re-encode) so the
+        # device treats it as a stream and shows the ICY StreamTitle. ffmpeg
+        # fetches the URL itself there, so the relay opens no upstream of its own.
+        if wants_icy and _is_aac_mp4(source):
+            self._reply_adts_icy(source, entry, send_body=send_body)
+            return
+
         request_headers = dict(source.headers)
         if not wants_icy:
             range_header = self.headers.get("Range")
             if range_header:
                 request_headers["Range"] = range_header
 
-        try:
-            upstream = requests.get(
-                source.url,
-                headers=request_headers,
-                stream=True,
-                timeout=_UPSTREAM_TIMEOUT_S,
-                allow_redirects=True,
-            )
-        except requests.RequestException:
-            log.exception("relay: upstream fetch failed for token %s", token)
-            self.send_error(502, "Failed to fetch upstream stream")
+        upstream = self._open_upstream(source.url, request_headers, token)
+        if upstream is None:
             return
-
         with upstream:
             try:
                 if wants_icy:
@@ -267,31 +323,73 @@ class _Handler(BaseHTTPRequestHandler):
                 # Device seeked or stopped mid-stream; nothing to do.
                 pass
 
-    def _reply_icy(
-        self, upstream: requests.Response, source: StreamSource, entry: _Entry, *, send_body: bool
-    ) -> None:
-        """Stream the body with ICY metadata so the renderer shows title/artist.
+    def _open_upstream(
+        self, url: str, headers: dict[str, str], token: str
+    ) -> requests.Response | None:
+        try:
+            return requests.get(
+                url, headers=headers, stream=True, timeout=_UPSTREAM_TIMEOUT_S, allow_redirects=True
+            )
+        except requests.RequestException:
+            log.exception("relay: upstream fetch failed for token %s", token)
+            self.send_error(502, "Failed to fetch upstream stream")
+            return None
 
-        A metadata block carrying ``StreamTitle`` is inserted after every
-        ``_ICY_METAINT`` bytes of audio. The stream is length-less and
-        non-seekable, so it's close-delimited.
-        """
+    def _icy_headers(self, content_type: str, entry: _Entry) -> None:
         self.send_response(200)
-        self.send_header(
-            "Content-Type", source.mime_type or upstream.headers.get("Content-Type", "audio/mpeg")
-        )
+        self.send_header("Content-Type", content_type)
         self.send_header("icy-metaint", str(_ICY_METAINT))
         name = _icy_stream_title(entry.title, entry.artist)
         if name:
             self.send_header("icy-name", name)
+        # An ICY stream is length-less and non-seekable, so close-delimit it.
         self.close_connection = True
         self.end_headers()
-        if not send_body:
+
+    def _reply_adts_icy(self, source: StreamSource, entry: _Entry, *, send_body: bool) -> None:
+        """Rewrap AAC/MP4 to ADTS via ffmpeg and interleave ICY metadata into it."""
+        if not send_body:  # HEAD: advertise the framing without spawning ffmpeg
+            self._icy_headers("audio/aac", entry)
+            return
+        try:
+            proc = _spawn_adts_remux(source)
+        except FileNotFoundError:
+            # No ffmpeg: fall back to a plain passive relay so audio still plays
+            # (the device just won't get a title from us).
+            log.warning("relay: ffmpeg unavailable; passthrough without ICY for %s", source.mime_type)
+            upstream = self._open_upstream(source.url, dict(source.headers), "adts-fallback")
+            if upstream is None:
+                return
+            with upstream:
+                try:
+                    self._reply(upstream, source, send_body=True)
+                except (BrokenPipeError, ConnectionResetError):
+                    pass
             return
 
-        meta_block = _icy_metadata_block(entry.title, entry.artist)
+        self._icy_headers("audio/aac", entry)
+        try:
+            assert proc.stdout is not None
+            self._write_icy(_read_chunks(proc.stdout), _icy_metadata_block(entry.title, entry.artist))
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            _stop_process(proc)
+
+    def _reply_icy(
+        self, upstream: requests.Response, source: StreamSource, entry: _Entry, *, send_body: bool
+    ) -> None:
+        """Interleave ICY metadata into an already-streamable body (an mp3/aac stream)."""
+        self._icy_headers(source.mime_type or upstream.headers.get("Content-Type", "audio/mpeg"), entry)
+        if send_body:
+            self._write_icy(
+                upstream.iter_content(_CHUNK_SIZE), _icy_metadata_block(entry.title, entry.artist)
+            )
+
+    def _write_icy(self, chunks: Iterator[bytes], meta_block: bytes) -> None:
+        """Write ``chunks`` to the client, inserting ``meta_block`` every metaint bytes."""
         remaining = _ICY_METAINT
-        for chunk in upstream.iter_content(_CHUNK_SIZE):
+        for chunk in chunks:
             if not chunk:
                 continue
             view = memoryview(chunk)

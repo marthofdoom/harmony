@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import threading
 from collections.abc import Iterator
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -240,3 +242,59 @@ def test_icy_metadata_block_is_padded_and_length_prefixed() -> None:
     length = block[0] * 16
     assert len(block) == 1 + length  # length byte counts 16-byte units
     assert block[1 : 1 + length].rstrip(b"\x00") == b"StreamTitle='Artist - Title';"
+
+
+def test_mp4_source_is_remuxed_to_adts_with_icy(tmp_path, relay: RelayServer) -> None:
+    if not shutil.which("ffmpeg"):
+        pytest.skip("ffmpeg not available")
+    m4a = tmp_path / "tone.m4a"
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "lavfi", "-i", "sine=frequency=440:duration=3", "-c:a", "aac", str(m4a)],
+        check=True, capture_output=True,
+    )
+    data = m4a.read_bytes()
+
+    class _MP4Upstream(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.0"
+
+        def do_GET(self) -> None:
+            rng = self.headers.get("Range")
+            if rng and (m := _RANGE_RE.match(rng)):
+                start = int(m.group(1)) if m.group(1) else 0
+                end = int(m.group(2)) if m.group(2) else len(data) - 1
+                chunk = data[start : end + 1]
+                self.send_response(206)
+                self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+                self.send_header("Content-Length", str(len(chunk)))
+                self.end_headers()
+                self.wfile.write(chunk)
+                return
+            self.send_response(200)
+            self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *a: object) -> None:
+            pass
+
+    up = ThreadingHTTPServer(("127.0.0.1", 0), _MP4Upstream)
+    threading.Thread(target=up.serve_forever, kwargs={"poll_interval": 0.05}, daemon=True).start()
+    try:
+        port = up.server_address[1]
+        token = relay.register(
+            lambda: StreamSource(url=f"http://127.0.0.1:{port}/a", mime_type="audio/mp4", container="m4a"),
+            title="Roygbiv", artist="Boards of Canada",
+        )
+        resp = requests.get(
+            f"http://127.0.0.1:{relay.port}/play/{token}", headers={"Icy-MetaData": "1"}, timeout=20
+        )
+        assert resp.status_code == 200
+        assert resp.headers["Content-Type"] == "audio/aac"
+        audio, metas = _deinterleave_icy(resp.content, int(resp.headers["icy-metaint"]))
+        # Rewrapped to ADTS: the first frame starts with the 12-bit sync word 0xFFF.
+        assert audio[:1] == b"\xff" and (audio[1] & 0xF0) == 0xF0
+        assert metas and metas[0] == "StreamTitle='Boards of Canada - Roygbiv';"
+    finally:
+        up.shutdown()
+        up.server_close()
