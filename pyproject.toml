@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harmony"
-version = "0.1.0"
+version = "0.5.0"
 description = "Create and sync playlists across YouTube Music and Qobuz, with search and recommendation tooling."
 readme = "README.md"
 requires-python = ">=3.11"
