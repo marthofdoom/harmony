@@ -511,3 +511,40 @@ def test_browser_auth_file_is_classified_as_browser_by_ytmusicapi(tmp_path):
     from ytmusicapi import YTMusic
     from ytmusicapi.auth.types import AuthType
     assert YTMusic(auth=str(path)).auth_type == AuthType.BROWSER
+
+
+# --------------------------------------------------------------------------
+# Qobuz token retrieval from Chrome/Chromium Local Storage (LevelDB byte scan)
+# --------------------------------------------------------------------------
+
+
+def test_read_chrome_qobuz_localstorage_extracts_scoped_token(tmp_path):
+    leveldb = tmp_path / "leveldb"
+    leveldb.mkdir()
+    # A different site's token first (must NOT be picked), then far away the
+    # qobuz origin marker immediately followed by its localuser JSON.
+    blob = (
+        b'_https://accounts.google.com\x00\x01auth_token":"OTHERSITEtokenmustnotbepicked999"'
+        + b"\x00" * 20000
+        + b'_https://play.qobuz.com\x00\x01localuser\x01{"user_auth_token":"QOBUZtok3nABCDEFGH1234567890"}'
+    )
+    (leveldb / "000005.log").write_bytes(blob)
+
+    assert harmony_setup.read_chrome_qobuz_localstorage(leveldb) == "QOBUZtok3nABCDEFGH1234567890"
+
+
+def test_read_chrome_qobuz_localstorage_none_when_no_qobuz(tmp_path):
+    leveldb = tmp_path / "leveldb"
+    leveldb.mkdir()
+    (leveldb / "x.ldb").write_bytes(b"just some leveldb noise, no qobuz origin here")
+
+    assert harmony_setup.read_chrome_qobuz_localstorage(leveldb) is None
+
+
+def test_find_qobuz_token_in_browsers_falls_through_to_chrome(monkeypatch):
+    monkeypatch.setattr(harmony_setup, "FIREFOX_STORAGE_SOURCES", [])
+    monkeypatch.setattr(harmony_setup, "CHROME_STORAGE_SOURCES", [("Chrome", "/fake/*/leveldb")])
+    monkeypatch.setattr(harmony_setup, "_glob_paths", lambda pattern: [harmony_setup.Path("/fake/p/leveldb")])
+    monkeypatch.setattr(harmony_setup, "read_chrome_qobuz_localstorage", lambda p: "TOKENfromChrome")
+
+    assert harmony_setup._find_qobuz_token_in_browsers() == "TOKENfromChrome"

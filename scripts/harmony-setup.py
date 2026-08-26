@@ -177,6 +177,17 @@ FIREFOX_STORAGE_SOURCES = [
     ("LibreWolf", "~/.librewolf/*/webappsstore.sqlite"),
 ]
 
+# Chromium stores localStorage in a LevelDB directory (not sqlite). We read the
+# raw files rather than depend on a LevelDB library -- see
+# read_chrome_qobuz_localstorage.
+CHROME_STORAGE_SOURCES = [
+    ("Google Chrome", "~/.config/google-chrome/*/Local Storage/leveldb"),
+    ("Google Chrome (Flatpak)", "~/.var/app/com.google.Chrome/config/google-chrome/*/Local Storage/leveldb"),
+    ("Chromium", "~/.config/chromium/*/Local Storage/leveldb"),
+    ("Chromium (Flatpak)", "~/.var/app/org.chromium.Chromium/config/chromium/*/Local Storage/leveldb"),
+    ("Ungoogled Chromium", "~/.config/ungoogled-chromium/*/Local Storage/leveldb"),
+]
+
 
 def _glob_paths(pattern: str) -> list[Path]:
     return [Path(p) for p in sorted(glob.glob(os.path.expanduser(pattern)))]
@@ -952,6 +963,41 @@ def read_firefox_qobuz_localstorage(webappsstore_path: Path) -> str | None:
     return None
 
 
+# Matches a "<key containing token/auth>": "<long value>" pair in raw bytes.
+_CHROME_TOKEN_RE = re.compile(
+    rb'([a-z_]*(?:token|auth)[a-z_]*)"?\s*[:=]\s*"?([A-Za-z0-9_\-.=/+]{25,})', re.IGNORECASE
+)
+
+
+def read_chrome_qobuz_localstorage(leveldb_dir: Path) -> str | None:
+    """Best-effort scan of a Chromium ``Local Storage/leveldb`` dir for a Qobuz token.
+
+    Chromium keeps localStorage in LevelDB, whose ``.ldb`` blocks may be
+    snappy-compressed but whose recent writes sit uncompressed in the ``.log``
+    write-ahead file. Rather than depend on a LevelDB reader, read the raw
+    files and, scoped to a window right after each ``play.qobuz.com`` origin
+    marker (the store is shared across all sites, so scoping avoids grabbing a
+    different site's token), pull out the first token/auth-looking value. The
+    common case -- an ASCII JSON value Chromium stores one-byte-encoded -- is
+    recoverable this way; a UTF-16-encoded value isn't, and falls through to
+    the paste-token option.
+    """
+    chunks: list[bytes] = []
+    for name in ("*.log", "*.ldb"):
+        for path in sorted(glob.glob(os.path.join(str(leveldb_dir), name))):
+            try:
+                chunks.append(Path(path).read_bytes())
+            except OSError:
+                continue
+    raw = b"".join(chunks)
+    for origin in re.finditer(rb"play\.qobuz\.com", raw):
+        window = raw[origin.start() : origin.start() + 8192]
+        match = _CHROME_TOKEN_RE.search(window)
+        if match:
+            return match.group(2).decode("ascii", "ignore")
+    return None
+
+
 # --------------------------------------------------------------------------
 # Interactive flow: YouTube Music
 # --------------------------------------------------------------------------
@@ -1241,26 +1287,35 @@ def _qobuz_paste_token(target: Target) -> None:
     print("Done -- (re)start Harmony.")
 
 
-def _qobuz_firefox_autograb(target: Target) -> None:
+def _find_qobuz_token_in_browsers() -> str | None:
+    """Scan Firefox (webappsstore.sqlite) and Chromium (Local Storage leveldb) for a Qobuz token."""
+    for _label, pattern in FIREFOX_STORAGE_SOURCES:
+        for path in _glob_paths(pattern):
+            try:
+                token = read_firefox_qobuz_localstorage(path)
+            except Exception:  # noqa: BLE001 - try the next profile
+                token = None
+            if token:
+                return token
+    for _label, pattern in CHROME_STORAGE_SOURCES:
+        for path in _glob_paths(pattern):
+            try:
+                token = read_chrome_qobuz_localstorage(path)
+            except Exception:  # noqa: BLE001 - try the next profile
+                token = None
+            if token:
+                return token
+    return None
+
+
+def _qobuz_browser_autograb(target: Target) -> None:
     if not ensure_keyring_for_target(target):
         return
-    print("Looking for a Qobuz session in Firefox's local storage (experimental)...")
-    found_paths = [(label, p) for label, pattern in FIREFOX_STORAGE_SOURCES for p in _glob_paths(pattern)]
-    if not found_paths:
-        print("No Firefox local-storage database found. Use the paste-token option instead.")
-        return
-
-    token = None
-    for _label, path in found_paths:
-        try:
-            token = read_firefox_qobuz_localstorage(path)
-        except Exception:  # noqa: BLE001 - try the next profile
-            token = None
-        if token:
-            break
+    print("Looking for a Qobuz session in your browsers' local storage (experimental)...")
+    token = _find_qobuz_token_in_browsers()
     if not token:
-        print("Could not find a Qobuz token in Firefox's storage. Make sure you're signed in")
-        print("at play.qobuz.com in Firefox, then try again, or use the paste-token option.")
+        print("Could not find a Qobuz token in Firefox or Chrome. Make sure you're signed in")
+        print("at play.qobuz.com, then try again, or use the paste-token option.")
         return
 
     app_id = _get_or_scrape_qobuz_app_id(target)
@@ -1292,7 +1347,7 @@ def qobuz_menu(target: Target) -> None:
         print("\nQobuz")
         print("  [1] Password login")
         print("  [2] Paste token (Google/social accounts)")
-        print("  [3] Auto-grab from Firefox (experimental)")
+        print("  [3] Auto-grab from browser (Firefox/Chrome, experimental)")
         print("  [b] Back")
         choice = input("> ").strip().lower()
         if choice == "1":
@@ -1300,7 +1355,7 @@ def qobuz_menu(target: Target) -> None:
         elif choice == "2":
             _qobuz_paste_token(target)
         elif choice == "3":
-            _qobuz_firefox_autograb(target)
+            _qobuz_browser_autograb(target)
         elif choice in ("b", "back", ""):
             return
         else:
