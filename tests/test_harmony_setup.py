@@ -548,3 +548,10 @@ def test_find_qobuz_token_in_browsers_falls_through_to_chrome(monkeypatch):
     monkeypatch.setattr(harmony_setup, "read_chrome_qobuz_localstorage", lambda p: "TOKENfromChrome")
 
     assert harmony_setup._find_qobuz_token_in_browsers() == "TOKENfromChrome"
+
+
+def test_qobuz_token_from_cookie_value_json_and_bare():
+    j = "%7B%22user_auth_token%22%3A%22TOKtok123456789012345%22%7D"  # url-enc {"user_auth_token":"..."}
+    assert harmony_setup._qobuz_token_from_cookie_value(j) == "TOKtok123456789012345"
+    assert harmony_setup._qobuz_token_from_cookie_value("BAREtoken1234567890abcdef") == "BAREtoken1234567890abcdef"
+    assert harmony_setup._qobuz_token_from_cookie_value("short") is None

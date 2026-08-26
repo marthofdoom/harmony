@@ -1000,6 +1000,64 @@ def read_chrome_qobuz_localstorage(leveldb_dir: Path) -> str | None:
     return None
 
 
+def _qobuz_token_from_cookie_value(value: str) -> str | None:
+    """Pull an auth token out of a decrypted ``qobuz-session`` cookie value.
+
+    The value is typically URL-encoded JSON carrying the credential; try the
+    deep search (JSON-aware), then a token/auth-field regex, then a bare token.
+    """
+    for candidate in (value, urllib.parse.unquote(value)):
+        token = _deep_search_token(candidate)
+        if token:
+            return token
+        match = re.search(
+            r"(?i)(?:user_auth_token|auth_token|token)\"?\s*[:=]\s*\"?([A-Za-z0-9_\-.=/+]{20,})",
+            candidate,
+        )
+        if match:
+            return match.group(1)
+    bare = urllib.parse.unquote(value).strip()
+    return bare if re.fullmatch(r"[A-Za-z0-9_\-.=/+]{20,}", bare) else None
+
+
+def read_chrome_qobuz_cookie(cookies_path: Path, password: bytes) -> str | None:
+    """Decrypt Chrome's ``qobuz-session`` cookie and extract the auth token."""
+    tmp = _copy_sqlite_to_temp(cookies_path)
+    try:
+        conn = sqlite3.connect(tmp)
+        try:
+            row = conn.execute(
+                "SELECT encrypted_value FROM cookies WHERE name='qobuz-session' AND host_key LIKE '%qobuz%'"
+            ).fetchone()
+        finally:
+            conn.close()
+    finally:
+        os.unlink(tmp)
+    if not row:
+        return None
+    try:
+        value = chrome_decrypt(row[0], password)
+    except Exception:  # noqa: BLE001 - a decrypt failure just means "no token here"
+        return None
+    return _qobuz_token_from_cookie_value(value)
+
+
+def read_firefox_qobuz_cookie(cookies_path: Path) -> str | None:
+    """Read Firefox's ``qobuz-session`` cookie (unencrypted) and extract the token."""
+    tmp = _copy_sqlite_to_temp(cookies_path)
+    try:
+        conn = sqlite3.connect(tmp)
+        try:
+            row = conn.execute(
+                "SELECT value FROM moz_cookies WHERE name='qobuz-session' AND host LIKE '%qobuz%'"
+            ).fetchone()
+        finally:
+            conn.close()
+    finally:
+        os.unlink(tmp)
+    return _qobuz_token_from_cookie_value(row[0]) if row else None
+
+
 # --------------------------------------------------------------------------
 # Interactive flow: YouTube Music
 # --------------------------------------------------------------------------
@@ -1290,24 +1348,29 @@ def _qobuz_paste_token(target: Target) -> None:
 
 
 def _find_qobuz_token_in_browsers() -> str | None:
-    """Scan Firefox (webappsstore.sqlite) and Chromium (Local Storage leveldb) for a Qobuz token."""
-    for _label, pattern in FIREFOX_STORAGE_SOURCES:
-        for path in _glob_paths(pattern):
-            try:
-                token = read_firefox_qobuz_localstorage(path)
-            except Exception:  # noqa: BLE001 - try the next profile
-                token = None
-            if token:
-                return token
-    for _label, pattern in CHROME_STORAGE_SOURCES:
-        for path in _glob_paths(pattern):
-            try:
-                token = read_chrome_qobuz_localstorage(path)
-            except Exception:  # noqa: BLE001 - try the next profile
-                token = None
-            if token:
-                return token
-    return None
+    """Find a Qobuz token across browsers: cookies first (the reliable path), then localStorage."""
+
+    def _scan(sources, reader) -> str | None:
+        for _label, pattern in sources:
+            for path in _glob_paths(pattern):
+                try:
+                    token = reader(path)
+                except Exception:  # noqa: BLE001 - try the next profile
+                    token = None
+                if token:
+                    return token
+        return None
+
+    # Cookies (qobuz-session) — where the auth token actually lives.
+    if token := _scan(FIREFOX_COOKIE_SOURCES, read_firefox_qobuz_cookie):
+        return token
+    chrome_pw = get_chrome_safe_storage_password()
+    if token := _scan(CHROME_COOKIE_SOURCES, lambda p: read_chrome_qobuz_cookie(p, chrome_pw)):
+        return token
+    # localStorage fallbacks (older web-player behaviour).
+    if token := _scan(FIREFOX_STORAGE_SOURCES, read_firefox_qobuz_localstorage):
+        return token
+    return _scan(CHROME_STORAGE_SOURCES, read_chrome_qobuz_localstorage)
 
 
 def _qobuz_browser_autograb(target: Target) -> None:
