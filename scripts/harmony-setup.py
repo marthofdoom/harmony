@@ -1230,10 +1230,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def reattach_tty_stdin() -> None:
+    """Make interactive prompts work under ``curl … | python3``.
+
+    When the script is piped into the interpreter, ``sys.stdin`` is the pipe
+    carrying the script's own source, so the very first ``input()`` sees EOF
+    and the tool aborts before asking anything (the reported "Aborted."
+    immediately after the banner). Re-open stdin on the controlling terminal so
+    prompts read the user's keystrokes instead. ``getpass`` already reads
+    ``/dev/tty`` directly, so password entry was never affected -- this only
+    fixes the plain ``input()`` menu/choice prompts.
+    """
+    if sys.stdin is not None and sys.stdin.isatty():
+        return
+    try:
+        sys.stdin = open("/dev/tty")  # noqa: SIM115 - kept open for the process lifetime
+    except OSError:
+        raise SystemExit(
+            "This setup tool is interactive, but stdin is not a terminal and no\n"
+            "controlling terminal (/dev/tty) is available. Download it and run it\n"
+            "directly instead of piping it in:\n"
+            "  curl -fsSLO https://raw.githubusercontent.com/marthofdoom/harmony/main/scripts/harmony-setup.py\n"
+            "  python3 harmony-setup.py"
+        ) from None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     print(BANNER)
+    reattach_tty_stdin()
     try:
         target = resolve_target(args)
         print(f"Setting up: {target.kind} install -> {target.config_dir}\n")

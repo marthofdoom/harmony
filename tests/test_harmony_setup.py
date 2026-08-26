@@ -391,3 +391,49 @@ def test_copy_sqlite_to_temp_is_0600_even_from_world_readable_source(tmp_path):
         assert mode == 0o600, oct(mode)
     finally:
         os.unlink(dest)
+
+
+# --------------------------------------------------------------------------
+# curl | python3 must not abort: interactive prompts read /dev/tty, not the pipe
+# --------------------------------------------------------------------------
+
+
+class _FakeTTY:
+    def __init__(self, tty: bool) -> None:
+        self._tty = tty
+
+    def isatty(self) -> bool:
+        return self._tty
+
+
+def test_reattach_tty_stdin_noop_when_already_a_terminal(monkeypatch):
+    already = _FakeTTY(tty=True)
+    monkeypatch.setattr(harmony_setup.sys, "stdin", already)
+    harmony_setup.reattach_tty_stdin()
+    assert harmony_setup.sys.stdin is already  # left untouched
+
+
+def test_reattach_tty_stdin_reopens_from_dev_tty_when_piped(monkeypatch):
+    monkeypatch.setattr(harmony_setup.sys, "stdin", _FakeTTY(tty=False))
+    sentinel = object()
+    seen = {}
+
+    def _fake_open(path, *a, **k):
+        seen["path"] = path
+        return sentinel
+
+    monkeypatch.setattr("builtins.open", _fake_open)
+    harmony_setup.reattach_tty_stdin()
+    assert seen["path"] == "/dev/tty"
+    assert harmony_setup.sys.stdin is sentinel  # reattached to the terminal
+
+
+def test_reattach_tty_stdin_exits_cleanly_without_a_terminal(monkeypatch):
+    monkeypatch.setattr(harmony_setup.sys, "stdin", _FakeTTY(tty=False))
+
+    def _no_tty(path, *a, **k):
+        raise OSError("no controlling terminal")
+
+    monkeypatch.setattr("builtins.open", _no_tty)
+    with pytest.raises(SystemExit):
+        harmony_setup.reattach_tty_stdin()
