@@ -27,6 +27,10 @@ from harmony.tasks import on_main, run_async  # noqa: E402
 
 # How often the queue poller checks a device for a track ending, in seconds.
 _QUEUE_POLL_S = 3
+# How close (seconds) the reported position must get to the track's duration to
+# count the track as finished. A couple of seconds absorbs the poll interval and
+# the device rounding/settling its final position.
+_END_EPSILON_S = 3
 
 log = logging.getLogger(__name__)
 
@@ -88,6 +92,10 @@ class AppState(GObject.Object):
         self._queues: dict[str, list[Any]] = {}
         self._queue_prev_state: dict[str, str] = {}
         self._queue_poll_ids: dict[str, int] = {}
+        # Per-host: True once we've seen the current track playing mid-way, so a
+        # single near-end reading advances exactly once (not every poll near the
+        # end). Re-armed when the next track is seen mid-play.
+        self._queue_armed: dict[str, bool] = {}
 
         self.reload_providers()
         self._init_recommender()
@@ -521,22 +529,43 @@ class AppState(GObject.Object):
         """Forget a device's queue and stop its poller (main loop only)."""
         self._queues.pop(host, None)
         self._queue_prev_state.pop(host, None)
+        self._queue_armed.pop(host, None)
         source_id = self._queue_poll_ids.pop(host, None)
         if source_id is not None:
             GLib.source_remove(source_id)
 
-    def _next_after_status(self, host: str, state: str) -> Any:
-        """Advance the queue if the current track just ended; return the next track or None.
+    def _next_after_status(
+        self, host: str, state: str, position: int | None, duration: int | None
+    ) -> Any:
+        """Advance the queue if the current track just finished; return the next track or None.
 
-        "Ended" = the device was ``playing`` and is now ``stopped``. Pure enough
-        to unit-test: only touches the in-memory queue dicts, no I/O.
+        Primary signal is progress: the reported position reaching the track's
+        duration — device-agnostic, and driven by the same data the progress bar
+        reads. Falls back to a state edge (``playing`` -> ``stopped``) only when
+        the device reports no duration. Armed by mid-track playback so one
+        near-end reading advances exactly once. Pure: only touches the in-memory
+        queue dicts, no I/O.
         """
         prev = self._queue_prev_state.get(host, "")
         self._queue_prev_state[host] = state or ""
         queue = self._queues.get(host)
         if not queue:
             return None
-        if prev == "playing" and state == "stopped":
+
+        has_duration = bool(duration and duration > 0 and position is not None)
+        near_end = has_duration and position >= duration - _END_EPSILON_S
+        mid_track = has_duration and position < duration - _END_EPSILON_S
+        if mid_track:
+            self._queue_armed[host] = True  # a real track is under way; arm end-detection
+
+        ended = False
+        if near_end and self._queue_armed.get(host):
+            self._queue_armed[host] = False  # advance once, until the next track is mid-play
+            ended = True
+        elif not has_duration and prev == "playing" and state == "stopped":
+            ended = True  # no progress info -> fall back to the state edge
+
+        if ended:
             queue.pop(0)
             if queue:
                 return queue[0]
@@ -550,7 +579,9 @@ class AppState(GObject.Object):
         device = self.device_for(host)
 
         def done(status: Any) -> None:
-            next_track = self._next_after_status(host, status.state or "")
+            next_track = self._next_after_status(
+                host, status.state or "", status.position_s, status.duration_s
+            )
             if next_track is not None:
                 run_async(
                     lambda: self._play_one(next_track, host),

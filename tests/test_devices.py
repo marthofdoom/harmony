@@ -326,32 +326,56 @@ def _track_n(n: int) -> Track:
     return Track(id=f"t{n}", title=f"Song {n}", service=Service.YTMUSIC, artists=["A"])
 
 
-def test_queue_advances_to_next_track_on_end(state: AppState) -> None:
-    state._queues = {"h": [_track_n(1), _track_n(2), _track_n(3)]}
-    state._queue_prev_state = {"h": "playing"}
+def _seed_queue(state: AppState, tracks: list) -> None:
+    state._queues = {"h": tracks}
+    state._queue_prev_state = {"h": ""}
     state._queue_poll_ids = {}
+    state._queue_armed = {"h": False}
 
-    nxt = state._next_after_status("h", "stopped")  # track 1 ended
 
+def test_queue_advances_when_position_reaches_duration(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
+    assert state._next_after_status("h", "playing", 10, 200) is None  # mid-track: arm, no advance
+    nxt = state._next_after_status("h", "playing", 199, 200)          # near end -> advance
     assert nxt is not None and nxt.id == "t2"
-    assert [t.id for t in state._queues["h"]] == ["t2", "t3"]  # t1 popped
+    assert [t.id for t in state._queues["h"]] == ["t2", "t3"]
 
 
-def test_queue_does_not_advance_while_still_playing(state: AppState) -> None:
-    state._queues = {"h": [_track_n(1), _track_n(2)]}
-    state._queue_prev_state = {"h": "playing"}
-    state._queue_poll_ids = {}
+def test_queue_progress_advances_exactly_once(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state._next_after_status("h", "playing", 10, 200)                 # arm
+    assert state._next_after_status("h", "playing", 199, 200).id == "t2"  # advance
+    # A second near-end reading before the next track starts must not advance again.
+    assert state._next_after_status("h", "playing", 200, 200) is None
+    assert [t.id for t in state._queues["h"]] == ["t2"]
 
-    assert state._next_after_status("h", "playing") is None
+
+def test_queue_rearms_for_the_next_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state._next_after_status("h", "playing", 10, 200)                 # arm t1
+    state._next_after_status("h", "playing", 199, 200)               # advance to t2, disarm
+    assert state._next_after_status("h", "playing", 5, 200) is None   # re-arm on t2
+    assert state._next_after_status("h", "playing", 199, 200) is None  # t2 was last -> clear
+    assert "h" not in state._queues
+
+
+def test_queue_does_not_advance_while_mid_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    assert state._next_after_status("h", "playing", 30, 200) is None
     assert len(state._queues["h"]) == 2
 
 
-def test_queue_clears_after_last_track(state: AppState) -> None:
-    state._queues = {"h": [_track_n(1)]}
+def test_queue_falls_back_to_stopped_without_duration(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
     state._queue_prev_state = {"h": "playing"}
-    state._queue_poll_ids = {}
+    nxt = state._next_after_status("h", "stopped", None, None)  # no duration -> state edge
+    assert nxt is not None and nxt.id == "t2"
 
-    assert state._next_after_status("h", "stopped") is None
+
+def test_queue_clears_after_last_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1)])
+    state._queue_prev_state = {"h": "playing"}
+    assert state._next_after_status("h", "stopped", None, None) is None
     assert "h" not in state._queues  # emptied and cleared
 
 
