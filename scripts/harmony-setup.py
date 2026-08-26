@@ -1379,7 +1379,12 @@ def _find_qobuz_token_in_browsers() -> str | None:
 def _qobuz_browser_autograb(target: Target) -> None:
     if not ensure_keyring_for_target(target):
         return
-    print("Looking for a Qobuz session in your browsers' local storage (experimental)...")
+    if try_import("cryptography") is None:
+        print("\nReading a Chrome/Chromium session needs the 'cryptography' package.")
+        if offer_venv_bootstrap(["cryptography"]):
+            return  # process is being replaced
+        print("Install it (`pip install cryptography`) and retry, or use paste-token.\n")
+    print("Looking for a Qobuz session in your browsers (experimental)...")
     token = _find_qobuz_token_in_browsers()
     if not token:
         print("Could not find a Qobuz token in Firefox or Chrome. Make sure you're signed in")
