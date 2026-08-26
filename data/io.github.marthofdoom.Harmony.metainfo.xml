@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.4" date="2026-08-26">
+      <description>
+        <p>Discover page overhaul: recommendation results are now actionable
+        (play to a device or add to a playlist right from the list), with live
+        progress while suggestions load, a Regenerate button, clearer empty
+        states, and friendlier source labels.</p>
+      </description>
+    </release>
     <release version="0.5.3" date="2026-08-26">
       <description>
         <p>Play-to-device now uses UPnP so the renderer's own screen can show the

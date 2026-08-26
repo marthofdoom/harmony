@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import gi
 
@@ -12,11 +13,51 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
-from harmony.tasks import run_async  # noqa: E402
+from harmony.tasks import on_main, run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
-from harmony.ui.widgets import missing_layer_status_page  # noqa: E402
+from harmony.ui.widgets import (  # noqa: E402
+    attach_context_menu,
+    error_status_page,
+    missing_layer_status_page,
+    set_stack_status,
+    status_page,
+)
 
 log = logging.getLogger(__name__)
+
+# Recommender source key -> friendly display name. "provider" is deliberately
+# absent: it means the vote came from the *target service's* own similar-
+# tracks endpoint, so it's rendered using that service's own label instead
+# (see `_humanize_sources`) rather than the internal word "provider".
+_SOURCE_LABELS = {"lastfm": "Last.fm", "listenbrainz": "ListenBrainz"}
+
+
+def _humanize_sources(sources: list[str], target_label: str) -> list[str]:
+    """Map recommender source keys to display names, deduped, order preserved.
+
+    Any key this doesn't recognise is passed through unchanged rather than
+    dropped, so a future recommender source never silently vanishes from the
+    subtitle just because this mapping hasn't been updated yet.
+    """
+    labels: list[str] = []
+    for source in sources:
+        label = _SOURCE_LABELS.get(source) or (target_label if source == "provider" else source)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _format_suggestion_subtitle(artist: str, sources: list[str], target_label: str) -> str:
+    """Humanized suggestion subtitle: friendly source names, no raw score.
+
+    e.g. ``"Radiohead · via Last.fm, ListenBrainz"`` instead of the old
+    ``"Radiohead · lastfm · listenbrainz · score 2.34"``. Pulled out as a
+    pure function (no widgets) so it's directly unit-testable.
+    """
+    labels = _humanize_sources(sources, target_label)
+    if not labels:
+        return artist
+    return f"{artist} · via {', '.join(labels)}"
 
 
 def _looks_resolved(pick, resolved: list[Track]) -> bool:  # noqa: ANN001 - TrackIdea, kept loosely typed
@@ -43,6 +84,7 @@ class DiscoverPage(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.state = state
         self._suggestions: list[object] = []
+        self._suggestions_loading = False
         self._playlist_choices: list[Playlist] = []
         self._idea = None
         self._resolved_tracks: list[Track] = []
@@ -68,7 +110,7 @@ class DiscoverPage(Gtk.Box):
         self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_choices())
         # Providers are built off the main loop, so this page is normally
         # constructed before any of them exist. Without this the service
-        # pickers would stay stuck on "No services configured" forever.
+        # pickers would stay stuck on "no services configured" forever.
         self.state.connect("providers-changed", lambda *_a: self._refresh_service_choices())
         self._refresh_playlist_choices()
         self._refresh_service_choices()
@@ -76,7 +118,7 @@ class DiscoverPage(Gtk.Box):
     def _refresh_service_choices(self) -> None:
         """Rebuild both service pickers from the providers that are live now."""
         services = [s for s in Service if s in self.state.providers]
-        labels = [s.label for s in services] or ["No services configured"]
+        labels = [s.label for s in services]
         # Both the recommendations picker and the AI picker only exist when
         # their section built real content (recommender configured / planner
         # configured with a key); without that, the section rendered a
@@ -111,6 +153,7 @@ class DiscoverPage(Gtk.Box):
                 dropdown.set_selected(services.index(previous_service))
 
         self._services_for_ai = services
+        self._update_recommendations_controls_visibility()
 
     # -- section 1: recommendations ------------------------------------------
 
@@ -125,24 +168,102 @@ class DiscoverPage(Gtk.Box):
         controls = Gtk.Box(spacing=8)
         self.seed_dropdown = Gtk.DropDown(hexpand=True)
         self.target_service_dropdown = Gtk.DropDown.new_from_strings(
-            [s.label for s in Service if s in self.state.providers] or ["No services configured"]
+            [s.label for s in Service if s in self.state.providers]
         )
-        get_button = Gtk.Button(label="Get Suggestions", css_classes=["suggested-action"])
-        get_button.connect("clicked", self._on_get_suggestions_clicked)
+        self.get_suggestions_button = Gtk.Button(label="Get Suggestions", css_classes=["suggested-action"])
+        self.get_suggestions_button.connect("clicked", self._on_get_suggestions_clicked)
+        self.regenerate_button = Gtk.Button(
+            icon_name="view-refresh-symbolic", tooltip_text="Regenerate with the same seed", sensitive=False,
+        )
+        self.regenerate_button.connect("clicked", self._on_get_suggestions_clicked)
         controls.append(Gtk.Label(label="Seed playlist:"))
         controls.append(self.seed_dropdown)
         controls.append(self.target_service_dropdown)
-        controls.append(get_button)
-        box.append(controls)
+        controls.append(self.get_suggestions_button)
+        controls.append(self.regenerate_button)
+        # Stale results reference a specific (seed, target service) pair --
+        # once either changes the old list no longer describes "the current
+        # seed", so clear it rather than leave misleading results on screen.
+        self.seed_dropdown.connect("notify::selected", self._on_seed_selection_changed)
+        self.target_service_dropdown.connect("notify::selected", self._on_seed_selection_changed)
+
+        # Swaps between the controls above and a status page when there's
+        # nothing to recommend from yet (no service, or no playlists on it) --
+        # replaces the old fake "No services configured" dropdown entry.
+        self.controls_stack = Gtk.Stack()
+        self.controls_stack.add_named(controls, "controls")
+        box.append(self.controls_stack)
+
+        legend = Gtk.Box(spacing=16)
+        for icon_name, text in (
+            ("emblem-ok-symbolic", "matched to a playable track"),
+            ("dialog-question-symbolic", "couldn't match — won't be added"),
+        ):
+            item = Gtk.Box(spacing=4)
+            item.append(Gtk.Image.new_from_icon_name(icon_name))
+            item.append(Gtk.Label(label=text, css_classes=["caption", "dim-label"]))
+            legend.append(item)
+        box.append(legend)
+
+        self.suggestions_progress_label = Gtk.Label(xalign=0.0)
+        self.suggestions_progress_bar = Gtk.ProgressBar()
+        progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
+                                margin_top=12, margin_bottom=12)
+        progress_box.append(self.suggestions_progress_label)
+        progress_box.append(self.suggestions_progress_bar)
 
         self.suggestions_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.suggestions_list.add_css_class("boxed-list")
-        box.append(self.suggestions_list)
+
+        self.suggestions_stack = Gtk.Stack()
+        self.suggestions_stack.add_named(progress_box, "loading")
+        self.suggestions_stack.add_named(self.suggestions_list, "results")
+        set_stack_status(
+            self.suggestions_stack, "idle",
+            status_page(icon_name="edit-find-symbolic", title="No suggestions yet",
+                        description="Pick a seed playlist and press Get Suggestions."),
+        )
+        box.append(self.suggestions_stack)
 
         self.create_from_suggestions_button = Gtk.Button(label="Create Playlist from These", sensitive=False)
         self.create_from_suggestions_button.connect("clicked", self._on_create_from_suggestions)
         box.append(self.create_from_suggestions_button)
+
+        self._update_recommendations_controls_visibility()
         return box
+
+    def _update_recommendations_controls_visibility(self) -> None:
+        """Show the seed/service controls, or a status page explaining why not.
+
+        Called after every playlist/provider refresh; a no-op before the
+        section has been built (recommender missing) or before it's been
+        built yet (called mid-``__init__``, guarded by ``hasattr``).
+        """
+        if not hasattr(self, "controls_stack"):
+            return
+        has_service = any(s in self.state.providers for s in Service)
+        has_seed = bool(self._playlist_choices)
+        if has_service and has_seed:
+            self.controls_stack.set_visible_child_name("controls")
+        else:
+            description = (
+                "Add a music service in Preferences to get started."
+                if not has_service
+                else "None of your playlists are available yet. Add one on the Playlists page."
+            )
+            set_stack_status(
+                self.controls_stack, "empty",
+                status_page(icon_name="dialog-information-symbolic", title="Nothing to recommend from yet",
+                            description=description),
+            )
+        self._update_get_suggestions_sensitivity()
+
+    def _update_get_suggestions_sensitivity(self) -> None:
+        if not hasattr(self, "get_suggestions_button"):
+            return
+        has_service = any(s in self.state.providers for s in Service)
+        has_seed = bool(self._playlist_choices)
+        self.get_suggestions_button.set_sensitive(has_service and has_seed and not self._suggestions_loading)
 
     def _refresh_playlist_choices(self) -> None:
         if self.state.recommender is None:
@@ -152,8 +273,29 @@ class DiscoverPage(Gtk.Box):
         for service in Service:
             choices.extend(by_service.get(service, []))
         self._playlist_choices = choices
-        labels = [f"{p.title} ({p.service.label})" for p in choices] or ["No playlists available"]
+        labels = [f"{p.title} ({p.service.label})" for p in choices]
         self.seed_dropdown.set_model(Gtk.StringList.new(labels))
+        self._update_recommendations_controls_visibility()
+
+    def _on_seed_selection_changed(self, *_args: object) -> None:
+        """Invalidate on-screen suggestions once the seed or target changes.
+
+        A no-op while nothing is showing (nothing to invalidate) or while a
+        fetch is already in flight (its own completion callback owns the
+        list at that point).
+        """
+        if self._suggestions_loading or not self._suggestions:
+            return
+        self._suggestions = []
+        self.create_from_suggestions_button.set_sensitive(False)
+        self.regenerate_button.set_sensitive(False)
+        while row := self.suggestions_list.get_row_at_index(0):
+            self.suggestions_list.remove(row)
+        set_stack_status(
+            self.suggestions_stack, "idle",
+            status_page(icon_name="edit-find-symbolic", title="No suggestions yet",
+                        description="Pick a seed playlist and press Get Suggestions."),
+        )
 
     def _on_get_suggestions_clicked(self, _button: Gtk.Button) -> None:
         index = self.seed_dropdown.get_selected()
@@ -172,29 +314,197 @@ class DiscoverPage(Gtk.Box):
         if seed_provider is None:
             return
 
+        self._suggestions_loading = True
+        self.get_suggestions_button.set_sensitive(False)
+        self.regenerate_button.set_sensitive(False)
+        self.create_from_suggestions_button.set_sensitive(False)
+        self.suggestions_progress_bar.set_fraction(0.0)
+        self.suggestions_progress_label.set_label("Starting…")
+        self.suggestions_stack.set_visible_child_name("loading")
+
         def work() -> list:
             seeds = seed_provider.get_playlist_tracks(seed_playlist.id)
-            return self.state.recommender.similar_to_tracks(seeds, target_provider, limit=30)
 
-        run_async(work, self._on_suggestions_done, lambda exc: self.state.toast(f"Couldn't get suggestions: {exc}"))
+            # `similar_to_tracks` invokes this from the worker thread doing
+            # the fetch, never the main loop -- marshal every UI touch
+            # through `on_main` so it lands safely on the GLib main loop
+            # instead of writing to a widget off-thread.
+            def on_progress(fraction: float, message: str) -> None:
+                on_main(self._update_suggestions_progress, fraction, message)
 
-    def _on_suggestions_done(self, suggestions: list) -> None:
+            return self.state.recommender.similar_to_tracks(
+                seeds, target_provider, limit=30, progress=on_progress
+            )
+
+        def done(suggestions: list) -> None:
+            self._on_suggestions_done(suggestions, target_service)
+
+        run_async(work, done, self._on_suggestions_error)
+
+    def _update_suggestions_progress(self, fraction: float, message: str) -> None:
+        self.suggestions_progress_bar.set_fraction(max(0.0, min(1.0, fraction)))
+        if message:
+            self.suggestions_progress_label.set_label(message)
+
+    def _on_suggestions_done(self, suggestions: list, target_service: Service) -> None:
         self._suggestions = suggestions
+        self._suggestions_loading = False
+        self._update_get_suggestions_sensitivity()
+        self.regenerate_button.set_sensitive(True)
         while row := self.suggestions_list.get_row_at_index(0):
             self.suggestions_list.remove(row)
         if not suggestions:
-            self.suggestions_list.append(Adw.ActionRow(title="No suggestions found"))
             self.create_from_suggestions_button.set_sensitive(False)
+            set_stack_status(
+                self.suggestions_stack, "empty",
+                status_page(icon_name="edit-find-symbolic", title="No suggestions found",
+                            description="Try a different seed playlist, or check that recommendation "
+                            "sources are configured in Preferences."),
+            )
             return
+        target_label = target_service.label
         for suggestion in suggestions:
-            badges = " · ".join(getattr(suggestion, "sources", []))
-            resolved = getattr(suggestion, "resolved", None)
-            subtitle = f"{suggestion.artist} · {badges} · score {suggestion.score:.2f}"
-            row = Adw.ActionRow(title=suggestion.title, subtitle=subtitle)
-            icon = "emblem-ok-symbolic" if resolved is not None else "dialog-question-symbolic"
-            row.add_suffix(Gtk.Image.new_from_icon_name(icon))
-            self.suggestions_list.append(row)
-        self.create_from_suggestions_button.set_sensitive(True)
+            self.suggestions_list.append(self._build_suggestion_row(suggestion, target_label))
+        resolved_any = any(getattr(s, "resolved", None) is not None for s in suggestions)
+        self.create_from_suggestions_button.set_sensitive(resolved_any)
+        self.suggestions_stack.set_visible_child_name("results")
+
+    def _on_suggestions_error(self, exc: BaseException) -> None:
+        self._suggestions_loading = False
+        self._update_get_suggestions_sensitivity()
+        self.regenerate_button.set_sensitive(bool(self._suggestions))
+        self.state.toast(f"Couldn't get suggestions: {exc}")
+        set_stack_status(self.suggestions_stack, "error", error_status_page(exc, title="Couldn't get suggestions"))
+
+    # -- suggestion rows: humanized subtitle + per-row actions ----------------
+
+    def _build_suggestion_row(self, suggestion: object, target_label: str) -> Adw.ActionRow:
+        resolved: Track | None = getattr(suggestion, "resolved", None)
+        sources = getattr(suggestion, "sources", None) or []
+        subtitle = _format_suggestion_subtitle(suggestion.artist, sources, target_label)
+        row = Adw.ActionRow(title=suggestion.title, subtitle=subtitle)
+
+        if resolved is not None:
+            icon_name, tooltip = "emblem-ok-symbolic", "Matched to a playable track"
+        else:
+            icon_name, tooltip = "dialog-question-symbolic", "Couldn't match to a catalog track — won't be added"
+        icon = Gtk.Image.new_from_icon_name(icon_name)
+        icon.set_tooltip_text(tooltip)
+        row.add_prefix(icon)
+
+        if resolved is not None:
+            play_button = Gtk.Button(icon_name="media-playback-start-symbolic",
+                                      tooltip_text="Play on Device", valign=Gtk.Align.CENTER)
+            play_button.connect("clicked", lambda _b, t=resolved: self._open_device_popover(play_button, t))
+            add_button = Gtk.Button(icon_name="list-add-symbolic",
+                                     tooltip_text="Add to Playlist…", valign=Gtk.Align.CENTER)
+            add_button.connect("clicked", lambda _b, t=resolved: self._open_playlist_popover(add_button, t))
+            row.add_suffix(play_button)
+            row.add_suffix(add_button)
+
+            def build_actions(t: Track = resolved) -> list[tuple[str, Callable[[], None]]]:
+                return [
+                    ("Add to Playlist…", lambda: self._open_playlist_popover(row, t)),
+                    ("Play on Device", lambda: self._open_device_popover(row, t)),
+                ]
+
+            attach_context_menu(row, build_actions)
+        return row
+
+    # -- per-suggestion actions: playlist/device popovers ------------------------
+    #
+    # Small, self-contained duplicates of similar_dialog's
+    # `_open_playlist_popover`/`_open_device_popover` idiom (single-track
+    # variants) rather than a shared import, matching the precedent it set
+    # for itself -- this page only ever acts on one resolved suggestion at a
+    # time too.
+
+    def _open_playlist_popover(self, parent: Gtk.Widget, track: Track) -> None:
+        playlists_by_service = self.state.all_playlists()
+        popover = Gtk.Popover()
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        found = False
+        for service in Service:
+            provider = self.state.providers.get(service)
+            if provider is None:
+                continue
+            for playlist in playlists_by_service.get(service, []):
+                row = Adw.ActionRow(title=playlist.title,
+                                     subtitle=f"{service.label} · {playlist.track_count or 0} tracks")
+                row.set_activatable(True)
+
+                def _pick(_row: Adw.ActionRow, p: Playlist = playlist, pop: Gtk.Popover = popover) -> None:
+                    pop.popdown()
+                    self._add_track_to_playlist(track, p)
+
+                row.connect("activated", _pick)
+                listbox.append(row)
+                found = True
+        if not found:
+            listbox.append(Adw.ActionRow(title="No playlists yet", sensitive=False))
+        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
+                                       propagate_natural_height=True, width_request=280)
+        popover.set_child(scroller)
+        popover.set_parent(parent)
+        popover.connect("closed", lambda p: p.unparent())
+        popover.popup()
+
+    def _add_track_to_playlist(self, track: Track, playlist: Playlist) -> None:
+        provider = self.state.providers.get(playlist.service)
+        if provider is None:
+            self.state.toast(f"No provider configured for {playlist.service.label}")
+            return
+        track_id = track.id
+
+        def work() -> None:
+            provider.add_tracks(playlist.id, [track_id])
+
+        def done(_result: None) -> None:
+            self.state.toast(f"Added “{track.title}” to {playlist.title}")
+            self.state.all_playlists(refresh=True)
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't add track: {exc}"))
+
+    def _open_device_popover(self, parent: Gtk.Widget, track: Track) -> None:
+        devices = self.state.known_devices()
+        popover = Gtk.Popover()
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        if not devices:
+            listbox.append(Adw.ActionRow(title="No devices yet", subtitle="Add one on the Devices page",
+                                          sensitive=False))
+        for info in devices:
+            row = Adw.ActionRow(title=info.name, subtitle=info.host)
+            row.set_activatable(True)
+            row.add_prefix(Gtk.Image.new_from_icon_name("audio-speakers-symbolic"))
+
+            def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name,
+                      pop: Gtk.Popover = popover) -> None:
+                pop.popdown()
+                self._play_track_on_device(track, host, name)
+
+            row.connect("activated", _pick)
+            listbox.append(row)
+        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
+                                       propagate_natural_height=True, width_request=280)
+        popover.set_child(scroller)
+        popover.set_parent(parent)
+        popover.connect("closed", lambda p: p.unparent())
+        popover.popup()
+
+    def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
+        self.state.toast(f"Starting “{track.title}” on {name}…")
+
+        def work() -> None:
+            self.state.play_track_on_device(track, host)
+
+        def done(_result: None) -> None:
+            self.state.toast(f"Playing “{track.title}” on {name}")
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't play on {name}: {exc}"))
+
+    # -- footer: create playlist from resolved suggestions -----------------------
 
     def _on_create_from_suggestions(self, _button: Gtk.Button) -> None:
         resolved = [s.resolved for s in self._suggestions if getattr(s, "resolved", None) is not None]
