@@ -369,3 +369,25 @@ def test_glob_paths_expands_user_and_globs(tmp_path, monkeypatch):
     (profile_dir / "cookies.sqlite").write_bytes(b"")
     found = harmony_setup._glob_paths("~/profile*/cookies.sqlite")
     assert found == [profile_dir / "cookies.sqlite"]
+
+
+# --------------------------------------------------------------------------
+# Temp-copy permissions (a world-readable copy would leak plaintext cookies)
+# --------------------------------------------------------------------------
+
+
+def test_copy_sqlite_to_temp_is_0600_even_from_world_readable_source(tmp_path):
+    import os
+    import stat
+
+    src = tmp_path / "cookies.sqlite"
+    src.write_bytes(b"not-really-sqlite-but-fine-for-a-copy")
+    os.chmod(src, 0o644)  # browsers commonly leave these 0644
+
+    dest = harmony_setup._copy_sqlite_to_temp(src)
+    try:
+        mode = stat.S_IMODE(os.stat(dest).st_mode)
+        # The copy must NOT inherit the source's 0644 — only the owner may read it.
+        assert mode == 0o600, oct(mode)
+    finally:
+        os.unlink(dest)

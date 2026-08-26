@@ -440,10 +440,17 @@ def ensure_ytmusicapi():
 
 
 def _copy_sqlite_to_temp(path: Path) -> str:
-    """Copy a possibly browser-locked sqlite db to a temp file before reading."""
+    """Copy a possibly browser-locked sqlite db to a temp file before reading.
+
+    Uses ``copyfile`` (data only), NOT ``copy2``/``copystat`` — the source
+    cookie/localStorage DBs are often 0644, and copying that mode onto the temp
+    file would undo the 0600 ``mkstemp`` gives it, briefly exposing plaintext
+    session cookies in a world-readable temp dir on a shared host.
+    """
     fd, name = tempfile.mkstemp(suffix=".sqlite")
     os.close(fd)
-    shutil.copy2(path, name)
+    shutil.copyfile(path, name)
+    os.chmod(name, 0o600)  # belt-and-suspenders in case the umask/mkstemp differs
     return name
 
 
@@ -931,6 +938,10 @@ def _ytmusic_oauth_setup(target: Target) -> None:
         seed_secret(target, YTMUSIC_OAUTH_SECRET, client_secret)
     except Exception as exc:  # noqa: BLE001
         print(f"Could not save the client secret ({exc}); settings were not updated.")
+        # Don't leave a refresh-token-bearing oauth.json behind for a sign-in
+        # that never completed; settings don't reference it, so it's just an
+        # orphaned credential at rest.
+        oauth_path.unlink(missing_ok=True)
         return
 
     merge_settings(
