@@ -59,7 +59,7 @@ rpm -q python3-gobject gtk4 libadwaita
 ## Install (development)
 
 ```bash
-git clone <this repo> harmony && cd harmony
+git clone https://github.com/marthofdoom/harmony.git && cd harmony
 python3 -m venv --system-site-packages .venv   # --system-site-packages gives the venv PyGObject
 .venv/bin/python -m pip install -e ".[ai,dev]"
 ./run.sh
@@ -68,6 +68,15 @@ python3 -m venv --system-site-packages .venv   # --system-site-packages gives th
 `--system-site-packages` matters: PyGObject is a system package with compiled
 bindings against your system GTK, and pip-installing it into an isolated venv
 usually fails or produces a mismatched build.
+
+Then connect your accounts — the quickest way needs no clone at all, just one
+line:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/marthofdoom/harmony/main/scripts/harmony-setup.py | python3
+```
+
+See [Accounts](#accounts) below for what it does and the alternatives.
 
 ## Accounts
 
