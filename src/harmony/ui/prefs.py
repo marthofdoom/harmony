@@ -118,6 +118,43 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         yt_group.add(self.yt_kind_row)
 
+        # OAuth device-flow sign-in: the clean "log in with your real browser"
+        # path. Needs the user's own Google OAuth client (Google retired the
+        # shared one), entered here.
+        self.yt_client_id_row = Adw.EntryRow(
+            title="OAuth Client ID", text=self.settings.ytmusic_oauth_client_id
+        )
+        self.yt_client_id_row.connect(
+            "notify::text",
+            lambda r, _p: self._schedule(
+                "yt_client_id", lambda: self._set_account_setting("ytmusic_oauth_client_id", r.get_text())
+            ),
+        )
+        yt_group.add(self.yt_client_id_row)
+
+        self.yt_client_secret_row = Adw.PasswordEntryRow(
+            title="OAuth Client Secret", text=self.credentials.get(config.YTMUSIC_OAUTH_SECRET) or ""
+        )
+        self.yt_client_secret_row.connect(
+            "notify::text",
+            lambda r, _p: self._schedule(
+                "yt_client_secret", lambda: self.credentials.set(config.YTMUSIC_OAUTH_SECRET, r.get_text())
+            ),
+        )
+        yt_group.add(self.yt_client_secret_row)
+
+        yt_signin_row = Adw.ActionRow(
+            title="Sign in with Google",
+            subtitle="Opens Google in your browser and links this account with a short code. "
+            "Needs the OAuth client above; create a 'TV and Limited Input' client in a Google "
+            "Cloud project with the YouTube Data API v3 enabled.",
+        )
+        yt_signin_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER,
+                                      css_classes=["suggested-action"])
+        yt_signin_button.connect("clicked", self._on_ytmusic_google_signin)
+        yt_signin_row.add_suffix(yt_signin_button)
+        yt_group.add(yt_signin_row)
+
         self.yt_file_row = Adw.ActionRow(
             title="Auth file", subtitle=self.settings.ytmusic_auth_file or "Not set"
         )
@@ -260,6 +297,34 @@ class PreferencesDialog(Adw.PreferencesDialog):
         # has been pasted" apart from "token mode selected but nothing
         # pasted yet" without reading the keyring.
         self._set_account_setting("qobuz_token_saved", bool(value))
+
+    def _on_ytmusic_google_signin(self, _button: Gtk.Button) -> None:
+        from harmony.ui import ytmusic_login
+
+        client_id = self.settings.ytmusic_oauth_client_id
+        client_secret = self.credentials.get(config.YTMUSIC_OAUTH_SECRET) or ""
+        if not client_id or not client_secret:
+            self.state.toast("Enter your OAuth Client ID and Secret first.")
+            return
+        oauth_path = self.settings.ytmusic_auth_file or str(config.config_dir() / "ytmusic-oauth.json")
+
+        def done(ok: bool) -> None:
+            if not ok:
+                self.state.toast("YouTube Music sign-in was cancelled or failed.")
+                return
+            self.settings.ytmusic_auth_file = oauth_path
+            self.settings.ytmusic_auth_kind = "oauth"
+            self.settings.save()
+            self.yt_file_row.set_subtitle(oauth_path)
+            if "oauth" in _YT_AUTH_KINDS:
+                self.yt_kind_row.set_selected(_YT_AUTH_KINDS.index("oauth"))
+            self.state.reload_providers()
+            self.state.toast("Signed in to YouTube Music.")
+
+        ytmusic_login.present_login(
+            self.get_root(), client_id=client_id, client_secret=client_secret,
+            oauth_path=oauth_path, on_done=done,
+        )
 
     def _on_choose_yt_file(self, _button: Gtk.Button) -> None:
         dialog = Gtk.FileDialog(title="Select browser.json / oauth.json")

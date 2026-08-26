@@ -50,33 +50,50 @@ except (ValueError, ImportError) as exc:  # pragma: no cover - depends on host
     log.debug("WebKitGTK 6.0 not available; embedded Qobuz login disabled: %s", exc)
 
 
-# JS that walks every localStorage entry, JSON-parses each value, and deep-scans
-# for a ``user_auth_token``. The web player's storage keys are runtime-obfuscated
-# (a computed prefix plus a transform), so keying off a fixed name is unreliable;
-# the token value, however, is always stored inside a JSON blob. Returns the
-# token string, or null when the user hasn't finished signing in yet.
+# Extracts the Qobuz session token from the page's own storage. Verified against
+# the real web player: the token lives in the ``localuser`` localStorage entry,
+# which Qobuz stores as a *double-encoded* JSON string (a JSON string whose value
+# is itself JSON), under a field whose name varies. So this: (1) checks
+# ``localuser`` first, then every other localStorage entry; (2) re-parses string
+# values, catching the double-encoding; (3) matches any field whose name contains
+# "token"/"auth" with a value longer than 20 chars, not a fixed key; (4) falls
+# back to auth-ish cookies. Returns the token, or null before sign-in completes.
 _EXTRACT_TOKEN_JS = """
 (function () {
-  function deepFind(node, depth) {
-    if (node == null || depth > 6) return null;
-    if (typeof node !== 'object') return null;
-    if (typeof node.user_auth_token === 'string' && node.user_auth_token.length > 20) {
-      return node.user_auth_token;
+  function deep(node, depth) {
+    if (node == null || depth > 8) return null;
+    if (typeof node === 'string') {
+      try { return deep(JSON.parse(node), depth + 1); } catch (e) { return null; }
     }
+    if (typeof node !== 'object') return null;
     for (var k in node) {
-      var found = deepFind(node[k], depth + 1);
+      var v = node[k];
+      if (typeof v === 'string' && v.length > 20 && /token|auth/i.test(k)) return v;
+      var found = deep(v, depth + 1);
       if (found) return found;
     }
     return null;
   }
   try {
+    var order = ['localuser'];
     for (var i = 0; i < localStorage.length; i++) {
-      var raw = localStorage.getItem(localStorage.key(i));
-      if (!raw || raw[0] !== '{' && raw[0] !== '[') continue;
-      var parsed;
-      try { parsed = JSON.parse(raw); } catch (e) { continue; }
-      var token = deepFind(parsed, 0);
+      var key = localStorage.key(i);
+      if (order.indexOf(key) < 0) order.push(key);
+    }
+    for (var n = 0; n < order.length; n++) {
+      var raw = localStorage.getItem(order[n]);
+      if (!raw) continue;
+      var val;
+      try { val = JSON.parse(raw); } catch (e) { val = raw; }
+      var token = deep(val, 0);
       if (token) return token;
+    }
+    var cookies = document.cookie.split(';');
+    for (var j = 0; j < cookies.length; j++) {
+      var parts = cookies[j].split('=');
+      var name = (parts[0] || '').trim();
+      var value = (parts.slice(1).join('=') || '').trim();
+      if (/token|auth/i.test(name) && value.length > 20) return decodeURIComponent(value);
     }
   } catch (e) {}
   return null;
