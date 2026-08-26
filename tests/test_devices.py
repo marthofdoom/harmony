@@ -40,6 +40,19 @@ def state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     GObject.Object.__init__(obj)
     obj.settings = config_module.Settings.load()
     obj._device_session = None
+    # Playback model + queue engine state that __init__ would have set up.
+    from harmony.ui.state import PlaybackState
+
+    obj.playback = PlaybackState()
+    obj._now_playing = {}
+    obj._upnp_cache = {}
+    obj._queues = {}
+    obj._queue_prev_state = {}
+    obj._queue_armed = {}
+    obj._queue_poll_ids = {}
+    obj._collection_full = {}
+    obj._collection_key = {}
+    obj._history = {}
     return obj
 
 
@@ -357,6 +370,32 @@ def test_queue_rearms_for_the_next_track(state: AppState) -> None:
     assert state._next_after_status("h", "playing", 5, 200) is None   # re-arm on t2
     assert state._next_after_status("h", "playing", 199, 200) is None  # t2 was last -> clear
     assert "h" not in state._queues
+
+
+def test_queue_advance_records_history(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state._next_after_status("h", "playing", 10, 200)   # arm
+    state._next_after_status("h", "playing", 199, 200)  # advance t1 -> t2
+    assert [t.id for t in state._history["h"]] == ["t1"]  # finished track remembered for "previous"
+
+
+def test_repeat_one_replays_current_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state.playback.repeat = "one"
+    state._next_after_status("h", "playing", 10, 200)          # arm
+    nxt = state._next_after_status("h", "playing", 199, 200)   # near end
+    assert nxt is not None and nxt.id == "t1"                  # same track again
+    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]  # queue untouched
+
+
+def test_repeat_all_refills_after_last_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1)])
+    state._collection_full = {"h": [_track_n(1), _track_n(2)]}
+    state.playback.repeat = "all"
+    state._next_after_status("h", "playing", 10, 200)          # arm
+    nxt = state._next_after_status("h", "playing", 199, 200)   # last track ends -> wrap
+    assert nxt is not None and nxt.id == "t1"
+    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]  # refilled from the collection
 
 
 def test_queue_does_not_advance_while_mid_track(state: AppState) -> None:

@@ -43,6 +43,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.13" date="2026-08-26">
+      <description>
+        <p>Adds a persistent Now Playing bar along the bottom of the window:
+        album art, title/artist, play-pause, previous/next, a draggable seek
+        bar, a volume slider (for devices that support it), shuffle and repeat,
+        and a device selector. Playback state is now centralized app-wide, so
+        the bar reflects and controls whatever is playing to a device.</p>
+      </description>
+    </release>
     <release version="0.5.12" date="2026-08-26">
       <description>
         <p>Route Audio (ROC) now rides through brief Wi-Fi stalls instead of

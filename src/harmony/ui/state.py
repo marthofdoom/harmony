@@ -11,7 +11,9 @@ parallel development (see docs/ARCHITECTURE.md).
 from __future__ import annotations
 
 import logging
+import random
 import time
+from dataclasses import dataclass
 from typing import Any
 
 import gi
@@ -24,6 +26,40 @@ from gi.repository import GLib, GObject  # noqa: E402
 from harmony.config import CredentialStore, Settings  # noqa: E402
 from harmony.models import Playlist, Service  # noqa: E402
 from harmony.tasks import on_main, run_async  # noqa: E402
+
+
+@dataclass
+class PlaybackState:
+    """App-wide 'what's playing right now' model, driven to the Now Playing bar
+    and the on-screen now-playing indicators via the ``playback-changed`` signal.
+
+    One active playback device at a time (``active_host``). ``track`` is the
+    current track object; ``collection_key`` is the ``(service, id)`` of the
+    album/playlist it came from, or ``None`` for a single track. Positions are
+    in seconds. ``repeat`` is ``"off" | "all" | "one"``.
+    """
+
+    active_host: str | None = None
+    track: Any | None = None
+    collection_key: tuple[Service, str] | None = None
+    state: str = "stopped"  # playing | paused | stopped | unknown
+    position_s: int | None = None
+    duration_s: int | None = None
+    volume: int | None = None
+    volume_supported: bool = False
+    shuffle: bool = False
+    repeat: str = "off"
+    has_prev: bool = False
+    has_next: bool = False
+
+    def track_key(self) -> tuple[Service, str] | None:
+        """``(service, id)`` of the current track, for row-indicator matching."""
+        if self.track is None:
+            return None
+        return (self.track.service, self.track.id)
+
+    def is_active(self) -> bool:
+        return self.track is not None and self.state in ("playing", "paused")
 
 # How often the queue poller checks a device for a track ending, in seconds.
 _QUEUE_POLL_S = 3
@@ -49,6 +85,11 @@ class AppState(GObject.Object):
         # The known-devices list (add/remove/rename) changed; devices_page
         # rebuilds its list from ``known_devices()`` in response.
         "devices-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # The app-wide playback model (self.playback) changed: current track,
+        # transport state, position/duration/volume, shuffle/repeat, or the
+        # active device. The Now Playing bar and every on-screen now-playing
+        # indicator subscribe to this.
+        "playback-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "toast": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
@@ -96,6 +137,14 @@ class AppState(GObject.Object):
         # single near-end reading advances exactly once (not every poll near the
         # end). Re-armed when the next track is seen mid-play.
         self._queue_armed: dict[str, bool] = {}
+        # Per-host play context for the media-player UI: the full track order a
+        # queue was built from (for repeat + shuffle), which collection it came
+        # from, and the tracks already played (so "previous" can go back).
+        self._collection_full: dict[str, list[Any]] = {}
+        self._collection_key: dict[str, tuple[Service, str] | None] = {}
+        self._history: dict[str, list[Any]] = {}
+        # The one app-wide playback model the Now Playing bar reflects/controls.
+        self.playback = PlaybackState()
 
         self.reload_providers()
         self._init_recommender()
@@ -503,22 +552,39 @@ class AppState(GObject.Object):
         queue-teardown is marshalled to the main loop, where its poller lives).
         """
         on_main(self._stop_queue, device_host)
+        self._collection_key[device_host] = None
+        self._history[device_host] = []
+        self.playback.active_host = device_host
         self._play_one(track, device_host)
+        on_main(self._start_queue_poller, device_host)
 
-    def play_tracks_on_device(self, tracks: list[Any], device_host: str) -> None:
+    def play_tracks_on_device(
+        self,
+        tracks: list[Any],
+        device_host: str,
+        collection_key: tuple[Service, str] | None = None,
+    ) -> None:
         """Play a sequence of tracks (an album/artist/playlist) on a device.
 
         Blocking — MUST run on a worker thread (it plays the first track). The
         rest are advanced by a main-loop poller that watches for each track to
         finish. Replaces any existing queue on that device; an empty list is a
-        no-op.
+        no-op. ``collection_key`` is the album/playlist's ``(service, id)`` so
+        on-screen indicators can light up the source collection.
         """
         tracks = list(tracks)
         if not tracks:
             return
-        self._queues[device_host] = tracks
+        order = list(tracks)
+        if self.playback.shuffle:
+            random.shuffle(order)
+        self._collection_full[device_host] = list(tracks)
+        self._collection_key[device_host] = collection_key
+        self._history[device_host] = []
+        self._queues[device_host] = order
         self._queue_prev_state[device_host] = ""
-        self._play_one(tracks[0], device_host)
+        self.playback.active_host = device_host
+        self._play_one(order[0], device_host)
         on_main(self._start_queue_poller, device_host)
 
     def _start_queue_poller(self, host: str) -> None:
@@ -566,31 +632,106 @@ class AppState(GObject.Object):
             ended = True  # no progress info -> fall back to the state edge
 
         if ended:
-            queue.pop(0)
+            repeat = self.playback.repeat
+            if repeat == "one":
+                return queue[0]  # replay the current track, don't advance
+            finished = queue.pop(0)
+            self._history.setdefault(host, []).append(finished)
             if queue:
                 return queue[0]
+            if repeat == "all" and self._collection_full.get(host):
+                refilled = list(self._collection_full[host])
+                if self.playback.shuffle:
+                    random.shuffle(refilled)
+                self._queues[host] = refilled
+                return refilled[0]
             self._stop_queue(host)
         return None
 
     def _poll_queue(self, host: str) -> bool:
-        if host not in self._queues:
+        # Poll while this host has a queue OR is the active single-track
+        # playback (so the Now Playing seek bar advances for single tracks too).
+        active = self.playback.active_host == host
+        if host not in self._queues and not active:
             self._queue_poll_ids.pop(host, None)
             return GLib.SOURCE_REMOVE
         device = self.device_for(host)
 
         def done(status: Any) -> None:
-            next_track = self._next_after_status(
-                host, status.state or "", status.position_s, status.duration_s
-            )
-            if next_track is not None:
-                run_async(
-                    lambda: self._play_one(next_track, host),
-                    None,
-                    lambda exc: log.warning("Queue advance on %s failed: %s", host, exc),
+            self._sync_status_to_playback(host, status)
+            if host in self._queues:
+                next_track = self._next_after_status(
+                    host, status.state or "", status.position_s, status.duration_s
                 )
+                if next_track is not None:
+                    if self.playback.track is not None and next_track is not self.playback.track:
+                        self._history.setdefault(host, []).append(self.playback.track)
+                    run_async(
+                        lambda: self._play_one(next_track, host),
+                        None,
+                        lambda exc: log.warning("Queue advance on %s failed: %s", host, exc),
+                    )
+            elif active and (status.state or "") == "stopped":
+                # A single track finished with nothing queued behind it.
+                self._end_playback(host)
 
         run_async(device.status, done, lambda _exc: None)  # transient poll errors ignored
         return GLib.SOURCE_CONTINUE
+
+    # -- app-wide playback model (Now Playing bar / indicators) -------------
+
+    def _emit_playback(self) -> None:
+        """Emit ``playback-changed`` on the main loop (safe from any thread)."""
+        on_main(self.emit, "playback-changed")
+
+    def _mark_now_playing(self, host: str, track: Any) -> None:
+        """Record ``track`` as now playing on ``host`` and update the model.
+
+        Runs on the worker thread that played the track; only touches in-memory
+        state and marshals the signal to the main loop.
+        """
+        self._now_playing[host] = (track.title, track.artist_name)
+        pb = self.playback
+        pb.active_host = host
+        pb.track = track
+        pb.collection_key = self._collection_key.get(host)
+        pb.state = "playing"
+        pb.position_s = 0
+        pb.duration_s = getattr(track, "duration_s", None)
+        pb.has_prev = bool(self._history.get(host))
+        pb.has_next = bool(self._queues.get(host)) or pb.repeat != "off"
+        self._emit_playback()
+
+    def _sync_status_to_playback(self, host: str, status: Any) -> None:
+        """Fold a device status poll into the model (main loop; active host only)."""
+        if self.playback.active_host != host:
+            return
+        pb = self.playback
+        pb.state = status.state or pb.state
+        if status.position_s is not None:
+            pb.position_s = status.position_s
+        if status.duration_s is not None:
+            pb.duration_s = status.duration_s
+        pb.volume = status.volume
+        pb.volume_supported = status.volume is not None
+        pb.has_prev = bool(self._history.get(host))
+        pb.has_next = bool(self._queues.get(host)) or pb.repeat != "off"
+        self.emit("playback-changed")
+
+    def _end_playback(self, host: str) -> None:
+        """The active playback stopped with nothing left: reset the model."""
+        self._stop_queue(host)
+        if self.playback.active_host == host:
+            self.playback.state = "stopped"
+            self.playback.track = None
+            self.playback.collection_key = None
+            self.playback.has_prev = False
+            self.playback.has_next = False
+            self.emit("playback-changed")
+
+    def _active_device(self) -> Any | None:
+        host = self.playback.active_host
+        return self.device_for(host) if host else None
 
     def _play_one(self, track: Any, device_host: str) -> None:
         """Resolve ``track``'s stream, register it with the relay, and play it (queue-agnostic).
@@ -635,7 +776,7 @@ class AppState(GObject.Object):
                     duration_s=getattr(track, "duration_s", None),
                     mime=source.mime_type or "audio/mpeg",
                 )
-                self._now_playing[device_host] = (track.title, track.artist_name)
+                self._mark_now_playing(device_host, track)
                 return
             except Exception as exc:  # noqa: BLE001 - any UPnP failure -> httpapi fallback
                 log.warning("UPnP play to %s failed (%s); falling back to httpapi", device_host, exc)
@@ -643,7 +784,7 @@ class AppState(GObject.Object):
         token = relay.register(resolver, title=track.title, artist=track.artist_name)
         url = relay.url_for(token, device_host)
         self.device_for(device_host).play_url(url)
-        self._now_playing[device_host] = (track.title, track.artist_name)
+        self._mark_now_playing(device_host, track)
 
     def _upnp_renderer_for(self, host: str) -> Any:
         """Return a cached ``UpnpRenderer`` for ``host``, or None if it has no AVTransport.
@@ -677,6 +818,115 @@ class AppState(GObject.Object):
         if host is None:
             return None
         return self._now_playing.get(host)
+
+    # -- transport (called from the Now Playing bar, main loop) --------------
+
+    def playback_toggle_pause(self) -> None:
+        """Pause if playing, resume if paused/stopped, on the active device."""
+        host = self.playback.active_host
+        if not host:
+            return
+        device = self.device_for(host)
+        pausing = self.playback.state == "playing"
+        self.playback.state = "paused" if pausing else "playing"
+        self.emit("playback-changed")
+        action = device.pause if pausing else device.resume
+        run_async(action, None, lambda exc: self.toast(f"Playback control failed: {exc}"))
+
+    def playback_next(self) -> None:
+        """Skip to the next queued track (wraps if repeat is on)."""
+        host = self.playback.active_host
+        queue = self._queues.get(host) if host else None
+        if not host or not queue:
+            return
+        if self.playback.track is not None:
+            self._history.setdefault(host, []).append(self.playback.track)
+        queue.pop(0)
+        if not queue:
+            if self.playback.repeat != "off" and self._collection_full.get(host):
+                refilled = list(self._collection_full[host])
+                if self.playback.shuffle:
+                    random.shuffle(refilled)
+                self._queues[host] = queue = refilled
+            else:
+                self._end_playback(host)
+                return
+        self._queue_armed[host] = False
+        nxt = queue[0]
+        run_async(lambda: self._play_one(nxt, host), None,
+                  lambda exc: self.toast(f"Skip failed: {exc}"))
+
+    def playback_previous(self) -> None:
+        """Go back to the previously played track (no-op if none)."""
+        host = self.playback.active_host
+        history = self._history.get(host) if host else None
+        if not host or not history:
+            return
+        prev = history.pop()
+        self._queues.setdefault(host, []).insert(0, prev)  # prev becomes the current front
+        self._queue_armed[host] = False
+        run_async(lambda: self._play_one(prev, host), None,
+                  lambda exc: self.toast(f"Previous failed: {exc}"))
+
+    def playback_seek(self, position_s: int) -> None:
+        """Seek the active device to ``position_s`` (UPnP only; toasts otherwise)."""
+        host = self.playback.active_host
+        if not host:
+            return
+        self.playback.position_s = int(position_s)
+        self.emit("playback-changed")
+
+        def work() -> None:
+            renderer = self._upnp_renderer_for(host)
+            if renderer is None:
+                raise RuntimeError("this device doesn't support seeking")
+            renderer.seek(int(position_s))
+
+        run_async(work, None, lambda exc: self.toast(f"Seek failed: {exc}"))
+
+    def playback_set_volume(self, level: int) -> None:
+        """Set the active device's volume (0..100)."""
+        host = self.playback.active_host
+        if not host:
+            return
+        level = max(0, min(100, int(level)))
+        self.playback.volume = level
+        device = self.device_for(host)
+        run_async(lambda: device.set_volume(level), None,
+                  lambda exc: self.toast(f"Volume failed: {exc}"))
+
+    def playback_set_active_device(self, host: str) -> None:
+        """Point the Now Playing bar at ``host`` (the active playback device)."""
+        if not host or self.playback.active_host == host:
+            return
+        self.playback.active_host = host
+        np = self._now_playing.get(host)
+        if np is None:
+            self.playback.track = None
+            self.playback.state = "stopped"
+        self.emit("playback-changed")
+        self._start_queue_poller(host)
+
+    def playback_set_shuffle(self, on: bool) -> None:
+        """Toggle shuffle; reshuffles the remaining queue when turned on."""
+        self.playback.shuffle = bool(on)
+        host = self.playback.active_host
+        if on and host and self._queues.get(host):
+            queue = self._queues[host]
+            head, rest = queue[0], queue[1:]
+            random.shuffle(rest)
+            self._queues[host] = [head, *rest]  # keep the current track playing
+        self.emit("playback-changed")
+
+    def playback_set_repeat(self, mode: str) -> None:
+        """Set repeat mode: ``"off" | "all" | "one"``."""
+        if mode not in ("off", "all", "one"):
+            return
+        self.playback.repeat = mode
+        host = self.playback.active_host
+        if host:
+            self.playback.has_next = bool(self._queues.get(host)) or mode != "off"
+        self.emit("playback-changed")
 
     def toast(self, text: str) -> None:
         """Emit a toast. Must be called from the main thread."""

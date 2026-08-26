@@ -9,7 +9,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gio, Gtk  # noqa: E402
+from gi.repository import Adw, Gio, GObject, Gtk  # noqa: E402
 
 from harmony.models import Service  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
@@ -45,8 +45,23 @@ class HarmonyWindow(Adw.ApplicationWindow):
         self.split_view = Adw.NavigationSplitView(min_sidebar_width=220, max_sidebar_width=320)
         self.split_view.set_sidebar(self._build_sidebar())
         self.split_view.set_content(self._build_content())
+        self.split_view.set_vexpand(True)
 
-        self.toast_overlay = Adw.ToastOverlay(child=self.split_view)
+        # The split view fills the window; the Now Playing bar spans the full
+        # width beneath it (across every page).
+        from harmony.ui.now_playing_bar import NowPlayingBar
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        outer.append(self.split_view)
+        self.now_playing_bar = NowPlayingBar(self.state)
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        self.now_playing_bar.bind_property(
+            "visible", separator, "visible", GObject.BindingFlags.SYNC_CREATE
+        )
+        outer.append(separator)
+        outer.append(self.now_playing_bar)
+
+        self.toast_overlay = Adw.ToastOverlay(child=outer)
         self.set_content(self.toast_overlay)
 
         focus_action = Gio.SimpleAction.new("focus-search", None)

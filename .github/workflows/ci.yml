@@ -141,6 +141,7 @@ jobs:
               "harmony.ui.sync_page",
               "harmony.ui.discover_page",
               "harmony.ui.audio_route_page",
+              "harmony.ui.now_playing_bar",
               "harmony.ui.prefs",
               "harmony.app",
               "harmony.__main__",
