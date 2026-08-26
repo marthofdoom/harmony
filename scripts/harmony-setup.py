@@ -328,7 +328,7 @@ def ensure_keyring_for_target(target: Target) -> bool:
     print("\nSaving a secret for a source install needs the 'keyring' package, which isn't installed.")
     if offer_venv_bootstrap(["keyring", "secretstorage"]):
         return False  # unreachable: the process is replaced on success
-    print("Install it yourself (`pip install --user keyring`) and re-run this script.\n")
+    print("Install them yourself (`pip install keyring secretstorage`) and re-run this script.\n")
     return False
 
 
@@ -391,17 +391,81 @@ def _reexec_in_venv() -> None:
         print("Continuing without the optional packages.")
 
 
-def offer_venv_bootstrap(packages: list[str]) -> bool:
-    """Ask to build a throwaway venv with ``packages`` and re-exec into it.
+def _in_virtualenv() -> bool:
+    """True when running inside a venv/virtualenv (an isolated interpreter)."""
+    return sys.prefix != getattr(sys, "base_prefix", sys.prefix)
 
-    Returns True only in the (unreachable-in-practice) case ``os.execv``
-    somehow returns; callers should treat a True return as "the process is
-    being replaced" and simply stop what they were doing.
+
+def _reexec_current_python() -> None:
+    """Restart the script under the *current* interpreter after an in-place install.
+
+    A module that already failed to import earlier in this process can't be
+    retried in place, so once we've pip-installed into the current environment
+    we re-exec to get a clean import. Mirrors ``_reexec_in_venv`` but keeps the
+    same interpreter instead of switching to the throwaway venv's.
     """
+    python = sys.executable
+    src = _self_source_path()
+    if src is not None:
+        os.execv(python, [python, str(src), *sys.argv[1:]])
+        return  # pragma: no cover - execv never returns on success
     try:
-        ans = input(
-            f"Create a throwaway virtual environment and install {', '.join(packages)} now? [y/N] "
-        ).strip().lower()
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cached = CACHE_DIR / "harmony-setup.py"
+        with urllib.request.urlopen(RAW_URL, timeout=20) as resp:  # noqa: S310 - fixed https URL
+            cached.write_bytes(resp.read())
+        os.execv(python, [python, str(cached), *sys.argv[1:]])
+    except Exception as exc:  # noqa: BLE001 - re-exec is best-effort
+        print(f"Installed the packages, but couldn't relaunch automatically: {exc}")
+        print("Re-run the script and it'll pick them up.")
+        raise SystemExit(0) from None
+
+
+def offer_venv_bootstrap(packages: list[str]) -> bool:
+    """Offer to install missing ``packages`` and re-exec with them available.
+
+    When already inside a virtualenv, installs straight into it with pip -- the
+    right move when the user launched us from their own venv (the reported case
+    where the old throwaway-venv-only path offered "no actual solution").
+    Otherwise builds a throwaway venv under the cache dir and re-execs into it.
+
+    Returns True only when the process is being replaced (via ``os.execv``);
+    callers treat a True return as "stop what you were doing".
+    """
+    if _in_virtualenv():
+        return _install_into_current_env(packages)
+    return _bootstrap_throwaway_venv(packages)
+
+
+def _install_into_current_env(packages: list[str]) -> bool:
+    try:
+        ans = (
+            input(f"Install {', '.join(packages)} into this environment ({sys.prefix}) now? [Y/n] ")
+            .strip()
+            .lower()
+        )
+    except EOFError:
+        ans = "n"
+    if ans in ("n", "no"):
+        print(f"Install them yourself:  pip install {' '.join(packages)}\n")
+        return False
+    try:
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", *packages], check=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Could not install into the current environment: {exc}")
+        print(f"Install them yourself:  pip install {' '.join(packages)}\n")
+        return False
+    _reexec_current_python()
+    return True
+
+
+def _bootstrap_throwaway_venv(packages: list[str]) -> bool:
+    try:
+        ans = (
+            input(f"Create a throwaway virtual environment and install {', '.join(packages)} now? [y/N] ")
+            .strip()
+            .lower()
+        )
     except EOFError:
         ans = "n"
     if ans not in ("y", "yes"):
@@ -428,8 +492,8 @@ def ensure_ytmusicapi():
     if offer_venv_bootstrap(["ytmusicapi", "requests"]):
         return None  # unreachable: the process is replaced on success
     print(
-        "Install it yourself (`pip install --user ytmusicapi`) and re-run this script, "
-        "or run `uv run harmony-setup.py` which installs it automatically.\n"
+        "Install them yourself (`pip install ytmusicapi requests`) and re-run this script, "
+        "or run `uv run harmony-setup.py` which installs everything automatically.\n"
     )
     return None
 
@@ -618,10 +682,12 @@ def discover_browser_sessions() -> list[BrowserCandidate]:
         chrome_found = any(_glob_paths(pattern) for _, pattern in CHROME_COOKIE_SOURCES)
         if chrome_found:
             print(
-                "Note: found Chrome/Chromium profiles but the 'cryptography' package "
-                "isn't installed, so they can't be decrypted right now. Install it "
-                "(or accept the venv-bootstrap prompt) to include them."
+                "\nFound Chrome/Chromium profiles, but decrypting their cookies needs "
+                "the 'cryptography' package, which isn't installed."
             )
+            if offer_venv_bootstrap(["cryptography"]):
+                return out  # unreachable: the process is replaced on success
+            print("Install it (`pip install cryptography`) and re-run to include Chrome.\n")
     return out
 
 

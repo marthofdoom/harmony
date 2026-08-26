@@ -437,3 +437,36 @@ def test_reattach_tty_stdin_exits_cleanly_without_a_terminal(monkeypatch):
     monkeypatch.setattr("builtins.open", _no_tty)
     with pytest.raises(SystemExit):
         harmony_setup.reattach_tty_stdin()
+
+
+# --------------------------------------------------------------------------
+# Dependency bootstrap: install into the CURRENT venv, not only a throwaway one
+# --------------------------------------------------------------------------
+
+
+def test_offer_venv_bootstrap_installs_into_current_env_when_in_a_venv(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(harmony_setup, "_in_virtualenv", lambda: True)
+    monkeypatch.setattr(harmony_setup, "_install_into_current_env", lambda pkgs: calls.setdefault("current", pkgs) or True)
+    monkeypatch.setattr(harmony_setup, "_bootstrap_throwaway_venv", lambda pkgs: calls.setdefault("throwaway", pkgs) or True)
+    harmony_setup.offer_venv_bootstrap(["cryptography"])
+    assert calls == {"current": ["cryptography"]}  # current env used, throwaway untouched
+
+
+def test_offer_venv_bootstrap_builds_throwaway_venv_when_not_in_a_venv(monkeypatch):
+    calls = {}
+    monkeypatch.setattr(harmony_setup, "_in_virtualenv", lambda: False)
+    monkeypatch.setattr(harmony_setup, "_install_into_current_env", lambda pkgs: calls.setdefault("current", pkgs) or True)
+    monkeypatch.setattr(harmony_setup, "_bootstrap_throwaway_venv", lambda pkgs: calls.setdefault("throwaway", pkgs) or True)
+    harmony_setup.offer_venv_bootstrap(["ytmusicapi"])
+    assert calls == {"throwaway": ["ytmusicapi"]}
+
+
+def test_install_into_current_env_declined_prints_command_and_returns_false(monkeypatch, capsys):
+    monkeypatch.setattr("builtins.input", lambda *_a: "n")
+    ran = {"pip": False}
+    monkeypatch.setattr(harmony_setup.subprocess, "run", lambda *a, **k: ran.__setitem__("pip", True))
+    result = harmony_setup._install_into_current_env(["cryptography", "keyring"])
+    assert result is False
+    assert ran["pip"] is False  # declining must not shell out
+    assert "pip install cryptography keyring" in capsys.readouterr().out
