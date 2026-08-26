@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.7" date="2026-08-26">
+      <description>
+        <p>Playlists can now export to and import from a plain, human-readable
+        text list (one "Artist - Title" per line, with the track's universal
+        ISRC id appended where known so it re-resolves exactly).</p>
+      </description>
+    </release>
     <release version="0.5.6" date="2026-08-26">
       <description>
         <p>Album/playlist queue playback now advances to the next track based on

@@ -38,7 +38,7 @@ from harmony.ui.widgets import (  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-_SUPPORTED_FORMATS = ["m3u", "csv", "json"]
+_SUPPORTED_FORMATS = ["m3u", "csv", "json", "txt"]
 
 
 @dataclass
@@ -419,6 +419,8 @@ class PlaylistsPage(Gtk.Box):
                 io_formats.export_m3u(tracks, path)
             elif suffix == "csv":
                 io_formats.export_csv(tracks, path)
+            elif suffix == "txt":
+                io_formats.export_txt(tracks, path)
             else:
                 io_formats.export_json(playlist, tracks, path)
 
@@ -454,7 +456,7 @@ class PlaylistsPage(Gtk.Box):
             from harmony import io_formats
 
             importer = {"m3u": io_formats.import_m3u, "csv": io_formats.import_csv,
-                        "json": io_formats.import_json}[suffix]
+                        "json": io_formats.import_json, "txt": io_formats.import_txt}[suffix]
             # Importers only ever hand back loose descriptor dicts (no stable
             # cross-service id survives an M3U/CSV/JSON round trip) — they must
             # be re-resolved against the target provider's real catalog via

@@ -303,3 +303,43 @@ def test_full_round_trip_export_import_resolve(tmp_path: Path) -> None:
     assert all(r.best is not None for r in results)
     resolved_ids = {r.best.track.id for r in results}
     assert resolved_ids == {"q1", "q2"}
+
+
+# -- plain text song list (human-readable, optional ISRC) --------------------
+
+
+def test_txt_round_trip_with_isrc(tmp_path):
+    tracks = [
+        Track(id="1", title="Roygbiv", service=Service.YTMUSIC, artists=["Boards of Canada"], isrc="GBAYE0000123"),
+        Track(id="2", title="No Code Song", service=Service.YTMUSIC, artists=["Someone"]),
+    ]
+    path = tmp_path / "list.txt"
+    io_formats.export_txt(tracks, path)
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "Boards of Canada - Roygbiv\tGBAYE0000123"
+    assert lines[1] == "Someone - No Code Song"  # no ISRC -> just the name
+
+    descriptors, warnings = io_formats.import_txt(path)
+    assert warnings == []
+    assert descriptors[0] == {"title": "Roygbiv", "artists": ["Boards of Canada"], "album": None,
+                              "duration_s": None, "isrc": "GBAYE0000123"}
+    assert descriptors[1] == {"title": "No Code Song", "artists": ["Someone"], "album": None,
+                              "duration_s": None, "isrc": None}
+
+
+def test_txt_export_without_isrc_is_pure_names(tmp_path):
+    tracks = [Track(id="1", title="T", service=Service.QOBUZ, artists=["A"], isrc="USRC17607839")]
+    path = tmp_path / "l.txt"
+    io_formats.export_txt(tracks, path, with_isrc=False)
+    assert path.read_text(encoding="utf-8").strip() == "A - T"
+
+
+def test_txt_import_skips_comments_blanks_and_accepts_bare_title(tmp_path):
+    path = tmp_path / "l.txt"
+    path.write_text("# my mix\n\nArtist - Title\nJustATitle\n   \n", encoding="utf-8")
+    descriptors, warnings = io_formats.import_txt(path)
+    assert warnings == []
+    assert [d["title"] for d in descriptors] == ["Title", "JustATitle"]
+    assert descriptors[0]["artists"] == ["Artist"]
+    assert descriptors[1]["artists"] == []  # bare title -> no artist, still importable

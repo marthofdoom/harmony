@@ -13,6 +13,7 @@ from __future__ import annotations
 import csv
 import json
 import logging
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -146,6 +147,30 @@ def export_json(playlist: Playlist, tracks: Sequence[Track], path: str | Path) -
     Path(path).write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+# An ISRC is 2 letters + 3 alphanumerics + 7 digits (e.g. USRC17607839). Used
+# to recognise an optional trailing universal id on a text-list line.
+_ISRC_RE = re.compile(r"^[A-Za-z]{2}[A-Za-z0-9]{3}\d{7}$")
+
+
+def export_txt(tracks: Sequence[Track], path: str | Path, *, with_isrc: bool = True) -> None:
+    """Write a plain, human-readable song list: one ``Artist - Title`` per line.
+
+    The simplest possible interchange format — readable, greppable, pasteable
+    anywhere. When ``with_isrc`` and a track carries an ISRC (the universal
+    recording id), it's appended after a tab so the list still round-trips
+    exactly; a track without one is just its ``Artist - Title``. ``import_txt``
+    reads both shapes back.
+    """
+    lines = []
+    for track in tracks:
+        name = f"{track.artist_name} - {track.title}" if track.artist_name else track.title
+        if with_isrc and track.isrc:
+            lines.append(f"{name}\t{track.isrc}")
+        else:
+            lines.append(name)
+    Path(path).write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 # --------------------------------------------------------------------------
 # Import — loose descriptors, malformed rows are skipped with a warning
 # --------------------------------------------------------------------------
@@ -228,6 +253,44 @@ def _row_to_descriptor(row: dict[str, str | None]) -> TrackDescriptor:
         "duration_s": duration_s,
         "isrc": (row.get("isrc") or "").strip() or None,
     }
+
+
+def import_txt(path: str | Path) -> tuple[list[TrackDescriptor], list[str]]:
+    """Parse a plain song list (``Artist - Title`` per line, optional tab + ISRC).
+
+    Blank lines and ``#`` comment lines are ignored, so a hand-annotated list
+    still imports. A line with no ``" - "`` is treated as a bare title (no
+    artist) rather than dropped — the matcher can still resolve it.
+    """
+    descriptors: list[TrackDescriptor] = []
+    warnings: list[str] = []
+    text = Path(path).read_text(encoding="utf-8")
+    for lineno, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        isrc: str | None = None
+        name = line
+        if "\t" in line:
+            name_part, _, tail = line.rpartition("\t")
+            tail = tail.strip()
+            if _ISRC_RE.match(tail):
+                isrc = tail.upper()
+                name = name_part.strip()
+        artist, sep, title = name.partition(" - ")
+        if sep:
+            artists = [artist.strip()] if artist.strip() else []
+            title = title.strip()
+        else:
+            artists = []
+            title = name.strip()  # no separator -> the whole line is the title
+        if not title:
+            warnings.append(f"line {lineno}: empty title, skipped")
+            continue
+        descriptors.append(
+            {"title": title, "artists": artists, "album": None, "duration_s": None, "isrc": isrc}
+        )
+    return descriptors, warnings
 
 
 def import_json(path: str | Path) -> tuple[list[TrackDescriptor], list[str]]:

@@ -33,7 +33,9 @@ matching, and recommendation tooling.
 - **Match cache** — once you resolve a track across services, the link is
   remembered, so repeat syncs are fast and stable.
 - **Snapshots** — every sync writes a before-state snapshot you can inspect or
-  restore, and playlists export to M3U / CSV / JSON.
+  restore, and playlists export to and import from M3U / CSV / JSON, or a plain
+  human-readable text list (`Artist - Title` per line, with the ISRC appended
+  where known so it re-resolves exactly). The format is chosen by file extension.
 - **Discovery** — similar artists and tracks blended from Last.fm,
   ListenBrainz/MusicBrainz, and each service's own recommendations.
 - **Natural-language playlist building** (optional) — describe a playlist and
