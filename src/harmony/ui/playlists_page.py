@@ -193,7 +193,7 @@ class PlaylistsPage(Gtk.Box):
             "empty",
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
-            on_row_menu=self._track_row_actions
+            on_row_menu=self._track_row_actions, state=self.state
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")

@@ -74,7 +74,13 @@ def attach_context_menu(
 
 
 class TrackObject(GObject.Object):
-    """Wraps a :class:`~harmony.models.Track` for use in a ``Gio.ListStore``."""
+    """Wraps a :class:`~harmony.models.Track` for use in a ``Gio.ListStore``.
+
+    ``is_playing`` is a bindable property so a now-playing indicator cell updates
+    itself via ``notify::is-playing`` when the app-wide playback model changes.
+    """
+
+    is_playing = GObject.Property(type=bool, default=False)
 
     def __init__(self, track: Track) -> None:
         super().__init__()
@@ -148,8 +154,46 @@ def _label_factory(
     return factory
 
 
+def _indicator_factory() -> Gtk.SignalListItemFactory:
+    """A leading cell showing a play glyph only for the currently-playing row."""
+    factory = Gtk.SignalListItemFactory()
+
+    def setup(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+        icon = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
+        icon.add_css_class("accent")
+        icon.set_visible(False)
+        item.set_child(icon)
+
+    def bind(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+        icon = item.get_child()
+        obj = item.get_item()
+        if not isinstance(obj, TrackObject):
+            return
+
+        def update(*_a: object) -> None:
+            icon.set_visible(bool(obj.is_playing))
+
+        update()
+        item._np_obj = obj
+        item._np_handler = obj.connect("notify::is-playing", update)
+
+    def unbind(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
+        handler = getattr(item, "_np_handler", None)
+        obj = getattr(item, "_np_obj", None)
+        if handler and obj is not None:
+            obj.disconnect(handler)
+        item._np_handler = None
+        item._np_obj = None
+
+    factory.connect("setup", setup)
+    factory.connect("bind", bind)
+    factory.connect("unbind", unbind)
+    return factory
+
+
 def build_track_column_view(
     on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None = None,
+    state: object | None = None,
 ) -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
     """Build a multi-select ``Gtk.ColumnView`` for track lists.
 
@@ -163,17 +207,40 @@ def build_track_column_view(
     selection -- a ``Gtk.ColumnView`` has no single per-row widget (each
     column binds its own cell), so the gesture is attached to every column's
     cell; whichever cell was clicked resolves its own row's track.
+
+    ``state``, if given (an ``AppState``), adds a leading now-playing indicator
+    column: whenever the app-wide playback model changes, the row whose track
+    matches the currently-playing track lights up. The view subscribes to
+    ``playback-changed`` and to its own store's changes, so newly-loaded results
+    also reflect what's playing.
     """
     store = Gio.ListStore(item_type=TrackObject)
     selection = Gtk.MultiSelection(model=store)
     column_view = Gtk.ColumnView(model=selection)
     column_view.add_css_class("data-table")
     column_view.set_show_row_separators(True)
+    if state is not None:
+        indicator = Gtk.ColumnViewColumn(title="", factory=_indicator_factory())
+        indicator.set_fixed_width(28)
+        column_view.append_column(indicator)
+        _wire_now_playing_indicator(store, state)
     for title, getter, expand in _TRACK_COLUMNS:
         column = Gtk.ColumnViewColumn(title=title, factory=_label_factory(getter, on_row_menu))
         column.set_expand(expand)
         column_view.append_column(column)
     return column_view, store, selection
+
+
+def _wire_now_playing_indicator(store: Gio.ListStore, state: object) -> None:
+    """Keep each ``TrackObject.is_playing`` in sync with ``state.playback``."""
+    def refresh(*_a: object) -> None:
+        key = state.playback.track_key()
+        for i in range(store.get_n_items()):
+            obj = store.get_item(i)
+            obj.is_playing = key is not None and (obj.track.service, obj.track.id) == key
+
+    state.connect("playback-changed", refresh)
+    store.connect("items-changed", lambda *_a: refresh())
 
 
 def selected_tracks(selection: Gtk.MultiSelection) -> list[Track]:

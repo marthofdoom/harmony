@@ -1,6 +1,6 @@
 """Harmony — cross-service music playlist management for YouTube Music and Qobuz."""
 
-__version__ = "0.5.13"
+__version__ = "0.5.14"
 
 APP_ID = "io.github.marthofdoom.Harmony"
 APP_NAME = "Harmony"

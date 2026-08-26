@@ -85,3 +85,25 @@ def test_prev_next_sensitivity_follows_flags(state: AppState) -> None:
     bar._render()
     assert bar._prev.get_sensitive() is False
     assert bar._next.get_sensitive() is True
+
+
+# -- on-screen now-playing indicator (track rows) ---------------------------
+
+
+def test_track_indicator_follows_playback(state: AppState) -> None:
+    from harmony.ui.widgets import TrackObject, build_track_column_view
+
+    _view, store, _sel = build_track_column_view(state=state)
+    for i in (1, 2, 3):
+        store.append(TrackObject(
+            Track(id=f"t{i}", title=f"S{i}", service=Service.YTMUSIC, artists=["A"])
+        ))
+    assert [store.get_item(i).is_playing for i in range(3)] == [False, False, False]
+
+    state.playback.track = Track(id="t2", title="S2", service=Service.YTMUSIC, artists=["A"])
+    state.emit("playback-changed")
+    assert [store.get_item(i).is_playing for i in range(3)] == [False, True, False]
+
+    state.playback.track = None
+    state.emit("playback-changed")
+    assert [store.get_item(i).is_playing for i in range(3)] == [False, False, False]
