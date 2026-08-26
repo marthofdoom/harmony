@@ -132,7 +132,7 @@ class NowPlayingBar(Gtk.Box):
     # -- device selector ----------------------------------------------------
 
     def _reload_devices(self) -> None:
-        self._devices = self.state.known_devices()
+        self._devices = self.state.playback_targets()
         self._syncing = True
         self._devices_model.splice(0, self._devices_model.get_n_items(),
                                    [d.name for d in self._devices] or ["No devices"])

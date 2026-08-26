@@ -21,6 +21,7 @@ def state(monkeypatch, tmp_path) -> AppState:
     GObject.Object.__init__(obj)
     obj.settings = config_module.Settings.load()
     obj._device_session = None
+    obj._local_player = None
     obj.playback = PlaybackState()
     for attr in ("_now_playing", "_upnp_cache", "_queues", "_queue_prev_state",
                  "_queue_armed", "_queue_poll_ids", "_collection_full",

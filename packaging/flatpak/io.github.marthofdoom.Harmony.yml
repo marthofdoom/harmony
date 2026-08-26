@@ -24,6 +24,9 @@ finish-args:
   # socket, so grant it. The runtime ships pactl + module-rtp-recv, so RTP
   # receive-to-a-local-sink works in-sandbox.
   - --socket=pulseaudio
+  # Local player ("This computer"): GStreamer's pipewiresink outputs to
+  # PipeWire directly, which needs the native PipeWire socket.
+  - --filesystem=xdg-run/pipewire-0
   # Credentials go to the Secret Service via the keyring package. Nothing is
   # written to a host path — import/export uses the file-chooser portal, so no
   # filesystem access is granted here.

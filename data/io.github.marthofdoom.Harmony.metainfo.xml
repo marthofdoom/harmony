@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.15" date="2026-08-26">
+      <description>
+        <p>Adds an in-app local player: pick "This computer" as a playback
+        target to decode and play a track (e.g. a Qobuz FLAC) on this machine
+        through PipeWire, controlled from the Now Playing bar like any device.
+        Uses GStreamer, already in the runtime.</p>
+      </description>
+    </release>
     <release version="0.5.14" date="2026-08-26">
       <description>
         <p>The currently-playing track now shows a play indicator next to it in

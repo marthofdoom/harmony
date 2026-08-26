@@ -98,6 +98,10 @@ class FakeState:
     def known_devices(self) -> list[object]:
         return self._devices
 
+    def playback_targets(self) -> list[object]:
+        local = SimpleNamespace(name="This computer", host="__local__", kind="local")
+        return [local, *self._devices]
+
     def all_playlists(self, refresh: bool = False) -> dict[Service, list[Playlist]]:
         if refresh:
             self.refreshed = True
@@ -108,7 +112,7 @@ class FakeState:
 
 
 def _device(name: str, host: str) -> SimpleNamespace:
-    return SimpleNamespace(name=name, host=host)
+    return SimpleNamespace(name=name, host=host, kind="wiim")
 
 
 def _listbox_of(popover: Gtk.Popover) -> Gtk.ListBox:
@@ -144,18 +148,17 @@ def test_play_collection_on_device_lists_known_devices(no_real_popup) -> None:
     play_collection_on_device(widget, state, label="Ziggy Stardust", fetch_tracks=lambda: [])
 
     assert len(no_real_popup) == 1
-    assert _row_titles(_listbox_of(no_real_popup[0])) == ["Living Room", "Kitchen"]
+    assert _row_titles(_listbox_of(no_real_popup[0])) == ["This computer", "Living Room", "Kitchen"]
 
 
-def test_play_collection_on_device_no_devices_shows_placeholder(no_real_popup) -> None:
+def test_play_collection_on_device_no_devices_still_offers_local(no_real_popup) -> None:
     state = FakeState()
     widget = Gtk.Button()
 
     play_collection_on_device(widget, state, label="Ziggy Stardust", fetch_tracks=lambda: [])
 
     listbox = _listbox_of(no_real_popup[0])
-    assert _row_titles(listbox) == ["No devices yet"]
-    assert listbox.get_row_at_index(0).get_sensitive() is False
+    assert _row_titles(listbox) == ["This computer"]  # local player always available
 
 
 def test_play_collection_on_device_picking_a_device_plays_fetched_tracks(no_real_popup) -> None:
@@ -169,7 +172,7 @@ def test_play_collection_on_device_picking_a_device_plays_fetched_tracks(no_real
 
     play_collection_on_device(widget, state, label="Ziggy Stardust", fetch_tracks=lambda: tracks)
     listbox = _listbox_of(no_real_popup[0])
-    listbox.get_row_at_index(0).emit("activated")
+    listbox.get_row_at_index(1).emit("activated")
 
     assert state.play_calls == [(tracks, "10.0.0.5")]
     assert state.toasts == ["Playing Ziggy Stardust on Living Room…", "Playing Ziggy Stardust on Living Room"]
@@ -182,7 +185,7 @@ def test_play_collection_on_device_empty_tracks_toasts_and_does_not_play(no_real
 
     play_collection_on_device(widget, state, label="Empty Album", fetch_tracks=lambda: [])
     listbox = _listbox_of(no_real_popup[0])
-    listbox.get_row_at_index(0).emit("activated")
+    listbox.get_row_at_index(1).emit("activated")
 
     assert state.play_calls == []
     assert state.toasts == ["Playing Empty Album on Living Room…", "Empty Album has no tracks to play."]
@@ -198,7 +201,7 @@ def test_play_collection_on_device_fetch_error_toasts(no_real_popup) -> None:
 
     play_collection_on_device(widget, state, label="Ziggy Stardust", fetch_tracks=boom)
     listbox = _listbox_of(no_real_popup[0])
-    listbox.get_row_at_index(0).emit("activated")
+    listbox.get_row_at_index(1).emit("activated")
 
     assert state.play_calls == []
     assert state.toasts[-1] == "Couldn't play Ziggy Stardust on Living Room: network down"
@@ -323,7 +326,7 @@ def test_track_menu_actions_play_on_device_wraps_single_track(no_real_popup) -> 
     actions = dict(track_menu_actions(Gtk.Button(), state, track))
     actions["Play on Device"]()
     listbox = _listbox_of(no_real_popup[0])
-    listbox.get_row_at_index(0).emit("activated")
+    listbox.get_row_at_index(1).emit("activated")  # index 0 is "This computer"
 
     assert state.play_calls == [([track], "10.0.0.5")]
 

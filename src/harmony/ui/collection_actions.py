@@ -49,18 +49,17 @@ def play_collection_on_device(
     does device I/O, so both run together on the worker thread once a device
     is chosen -- this function itself only ever touches widgets.
     """
-    devices = state.known_devices()
+    devices = state.playback_targets()
     popover = Gtk.Popover()
     listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
     listbox.add_css_class("boxed-list")
-    if not devices:
-        listbox.append(
-            Adw.ActionRow(title="No devices yet", subtitle="Add one on the Devices page", sensitive=False)
-        )
     for info in devices:
-        row = Adw.ActionRow(title=info.name, subtitle=info.host)
+        is_local = info.kind == "local"
+        row = Adw.ActionRow(title=info.name, subtitle="In this app" if is_local else info.host)
         row.set_activatable(True)
-        row.add_prefix(Gtk.Image.new_from_icon_name("audio-speakers-symbolic"))
+        row.add_prefix(Gtk.Image.new_from_icon_name(
+            "computer-symbolic" if is_local else "audio-speakers-symbolic"
+        ))
 
         def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name, pop: Gtk.Popover = popover) -> None:
             pop.popdown()

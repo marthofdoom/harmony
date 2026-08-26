@@ -61,6 +61,10 @@ class PlaybackState:
     def is_active(self) -> bool:
         return self.track is not None and self.state in ("playing", "paused")
 
+# Synthetic host id for the in-app local player ("This computer"). Routed to a
+# GStreamer LocalPlayer instead of the relay + a network device.
+LOCAL_HOST = "__local__"
+
 # How often the queue poller checks a device for a track ending, in seconds.
 _QUEUE_POLL_S = 3
 # How close (seconds) the reported position must get to the track's duration to
@@ -145,6 +149,8 @@ class AppState(GObject.Object):
         self._history: dict[str, list[Any]] = {}
         # The one app-wide playback model the Now Playing bar reflects/controls.
         self.playback = PlaybackState()
+        # The in-app GStreamer player ("This computer"); created on first use.
+        self._local_player: Any | None = None
 
         self.reload_providers()
         self._init_recommender()
@@ -472,6 +478,63 @@ class AppState(GObject.Object):
             )
         return devices
 
+    def playback_targets(self) -> list[Any]:
+        """Known devices plus the synthetic 'This computer' local player, first.
+
+        Used by the device pickers and the Now Playing bar so local playback is
+        just another target. Returns ``harmony.playback.DeviceInfo`` entries.
+        """
+        try:
+            from harmony.playback import DeviceInfo
+        except ImportError:
+            return self.known_devices()
+        local = DeviceInfo(id=LOCAL_HOST, name="This computer", host=LOCAL_HOST, kind="local")
+        return [local, *self.known_devices()]
+
+    def _get_local_player(self) -> Any:
+        """Lazily create the GStreamer local player (main loop only)."""
+        if self._local_player is None:
+            from harmony.ui.local_player import LocalPlayer
+
+            self._local_player = LocalPlayer(
+                on_eos=self._on_local_eos,
+                on_error=lambda msg: self.toast(f"Local playback error: {msg}"),
+            )
+        return self._local_player
+
+    def _on_local_eos(self) -> None:
+        """A locally-played track ended: advance the queue or stop (main loop)."""
+        host = LOCAL_HOST
+        if self.playback.active_host != host:
+            return
+        nxt = self._queue_step_forward(host, allow_repeat_one=True)
+        if nxt is not None:
+            run_async(lambda: self._play_one(nxt, host), None,
+                      lambda exc: log.warning("Local queue advance failed: %s", exc))
+        else:
+            self._end_playback(host)
+
+    def _queue_step_forward(self, host: str, *, allow_repeat_one: bool) -> Any | None:
+        """Pop the current track and return the next to play, honouring repeat/
+        shuffle; ``None`` means playback should end. Pure (in-memory only)."""
+        if allow_repeat_one and self.playback.repeat == "one" and self.playback.track is not None:
+            return self.playback.track
+        queue = self._queues.get(host)
+        if not queue:
+            return None
+        if self.playback.track is not None:
+            self._history.setdefault(host, []).append(self.playback.track)
+        queue.pop(0)
+        if queue:
+            return queue[0]
+        if self.playback.repeat == "all" and self._collection_full.get(host):
+            refilled = list(self._collection_full[host])
+            if self.playback.shuffle:
+                random.shuffle(refilled)
+            self._queues[host] = refilled
+            return refilled[0]
+        return None
+
     def add_device(self, host: str, name: str | None = None) -> None:
         """Add a device by host, deduped by host. No-op if already known."""
         host = host.strip()
@@ -552,6 +615,8 @@ class AppState(GObject.Object):
         queue-teardown is marshalled to the main loop, where its poller lives).
         """
         on_main(self._stop_queue, device_host)
+        if device_host != LOCAL_HOST:
+            on_main(self._stop_local_player)
         self._collection_key[device_host] = None
         self._history[device_host] = []
         self.playback.active_host = device_host
@@ -575,6 +640,8 @@ class AppState(GObject.Object):
         tracks = list(tracks)
         if not tracks:
             return
+        if device_host != LOCAL_HOST:
+            on_main(self._stop_local_player)
         order = list(tracks)
         if self.playback.shuffle:
             random.shuffle(order)
@@ -655,6 +722,13 @@ class AppState(GObject.Object):
         if host not in self._queues and not active:
             self._queue_poll_ids.pop(host, None)
             return GLib.SOURCE_REMOVE
+        if host == LOCAL_HOST:
+            # Local playback has no network device: read the GStreamer player's
+            # status directly (fast, main loop). Track-end is driven by EOS
+            # (``_on_local_eos``), not position.
+            if self._local_player is not None:
+                self._sync_status_to_playback(host, self._local_player.status())
+            return GLib.SOURCE_CONTINUE
         device = self.device_for(host)
 
         def done(status: Any) -> None:
@@ -718,8 +792,15 @@ class AppState(GObject.Object):
         pb.has_next = bool(self._queues.get(host)) or pb.repeat != "off"
         self.emit("playback-changed")
 
+    def _stop_local_player(self) -> None:
+        """Stop the GStreamer local player if it exists (main loop)."""
+        if self._local_player is not None:
+            self._local_player.stop()
+
     def _end_playback(self, host: str) -> None:
         """The active playback stopped with nothing left: reset the model."""
+        if host == LOCAL_HOST:
+            self._stop_local_player()
         self._stop_queue(host)
         if self.playback.active_host == host:
             self.playback.state = "stopped"
@@ -747,6 +828,14 @@ class AppState(GObject.Object):
 
         cached = {"source": provider.resolve_stream(track.id), "at": time.monotonic()}
         ttl_s = 600.0
+
+        # "This computer": decode + play the resolved stream locally via
+        # GStreamer, no relay/device. GStreamer must be driven on the main loop.
+        if device_host == LOCAL_HOST:
+            source = cached["source"]
+            on_main(lambda: self._get_local_player().load_and_play(source.url, dict(source.headers)))
+            self._mark_now_playing(device_host, track)
+            return
 
         def resolver() -> Any:
             if time.monotonic() - cached["at"] > ttl_s:
@@ -826,33 +915,27 @@ class AppState(GObject.Object):
         host = self.playback.active_host
         if not host:
             return
-        device = self.device_for(host)
         pausing = self.playback.state == "playing"
         self.playback.state = "paused" if pausing else "playing"
         self.emit("playback-changed")
+        if host == LOCAL_HOST:
+            player = self._get_local_player()
+            (player.pause if pausing else player.resume)()
+            return
+        device = self.device_for(host)
         action = device.pause if pausing else device.resume
         run_async(action, None, lambda exc: self.toast(f"Playback control failed: {exc}"))
 
     def playback_next(self) -> None:
         """Skip to the next queued track (wraps if repeat is on)."""
         host = self.playback.active_host
-        queue = self._queues.get(host) if host else None
-        if not host or not queue:
+        if not host or not self._queues.get(host):
             return
-        if self.playback.track is not None:
-            self._history.setdefault(host, []).append(self.playback.track)
-        queue.pop(0)
-        if not queue:
-            if self.playback.repeat != "off" and self._collection_full.get(host):
-                refilled = list(self._collection_full[host])
-                if self.playback.shuffle:
-                    random.shuffle(refilled)
-                self._queues[host] = queue = refilled
-            else:
-                self._end_playback(host)
-                return
         self._queue_armed[host] = False
-        nxt = queue[0]
+        nxt = self._queue_step_forward(host, allow_repeat_one=False)
+        if nxt is None:
+            self._end_playback(host)
+            return
         run_async(lambda: self._play_one(nxt, host), None,
                   lambda exc: self.toast(f"Skip failed: {exc}"))
 
@@ -875,6 +958,9 @@ class AppState(GObject.Object):
             return
         self.playback.position_s = int(position_s)
         self.emit("playback-changed")
+        if host == LOCAL_HOST:
+            self._get_local_player().seek(int(position_s))
+            return
 
         def work() -> None:
             renderer = self._upnp_renderer_for(host)
@@ -891,6 +977,9 @@ class AppState(GObject.Object):
             return
         level = max(0, min(100, int(level)))
         self.playback.volume = level
+        if host == LOCAL_HOST:
+            self._get_local_player().set_volume(level)
+            return
         device = self.device_for(host)
         run_async(lambda: device.set_volume(level), None,
                   lambda exc: self.toast(f"Volume failed: {exc}"))

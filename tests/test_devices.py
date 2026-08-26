@@ -40,6 +40,7 @@ def state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     GObject.Object.__init__(obj)
     obj.settings = config_module.Settings.load()
     obj._device_session = None
+    obj._local_player = None
     # Playback model + queue engine state that __init__ would have set up.
     from harmony.ui.state import PlaybackState
 
