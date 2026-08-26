@@ -1006,6 +1006,9 @@ def _qobuz_token_from_cookie_value(value: str) -> str | None:
     The value is typically URL-encoded JSON carrying the credential; try the
     deep search (JSON-aware), then a token/auth-field regex, then a bare token.
     """
+    if os.environ.get("HARMONY_DEBUG"):
+        masked = re.sub(r"[A-Za-z0-9+/=_\-]{16,}", lambda m: f"<{len(m.group())}>", urllib.parse.unquote(value))
+        print(f"[debug] qobuz-session structure: {masked[:600]}")
     for candidate in (value, urllib.parse.unquote(value)):
         token = _deep_search_token(candidate)
         if token:
