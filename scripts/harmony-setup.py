@@ -1249,12 +1249,15 @@ def ytmusic_menu(target: Target) -> None:
 
 def _get_or_scrape_qobuz_app_id(target: Target) -> str | None:
     existing = read_settings(target.config_dir).get("qobuz_app_id")
-    if existing:
-        return existing
-    print("Looking up Qobuz's app_id from the web player...")
+    # Always scrape, even when the app_id is already known: the app SECRET (used
+    # to sign streaming requests) must be seeded too, and an earlier run may have
+    # saved the id without it -> "app secret unavailable" when playing a track.
+    print("Looking up Qobuz's app credentials from the web player...")
     try:
         app_id, secret = scrape_qobuz_app_credentials()
     except Exception as exc:  # noqa: BLE001
+        if existing:
+            return existing  # keep the known app_id; its secret may already be seeded
         print(f"Could not auto-detect app_id ({exc}).")
         app_id = input("Enter a Qobuz app_id manually (or leave blank to cancel): ").strip()
         if not app_id:
@@ -1265,7 +1268,7 @@ def _get_or_scrape_qobuz_app_id(target: Target) -> str | None:
             seed_secret(target, QOBUZ_APP_SECRET, secret)
         except Exception:  # noqa: BLE001 - the app_id alone is still useful without the secret
             pass
-    return app_id
+    return app_id or existing
 
 
 def _qobuz_password_login(target: Target) -> None:
