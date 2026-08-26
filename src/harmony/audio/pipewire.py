@@ -194,6 +194,13 @@ def roc_receiver_up(
     - a high-quality resampler (``--resampler-profile=high``), since ROC is
       continuously resampling to track the sender clock -- a cheap resampler
       makes that audible;
+    - a **widened watchdog** (``--no-play-timeout``/``--choppy-play-timeout``).
+      By default roc tears the session down after only 133 ms of blank audio,
+      so a brief Wi-Fi stall triggers a full teardown + FEC re-converge (a
+      pop) instead of just resuming. Raising the blank tolerance to 2 s and the
+      choppy tolerance to 4 s lets a transient stall ride through -- playback
+      resumes seamlessly when packets return, keeping latency low without the
+      ticks;
     - roc-recv's log is written to a **file**, never a pipe: an undrained stderr
       pipe fills after ~64 KB and then roc-recv blocks on write, which stalls
       audio -- another cause of periodic digital breaks.
@@ -216,6 +223,8 @@ def roc_receiver_up(
         "-o", f"pulse://{sink}",
         f"--target-latency={target_latency_ms}ms",
         f"--latency-tolerance={tolerance_ms}ms",
+        "--no-play-timeout=2s",     # ride through a Wi-Fi stall instead of tearing down
+        "--choppy-play-timeout=4s",
         "--resampler-profile=high",
     ]
     log_path = _roc_log_path()

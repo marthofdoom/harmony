@@ -43,6 +43,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.12" date="2026-08-26">
+      <description>
+        <p>Route Audio (ROC) now rides through brief Wi-Fi stalls instead of
+        tearing down the session. roc's watchdog dropped the session after only
+        133ms of blank audio, so a momentary network hiccup caused a pop;
+        widening the blank tolerance to 2s (and choppy to 4s) lets playback
+        resume seamlessly, keeping latency low without the occasional ticks.</p>
+      </description>
+    </release>
     <release version="0.5.11" date="2026-08-26">
       <description>
         <p>Fixes the root cause of Route Audio (ROC) dropouts: the receiver was

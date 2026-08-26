@@ -160,6 +160,8 @@ def test_roc_receiver_up_spawns_roc_recv(monkeypatch, tmp_path):
     assert "-o" in argv and "pulse://alsa_output.usb-DAC" in argv
     assert "--target-latency=80ms" in argv
     assert "--resampler-profile=high" in argv                       # quality resampler
+    assert "--no-play-timeout=2s" in argv                           # ride-through watchdog
+    assert "--choppy-play-timeout=4s" in argv
     assert any(a.startswith("--latency-tolerance=") for a in argv)  # jitter headroom
     assert any(a.startswith("rtp+rs8m://0.0.0.0:") for a in argv)   # source endpoint
     assert any(a.startswith("rs8m://0.0.0.0:") for a in argv)       # FEC repair endpoint
