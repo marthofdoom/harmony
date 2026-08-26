@@ -169,6 +169,22 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         qb_group.add(self.qb_password_row)
 
+        # The pleasant path: an in-app browser that captures the token for you.
+        # Only meaningful when WebKitGTK is present (always so in the Flatpak).
+        from harmony.ui import qobuz_login
+
+        self.qb_browser_login_row = Adw.ActionRow(
+            title="Sign in with browser",
+            subtitle="Opens Qobuz's own login — Google sign-in included — and captures the "
+            "session token for you. No devtools needed.",
+        )
+        browser_login_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER,
+                                          css_classes=["suggested-action"])
+        browser_login_button.connect("clicked", self._on_qobuz_browser_login)
+        self.qb_browser_login_row.add_suffix(browser_login_button)
+        self._webkit_login_available = qobuz_login.AVAILABLE
+        qb_group.add(self.qb_browser_login_row)
+
         self.qb_token_row = Adw.PasswordEntryRow(
             title="Session token", text=self.credentials.get(config.QOBUZ_TOKEN) or ""
         )
@@ -178,9 +194,8 @@ class PreferencesDialog(Adw.PreferencesDialog):
         qb_group.add(self.qb_token_row)
 
         self.qb_token_help_row = Adw.ActionRow(
-            title="Where to find this",
-            subtitle="Accounts created via Google/social sign-in have no password. Sign in at "
-            "play.qobuz.com, open devtools → Network, click any request to "
+            title="Or paste a token manually",
+            subtitle="Sign in at play.qobuz.com, open devtools → Network, click any request to "
             "www.qobuz.com/api.json/0.2/, and copy the X-User-Auth-Token request header "
             "(the X-App-Id header on that same request goes in App ID below, if auto-detection "
             "ever fails).",
@@ -218,8 +233,25 @@ class PreferencesDialog(Adw.PreferencesDialog):
         is_token = self.settings.qobuz_auth_kind == "token"
         self.qb_email_row.set_visible(not is_token)
         self.qb_password_row.set_visible(not is_token)
+        # The browser-login button only makes sense in token mode, and only
+        # when WebKit is actually there to open a webview.
+        self.qb_browser_login_row.set_visible(is_token and self._webkit_login_available)
         self.qb_token_row.set_visible(is_token)
         self.qb_token_help_row.set_visible(is_token)
+
+    def _on_qobuz_browser_login(self, _button: Gtk.Button) -> None:
+        from harmony.ui import qobuz_login
+
+        def handle(token: str | None) -> None:
+            if not token:
+                self.state.toast("Qobuz sign-in was cancelled or captured no token.")
+                return
+            self.credentials.set(config.QOBUZ_TOKEN, token)
+            self.qb_token_row.set_text(token)  # reflect it in the manual field
+            self._set_account_setting("qobuz_token_saved", True)
+            self.state.toast("Signed in to Qobuz.")
+
+        qobuz_login.present_login(self.get_root(), handle)
 
     def _on_qobuz_token_changed(self, value: str) -> None:
         self.credentials.set(config.QOBUZ_TOKEN, value)
