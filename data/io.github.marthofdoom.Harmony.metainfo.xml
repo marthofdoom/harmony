@@ -43,6 +43,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.11" date="2026-08-26">
+      <description>
+        <p>Fixes the root cause of Route Audio (ROC) dropouts: the receiver was
+        restarting its session dozens of times a second because the latency
+        tolerance was too tight, so normal latency fluctuation kept crossing the
+        bound. Widening it yields a single stable session (diagnosed from a
+        verbose loopback: ~79 restarts in 15s before, 1 after).</p>
+      </description>
+    </release>
     <release version="0.5.10" date="2026-08-26">
       <description>
         <p>Fixes frequent audio dropouts on Route Audio (ROC): roc-recv's log no

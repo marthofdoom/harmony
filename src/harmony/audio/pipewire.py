@@ -182,14 +182,21 @@ def roc_receiver_up(
     name or a port already in use).
 
     Tuning for glitch-free playback over Wi-Fi:
+    - a **wide** ``--latency-tolerance``. ROC restarts the whole session (an
+      audible break) when the measured latency leaves ``target +/- tolerance``.
+      The stream's natural latency sits well below the target while the tuner is
+      converging, so a tight tolerance puts the lower bound right on the
+      operating point and ROC restarts dozens of times a second. Making the
+      tolerance >= the target pushes the lower bound to zero, so it only ever
+      restarts on a genuinely pathological latency, not normal convergence.
+      (Diagnosed from a -vv loopback: tight tolerance -> ~79 restarts/15s;
+      wide -> 1 stable session.)
     - a high-quality resampler (``--resampler-profile=high``), since ROC is
       continuously resampling to track the sender clock -- a cheap resampler
       makes that audible;
-    - ``--latency-tolerance`` set wide so a transient jitter spike doesn't force
-      a disruptive latency restart;
     - roc-recv's log is written to a **file**, never a pipe: an undrained stderr
       pipe fills after ~64 KB and then roc-recv blocks on write, which stalls
-      audio -- the classic cause of periodic digital breaks.
+      audio -- another cause of periodic digital breaks.
     """
     exe = shutil.which("roc-recv")
     if exe is None:
@@ -197,8 +204,9 @@ def roc_receiver_up(
             "roc-recv not found -- install roc-toolkit (bundled in the Flatpak) "
             "for FEC / low-latency receive."
         )
-    # Let ROC drift up to half the target (min 40 ms) before a hard restart.
-    tolerance_ms = max(40, target_latency_ms // 2)
+    # >= target so the lower restart bound (target - tolerance) is <= 0; floor
+    # of 150 ms keeps the upper bound clear of the natural operating latency.
+    tolerance_ms = max(target_latency_ms, 150)
     argv = [
         exe,
         "-v",  # info-level diagnostics (packet loss, latency tuning) -> the log file
