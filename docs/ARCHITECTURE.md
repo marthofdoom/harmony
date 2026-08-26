@@ -1,5 +1,10 @@
 # Harmony — architecture & module contracts
 
+> This is the binding **module-contract** doc, referenced from source
+> docstrings. For the broader picture — product vision, federation, auth,
+> packaging, roadmap, and decision records — see the [documentation
+> index](README.md).
+
 Python 3.11+, GTK4 + libadwaita (PyGObject), package root `src/harmony/`.
 All modules import domain types from `harmony.models` (`Service`, `Track`, `Album`,
 `Artist`, `Playlist`, `SearchResults`). **These types are frozen — do not edit

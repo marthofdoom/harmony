@@ -102,13 +102,17 @@ Secrets go to your system keyring (GNOME Keyring / KWallet). If no keyring
 backend is available, Harmony falls back to a `0600` JSON file under
 `~/.config/harmony/` and tells you it did.
 
-## Architecture
+## Documentation
 
-See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for module contracts. The
-short version: providers normalise each service into shared dataclasses,
+The [`docs/`](docs/README.md) directory is the map — architecture, design
+(vision, federation, auth, playback), packaging, roadmap, and decision records.
+
+The short version: providers normalise each service into shared dataclasses,
 `matching` resolves tracks across services, `sync` turns two playlists into a
 reviewable plan before it writes anything, and the UI only ever talks to those
-layers through a worker thread pool.
+layers through a worker thread pool. The engine never imports GTK, so it can
+back a desktop app today and a web/Android client or a federated instance later.
+Module contracts live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Development
 
