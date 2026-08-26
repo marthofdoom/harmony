@@ -43,6 +43,24 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.6.0" date="2026-08-26">
+      <description>
+        <p>Milestone release. Harmony is now a full music hub, not just a
+        playlist syncer:</p>
+        <ul>
+          <li>A persistent Now Playing bar with transport, seek, volume,
+          shuffle/repeat, a device selector, and on-screen playing indicators.</li>
+          <li>Local playback ("This computer") — decode and play tracks on this
+          machine through PipeWire, alongside casting to devices.</li>
+          <li>Route Audio — receive a low-latency network stream (ROC, with
+          forward error correction) from another machine and play it locally.</li>
+          <li>Qobuz streaming reliability fixes, including recovering the app
+          secret used to sign streaming requests.</li>
+          <li>Stability: a crash fix in album-art loading, log files for easier
+          diagnosis, and clean shutdown of routed streams.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.5.18" date="2026-08-26">
       <description>
         <p>Fixes a crash (segfault) that could happen while album art loaded in
