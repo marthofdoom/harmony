@@ -62,6 +62,14 @@ class HarmonyApplication(Adw.Application):
         self.set_accels_for_action("win.focus-search", ["<Control>f"])
 
     def _on_preferences(self, _action: Gio.SimpleAction, _param: None) -> None:
+        self.open_preferences()
+
+    def open_preferences(self, page_name: str | None = None) -> None:
+        """Open Preferences, optionally jumping straight to one page.
+
+        Callers like the sidebar's Accounts row want to land the user on the
+        page they clicked rather than making them find it.
+        """
         from harmony.ui.prefs import PreferencesDialog
 
         if self._window is None:
@@ -72,6 +80,11 @@ class HarmonyApplication(Adw.Application):
             log.exception("Failed to open Preferences")
             self.state.toast("Couldn't open Preferences.")
             return
+        if page_name:
+            try:
+                dialog.set_visible_page_name(page_name)
+            except Exception:  # noqa: BLE001 - landing on page one is a fine fallback
+                log.debug("Could not select preferences page %r", page_name)
         dialog.present(self._window)
 
     def _on_about(self, _action: Gio.SimpleAction, _param: None) -> None:

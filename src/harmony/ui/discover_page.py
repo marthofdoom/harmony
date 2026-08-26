@@ -53,9 +53,17 @@ class DiscoverPage(Gtk.Box):
                            margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         content.append(self._build_recommendations_section())
         content.append(Gtk.Separator())
-        content.append(self._build_ai_section())
+        self._ai_section = self._build_ai_section()
+        content.append(self._ai_section)
+        self._content_box = content
         scroller.set_child(content)
         self.append(scroller)
+
+        # Rebuilt rather than merely re-revealed: the section renders a banner,
+        # a "missing layer" page, or the full builder depending on how the AI
+        # integration is configured, so switching between those states means
+        # constructing different widgets.
+        self.state.connect("integrations-changed", lambda *_a: self._rebuild_ai_section())
 
         self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_choices())
         # Providers are built off the main loop, so this page is normally
@@ -236,6 +244,32 @@ class DiscoverPage(Gtk.Box):
 
     # -- section 2: AI playlist builder ---------------------------------------
 
+    def _open_integrations_preferences(self) -> None:
+        root = self.get_root()
+        app = root.get_application() if root is not None else None
+        if app is not None and hasattr(app, "open_preferences"):
+            app.open_preferences("integrations")
+        else:  # pragma: no cover - fallback if the widget is unrooted
+            self.activate_action("app.preferences", None)
+
+    def _rebuild_ai_section(self) -> None:
+        """Swap in a freshly-built AI section after the integration changed."""
+        if not hasattr(self, "_content_box"):
+            return
+        # Anything the old section owned is about to be destroyed; drop the
+        # references so a stale widget can't be written into later.
+        for attr in ("prompt_view", "ai_target_dropdown", "idea_list", "create_ai_button"):
+            if hasattr(self, attr):
+                delattr(self, attr)
+        self._idea = None
+        self._resolved_tracks = []
+
+        new_section = self._build_ai_section()
+        self._content_box.remove(self._ai_section)
+        self._content_box.append(new_section)
+        self._ai_section = new_section
+        self._refresh_service_choices()
+
     def _build_ai_section(self) -> Gtk.Widget:
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         box.append(Gtk.Label(label="AI Playlist Builder", xalign=0.0, css_classes=["title-2"]))
@@ -250,7 +284,7 @@ class DiscoverPage(Gtk.Box):
                 revealed=True,
             )
             banner.set_button_label("Open Preferences")
-            banner.connect("button-clicked", lambda *_a: self.activate_action("app.preferences", None))
+            banner.connect("button-clicked", lambda *_a: self._open_integrations_preferences())
             box.append(banner)
             return box
 

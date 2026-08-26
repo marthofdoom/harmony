@@ -69,11 +69,25 @@ both configured in **Preferences → Accounts**:
 ### Qobuz
 
 Qobuz publishes no official API; Harmony talks to the same private API the web
-player uses. Enter your account email and password in Preferences — the password
-is hashed before it leaves the machine and only a session token is stored. The
-app ID is scraped once from the public web player bundle; if that ever breaks
-you can paste an app ID manually. A paid Qobuz subscription is required for the
-account to have playlists worth syncing.
+player uses. Everything past sign-in runs on a bearer session token, so
+Preferences → Accounts → Qobuz offers two ways to obtain one:
+
+- **Email and password (default).** Enter your account email and password —
+  the password is hashed before it leaves the machine and only the resulting
+  session token is stored.
+- **Paste session token.** Required if your Qobuz account was created through
+  Google or another social sign-in: those accounts have no password for
+  Harmony to hash, so the password method can't authenticate them. Sign in at
+  play.qobuz.com, open devtools → Network, click any request to
+  `www.qobuz.com/api.json/0.2/`, and copy the `X-User-Auth-Token` request
+  header into the token field. Qobuz's session tokens do eventually expire;
+  when Harmony reports the saved token is no longer accepted, repeat these
+  steps and paste a fresh one.
+
+The app ID is scraped once from the public web player bundle; if that ever
+breaks you can paste an app ID manually — it's the `X-App-Id` header on that
+same devtools request. A paid Qobuz subscription is required for the account
+to have playlists worth syncing.
 
 ### Optional integrations
 

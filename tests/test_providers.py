@@ -946,6 +946,159 @@ class TestQobuzWarmUpCost:
         assert provider.account_name() == "Refreshed"
 
 
+class TestQobuzTokenAuth:
+    """Token-mode authentication: for accounts with no password (e.g. signed
+    in to Qobuz via Google OAuth), authenticate() must validate a pasted
+    token instead of logging in with a password."""
+
+    def test_token_mode_authenticates_with_no_login_call(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token")
+        credentials.set(config_module.QOBUZ_TOKEN, "pasted-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        calls: list[str] = []
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            calls.append(path)
+            if path == "user/login":
+                raise AssertionError("token mode must never call user/login")
+            if path == "user/get":
+                return {"user": {"display_name": "Pasted User"}}
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        provider.authenticate()
+
+        assert calls == ["user/get"]
+        assert provider.is_authenticated is True
+        assert provider.account_name() == "Pasted User"
+        assert provider._auth_token == "pasted-tok"
+
+    def test_token_mode_missing_token_raises_and_performs_zero_http(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token")
+        provider = QobuzProvider(settings, credentials)
+
+        def boom(*a, **kw):
+            raise AssertionError("a missing token must fail with zero HTTP")
+
+        monkeypatch.setattr(requests.Session, "get", boom)
+        monkeypatch.setattr(requests.Session, "request", boom)
+
+        with pytest.raises(AuthError, match="No Qobuz session token is saved"):
+            provider.authenticate()
+
+    def test_token_mode_never_reads_or_writes_password(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token")
+        credentials.set(config_module.QOBUZ_TOKEN, "pasted-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            return {"user": {"display_name": "Pasted User"}}
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+        provider.authenticate()
+
+        assert config_module.QOBUZ_PASSWORD not in credentials.get_calls
+
+    def test_token_mode_invalid_token_raises_reauth_message(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An expired/revoked pasted token is the routine failure here -- the
+        error must point the user at re-pasting a fresh one, not read as a
+        generic/broken-app failure."""
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token")
+        credentials.set(config_module.QOBUZ_TOKEN, "dead-tok")
+        provider = QobuzProvider(settings, credentials)
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            if path == "user/get":
+                raise ProviderError("Qobuz API error 401 on user/get: invalid token")
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        with pytest.raises(AuthError, match="no longer accepted"):
+            provider.authenticate()
+
+        assert provider.is_authenticated is False
+
+    def test_has_credentials_token_mode_true_only_when_saved_flag_set(
+        self, credentials: FakeCredentialStore
+    ) -> None:
+        not_saved = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token", qobuz_token_saved=False)
+        provider = QobuzProvider(not_saved, credentials)
+        assert provider.has_credentials is False
+
+        saved = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="token", qobuz_token_saved=True)
+        provider = QobuzProvider(saved, credentials)
+        assert provider.has_credentials is True
+
+        assert credentials.get_calls == []  # I/O-free in both cases -- no keyring read
+
+    def test_has_credentials_token_mode_ignores_qobuz_email(self, credentials: FakeCredentialStore) -> None:
+        """Token mode must not fall back to checking qobuz_email -- an
+        account mid-switch from password to token mode with a stale email
+        still set shouldn't be reported as configured until a token is
+        actually saved."""
+        settings = Settings(
+            qobuz_app_id="test_app_id",
+            qobuz_auth_kind="token",
+            qobuz_email="alice@example.com",
+            qobuz_token_saved=False,
+        )
+        provider = QobuzProvider(settings, credentials)
+        assert provider.has_credentials is False
+        assert credentials.get_calls == []
+
+    def test_has_credentials_password_mode_unaffected_by_token_fields(
+        self, credentials: FakeCredentialStore
+    ) -> None:
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_auth_kind="password", qobuz_token_saved=True)
+        provider = QobuzProvider(settings, credentials)
+        assert provider.has_credentials is False  # no email set
+        assert credentials.get_calls == []
+
+    def test_password_mode_authenticate_unchanged(
+        self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Sanity check that adding token mode didn't disturb the default
+        (password) branch of authenticate()."""
+        from harmony import config as config_module
+
+        settings = Settings(qobuz_app_id="test_app_id", qobuz_email="alice@example.com")
+        assert settings.qobuz_auth_kind == "password"
+        credentials.set(config_module.QOBUZ_PASSWORD, "hunter2")
+        provider = QobuzProvider(settings, credentials)
+
+        calls: list[str] = []
+
+        def fake_request(method, path, *, params=None, data=None, authed=True, _retry_on_401=True):
+            calls.append(path)
+            if path == "user/login":
+                return {"user_auth_token": "fresh-tok", "user": {"display_name": "Alice"}}
+            raise AssertionError(f"unexpected path {path}")
+
+        monkeypatch.setattr(provider, "_request", fake_request)
+
+        provider.authenticate()
+
+        assert calls == ["user/login"]
+        assert provider._auth_token == "fresh-tok"
+
+
 class TestQobuzLeakProof:
     def test_forced_connection_error_does_not_leak_credentials(
         self,

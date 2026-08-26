@@ -166,6 +166,9 @@ class Settings:
     ytmusic_auth_kind: str = "browser"   # "browser" | "oauth"
     ytmusic_oauth_client_id: str = ""
     qobuz_email: str = ""
+    qobuz_auth_kind: str = "password"    # "password" | "token"
+    qobuz_token_saved: bool = False      # non-secret "a token has been pasted" flag; the
+                                          # token itself lives in the keyring (QOBUZ_TOKEN)
     qobuz_app_id: str = ""               # blank => scrape from the web player
 
     # Matching

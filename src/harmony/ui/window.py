@@ -98,19 +98,41 @@ class HarmonyWindow(Adw.ApplicationWindow):
         )
         self._account_row.add_prefix(Gtk.Image.new_from_icon_name("avatar-default-symbolic"))
         self._account_row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-        self._account_row.connect(
-            "activated", lambda *_a: self.activate_action("app.preferences", None)
-        )
-        outer.append(self._account_row)
+        # An ActionRow only emits "activated" when a GtkListBox activates it —
+        # appended straight to a Box it is inert, which is what made this row a
+        # dead button. Give it the ListBox it needs and handle row-activated.
+        account_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        account_list.add_css_class("navigation-sidebar")
+        account_list.append(self._account_row)
+        account_list.connect("row-activated", lambda *_a: self._open_accounts_preferences())
+        outer.append(account_list)
 
         toolbar.set_content(outer)
         return Adw.NavigationPage(title="Harmony", child=toolbar)
+
+    def _open_accounts_preferences(self) -> None:
+        app = self.get_application()
+        if app is not None and hasattr(app, "open_preferences"):
+            app.open_preferences("accounts")
+        else:  # pragma: no cover - only if the window outlives its application
+            self.activate_action("app.preferences", None)
 
     def _build_content(self) -> Adw.NavigationPage:
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         self._window_title = Adw.WindowTitle(title="Search")
         header.set_title_widget(self._window_title)
+
+        # Without a primary menu the only ways to reach Preferences were
+        # Ctrl+comma and an incidental banner on the Discover page.
+        menu = Gio.Menu()
+        menu.append("Preferences", "app.preferences")
+        menu.append("About Harmony", "app.about")
+        menu.append("Quit", "app.quit")
+        menu_button = Gtk.MenuButton(
+            icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Main menu"
+        )
+        header.pack_end(menu_button)
         toolbar.add_top_bar(header)
 
         self.stack = Adw.ViewStack()

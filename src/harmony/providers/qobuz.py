@@ -193,15 +193,34 @@ class QobuzProvider(MusicProvider):
         construction -- no keyring read, no network -- so callers like
         ``AppState._warm_up`` can skip an unconfigured account entirely
         instead of calling ``authenticate()`` and paying for (and logging)
-        its failure. ``authenticate()`` itself still checks the password too
+        its failure. ``authenticate()`` itself still checks credentials too
         and still fails fast with zero I/O either way; this just lets a
         caller avoid the call altogether for the common "never set up
-        Qobuz" case. Deliberately does not check the keyring-stored
-        password: that would make this property I/O, defeating the point.
+        Qobuz" case.
+
+        In "token" mode the token itself lives in the keyring, and reading
+        it here to check for presence would make this property I/O and
+        defeat the point (same reason password mode deliberately never
+        checks the keyring-stored password). Instead this trusts
+        ``Settings.qobuz_token_saved`` -- a non-secret bool that ``prefs.py``
+        sets the moment the user pastes something into the token row, right
+        alongside the (keyring) write of the token itself. That mirrors what
+        password mode already does structurally: it gates on the non-secret
+        "did the user configure this" signal (``qobuz_email``), never on the
+        secret's presence. Worst case if the two ever fall out of sync
+        (e.g. a hand-edited settings.json) is a single doomed
+        ``authenticate()`` call, exactly like an unconfigured password
+        account already risks today.
         """
+        if self._settings.qobuz_auth_kind == "token":
+            return self._settings.qobuz_token_saved
         return bool(self._settings.qobuz_email)
 
     def authenticate(self) -> None:
+        if self._settings.qobuz_auth_kind == "token":
+            self._authenticate_with_token()
+            return
+
         # Check for configured credentials *before* any scraping or network
         # work: _ensure_ready() may scrape play.qobuz.com plus a multi-MB
         # bundle.js (two 15s-timeout requests) to auto-detect app_id/secret
@@ -227,6 +246,42 @@ class QobuzProvider(MusicProvider):
         if self._auth_token and self._token_is_valid():
             return
         self._login(email, password)
+
+    def _authenticate_with_token(self) -> None:
+        """Token-mode ``authenticate()``: validate a pasted session token.
+
+        For accounts with no password to hash in the first place -- e.g. the
+        app owner's own Qobuz account, signed in via Google OAuth on Qobuz's
+        side, which ``_login()``'s md5-of-password flow has nothing to work
+        with. Everything past login already runs on the bearer token alone
+        (``X-App-Id`` + ``X-User-Auth-Token`` on every request via
+        ``_request``); this just skips straight to having one instead of
+        minting it through ``user/login``. Never touches
+        ``config.QOBUZ_PASSWORD`` and never calls ``_login()``.
+
+        Mirrors the password path's "unconfigured fails with zero I/O"
+        guarantee: reading the token from the credential store is the only
+        thing that runs before bailing out on a missing token, so
+        ``_ensure_ready()`` (which may scrape play.qobuz.com for the app_id)
+        never fires for a token account that was never set up.
+        """
+        token = self._credentials.get(config.QOBUZ_TOKEN)
+        if not token:
+            raise AuthError(
+                "No Qobuz session token is saved. In Preferences -> Accounts -> Qobuz, "
+                "sign in at play.qobuz.com, copy the X-User-Auth-Token request header "
+                "from devtools, and paste it into the token field."
+            )
+        self._auth_token = token
+        # Still need the app_id for the X-App-Id header _token_is_valid()'s
+        # request sends -- token mode skips the login step, not this.
+        self._ensure_ready()
+        if not self._token_is_valid():
+            self._auth_token = None
+            raise AuthError(
+                "The saved Qobuz session token is no longer accepted. Sign in at "
+                "play.qobuz.com again and paste a fresh token in Preferences."
+            )
 
     def _token_is_valid(self) -> bool:
         """Cheaply confirm ``self._auth_token`` is still accepted by Qobuz.

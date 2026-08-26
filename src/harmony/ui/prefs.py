@@ -27,6 +27,7 @@ from harmony.ui.state import AppState  # noqa: E402
 log = logging.getLogger(__name__)
 
 _YT_AUTH_KINDS = ["browser", "oauth"]
+_QOBUZ_AUTH_KINDS = ["password", "token"]
 _DIRECTIONS = ["mirror-a-to-b", "mirror-b-to-a", "two-way"]
 
 
@@ -75,6 +76,11 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self._set_setting(name, value)
         self.state.reload_providers()
 
+    def _set_ai_setting(self, name: str, value: object) -> None:
+        """Persist an AI setting and rebuild the planner so pages redraw."""
+        self._set_setting(name, value)
+        self.state.reload_planner()
+
     def _set_matching_setting(self, name: str, value: object) -> None:
         """Persist a match setting and push it into the running sync engine.
 
@@ -87,7 +93,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
     # -- accounts ---------------------------------------------------------------
 
     def _build_accounts_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage(title="Accounts", icon_name="avatar-default-symbolic")
+        page = Adw.PreferencesPage(title="Accounts", name="accounts", icon_name="avatar-default-symbolic")
 
         if not self.credentials.uses_keyring:
             warn_group = Adw.PreferencesGroup()
@@ -137,6 +143,18 @@ class PreferencesDialog(Adw.PreferencesDialog):
         page.add(yt_group)
 
         qb_group = Adw.PreferencesGroup(title="Qobuz")
+
+        self.qb_auth_kind_row = Adw.ComboRow(
+            title="Sign-in method",
+            model=Gtk.StringList.new(["Email and password", "Paste session token"]),
+        )
+        self.qb_auth_kind_row.set_selected(
+            _QOBUZ_AUTH_KINDS.index(self.settings.qobuz_auth_kind)
+            if self.settings.qobuz_auth_kind in _QOBUZ_AUTH_KINDS else 0
+        )
+        self.qb_auth_kind_row.connect("notify::selected", self._on_qobuz_auth_kind_changed)
+        qb_group.add(self.qb_auth_kind_row)
+
         self.qb_email_row = Adw.EntryRow(title="Email", text=self.settings.qobuz_email)
         self.qb_email_row.connect(
             "notify::text", lambda r, _p: self._schedule("qobuz_email", lambda: self._set_account_setting("qobuz_email", r.get_text()))
@@ -151,6 +169,26 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         qb_group.add(self.qb_password_row)
 
+        self.qb_token_row = Adw.PasswordEntryRow(
+            title="Session token", text=self.credentials.get(config.QOBUZ_TOKEN) or ""
+        )
+        self.qb_token_row.connect(
+            "notify::text", lambda r, _p: self._schedule("qobuz_token", lambda: self._on_qobuz_token_changed(r.get_text()))
+        )
+        qb_group.add(self.qb_token_row)
+
+        self.qb_token_help_row = Adw.ActionRow(
+            title="Where to find this",
+            subtitle="Accounts created via Google/social sign-in have no password. Sign in at "
+            "play.qobuz.com, open devtools → Network, click any request to "
+            "www.qobuz.com/api.json/0.2/, and copy the X-User-Auth-Token request header "
+            "(the X-App-Id header on that same request goes in App ID below, if auto-detection "
+            "ever fails).",
+        )
+        qb_group.add(self.qb_token_help_row)
+
+        self._update_qobuz_auth_visibility()
+
         self.qb_app_id_row = Adw.EntryRow(title="App ID (optional)", text=self.settings.qobuz_app_id)
         self.qb_app_id_row.connect(
             "notify::text", lambda r, _p: self._schedule("qobuz_app_id", lambda: self._set_account_setting("qobuz_app_id", r.get_text()))
@@ -164,6 +202,32 @@ class PreferencesDialog(Adw.PreferencesDialog):
         qb_group.add(self.qb_status_row)
         page.add(qb_group)
         return page
+
+    def _on_qobuz_auth_kind_changed(self, row: Adw.ComboRow, _param: object) -> None:
+        kind = _QOBUZ_AUTH_KINDS[row.get_selected()]
+        self._set_account_setting("qobuz_auth_kind", kind)
+        self._update_qobuz_auth_visibility()
+
+    def _update_qobuz_auth_visibility(self) -> None:
+        """Show only the row(s) the selected sign-in method actually uses.
+
+        Keeps the dialog from implying both a password *and* a token are
+        needed at once -- the two methods are mutually exclusive ways to
+        reach the same bearer token, not additive settings.
+        """
+        is_token = self.settings.qobuz_auth_kind == "token"
+        self.qb_email_row.set_visible(not is_token)
+        self.qb_password_row.set_visible(not is_token)
+        self.qb_token_row.set_visible(is_token)
+        self.qb_token_help_row.set_visible(is_token)
+
+    def _on_qobuz_token_changed(self, value: str) -> None:
+        self.credentials.set(config.QOBUZ_TOKEN, value)
+        # Non-secret companion flag so has_credentials (which must stay
+        # I/O-free -- see QobuzProvider.has_credentials) can tell "a token
+        # has been pasted" apart from "token mode selected but nothing
+        # pasted yet" without reading the keyring.
+        self._set_account_setting("qobuz_token_saved", bool(value))
 
     def _on_choose_yt_file(self, _button: Gtk.Button) -> None:
         dialog = Gtk.FileDialog(title="Select browser.json / oauth.json")
@@ -245,7 +309,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
     # -- integrations ---------------------------------------------------------
 
     def _build_integrations_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage(title="Integrations", icon_name="applications-internet-symbolic")
+        page = Adw.PreferencesPage(title="Integrations", name="integrations", icon_name="applications-internet-symbolic")
 
         lastfm_group = Adw.PreferencesGroup(title="Last.fm")
         enabled_row = Adw.SwitchRow(title="Enabled", active=self.settings.lastfm_enabled)
@@ -274,7 +338,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
 
         ai_group = Adw.PreferencesGroup(title="AI Playlist Builder")
         ai_enabled_row = Adw.SwitchRow(title="Enabled", active=self.settings.ai_enabled)
-        ai_enabled_row.connect("notify::active", lambda r, _p: self._set_setting("ai_enabled", r.get_active()))
+        ai_enabled_row.connect(
+            "notify::active",
+            # Reload the planner too: flipping this changes whether the
+            # Discover page shows its builder or its "not configured"
+            # banner, and reload_planner is what tells that page to redraw.
+            lambda r, _p: self._set_ai_setting("ai_enabled", r.get_active()),
+        )
         ai_group.add(ai_enabled_row)
         ai_key_row = Adw.PasswordEntryRow(title="Anthropic API Key", text=self.credentials.get(config.ANTHROPIC_API_KEY) or "")
         ai_key_row.connect("notify::text", lambda r, _p: self._schedule("ai_key", lambda: self._on_ai_key_changed(r.get_text())))
@@ -307,7 +377,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
     # -- sync ---------------------------------------------------------------------
 
     def _build_sync_page(self) -> Adw.PreferencesPage:
-        page = Adw.PreferencesPage(title="Sync", icon_name="emblem-synchronizing-symbolic")
+        page = Adw.PreferencesPage(title="Sync", name="sync", icon_name="emblem-synchronizing-symbolic")
 
         group = Adw.PreferencesGroup(title="Defaults")
         direction_row = Adw.ComboRow(

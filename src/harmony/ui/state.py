@@ -33,6 +33,11 @@ class AppState(GObject.Object):
     __gsignals__ = {
         "providers-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # The optional integrations (AI planner, recommender sources) were
+        # reconfigured. Pages that render "not configured" placeholders must
+        # listen for this, or those placeholders survive the user fixing the
+        # very thing they complain about.
+        "integrations-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "toast": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
@@ -289,6 +294,7 @@ class AppState(GObject.Object):
     def reload_planner(self) -> None:
         """Recreate the AI planner (e.g. after the API key changes in Preferences)."""
         self._init_planner()
+        self.emit("integrations-changed")
 
     def all_playlists(self, refresh: bool = False) -> dict[Service, list[Playlist]]:
         """Return cached playlists, kicking off a background refresh as needed.
