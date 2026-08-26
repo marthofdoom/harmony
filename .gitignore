@@ -19,3 +19,6 @@ oauth.json
 browser.json
 secrets.json
 .env
+
+# Claude Code local session data
+.claude/

@@ -1,0 +1,57 @@
+# Flatpak manifest for Harmony.
+#
+# WebKitGTK (for the planned embedded Qobuz login) is provided by the GNOME
+# runtime — WebKit-6.0.typelib and libwebkitgtk-6.0 ship in org.gnome.Platform,
+# so the login webview needs no extra module and no user-installed dependency.
+#
+# Build:  flatpak run org.flatpak.Builder --force-clean --user --install \
+#             build-dir packaging/flatpak/io.github.marthofdoom.Harmony.yml
+# (see packaging/flatpak/build.sh)
+app-id: io.github.marthofdoom.Harmony
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: harmony
+
+finish-args:
+  # The whole point of the app: talk to the YouTube Music and Qobuz APIs.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Credentials go to the Secret Service via the keyring package. Nothing is
+  # written to a host path — import/export uses the file-chooser portal, so no
+  # filesystem access is granted here.
+  - --talk-name=org.freedesktop.secrets
+
+cleanup:
+  - '/include'
+  - '/lib/pkgconfig'
+  - '/share/man'
+  - '*.a'
+  - '*.la'
+  - '__pycache__'
+
+modules:
+  # Pinned Python dependency wheels (generated with flatpak-pip-generator, then
+  # every sdist swapped for its manylinux/abi3 wheel so the build needs no
+  # compiler, Rust, or network). Regenerate with packaging/flatpak/regen-deps.sh.
+  - python3-deps.json
+
+  - name: harmony
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-index --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - install -Dm644 data/io.github.marthofdoom.Harmony.desktop
+          ${FLATPAK_DEST}/share/applications/io.github.marthofdoom.Harmony.desktop
+      - install -Dm644 data/io.github.marthofdoom.Harmony.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/io.github.marthofdoom.Harmony.metainfo.xml
+      - install -Dm644 data/icons/io.github.marthofdoom.Harmony.svg
+          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.marthofdoom.Harmony.svg
+    sources:
+      - type: git
+        # Local checkout; flatpak-builder exports only tracked files, so the
+        # venv and build artifacts never enter the sandbox. Commit before build.
+        url: file:///var/home/marth/Documents/Projects/ytmusic
+        branch: main
