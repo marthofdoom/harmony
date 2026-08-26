@@ -206,6 +206,16 @@ class _Handler(BaseHTTPRequestHandler):
         self._handle(send_body=True)
 
     def _handle(self, *, send_body: bool) -> None:
+        # Logged at INFO so a device's request headers can be inspected by
+        # running the app from a terminal -- key for knowing whether a renderer
+        # asks for ICY metadata (Icy-MetaData: 1) or treats the URL as a file.
+        log.info(
+            "relay %s %s from %s | headers=%s",
+            self.command,
+            self.path,
+            self.client_address[0],
+            dict(self.headers),
+        )
         token = self._token_from_path()
         if token is None:
             self.send_error(404, "Not Found")
