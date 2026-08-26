@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.16" date="2026-08-26">
+      <description>
+        <p>"This computer" (local playback) now appears in every play-to-device
+        picker — the Search toolbar, Discover, and the Similar dialog — not just
+        the right-click menu. Also clearer Qobuz sign-in guidance in the setup
+        script, which now leads with the reliable token option.</p>
+      </description>
+    </release>
     <release version="0.5.15" date="2026-08-26">
       <description>
         <p>Adds an in-app local player: pick "This computer" as a playback

@@ -467,7 +467,7 @@ class DiscoverPage(Gtk.Box):
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't add track: {exc}"))
 
     def _open_device_popover(self, parent: Gtk.Widget, track: Track) -> None:
-        devices = self.state.known_devices()
+        devices = self.state.playback_targets()
         popover = Gtk.Popover()
         listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         listbox.add_css_class("boxed-list")
@@ -475,9 +475,12 @@ class DiscoverPage(Gtk.Box):
             listbox.append(Adw.ActionRow(title="No devices yet", subtitle="Add one on the Devices page",
                                           sensitive=False))
         for info in devices:
-            row = Adw.ActionRow(title=info.name, subtitle=info.host)
+            is_local = info.kind == "local"
+            row = Adw.ActionRow(title=info.name,
+                                subtitle="In this app" if is_local else info.host)
             row.set_activatable(True)
-            row.add_prefix(Gtk.Image.new_from_icon_name("audio-speakers-symbolic"))
+            row.add_prefix(Gtk.Image.new_from_icon_name(
+                "computer-symbolic" if is_local else "audio-speakers-symbolic"))
 
             def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name,
                       pop: Gtk.Popover = popover) -> None:

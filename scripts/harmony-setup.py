@@ -868,21 +868,44 @@ def scrape_qobuz_app_credentials() -> tuple[str, str]:
     return app_id, secret
 
 
+def _qobuz_error_message(body: str) -> str | None:
+    """Pull Qobuz's human error out of a failed API response body, if present."""
+    try:
+        payload = json.loads(body)
+    except (ValueError, TypeError):
+        return None
+    if isinstance(payload, dict):
+        message = payload.get("message") or payload.get("error")
+        if message:
+            return str(message)
+    return None
+
+
 def qobuz_password_login(app_id: str, email: str, password: str) -> str:
+    # Mirror what working Qobuz clients (streamrip, qobuz-dl) send: a GET to
+    # user/login with email + md5(password) + app_id, and X-App-Id. Notably NOT
+    # a `username` field -- passing both username and email makes Qobuz 401 some
+    # accounts, and email is the login identifier for the web player anyway.
     digest = hashlib.md5(password.encode("utf-8")).hexdigest()  # noqa: S324 - Qobuz's own scheme
-    params = urllib.parse.urlencode(
-        {"app_id": app_id, "username": email, "email": email, "password": digest}
-    ).encode("utf-8")
+    query = urllib.parse.urlencode({"email": email, "password": digest, "app_id": app_id})
     req = urllib.request.Request(
-        QOBUZ_BASE_URL + "user/login",
-        data=params,
+        QOBUZ_BASE_URL + "user/login?" + query,
         headers={"X-App-Id": app_id, "User-Agent": DESKTOP_USER_AGENT},
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310 - fixed https URL
             data = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Qobuz login failed: HTTP {exc.code}") from exc
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - best-effort diagnostics
+            pass
+        detail = _qobuz_error_message(body)
+        if exc.code == 401 and not detail:
+            detail = ("wrong email/password, or this account signs in with Google/"
+                      "social login (no Qobuz password) -- use the paste-token option")
+        raise RuntimeError(f"Qobuz login failed: {detail or f'HTTP {exc.code}'}") from exc
     except urllib.error.URLError as exc:
         raise RuntimeError(f"Could not reach Qobuz: {exc.reason}") from exc
 
@@ -1423,14 +1446,14 @@ def _qobuz_browser_autograb(target: Target) -> None:
 def qobuz_menu(target: Target) -> None:
     while True:
         print("\nQobuz")
-        print("  [1] Username + password (recommended)")
-        print("  [2] Paste token (only for Google/social sign-in accounts)")
+        print("  [1] Paste token (recommended -- reliable)")
+        print("  [2] Email + password (Qobuz often blocks API login; may return 401)")
         print("  [b] Back")
         choice = input("> ").strip().lower()
         if choice == "1":
-            _qobuz_password_login(target)
-        elif choice == "2":
             _qobuz_paste_token(target)
+        elif choice == "2":
+            _qobuz_password_login(target)
         elif choice in ("b", "back", ""):
             return
         else:
