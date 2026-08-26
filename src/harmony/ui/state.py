@@ -72,6 +72,10 @@ class AppState(GObject.Object):
         # single relay serves every device for the app's lifetime (a daemon
         # thread, so it goes away with the process).
         self._relay: Any | None = None
+        # host -> (title, artist) we last relayed to that device, so the UI can
+        # show now-playing text even when the device reports none (a bare URL
+        # carries no metadata unless the stream itself does).
+        self._now_playing: dict[str, tuple[str, str]] = {}
 
         self.reload_providers()
         self._init_recommender()
@@ -496,9 +500,16 @@ class AppState(GObject.Object):
             return cached["source"]
 
         relay = self._get_relay()
-        token = relay.register(resolver)
+        token = relay.register(resolver, title=track.title, artist=track.artist_name)
         url = relay.url_for(token, device_host)
         self.device_for(device_host).play_url(url)
+        self._now_playing[device_host] = (track.title, track.artist_name)
+
+    def last_played_on(self, host: str | None) -> tuple[str, str] | None:
+        """Return the (title, artist) last relayed to ``host`` via play-to-device, if any."""
+        if host is None:
+            return None
+        return self._now_playing.get(host)
 
     def toast(self, text: str) -> None:
         """Emit a toast. Must be called from the main thread."""

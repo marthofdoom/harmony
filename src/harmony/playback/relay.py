@@ -25,6 +25,7 @@ import socket
 import threading
 from collections import OrderedDict
 from collections.abc import Callable
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit
 
@@ -55,6 +56,37 @@ _CHUNK_SIZE = 64 * 1024
 # the device sees the same seek/length semantics the provider CDN offers.
 _PASSTHROUGH_HEADERS = ("Accept-Ranges", "Content-Length", "Content-Range")
 
+# Bytes of audio between ICY metadata blocks. 16 KiB is the common radio-stream
+# default and what LinkPlay/WiiM firmware expects when it requests metadata.
+_ICY_METAINT = 16384
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """A registered playable: the per-fetch resolver plus static now-playing text."""
+
+    resolver: Resolver
+    title: str | None = None
+    artist: str | None = None
+
+
+def _icy_stream_title(title: str | None, artist: str | None) -> str:
+    return " - ".join(part for part in (artist, title) if part)
+
+
+def _icy_metadata_block(title: str | None, artist: str | None) -> bytes:
+    """Build an ICY in-stream metadata block: a length byte + a padded StreamTitle.
+
+    ICY has no escaping, so the quote/semicolon delimiters are stripped rather
+    than escaped. The payload is zero-padded to a 16-byte multiple and prefixed
+    with a single byte counting those 16-byte units, per the SHOUTcast
+    convention every LinkPlay renderer implements.
+    """
+    text = _icy_stream_title(title, artist).replace("'", "").replace(";", "")
+    payload = f"StreamTitle='{text}';".encode("utf-8", "replace")
+    payload += b"\x00" * (-len(payload) % 16)
+    return bytes([len(payload) // 16]) + payload
+
 
 class RelayServer:
     """Serves ``GET/HEAD /play/<token>`` by resolving and re-streaming a track.
@@ -71,7 +103,7 @@ class RelayServer:
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
         self._lock = threading.Lock()
-        self._resolvers: OrderedDict[str, Resolver] = OrderedDict()
+        self._entries: OrderedDict[str, _Entry] = OrderedDict()
 
     def start(self) -> None:
         """Bind and start serving in a daemon thread. Safe to call more than once."""
@@ -107,19 +139,28 @@ class RelayServer:
             raise RuntimeError("RelayServer has not been started")
         return self._server.server_address[1]
 
-    def register(self, resolver: Resolver) -> str:
-        """Register a resolver and return a fresh, unguessable token for it."""
+    def register(self, resolver: Resolver, *, title: str | None = None, artist: str | None = None) -> str:
+        """Register a resolver (with optional now-playing text) and return a token.
+
+        ``title``/``artist`` are handed to a device via ICY stream metadata when
+        it asks for it, so the renderer can show what's playing for a bare URL.
+        """
         token = secrets.token_urlsafe(16)
         with self._lock:
-            self._resolvers[token] = resolver
-            while len(self._resolvers) > _MAX_TOKENS:
-                self._resolvers.popitem(last=False)  # evict oldest
+            self._entries[token] = _Entry(resolver=resolver, title=title, artist=artist)
+            while len(self._entries) > _MAX_TOKENS:
+                self._entries.popitem(last=False)  # evict oldest
         return token
 
     def resolver_for(self, token: str) -> Resolver | None:
-        """Thread-safe lookup used by the request handler."""
+        """Thread-safe resolver lookup (for callers that only need the resolver)."""
+        entry = self.entry_for(token)
+        return entry.resolver if entry is not None else None
+
+    def entry_for(self, token: str) -> _Entry | None:
+        """Thread-safe lookup of the full registration used by the request handler."""
         with self._lock:
-            return self._resolvers.get(token)
+            return self._entries.get(token)
 
     def url_for(self, token: str, device_host: str) -> str:
         """Build the URL a device at ``device_host`` should use to fetch ``token``.
@@ -171,22 +212,27 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         relay: RelayServer = self.server.relay  # type: ignore[attr-defined]
-        resolver = relay.resolver_for(token)
-        if resolver is None:
+        entry = relay.entry_for(token)
+        if entry is None:
             self.send_error(404, "Unknown or expired token")
             return
 
         try:
-            source = resolver()
+            source = entry.resolver()
         except Exception:
             log.exception("relay: resolver failed for token %s", token)
             self.send_error(502, "Failed to resolve stream")
             return
 
+        # Serve ICY in-stream metadata only when the device asks for it and we
+        # have something to show. In that mode the body is streamed from the
+        # start (no Range), so metadata blocks land at fixed offsets.
+        wants_icy = self.headers.get("Icy-MetaData") == "1" and bool(entry.title or entry.artist)
         request_headers = dict(source.headers)
-        range_header = self.headers.get("Range")
-        if range_header:
-            request_headers["Range"] = range_header
+        if not wants_icy:
+            range_header = self.headers.get("Range")
+            if range_header:
+                request_headers["Range"] = range_header
 
         try:
             upstream = requests.get(
@@ -203,10 +249,50 @@ class _Handler(BaseHTTPRequestHandler):
 
         with upstream:
             try:
-                self._reply(upstream, source, send_body=send_body)
+                if wants_icy:
+                    self._reply_icy(upstream, source, entry, send_body=send_body)
+                else:
+                    self._reply(upstream, source, send_body=send_body)
             except (BrokenPipeError, ConnectionResetError):
                 # Device seeked or stopped mid-stream; nothing to do.
                 pass
+
+    def _reply_icy(
+        self, upstream: requests.Response, source: StreamSource, entry: _Entry, *, send_body: bool
+    ) -> None:
+        """Stream the body with ICY metadata so the renderer shows title/artist.
+
+        A metadata block carrying ``StreamTitle`` is inserted after every
+        ``_ICY_METAINT`` bytes of audio. The stream is length-less and
+        non-seekable, so it's close-delimited.
+        """
+        self.send_response(200)
+        self.send_header(
+            "Content-Type", source.mime_type or upstream.headers.get("Content-Type", "audio/mpeg")
+        )
+        self.send_header("icy-metaint", str(_ICY_METAINT))
+        name = _icy_stream_title(entry.title, entry.artist)
+        if name:
+            self.send_header("icy-name", name)
+        self.close_connection = True
+        self.end_headers()
+        if not send_body:
+            return
+
+        meta_block = _icy_metadata_block(entry.title, entry.artist)
+        remaining = _ICY_METAINT
+        for chunk in upstream.iter_content(_CHUNK_SIZE):
+            if not chunk:
+                continue
+            view = memoryview(chunk)
+            while len(view) >= remaining:
+                self.wfile.write(view[:remaining])
+                self.wfile.write(meta_block)
+                view = view[remaining:]
+                remaining = _ICY_METAINT
+            if len(view):
+                self.wfile.write(bytes(view))
+                remaining -= len(view)
 
     def _reply(self, upstream: requests.Response, source: StreamSource, *, send_body: bool) -> None:
         status = upstream.status_code if upstream.status_code in (200, 206) else 200

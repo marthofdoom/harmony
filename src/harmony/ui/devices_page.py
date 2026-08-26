@@ -309,8 +309,16 @@ class DevicesPage(Gtk.Box):
     def _apply_status(self, status: Any) -> None:
         self._last_status = status
         self.state_row.set_subtitle((status.state or "unknown").capitalize())
-        self.title_row.set_subtitle(status.title or "Nothing playing")
-        self.artist_row.set_subtitle(status.artist or "—")
+        # A bare relay URL carries no metadata, so the device often reports an
+        # empty title/artist even while playing. Fall back to what we relayed
+        # to this device so the UI still shows the track.
+        title, artist = status.title or "", status.artist or ""
+        if not title:
+            remembered = self.state.last_played_on(self._selected_host)
+            if remembered is not None:
+                title, artist = remembered
+        self.title_row.set_subtitle(title or "Nothing playing")
+        self.artist_row.set_subtitle(artist or "—")
         self._updating_from_status = True
         try:
             if status.volume is not None:

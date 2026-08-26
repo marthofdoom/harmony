@@ -166,3 +166,77 @@ def test_port_before_start_raises() -> None:
     server = RelayServer(bind_host="127.0.0.1", port=0)
     with pytest.raises(RuntimeError):
         _ = server.port
+
+
+# --------------------------------------------------------------------------
+# ICY stream metadata (so a renderer shows title/artist for a bare URL)
+# --------------------------------------------------------------------------
+
+
+def _deinterleave_icy(body: bytes, metaint: int) -> tuple[bytes, list[str]]:
+    """Split an ICY body into (audio, [StreamTitle strings]) given the metaint."""
+    audio = bytearray()
+    metas: list[str] = []
+    i = 0
+    while i < len(body):
+        audio += body[i : i + metaint]
+        i += metaint
+        if i >= len(body):
+            break
+        length = body[i] * 16
+        i += 1
+        meta = body[i : i + length]
+        i += length
+        text = meta.rstrip(b"\x00").decode("utf-8", "replace")
+        if text:
+            metas.append(text)
+    return bytes(audio), metas
+
+
+def _register_with_meta(relay: RelayServer, fake_upstream: ThreadingHTTPServer, title: str, artist: str) -> str:
+    port = fake_upstream.server_address[1]
+
+    def resolver() -> StreamSource:
+        return StreamSource(url=f"http://127.0.0.1:{port}/audio", mime_type="audio/mpeg")
+
+    return relay.register(resolver, title=title, artist=artist)
+
+
+def test_icy_metadata_interleaved_when_requested(relay: RelayServer, fake_upstream: ThreadingHTTPServer) -> None:
+    token = _register_with_meta(relay, fake_upstream, title="Roygbiv", artist="Boards of Canada")
+
+    resp = requests.get(
+        f"http://127.0.0.1:{relay.port}/play/{token}",
+        headers={"Icy-MetaData": "1"},
+        timeout=5,
+    )
+
+    assert resp.status_code == 200
+    metaint = int(resp.headers["icy-metaint"])
+    assert resp.headers.get("icy-name") == "Boards of Canada - Roygbiv"
+    audio, metas = _deinterleave_icy(resp.content, metaint)
+    assert audio == PAYLOAD  # de-interleaving recovers the exact upstream bytes
+    assert metas and all(m == "StreamTitle='Boards of Canada - Roygbiv';" for m in metas)
+
+
+def test_no_icy_without_metadata_even_if_requested(relay: RelayServer, fake_upstream: ThreadingHTTPServer) -> None:
+    token = _register_audio_resolver(relay, fake_upstream)  # registered without title/artist
+
+    resp = requests.get(
+        f"http://127.0.0.1:{relay.port}/play/{token}",
+        headers={"Icy-MetaData": "1"},
+        timeout=5,
+    )
+
+    assert resp.status_code == 200
+    assert "icy-metaint" not in resp.headers
+    assert resp.content == PAYLOAD  # plain passthrough, no interleaving
+
+
+def test_icy_metadata_block_is_padded_and_length_prefixed() -> None:
+    from harmony.playback.relay import _icy_metadata_block
+
+    block = _icy_metadata_block("Title", "Artist")
+    length = block[0] * 16
+    assert len(block) == 1 + length  # length byte counts 16-byte units
+    assert block[1 : 1 + length].rstrip(b"\x00") == b"StreamTitle='Artist - Title';"
