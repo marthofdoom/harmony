@@ -143,11 +143,47 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         yt_group.add(self.yt_client_secret_row)
 
+        # In-app setup guide so the OAuth client isn't a mystery — a one-time
+        # Google Cloud setup, with the console linked directly.
+        yt_help_row = Adw.ExpanderRow(
+            title="How to get a Client ID and Secret",
+            subtitle="One-time Google Cloud setup — click to expand",
+        )
+        steps = Gtk.Label(
+            use_markup=True, wrap=True, xalign=0.0, selectable=True,
+            css_classes=["dim-label"],
+            margin_top=8, margin_bottom=8, margin_start=12, margin_end=12,
+        )
+        steps.set_markup(
+            "1. Open the "
+            "<a href='https://console.cloud.google.com'>Google Cloud Console</a> "
+            "and create or pick a project.\n"
+            "2. Enable <b>YouTube Data API v3</b> (APIs &amp; Services → Library).\n"
+            "3. Configure the <b>OAuth consent screen</b> (User type <b>External</b>) "
+            "and add your own Google account as a <b>Test user</b>.\n"
+            "4. Create <b>Credentials → OAuth client ID</b>, application type "
+            "<b>TVs and Limited Input devices</b>.\n"
+            "5. Paste the Client ID and Secret above, then Sign in.\n\n"
+            "While the consent screen stays in “testing”, sign-in expires after "
+            "~7 days; publishing it (no Google review needed for your own use) keeps it "
+            "long-lived."
+        )
+        steps_row = Gtk.ListBoxRow(activatable=False, selectable=False, child=steps)
+        yt_help_row.add_row(steps_row)
+        console_button = Gtk.Button(
+            label="Open Google Cloud Console", valign=Gtk.Align.CENTER,
+        )
+        console_button.connect(
+            "clicked",
+            lambda *_a: self._open_uri("https://console.cloud.google.com/apis/credentials"),
+        )
+        yt_help_row.add_suffix(console_button)
+        yt_group.add(yt_help_row)
+
         yt_signin_row = Adw.ActionRow(
             title="Sign in with Google",
-            subtitle="Opens Google in your browser and links this account with a short code. "
-            "Needs the OAuth client above; create a 'TV and Limited Input' client in a Google "
-            "Cloud project with the YouTube Data API v3 enabled.",
+            subtitle="Opens Google in your browser and links this account with a short code — "
+            "no devtools needed. Needs the OAuth client above.",
         )
         yt_signin_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER,
                                       css_classes=["suggested-action"])
@@ -297,6 +333,12 @@ class PreferencesDialog(Adw.PreferencesDialog):
         # has been pasted" apart from "token mode selected but nothing
         # pasted yet" without reading the keyring.
         self._set_account_setting("qobuz_token_saved", bool(value))
+
+    def _open_uri(self, uri: str) -> None:
+        try:
+            Gtk.UriLauncher.new(uri).launch(self.get_root(), None, None)
+        except Exception:  # noqa: BLE001 - non-fatal; the link is also shown as text
+            log.debug("Could not open %s", uri, exc_info=True)
 
     def _on_ytmusic_google_signin(self, _button: Gtk.Button) -> None:
         from harmony.ui import ytmusic_login
