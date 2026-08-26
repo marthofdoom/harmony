@@ -29,6 +29,14 @@ log = logging.getLogger(__name__)
 
 LOGIN_URL = "https://play.qobuz.com/login"
 
+# A current mainstream desktop Chrome UA — the same class of string Qobuz's own
+# web player runs under. Without this WebKitGTK identifies as an unsupported
+# browser and Qobuz redirects to an app-download page.
+_DESKTOP_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+)
+
 # Try the modern WebKitGTK 6.0 binding. Absent on a bare source install; present
 # in org.gnome.Platform (the Flatpak) and on systems with webkitgtk6.0.
 try:
@@ -91,8 +99,11 @@ class QobuzLoginDialog(Adw.Window):
             title="Sign in to Qobuz",
             modal=True,
             transient_for=parent,
-            default_width=520,
-            default_height=720,
+            # Qobuz's web player is desktop-first and shows a "screen too small"
+            # notice below a wide viewport, so the window has to be broad enough
+            # to clear that check rather than a narrow login panel.
+            default_width=1120,
+            default_height=820,
         )
         self._on_token = on_token
         self._settled = False
@@ -116,6 +127,15 @@ class QobuzLoginDialog(Adw.Window):
         except Exception:  # noqa: BLE001 - fall back to the default session
             log.debug("Falling back to default WebKit session", exc_info=True)
             self._webview = WebKit.WebView()
+
+        # WebKitGTK's default user-agent makes Qobuz serve a "get the app"
+        # interstitial instead of the login form; present as a mainstream
+        # desktop browser so it serves the real web player.
+        try:
+            settings = self._webview.get_settings()
+            settings.set_user_agent(_DESKTOP_USER_AGENT)
+        except Exception:  # noqa: BLE001 - non-fatal; login page may still work
+            log.debug("Could not set webview user-agent", exc_info=True)
 
         self._webview.set_vexpand(True)
         self._webview.connect("load-changed", self._on_load_changed)
