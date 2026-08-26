@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.0" date="2026-08-26">
+      <description>
+        <p>Unified search and cross-service playlist sync across YouTube Music
+        and Qobuz, discovery, WiiM/LinkPlay device control, and play-to-device
+        (a passive LAN relay that streams a track to a speaker).</p>
+      </description>
+    </release>
     <release version="0.1.0" date="2026-08-25">
       <description>
         <p>Initial packaged release.</p>
