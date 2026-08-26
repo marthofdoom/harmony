@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import pathlib
 import shutil
 import subprocess
 import time
@@ -138,11 +139,22 @@ _ROC_REPAIR_PORT = 10002
 _ROC_CONTROL_PORT = 10003
 
 
+def _roc_log_path() -> pathlib.Path:
+    """Where roc-recv's diagnostics go (a real file, never a pipe)."""
+    import platformdirs
+
+    directory = pathlib.Path(platformdirs.user_cache_dir("harmony"))
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory / "roc-recv.log"
+
+
 @dataclass(frozen=True)
 class RocReceiver:
     """Handle to a live ROC receiver (a running ``roc-recv`` process)."""
 
     process: subprocess.Popen
+    log_file: object  # open file object roc-recv writes its log to; closed on teardown
+    log_path: str
     source_port: int
     repair_port: int
     control_port: int
@@ -156,7 +168,7 @@ def roc_available() -> bool:
 def roc_receiver_up(
     sink: str,
     *,
-    target_latency_ms: int = 60,
+    target_latency_ms: int = 100,
     source_port: int = _ROC_SOURCE_PORT,
     repair_port: int = _ROC_REPAIR_PORT,
     control_port: int = _ROC_CONTROL_PORT,
@@ -168,6 +180,16 @@ def roc_receiver_up(
     holds close to it). Returns a handle to tear it down. Raises
     ``ProviderError`` if roc-recv is missing or dies on startup (e.g. a bad sink
     name or a port already in use).
+
+    Tuning for glitch-free playback over Wi-Fi:
+    - a high-quality resampler (``--resampler-profile=high``), since ROC is
+      continuously resampling to track the sender clock -- a cheap resampler
+      makes that audible;
+    - ``--latency-tolerance`` set wide so a transient jitter spike doesn't force
+      a disruptive latency restart;
+    - roc-recv's log is written to a **file**, never a pipe: an undrained stderr
+      pipe fills after ~64 KB and then roc-recv blocks on write, which stalls
+      audio -- the classic cause of periodic digital breaks.
     """
     exe = shutil.which("roc-recv")
     if exe is None:
@@ -175,30 +197,43 @@ def roc_receiver_up(
             "roc-recv not found -- install roc-toolkit (bundled in the Flatpak) "
             "for FEC / low-latency receive."
         )
+    # Let ROC drift up to half the target (min 40 ms) before a hard restart.
+    tolerance_ms = max(40, target_latency_ms // 2)
     argv = [
         exe,
+        "-v",  # info-level diagnostics (packet loss, latency tuning) -> the log file
         "-s", f"rtp+rs8m://0.0.0.0:{source_port}",
         "-r", f"rs8m://0.0.0.0:{repair_port}",
         "-c", f"rtcp://0.0.0.0:{control_port}",
         "-o", f"pulse://{sink}",
         f"--target-latency={target_latency_ms}ms",
+        f"--latency-tolerance={tolerance_ms}ms",
+        "--resampler-profile=high",
     ]
+    log_path = _roc_log_path()
+    log_file = open(log_path, "wb")
     try:
         proc = subprocess.Popen(
-            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_file
         )
     except OSError as exc:
+        log_file.close()
         raise ProviderError(f"couldn't start roc-recv: {exc}") from exc
     # roc-recv opens the output device immediately, so a fast exit means a real
     # error (bad sink, port taken). Give it a moment, then check it's alive.
     time.sleep(0.4)
     if proc.poll() is not None:
+        log_file.close()
         err = ""
-        if proc.stderr is not None:
-            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+        try:
+            err = log_path.read_text(errors="replace").strip().splitlines()[-1]
+        except (OSError, IndexError):
+            pass
         raise ProviderError(f"roc-recv exited immediately: {err or f'code {proc.returncode}'}")
     return RocReceiver(
         process=proc,
+        log_file=log_file,
+        log_path=str(log_path),
         source_port=source_port,
         repair_port=repair_port,
         control_port=control_port,
@@ -208,10 +243,13 @@ def roc_receiver_up(
 def roc_receiver_down(receiver: RocReceiver) -> None:
     """Stop a ROC receiver (terminate the roc-recv process)."""
     proc = receiver.process
-    if proc.poll() is not None:
-        return
-    proc.terminate()
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
     try:
-        proc.wait(timeout=3)
-    except subprocess.TimeoutExpired:
-        proc.kill()
+        receiver.log_file.close()
+    except OSError:
+        pass

@@ -68,9 +68,10 @@ class AudioRoutePage(Gtk.Box):
         group = Adw.PreferencesGroup(title="Receiver")
         self.sink_row = Adw.ComboRow(title="Output device")
         group.add(self.sink_row)
-        self.latency_row = Adw.SpinRow.new_with_range(20, 200, 5)
+        self.latency_row = Adw.SpinRow.new_with_range(20, 500, 5)
         self.latency_row.set_title("Target latency (ms)")
-        self.latency_row.set_value(60 if self._roc else 40)
+        self.latency_row.set_subtitle("Higher is more stable over Wi-Fi; lower is tighter")
+        self.latency_row.set_value(100 if self._roc else 40)
         group.add(self.latency_row)
         self.append(group)
 
@@ -161,9 +162,10 @@ class AudioRoutePage(Gtk.Box):
             self._receiver = receiver
             self.stop_button.set_sensitive(True)
             self.sender_label.set_label(self._sender_command(_local_ip()))
-            self.status_label.set_label(
-                f"Receiving {kind} → {sink.description}. Start sending on the other machine."
-            )
+            msg = f"Receiving {kind} → {sink.description}. Start sending on the other machine."
+            if use_roc and getattr(receiver, "log_path", None):
+                msg += f"\nIf audio breaks up, raise the target latency. Diagnostics: {receiver.log_path}"
+            self.status_label.set_label(msg)
 
         def error(exc: BaseException) -> None:
             self.start_button.set_sensitive(True)
