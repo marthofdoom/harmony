@@ -23,7 +23,10 @@ from .base import DeviceInfo, PlaybackDevice, PlaybackStatus
 
 log = logging.getLogger(__name__)
 
-_TIMEOUT_S = 5.0
+# Kept short because a UI action blocks its controls until the call returns.
+# An unreachable device costs at most two of these (http then the https
+# fallback), so this bounds the worst-case "spinning" time a user sees.
+_TIMEOUT_S = 3.0
 
 # See the module docstring: verify=False here is a deliberate choice for a
 # self-signed, on-LAN-only device, not a suppressed mistake.

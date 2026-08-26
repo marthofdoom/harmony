@@ -329,6 +329,10 @@ class DevicesPage(Gtk.Box):
             return
         device = self._get_device(host)
         self.refresh_button.set_sensitive(False)
+        # Immediate feedback: a device call can take a few seconds against a
+        # slow or unreachable device, and disabled controls with no cue read
+        # as a freeze rather than as work in progress.
+        self.state_row.set_subtitle("Contacting device…")
 
         def work() -> tuple[Any, Any]:
             return device.info, device.status()
@@ -346,6 +350,7 @@ class DevicesPage(Gtk.Box):
             self.refresh_button.set_sensitive(True)
             if self._selected_host != host:
                 return
+            self.state_row.set_subtitle("Unavailable")
             self._report_error(exc, "Couldn't reach device")
 
         run_async(work, done, error)
@@ -363,6 +368,7 @@ class DevicesPage(Gtk.Box):
             return
         device = self._get_device(host)
         self._set_controls_sensitive(False)
+        self.state_row.set_subtitle("Contacting device…")
 
         def work() -> Any:
             action(device)
@@ -376,6 +382,7 @@ class DevicesPage(Gtk.Box):
         def error(exc: BaseException) -> None:
             if self._selected_host == host:
                 self._set_controls_sensitive(True)
+                self.state_row.set_subtitle("Unavailable")
             self._report_error(exc, "Command failed")
 
         run_async(work, done, error)
