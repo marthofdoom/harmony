@@ -1036,11 +1036,16 @@ def read_chrome_qobuz_cookie(cookies_path: Path, password: bytes) -> str | None:
             conn.close()
     finally:
         os.unlink(tmp)
+    debug = os.environ.get("HARMONY_DEBUG")
     if not row:
+        if debug:
+            print(f"[debug] no qobuz-session cookie in {cookies_path}")
         return None
     try:
         value = chrome_decrypt(row[0], password)
-    except Exception:  # noqa: BLE001 - a decrypt failure just means "no token here"
+    except Exception as exc:  # noqa: BLE001 - a decrypt failure just means "no token here"
+        if debug:
+            print(f"[debug] decrypt failed for {cookies_path}: {exc}")
         return None
     return _qobuz_token_from_cookie_value(value)
 
@@ -1368,12 +1373,7 @@ def _find_qobuz_token_in_browsers() -> str | None:
     if token := _scan(FIREFOX_COOKIE_SOURCES, read_firefox_qobuz_cookie):
         return token
     chrome_pw = get_chrome_safe_storage_password()
-    if token := _scan(CHROME_COOKIE_SOURCES, lambda p: read_chrome_qobuz_cookie(p, chrome_pw)):
-        return token
-    # localStorage fallbacks (older web-player behaviour).
-    if token := _scan(FIREFOX_STORAGE_SOURCES, read_firefox_qobuz_localstorage):
-        return token
-    return _scan(CHROME_STORAGE_SOURCES, read_chrome_qobuz_localstorage)
+    return _scan(CHROME_COOKIE_SOURCES, lambda p: read_chrome_qobuz_cookie(p, chrome_pw))
 
 
 def _qobuz_browser_autograb(target: Target) -> None:
