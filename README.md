@@ -8,6 +8,16 @@ matching, and recommendation tooling.
 > two-way sync against playlists you care about as experimental and keep the
 > automatic snapshots turned on.
 
+> **Unofficial — use at your own risk.** Harmony is not affiliated with,
+> endorsed by, or connected to YouTube Music, Qobuz, or any other service it
+> talks to. It reaches those services through unofficial, reverse-engineered
+> interfaces using **your own account credentials**, which likely violates each
+> service's Terms of Service — accessing your own account through an unofficial
+> client can get that account limited or terminated. Harmony manages playlists
+> and metadata only; **it does not download, stream, decrypt, or redistribute
+> any audio**, and it does not circumvent any technical protection measure. You
+> are responsible for your use of it. See [LICENSE](LICENSE) (GPL-3.0-or-later).
+
 ## Features
 
 - **Unified search** across both services — tracks, albums, artists, playlists.
@@ -122,12 +132,19 @@ PYTHONPATH=src .venv/bin/python -m ruff check src tests
 PYTHONPATH=src .venv/bin/python -m harmony     # run from source
 ```
 
-## A note on the Qobuz API
+## A note on the service APIs
 
-The Qobuz client here is reverse-engineered from the public web player, as every
-third-party Qobuz tool is. It can break whenever Qobuz changes their frontend,
-and it is not endorsed by Qobuz. Harmony only uses it for catalog search and
-playlist management on your own account — it does not download or decrypt audio.
+Neither YouTube Music nor Qobuz publishes an official public API for this, so
+both clients are reverse-engineered from the services' own web players — the
+same approach every third-party tool in this space uses (ytmusicapi, yt-dlp,
+Music Assistant, streamrip, …). They can break whenever a service changes its
+frontend, and neither service endorses this.
+
+Harmony uses these interfaces only for **catalog search and playlist/library
+management on your own account, authenticated with your own credentials**. It
+does **not** download, stream, decrypt, or redistribute audio, and it does not
+circumvent any DRM or technical protection measure. See the "unofficial — use
+at your own risk" notice at the top of this file.
 
 ## Licence
 
