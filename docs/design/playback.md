@@ -1,7 +1,7 @@
 # Playback: play-to-device, not in-app decode
 
-**Status: Device control — Built & verified. Play-to-device (streaming) —
-design decided, not yet built.**
+**Status: Device control — Built & verified. Play-to-device (passive relay) —
+Built; end-to-end verification against real hardware pending.**
 
 In-app audio playback was deprioritized early for a real reason: decoding YT
 Music or Qobuz streams in-process is a licensing/ToS gray area and technically
@@ -25,12 +25,15 @@ The **control plane** is built: `harmony/playback/` (engine, headless) plus a
 - The Devices page adds/discovers renderers and drives transport, volume, mute,
   and now-playing — every call off the main loop per the threading rule.
 
-What is **not** wired: pushing a track from your library to a device. The
-Devices page controls what a device is *already* playing; `play_url()` exists on
-the backend but nothing in the UI feeds it a resolved stream. That is the
-play-to-device work below.
+Play-to-device is now wired too: a **Play on Device** action on search results
+resolves a stream, registers it with the relay, and tells the selected device to
+play the relay URL (`AppState.play_track_on_device`). `MusicProvider.resolve_stream`
+returns a `StreamSource` (Qobuz via signed `track/getFileUrl` → FLAC; YouTube via
+yt-dlp → the AAC/M4A itag 140), and `RelayServer` (`playback/relay.py`) does the
+byte-forwarding. What remains is real-hardware verification and extending the
+action beyond search (playlists/library).
 
-## Play-to-device: the passive-relay design (decided)
+## Play-to-device: the passive-relay design
 
 The chosen method is a **passive relay**, not a redirect. Harmony runs a small
 local HTTP endpoint; the device plays *from Harmony*

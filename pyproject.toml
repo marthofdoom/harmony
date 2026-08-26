@@ -16,6 +16,10 @@ dependencies = [
     "rapidfuzz>=3.0",
     "platformdirs>=4.0",
     "keyring>=24.0",
+    # Resolves a playable YouTube audio stream URL for play-to-device (the
+    # relay). Imported lazily in the YT provider so a minimal install still
+    # works — it just can't stream YouTube to a device without this.
+    "yt-dlp>=2024.12",
 ]
 
 [project.optional-dependencies]

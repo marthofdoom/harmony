@@ -9,12 +9,14 @@ from __future__ import annotations
 
 from .base import DeviceInfo, PlaybackDevice, PlaybackStatus
 from .discovery import discover_wiim
+from .relay import RelayServer
 from .wiim import WiiMDevice, device_from_host
 
 __all__ = [
     "DeviceInfo",
     "PlaybackDevice",
     "PlaybackStatus",
+    "RelayServer",
     "WiiMDevice",
     "device_from_host",
     "discover_wiim",

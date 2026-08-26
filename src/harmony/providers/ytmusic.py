@@ -20,7 +20,7 @@ from ytmusicapi.exceptions import YTMusicServerError, YTMusicUserError
 from .. import config
 from ..config import CredentialStore, Settings
 from ..errors import AuthError, NotSupportedError, ProviderError, RateLimitedError
-from ..models import Album, Artist, Playlist, SearchResults, Service, Track
+from ..models import Album, Artist, Playlist, SearchResults, Service, StreamSource, Track
 from .base import MusicProvider, _chunked, retry_on_rate_limit
 
 log = logging.getLogger(__name__)
@@ -107,6 +107,29 @@ def _largest_thumbnail(raw: Any) -> str | None:
     except (TypeError, AttributeError):
         return None
     return best.get("url")
+
+
+def _pick_audio_format(info: dict[str, Any]) -> dict[str, Any]:
+    """Pick the best audio-only format out of a yt-dlp ``extract_info`` result.
+
+    Preference order: itag 140 (YouTube's standard 128kbps AAC/m4a, present on
+    almost every video and a safe default for LAN playback targets) beats the
+    highest-bitrate audio-only m4a, which beats any other audio-only format.
+    Pure and network-free so it's cheap to unit test against canned ``formats``
+    lists. Raises ``ProviderError`` if nothing audio-only is available.
+    """
+    candidates: list[dict[str, Any]] = info.get("requested_formats") or info.get("formats") or []
+    audio_only = [f for f in candidates if f.get("acodec") not in (None, "none") and f.get("vcodec") == "none"]
+    if not audio_only:
+        raise ProviderError("No audio-only format found in yt-dlp's extracted info.")
+
+    for fmt in audio_only:
+        if fmt.get("format_id") == "140":
+            return fmt
+
+    m4a = [f for f in audio_only if f.get("ext") == "m4a"]
+    pool = m4a or audio_only
+    return max(pool, key=lambda f: f.get("abr") or 0)
 
 
 class YTMusicProvider(MusicProvider):
@@ -411,6 +434,50 @@ class YTMusicProvider(MusicProvider):
             raise AuthError("Sign in to YouTube Music to view your liked songs.")
         raw = self._call(self._yt.get_liked_songs, limit=limit)
         return [self._track_from_raw(t) for t in raw.get("tracks", [])]
+
+    # -- streaming --------------------------------------------------------
+
+    def resolve_stream(self, track_id: str) -> StreamSource:
+        """Resolve a playable stream URL for a videoId via yt-dlp.
+
+        YouTube Music has no clean, stable stream-URL API of its own, so this
+        shells out to yt-dlp's extractor -- the same approach every third-party
+        YouTube player uses. yt-dlp is an optional runtime dependency (not
+        imported at module scope) so importing this module doesn't force it on
+        callers who never resolve a stream.
+        """
+        try:
+            import yt_dlp  # lazy: optional runtime dependency
+        except ImportError as exc:
+            raise NotSupportedError(
+                "Playing YouTube Music to a device needs yt-dlp (pip install yt-dlp)."
+            ) from exc
+
+        url = f"https://music.youtube.com/watch?v={track_id}"
+        opts = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "format": "140/bestaudio[ext=m4a]/bestaudio",
+            "noplaylist": True,
+        }
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as exc:  # noqa: BLE001 - yt_dlp raises its own DownloadError et al.
+            raise ProviderError(f"Could not resolve a YouTube stream for {track_id}: {exc}") from exc
+
+        fmt = _pick_audio_format(info)
+        stream_url = fmt.get("url")
+        if not stream_url:
+            raise ProviderError(f"YouTube returned no playable audio URL for {track_id}.")
+        return StreamSource(
+            url=stream_url,
+            mime_type="audio/mp4",
+            container="m4a",
+            headers=dict(fmt.get("http_headers") or {}),
+            label=f"AAC (itag {fmt.get('format_id')})",
+        )
 
 
 def _album_artist_name(album: dict[str, Any]) -> str | None:

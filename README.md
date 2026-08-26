@@ -6,9 +6,9 @@ matching, and recommendation tooling.
 
 > **Status:** 0.5.0 — first tagged release. The sync engine, matching, search,
 > discovery, and the desktop UI are functional, and WiiM/LinkPlay devices can be
-> controlled from the app. Treat two-way sync against playlists you care about as
-> experimental and keep the automatic snapshots turned on. Playing a track from
-> your library *to* a device is not wired up yet (see [roadmap](docs/roadmap.md)).
+> controlled from the app, and you can play a track to one. Treat two-way sync
+> against playlists you care about as experimental and keep the automatic
+> snapshots turned on.
 
 > **Unofficial — use at your own risk.** Harmony is not affiliated with,
 > endorsed by, or connected to YouTube Music, Qobuz, or any other service it
@@ -16,9 +16,11 @@ matching, and recommendation tooling.
 > interfaces using **your own account credentials**, which likely violates each
 > service's Terms of Service — accessing your own account through an unofficial
 > client can get that account limited or terminated. Harmony manages playlists
-> and metadata only; **it does not download, stream, decrypt, or redistribute
-> any audio**, and it does not circumvent any technical protection measure. You
-> are responsible for your use of it. See [LICENSE](LICENSE) (GPL-3.0-or-later).
+> and metadata, and can relay a stream you are entitled to from the service to a
+> speaker on your own network; **it does not download audio to disk, strip DRM,
+> or redistribute anything to third parties**, and it does not circumvent any
+> technical protection measure. You are responsible for your use of it. See
+> [LICENSE](LICENSE) (GPL-3.0-or-later).
 
 ## Features
 
@@ -37,10 +39,11 @@ matching, and recommendation tooling.
 - **Natural-language playlist building** (optional) — describe a playlist and
   have Claude plan it; every suggestion is then resolved against the real
   catalog, so nothing invented ever ends up in your library.
-- **Device control** — discover WiiM/LinkPlay renderers on your network and
-  control them (play/pause, skip, stop, volume, mute, now-playing) from the
-  **Devices** page. Pushing a track from your library to a device is planned,
-  not yet wired.
+- **Play to a device** — discover WiiM/LinkPlay renderers on your network,
+  control them (play/pause, skip, stop, volume, mute) from the **Devices** page,
+  and send any search result straight to one with **Play on Device**. Harmony
+  relays the stream on your LAN, so the speaker plays your own entitled audio
+  (YouTube via an AAC stream, Qobuz via FLAC).
 - **Guided account setup** — a standalone [`harmony-setup.py`](scripts/harmony-setup.py)
   that interactively obtains your YouTube Music and Qobuz credentials and seeds
   them where a source or Flatpak install reads them (see below).
@@ -178,11 +181,13 @@ same approach every third-party tool in this space uses (ytmusicapi, yt-dlp,
 Music Assistant, streamrip, …). They can break whenever a service changes its
 frontend, and neither service endorses this.
 
-Harmony uses these interfaces only for **catalog search and playlist/library
-management on your own account, authenticated with your own credentials**. It
-does **not** download, stream, decrypt, or redistribute audio, and it does not
-circumvent any DRM or technical protection measure. See the "unofficial — use
-at your own risk" notice at the top of this file.
+Harmony uses these interfaces for **catalog search and playlist/library
+management on your own account, authenticated with your own credentials**, and
+for an optional **play-to-device** feature that relays a stream you're entitled
+to from the service to a renderer on your own network. It does **not** download
+audio to disk, strip DRM, or redistribute anything to third parties, and it does
+not circumvent any DRM or technical protection measure. See the "unofficial —
+use at your own risk" notice at the top of this file.
 
 ## Licence
 

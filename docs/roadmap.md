@@ -26,6 +26,11 @@ aspiration — see the legend in the [docs index](README.md). Current release:
   (offline test suite) — standalone interactive tool that obtains YT Music and
   Qobuz credentials (browser-cookie extraction, OAuth device flow, token paste)
   and seeds them into a source or Flatpak install.
+- **Play-to-device (passive relay)** — `MusicProvider.resolve_stream` (Qobuz
+  signed `getFileUrl` → FLAC; YouTube via yt-dlp → AAC itag 140), `RelayServer`
+  (`playback/relay.py`) byte-forwarding with `Range` passthrough, and a **Play
+  on Device** action on search results. *Built & unit-tested; end-to-end against
+  a real device pending.* See [playback](design/playback.md).
 
 ## In progress
 
@@ -46,12 +51,11 @@ aspiration — see the legend in the [docs index](README.md). Current release:
 4. **Android client** — native app against the engine API.
 5. **[Federation](design/federation.md)** — instance-to-client auth so a client
    can point at a trusted instance; the credential-custody answer.
-6. **[Play-to-device](design/playback.md)** — push a resolved library track to a
-   renderer. Design decided (**passive relay**: Harmony forwards the bytes and
-   selects the per-device codec; the device only talks to Harmony). Backend
-   `play_url()` and device control already exist; what's left is the relay
-   endpoint + a "play here" action wiring them together. Doubles as a federation
-   primitive (a spoke pulls playback from the credential-holding instance).
+6. **Play-to-device — remaining work.** The relay and a search-page **Play on
+   Device** action shipped (see Done); what's left: verify end-to-end against a
+   real WiiM, extend the action to playlists/library, add per-device codec
+   negotiation, and reuse the relay as a **federation primitive** (a spoke pulls
+   playback from the credential-holding instance). See [playback](design/playback.md).
 
 ## Known loose ends
 

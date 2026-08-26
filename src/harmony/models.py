@@ -84,6 +84,26 @@ class Track:
         return (self.service.value, self.id)
 
 
+@dataclass(slots=True, frozen=True)
+class StreamSource:
+    """A resolved, directly-fetchable audio stream for one track.
+
+    Produced by ``MusicProvider.resolve_stream`` and consumed by the playback
+    relay. ``url`` is time-limited and provider-signed (a Qobuz ``getFileUrl``
+    result, a YouTube ``googlevideo`` URL); ``headers`` are any request headers
+    the CDN fetch requires (empty for Qobuz; YouTube may want a User-Agent).
+    The relay fetches ``url`` with ``headers`` and forwards the bytes to a
+    renderer, choosing a container the device can decode — hence ``mime_type``
+    and ``container`` travel with the URL rather than being guessed downstream.
+    """
+
+    url: str
+    mime_type: str
+    container: str | None = None
+    headers: dict[str, str] = field(default_factory=dict)
+    label: str | None = None
+
+
 @dataclass(slots=True)
 class Playlist:
     id: str

@@ -14,6 +14,7 @@ import hashlib
 import logging
 import re
 import threading
+import time
 from collections.abc import Iterator, Mapping, Sequence
 from typing import Any
 
@@ -22,7 +23,7 @@ import requests
 from .. import config
 from ..config import CredentialStore, Settings, user_agent
 from ..errors import AuthError, NotSupportedError, ProviderError, RateLimitedError
-from ..models import Album, Artist, Playlist, SearchResults, Service, Track
+from ..models import Album, Artist, Playlist, SearchResults, Service, StreamSource, Track
 from .base import MusicProvider, _chunked
 
 log = logging.getLogger(__name__)
@@ -620,3 +621,48 @@ class QobuzProvider(MusicProvider):
             if len(items) < page:
                 break
         return tracks[:limit]
+
+    # -- streaming --------------------------------------------------------
+
+    def resolve_stream(self, track_id: str) -> StreamSource:
+        """Resolve a playable stream URL via Qobuz's signed ``track/getFileUrl``.
+
+        Unlike every other endpoint this provider calls, ``getFileUrl`` requires
+        a per-request md5 signature (see ``request_sig``) alongside the usual
+        ``X-App-Id``/``X-User-Auth-Token`` headers, since it's what actually
+        grants access to (rights-limited, format-selected) audio bytes rather
+        than catalog metadata. ``format_id`` 6 is Qobuz's FLAC 16-bit/44.1kHz
+        tier -- lossless but not the hi-res tiers, which keeps bandwidth/decoder
+        requirements broadly compatible with LAN playback targets like the WiiM.
+        """
+        self._ensure_ready()
+        if not self._app_secret:
+            raise ProviderError("Qobuz app secret unavailable; cannot sign a stream request.")
+        format_id = 6  # FLAC, 16-bit / 44.1kHz
+        ts = int(time.time())
+        sig_params = {"format_id": format_id, "intent": "stream", "track_id": str(track_id)}
+        sig = request_sig("track", "getFileUrl", sig_params, ts, self._app_secret)
+        data = self._request(
+            "GET",
+            "track/getFileUrl",
+            params={
+                "request_ts": ts,
+                "request_sig": sig,
+                "track_id": str(track_id),
+                "format_id": format_id,
+                "intent": "stream",
+            },
+        )
+        url = data.get("url")
+        if not url:
+            # e.g. {"restrictions": [{"code": "..."}]} for a non-streamable
+            # or unentitled track (wrong subscription tier, region lock, ...).
+            raise ProviderError(
+                f"Qobuz returned no stream URL for track {track_id} "
+                "(needs a streaming subscription / not available)."
+            )
+        mime = data.get("mime_type") or "audio/flac"
+        container = "flac" if "flac" in mime else ("mp3" if "mp" in mime else None)
+        bit_depth, sampling_rate = data.get("bit_depth"), data.get("sampling_rate")
+        label = f"FLAC {bit_depth}/{sampling_rate}" if bit_depth and sampling_rate else (mime or None)
+        return StreamSource(url=url, mime_type=mime, container=container, label=label)

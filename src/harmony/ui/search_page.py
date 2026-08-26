@@ -120,7 +120,9 @@ class SearchPage(Gtk.Box):
         self.find_button.connect("clicked", self._on_find_other_clicked)
         self.similar_button = Gtk.Button(label="Show Similar")
         self.similar_button.connect("clicked", self._on_show_similar_clicked)
-        for button in (self.add_button, self.find_button, self.similar_button):
+        self.play_button = Gtk.Button(label="Play on Device")
+        self.play_button.connect("clicked", self._on_play_device_clicked)
+        for button in (self.add_button, self.find_button, self.similar_button, self.play_button):
             button.set_sensitive(False)
             bar.append(button)
         return bar
@@ -345,6 +347,7 @@ class SearchPage(Gtk.Box):
         self.add_button.set_sensitive(bool(tracks))
         self.find_button.set_sensitive(len(tracks) == 1)
         self.similar_button.set_sensitive(len(tracks) == 1)
+        self.play_button.set_sensitive(len(tracks) == 1)
 
     def _on_add_clicked(self, button: Gtk.Button) -> None:
         tracks = selected_tracks(self.track_selection)
@@ -397,6 +400,55 @@ class SearchPage(Gtk.Box):
             self.state.all_playlists(refresh=True)
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't add tracks: {exc}"))
+
+    def _on_play_device_clicked(self, button: Gtk.Button) -> None:
+        tracks = selected_tracks(self.track_selection)
+        if len(tracks) != 1:
+            return
+        self._open_device_popover(button, tracks[0])
+
+    def _open_device_popover(self, parent: Gtk.Widget, track: Track) -> None:
+        devices = self.state.known_devices()
+        popover = Gtk.Popover()
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        if not devices:
+            listbox.append(
+                Adw.ActionRow(
+                    title="No devices yet",
+                    subtitle="Add one on the Devices page",
+                    sensitive=False,
+                )
+            )
+        for info in devices:
+            row = Adw.ActionRow(title=info.name, subtitle=info.host)
+            row.set_activatable(True)
+            row.add_prefix(Gtk.Image.new_from_icon_name("audio-speakers-symbolic"))
+
+            def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name,
+                      pop: Gtk.Popover = popover) -> None:
+                pop.popdown()
+                self._play_track_on_device(track, host, name)
+
+            row.connect("activated", _pick)
+            listbox.append(row)
+        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
+                                       propagate_natural_height=True, width_request=280)
+        popover.set_child(scroller)
+        popover.set_parent(parent)
+        popover.connect("closed", lambda p: p.unparent())
+        popover.popup()
+
+    def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
+        self.state.toast(f"Starting “{track.title}” on {name}…")
+
+        def work() -> None:
+            self.state.play_track_on_device(track, host)
+
+        def done(_result: None) -> None:
+            self.state.toast(f"Playing “{track.title}” on {name}")
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't play on {name}: {exc}"))
 
     def _on_find_other_clicked(self, _button: Gtk.Button) -> None:
         tracks = selected_tracks(self.track_selection)

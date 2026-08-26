@@ -11,6 +11,7 @@ parallel development (see docs/ARCHITECTURE.md).
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 
 import gi
@@ -66,6 +67,11 @@ class AppState(GObject.Object):
         # every ``WiiMDevice`` a page constructs for the same session reuses
         # one connection pool instead of opening a fresh one per call.
         self._device_session: Any | None = None
+
+        # Lazily created + started on the first play-to-device request; a
+        # single relay serves every device for the app's lifetime (a daemon
+        # thread, so it goes away with the process).
+        self._relay: Any | None = None
 
         self.reload_providers()
         self._init_recommender()
@@ -447,6 +453,52 @@ class AppState(GObject.Object):
 
             self._device_session = requests.Session()
         return device_from_host(host, session=self._device_session)
+
+    def _get_relay(self) -> Any:
+        """Lazily create and start the shared playback relay (engine layer).
+
+        Imported lazily like ``device_for`` so a headless/no-GTK import of this
+        module never pays for ``harmony.playback``. The relay binds an OS-chosen
+        port on all interfaces and serves on a daemon thread, so it costs
+        nothing until the first play-to-device request and needs no explicit
+        shutdown.
+        """
+        if self._relay is None:
+            from harmony.playback import RelayServer
+
+            relay = RelayServer()
+            relay.start()
+            self._relay = relay
+        return self._relay
+
+    def play_track_on_device(self, track: Any, device_host: str) -> None:
+        """Resolve ``track``'s stream, register it with the relay, and play it on the device.
+
+        Blocking — MUST run on a worker thread via ``run_async`` (it does
+        provider *and* device network I/O). The stream is resolved once up
+        front so auth/subscription/codec failures surface immediately (before a
+        URL reaches the device), then wrapped in a resolver the relay re-invokes
+        per fetch, re-resolving only once the provider's time-limited URL is old
+        enough to have expired — so a later seek gets a fresh URL without a
+        redundant resolve on the first play.
+        """
+        provider = self.providers.get(track.service)
+        if provider is None:
+            raise RuntimeError(f"No provider configured for {track.service.label}")
+
+        cached = {"source": provider.resolve_stream(track.id), "at": time.monotonic()}
+        ttl_s = 600.0
+
+        def resolver() -> Any:
+            if time.monotonic() - cached["at"] > ttl_s:
+                cached["source"] = provider.resolve_stream(track.id)
+                cached["at"] = time.monotonic()
+            return cached["source"]
+
+        relay = self._get_relay()
+        token = relay.register(resolver)
+        url = relay.url_for(token, device_host)
+        self.device_for(device_host).play_url(url)
 
     def toast(self, text: str) -> None:
         """Emit a toast. Must be called from the main thread."""

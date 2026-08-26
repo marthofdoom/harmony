@@ -15,8 +15,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from typing import Any, TypeVar
 
-from ..errors import RateLimitedError
-from ..models import Album, Playlist, SearchResults, Service, Track
+from ..errors import NotSupportedError, RateLimitedError
+from ..models import Album, Playlist, SearchResults, Service, StreamSource, Track
 
 log = logging.getLogger(__name__)
 
@@ -141,6 +141,15 @@ class MusicProvider(ABC):
 
     @abstractmethod
     def liked_tracks(self, *, limit: int = 500) -> list[Track]: ...
+
+    def resolve_stream(self, track_id: str) -> StreamSource:
+        """Resolve a directly-fetchable, device-friendly audio stream for a track.
+
+        Returns a time-limited provider URL plus the container/mime and any headers
+        the CDN fetch needs. Consumed by the playback relay. Providers that can't
+        stream raise NotSupportedError.
+        """
+        raise NotSupportedError(f"{type(self).__name__} does not support stream resolution")
 
 
 __all__ = ["MusicProvider", "_chunked", "retry_on_rate_limit"]
