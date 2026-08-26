@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.17" date="2026-08-26">
+      <description>
+        <p>A Route Audio receiver no longer keeps running after you close the
+        app: it's stopped on window close, and any survivor is terminated when
+        the app exits — so a routed stream can't be left playing with no way to
+        stop it.</p>
+      </description>
+    </release>
     <release version="0.5.16" date="2026-08-26">
       <description>
         <p>"This computer" (local playback) now appears in every play-to-device

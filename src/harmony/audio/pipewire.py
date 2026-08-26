@@ -8,6 +8,7 @@ list, so a caller can always ask "what outputs are there?" safely.
 
 from __future__ import annotations
 
+import atexit
 import json
 import logging
 import pathlib
@@ -138,6 +139,34 @@ _ROC_SOURCE_PORT = 10001
 _ROC_REPAIR_PORT = 10002
 _ROC_CONTROL_PORT = 10003
 
+# Live roc-recv processes, so a receiver never outlives the app: a subprocess
+# isn't killed when its parent exits, which would leave a stream playing with no
+# in-app way to stop it. We terminate any survivors on interpreter exit.
+_live_roc_procs: set[subprocess.Popen] = set()
+_atexit_registered = False
+
+
+def _terminate_roc_procs() -> None:
+    for proc in list(_live_roc_procs):
+        try:
+            if proc.poll() is None:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception:  # noqa: BLE001 - best-effort shutdown cleanup
+            pass
+        _live_roc_procs.discard(proc)
+
+
+def _track_roc_proc(proc: subprocess.Popen) -> None:
+    global _atexit_registered
+    _live_roc_procs.add(proc)
+    if not _atexit_registered:
+        atexit.register(_terminate_roc_procs)
+        _atexit_registered = True
+
 
 def _roc_log_path() -> pathlib.Path:
     """Where roc-recv's diagnostics go (a real file, never a pipe)."""
@@ -247,6 +276,7 @@ def roc_receiver_up(
         except (OSError, IndexError):
             pass
         raise ProviderError(f"roc-recv exited immediately: {err or f'code {proc.returncode}'}")
+    _track_roc_proc(proc)
     return RocReceiver(
         process=proc,
         log_file=log_file,
@@ -260,6 +290,7 @@ def roc_receiver_up(
 def roc_receiver_down(receiver: RocReceiver) -> None:
     """Stop a ROC receiver (terminate the roc-recv process)."""
     proc = receiver.process
+    _live_roc_procs.discard(proc)
     if proc.poll() is None:
         proc.terminate()
         try:

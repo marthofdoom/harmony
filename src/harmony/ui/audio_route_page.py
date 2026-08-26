@@ -174,6 +174,29 @@ class AudioRoutePage(Gtk.Box):
 
         run_async(work, done, error)
 
+    def shutdown(self) -> None:
+        """Tear down a running receiver synchronously (called on window close).
+
+        A ROC receiver is a subprocess and an RTP receiver is a module loaded
+        into the host's PipeWire; either would outlive the app otherwise, with
+        no in-app way to stop it after reopening.
+        """
+        receiver = self._receiver
+        if receiver is None:
+            return
+        self._receiver = None
+        try:
+            if self._roc:
+                from harmony.audio import roc_receiver_down
+
+                roc_receiver_down(receiver)
+            else:
+                from harmony.audio import rtp_receiver_down
+
+                rtp_receiver_down(receiver)
+        except Exception:  # noqa: BLE001 - best-effort shutdown cleanup
+            log.debug("receiver shutdown failed", exc_info=True)
+
     def _on_stop(self, _button: Gtk.Button) -> None:
         receiver = self._receiver
         if receiver is None:

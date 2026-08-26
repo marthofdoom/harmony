@@ -256,4 +256,8 @@ class HarmonyWindow(Adw.ApplicationWindow):
         self.state.settings.window_height = self.get_height()
         self.state.settings.window_maximized = self.is_maximized()
         self.state.settings.save()
+        # Stop a running Route Audio receiver so it doesn't outlive the app.
+        route_page = self._pages.get("audio_route")
+        if route_page is not None and hasattr(route_page, "shutdown"):
+            route_page.shutdown()
         return False
