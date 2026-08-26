@@ -26,3 +26,5 @@ secrets.json
 # Flatpak build artifacts
 packaging/flatpak/build/
 packaging/flatpak/.flatpak-builder/
+packaging/flatpak/repo/
+packaging/flatpak/*.flatpak
