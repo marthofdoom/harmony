@@ -51,7 +51,9 @@ modules:
           ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.marthofdoom.Harmony.svg
     sources:
       - type: git
-        # Local checkout; flatpak-builder exports only tracked files, so the
-        # venv and build artifacts never enter the sandbox. Commit before build.
-        url: file:///var/home/marth/Documents/Projects/ytmusic
+        # Public repo. For a local dev build, override with:
+        #   flatpak-builder --default-branch=main ... (or point url at a local
+        #   checkout). flatpak-builder exports only tracked files, so the venv
+        #   and build artifacts never enter the sandbox.
+        url: https://github.com/marthofdoom/harmony.git
         branch: main

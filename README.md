@@ -73,11 +73,19 @@ usually fails or produces a mismatched build.
 
 **Easiest path — the setup tool.** Rather than pasting headers by hand, run the
 standalone bootstrapper, which walks you through both services and writes the
-credentials where your install expects them:
+credentials where your install expects them. It needs no clone — run it straight
+from GitHub:
 
 ```bash
-uv run scripts/harmony-setup.py --target source     # or: --target flatpak / auto
+# with uv (manages the script's dependencies automatically):
+uv run https://raw.githubusercontent.com/marthofdoom/harmony/main/scripts/harmony-setup.py
+
+# or with plain python (offers to build a throwaway venv if deps are missing):
+curl -fsSL https://raw.githubusercontent.com/marthofdoom/harmony/main/scripts/harmony-setup.py | python3
 ```
+
+From a clone, `uv run scripts/harmony-setup.py --target source` does the same and
+lets you pick the target install (`source` / `flatpak` / `auto`).
 
 It has no dependency on the app (constants are inlined), imports its heavier
 dependencies lazily, and offers a throwaway virtualenv if any are missing. The
