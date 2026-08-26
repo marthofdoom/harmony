@@ -752,6 +752,21 @@ def test_recommender_similar_to_artist_ranks_by_lastfm_match(monkeypatch, db):
     assert "Popular by Boards of Canada" in suggestions[0].reason
 
 
+def test_recommender_reason_is_safe_for_artist_names_with_braces(monkeypatch, db):
+    # The reason used to be built with str.format, so a literal { or } in the
+    # artist name (or title) raised. Build it directly instead.
+    monkeypatch.setattr(
+        recommender.lastfm,
+        "top_tracks_for_artist",
+        lambda artist, **kw: [SimilarTrack(name="Song {mix}", artist=artist, match=1.0)],
+    )
+    provider = FakeProvider([_track("s", "Song {mix}", "The {Braces}")])
+
+    suggestions = Recommender(db=db).similar_to_artist("The {Braces}", provider, limit=5)
+
+    assert suggestions and "Popular by The {Braces}" in suggestions[0].reason
+
+
 def test_recommender_expand_playlist_excludes_existing_tracks(monkeypatch, db):
     existing = [_track("e1", "Song A", "Artist A")]
     monkeypatch.setattr(

@@ -140,7 +140,11 @@ class Recommender:
     # -- resolution against the real catalog --
 
     def _resolve_ranked(
-        self, ballot: _Ballot, ranked: list[tuple[tuple[str, str], float]], provider: MusicProvider, reason: str
+        self,
+        ballot: _Ballot,
+        ranked: list[tuple[tuple[str, str], float]],
+        provider: MusicProvider,
+        reason_prefix: str,
     ) -> list[Suggestion]:
         from .. import matching
 
@@ -159,7 +163,9 @@ class Recommender:
                     sources=sources,
                     score=total_score,
                     resolved=result.best.track,
-                    reason=reason.format(sources=", ".join(sources)),
+                    # Build the reason directly rather than str.format so an
+                    # artist/title carrying a literal { or } can't raise.
+                    reason=f"{reason_prefix} ({', '.join(sources)})",
                 )
             )
         return suggestions
@@ -197,7 +203,7 @@ class Recommender:
                 progress((i + 1) / total, f"Gathering recommendations for {seed.title}")
 
         ranked = ballot.ranked(limit)
-        return self._resolve_ranked(ballot, ranked, provider, "Similar via {sources}")
+        return self._resolve_ranked(ballot, ranked, provider, "Similar")
 
     def similar_to_artist(self, artist_name: str, provider: MusicProvider, *, limit: int = 30) -> list[Suggestion]:
         """Blend an artist's own popular tracks (currently Last.fm only) and resolve them."""
@@ -218,7 +224,7 @@ class Recommender:
                 )
 
         ranked = ballot.ranked(limit)
-        return self._resolve_ranked(ballot, ranked, provider, f"Popular by {artist_name}" + " ({sources})")
+        return self._resolve_ranked(ballot, ranked, provider, f"Popular by {artist_name}")
 
     def expand_playlist(self, tracks: list[Track], provider: MusicProvider, *, limit: int = 25) -> list[Suggestion]:
         """Suggest additions to an existing playlist, treating its tracks as seeds."""
