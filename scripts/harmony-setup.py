@@ -1420,17 +1420,14 @@ def _qobuz_browser_autograb(target: Target) -> None:
 def qobuz_menu(target: Target) -> None:
     while True:
         print("\nQobuz")
-        print("  [1] Password login")
-        print("  [2] Paste token (Google/social accounts)")
-        print("  [3] Auto-grab from browser (Firefox/Chrome, experimental)")
+        print("  [1] Username + password (recommended)")
+        print("  [2] Paste token (only for Google/social sign-in accounts)")
         print("  [b] Back")
         choice = input("> ").strip().lower()
         if choice == "1":
             _qobuz_password_login(target)
         elif choice == "2":
             _qobuz_paste_token(target)
-        elif choice == "3":
-            _qobuz_browser_autograb(target)
         elif choice in ("b", "back", ""):
             return
         else:
