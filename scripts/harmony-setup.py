@@ -640,15 +640,51 @@ def build_cookie_header(cookies: list[tuple[str, str, str]]) -> str:
     return "; ".join(f"{name}={value}" for name, value in seen.items())
 
 
-def build_headers_raw(cookie_header: str) -> str:
-    return "\n".join(
-        [
-            f"Cookie: {cookie_header}",
-            f"User-Agent: {DESKTOP_USER_AGENT}",
-            "X-Goog-AuthUser: 0",
-            "Origin: https://music.youtube.com",
-        ]
-    )
+# Google's SAPISID cookie under the names a YouTube Music session may store it,
+# most specific first.
+_SAPISID_COOKIE_NAMES = ("SAPISID", "__Secure-3PAPISID", "__Secure-1PAPISID")
+_YTM_ORIGIN = "https://music.youtube.com"
+
+
+def find_sapisid(cookies: list[tuple[str, str, str]]) -> str | None:
+    """Return the Google SAPISID value from extracted cookies, or None.
+
+    ytmusicapi >= 1.12 classifies an auth file as *browser* (rather than
+    defaulting it to OAuth) only when it carries an ``Authorization:
+    SAPISIDHASH ...`` header, and it recomputes that hash per request from the
+    SAPISID cookie -- so a session without one can't drive browser auth at all.
+    """
+    by_name = {name: value for _host, name, value in cookies}
+    for key in _SAPISID_COOKIE_NAMES:
+        if by_name.get(key):
+            return by_name[key]
+    return None
+
+
+def sapisid_hash(sapisid: str, origin: str = _YTM_ORIGIN) -> str:
+    """Compute an ``Authorization: SAPISIDHASH`` value the way Google's web apps do.
+
+    ytmusicapi only inspects this header to decide the auth is browser type; it
+    recomputes a fresh hash from the cookie on every request, so the timestamp
+    baked in here only needs to be well-formed, not fresh at use time.
+    """
+    ts = str(int(time.time()))
+    digest = hashlib.sha1(f"{ts} {sapisid} {origin}".encode()).hexdigest()
+    return f"SAPISIDHASH {ts}_{digest}"
+
+
+def build_headers_raw(cookie_header: str, sapisid: str | None = None) -> str:
+    lines = [
+        f"Cookie: {cookie_header}",
+        f"User-Agent: {DESKTOP_USER_AGENT}",
+        "X-Goog-AuthUser: 0",
+        f"Origin: {_YTM_ORIGIN}",
+    ]
+    if sapisid:
+        # Required by ytmusicapi >= 1.12 to recognise this as browser auth
+        # rather than falling through to its OAuth default.
+        lines.insert(0, f"Authorization: {sapisid_hash(sapisid)}")
+    return "\n".join(lines)
 
 
 @dataclass
@@ -949,7 +985,15 @@ def _ytmusic_auto_extract(target: Target) -> None:
         print("No YouTube/Google cookies found in that profile.")
         return
 
-    headers_raw = build_headers_raw(build_cookie_header(cookies))
+    sapisid = find_sapisid(cookies)
+    if not sapisid:
+        print(
+            "That profile has YouTube cookies but no Google SAPISID cookie, so it "
+            "can't be used for browser auth. Make sure you're signed in to "
+            "music.youtube.com in that browser, or use OAuth / manual paste instead."
+        )
+        return
+    headers_raw = build_headers_raw(build_cookie_header(cookies), sapisid)
     target.config_dir.mkdir(parents=True, exist_ok=True)
     auth_path = target.config_dir / "browser.json"
 

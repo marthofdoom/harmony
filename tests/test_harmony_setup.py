@@ -470,3 +470,44 @@ def test_install_into_current_env_declined_prints_command_and_returns_false(monk
     assert result is False
     assert ran["pip"] is False  # declining must not shell out
     assert "pip install cryptography keyring" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------
+# YouTube Music browser auth needs an Authorization: SAPISIDHASH header
+# (ytmusicapi >= 1.12 otherwise treats the extracted file as OAuth)
+# --------------------------------------------------------------------------
+
+
+def test_find_sapisid_prefers_sapisid_then_secure_variants():
+    cookies = [("h", "__Secure-3PAPISID", "third"), ("h", "SAPISID", "plain")]
+    assert harmony_setup.find_sapisid(cookies) == "plain"
+    assert harmony_setup.find_sapisid([("h", "__Secure-3PAPISID", "third")]) == "third"
+    assert harmony_setup.find_sapisid([("h", "FOO", "bar")]) is None
+
+
+def test_sapisid_hash_format():
+    val = harmony_setup.sapisid_hash("secret")
+    assert val.startswith("SAPISIDHASH ")
+    ts, _, digest = val[len("SAPISIDHASH "):].partition("_")
+    assert ts.isdigit()
+    assert len(digest) == 40 and all(c in "0123456789abcdef" for c in digest)
+
+
+def test_build_headers_raw_includes_authorization_when_sapisid_present():
+    raw = harmony_setup.build_headers_raw("SAPISID=x; FOO=bar", sapisid="x")
+    assert "Authorization: SAPISIDHASH " in raw
+    assert "Cookie: SAPISID=x; FOO=bar" in raw
+
+
+def test_build_headers_raw_omits_authorization_without_sapisid():
+    assert "Authorization" not in harmony_setup.build_headers_raw("FOO=bar")
+
+
+def test_browser_auth_file_is_classified_as_browser_by_ytmusicapi(tmp_path):
+    ytmusicapi = pytest.importorskip("ytmusicapi")
+    raw = harmony_setup.build_headers_raw("SAPISID=abc; __Secure-3PAPISID=abc", sapisid="abc")
+    path = tmp_path / "browser.json"
+    ytmusicapi.setup(filepath=str(path), headers_raw=raw)
+    from ytmusicapi import YTMusic
+    from ytmusicapi.auth.types import AuthType
+    assert YTMusic(auth=str(path)).auth_type == AuthType.BROWSER
