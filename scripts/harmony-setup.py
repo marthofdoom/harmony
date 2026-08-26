@@ -990,11 +990,13 @@ def read_chrome_qobuz_localstorage(leveldb_dir: Path) -> str | None:
             except OSError:
                 continue
     raw = b"".join(chunks)
-    for origin in re.finditer(rb"play\.qobuz\.com", raw):
-        window = raw[origin.start() : origin.start() + 8192]
-        match = _CHROME_TOKEN_RE.search(window)
-        if match:
-            return match.group(2).decode("ascii", "ignore")
+    # Try the raw bytes, then a crude UTF-16LE collapse (Chromium stores some
+    # localStorage values UTF-16, i.e. ASCII chars interleaved with NULs).
+    for view in (raw, raw.replace(b"\x00", b"")):
+        for origin in re.finditer(rb"qobuz", view):
+            match = _CHROME_TOKEN_RE.search(view[origin.start() : origin.start() + 16384])
+            if match:
+                return match.group(2).decode("ascii", "ignore")
     return None
 
 
