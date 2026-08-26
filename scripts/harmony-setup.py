@@ -1399,6 +1399,8 @@ def _qobuz_browser_autograb(target: Target) -> None:
     ok, detail, display_name = verify_qobuz_token(app_id, token)
     if not ok:
         print(f"Verification failed ({detail}); nothing was saved.")
+        print("Qobuz's browser session isn't its API token (kept in memory, not on disk);")
+        print("use option [2] Paste token: copy the X-User-Auth-Token header from devtools.")
         return
 
     try:
