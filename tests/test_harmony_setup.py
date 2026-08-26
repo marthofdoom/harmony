@@ -541,13 +541,15 @@ def test_read_chrome_qobuz_localstorage_none_when_no_qobuz(tmp_path):
     assert harmony_setup.read_chrome_qobuz_localstorage(leveldb) is None
 
 
-def test_find_qobuz_token_in_browsers_falls_through_to_chrome(monkeypatch):
+def test_find_qobuz_token_in_browsers_uses_chrome_cookie(monkeypatch):
+    monkeypatch.setattr(harmony_setup, "FIREFOX_COOKIE_SOURCES", [])
     monkeypatch.setattr(harmony_setup, "FIREFOX_STORAGE_SOURCES", [])
-    monkeypatch.setattr(harmony_setup, "CHROME_STORAGE_SOURCES", [("Chrome", "/fake/*/leveldb")])
-    monkeypatch.setattr(harmony_setup, "_glob_paths", lambda pattern: [harmony_setup.Path("/fake/p/leveldb")])
-    monkeypatch.setattr(harmony_setup, "read_chrome_qobuz_localstorage", lambda p: "TOKENfromChrome")
+    monkeypatch.setattr(harmony_setup, "CHROME_COOKIE_SOURCES", [("Chrome", "/fake/*/Cookies")])
+    monkeypatch.setattr(harmony_setup, "_glob_paths", lambda pattern: [harmony_setup.Path("/fake/p/Cookies")])
+    monkeypatch.setattr(harmony_setup, "get_chrome_safe_storage_password", lambda: b"pw")
+    monkeypatch.setattr(harmony_setup, "read_chrome_qobuz_cookie", lambda p, pw: "TOKENfromCookie")
 
-    assert harmony_setup._find_qobuz_token_in_browsers() == "TOKENfromChrome"
+    assert harmony_setup._find_qobuz_token_in_browsers() == "TOKENfromCookie"
 
 
 def test_qobuz_token_from_cookie_value_json_and_bare():
