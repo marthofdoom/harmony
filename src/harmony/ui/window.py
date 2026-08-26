@@ -22,6 +22,7 @@ _PAGES: list[tuple[str, str, str]] = [
     ("playlists", "Playlists", "view-list-symbolic"),
     ("sync", "Sync", "emblem-synchronizing-symbolic"),
     ("discover", "Discover", "starred-symbolic"),
+    ("devices", "Devices", "audio-speakers-symbolic"),
 ]
 _TITLES = {name: title for name, title, _ in _PAGES}
 
@@ -169,6 +170,10 @@ class HarmonyWindow(Adw.ApplicationWindow):
                 from harmony.ui.discover_page import DiscoverPage
 
                 return DiscoverPage(self.state)
+            if name == "devices":
+                from harmony.ui.devices_page import DevicesPage
+
+                return DevicesPage(self.state)
         except Exception:
             log.exception("Failed to build page %r", name)
         return Adw.StatusPage(

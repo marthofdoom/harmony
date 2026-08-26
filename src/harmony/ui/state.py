@@ -38,6 +38,9 @@ class AppState(GObject.Object):
         # listen for this, or those placeholders survive the user fixing the
         # very thing they complain about.
         "integrations-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # The known-devices list (add/remove/rename) changed; devices_page
+        # rebuilds its list from ``known_devices()`` in response.
+        "devices-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "toast": (GObject.SignalFlags.RUN_FIRST, None, (str,)),
     }
 
@@ -58,6 +61,11 @@ class AppState(GObject.Object):
 
         self._loading_providers = False
         self._providers_reload_pending = False
+
+        # Lazily created the first time ``device_for`` needs one; shared so
+        # every ``WiiMDevice`` a page constructs for the same session reuses
+        # one connection pool instead of opening a fresh one per call.
+        self._device_session: Any | None = None
 
         self.reload_providers()
         self._init_recommender()
@@ -348,6 +356,97 @@ class AppState(GObject.Object):
             finish()
 
         run_async(work, done, error)
+
+    # -- playback devices ---------------------------------------------------
+    #
+    # Deliberately synchronous and network-free: these methods only ever read
+    # or write ``self.settings.known_devices`` (a plain list of dicts) and
+    # emit ``devices-changed``. Anything that talks to a device over HTTP
+    # (status/play/pause/volume/discovery) belongs in devices_page.py, run
+    # through ``harmony.tasks.run_async`` per the threading rule in
+    # docs/ARCHITECTURE.md — never here.
+
+    def known_devices(self) -> list[Any]:
+        """Return ``settings.known_devices`` as ``harmony.playback.DeviceInfo``.
+
+        Imports ``harmony.playback`` lazily (see ``device_for``) and degrades
+        to an empty list if that layer isn't importable, matching how the
+        rest of this class treats optional backend layers.
+        """
+        try:
+            from harmony.playback import DeviceInfo
+        except ImportError as exc:
+            log.warning("playback layer unavailable: %s", exc)
+            return []
+        devices = []
+        for entry in self.settings.known_devices:
+            host = entry.get("host")
+            if not host:
+                continue
+            devices.append(
+                DeviceInfo(
+                    id=host,
+                    name=entry.get("name") or host,
+                    host=host,
+                    kind=entry.get("kind", "wiim"),
+                )
+            )
+        return devices
+
+    def add_device(self, host: str, name: str | None = None) -> None:
+        """Add a device by host, deduped by host. No-op if already known."""
+        host = host.strip()
+        if not host:
+            return
+        if any(entry.get("host") == host for entry in self.settings.known_devices):
+            return
+        self.settings.known_devices.append({"host": host, "name": (name or host).strip() or host, "kind": "wiim"})
+        self.settings.save()
+        self.emit("devices-changed")
+
+    def remove_device(self, host: str) -> None:
+        """Forget a device. No-op if it wasn't known."""
+        before = len(self.settings.known_devices)
+        self.settings.known_devices = [e for e in self.settings.known_devices if e.get("host") != host]
+        if len(self.settings.known_devices) != before:
+            self.settings.save()
+            self.emit("devices-changed")
+
+    def set_device_name(self, host: str, name: str) -> None:
+        """Persist a display name discovered from the device itself (getStatusEx).
+
+        Called once a status/info fetch resolves the real device name for an
+        entry that was added by host only (so it was showing the host as its
+        name until now).
+        """
+        name = name.strip()
+        changed = False
+        for entry in self.settings.known_devices:
+            if entry.get("host") == host and name and entry.get("name") != name:
+                entry["name"] = name
+                changed = True
+        if changed:
+            self.settings.save()
+            self.emit("devices-changed")
+
+    def device_for(self, host: str) -> Any:
+        """Construct a ``WiiMDevice`` for ``host``.
+
+        Imported lazily so a headless/no-GTK import of ``AppState`` (tests,
+        or a future non-desktop frontend importing this module by mistake)
+        never pays for ``harmony.playback`` — and so the constructor cost
+        stays off the hot path of just building ``AppState``. Callers run
+        this off the main loop via ``run_async``; construction itself does
+        no I/O (``WiiMDevice.__init__`` is pure), only the methods called on
+        the result do.
+        """
+        from harmony.playback import device_from_host
+
+        if self._device_session is None:
+            import requests
+
+            self._device_session = requests.Session()
+        return device_from_host(host, session=self._device_session)
 
     def toast(self, text: str) -> None:
         """Emit a toast. Must be called from the main thread."""

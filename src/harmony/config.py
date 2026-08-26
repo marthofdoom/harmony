@@ -194,6 +194,12 @@ class Settings:
     window_maximized: bool = False
     last_page: str = "search"
 
+    # Devices (WiiM/LinkPlay playback renderers). Non-secret: host, a
+    # user/device-supplied display name, and a backend discriminator
+    # ("wiim" today; future-proofed for other PlaybackDevice backends the
+    # same way harmony.playback.DeviceInfo.kind is).
+    known_devices: list[dict[str, Any]] = field(default_factory=list)
+
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod
