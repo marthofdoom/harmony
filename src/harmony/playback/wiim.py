@@ -12,6 +12,7 @@ LAN — there is no CA to verify against and no third party in the path.
 from __future__ import annotations
 
 import logging
+import time
 from typing import Any
 from urllib.parse import quote
 
@@ -27,6 +28,18 @@ log = logging.getLogger(__name__)
 # An unreachable device costs at most two of these (http then the https
 # fallback), so this bounds the worst-case "spinning" time a user sees.
 _TIMEOUT_S = 3.0
+
+# LinkPlay's little HTTP server accepts the TCP connection then closes it
+# without a response when it's busy (e.g. buffering a stream we just handed it),
+# which surfaces as RemoteDisconnected/ConnectionReset. That's transient, so one
+# quick retry usually succeeds instead of blanking the UI with an error.
+_RETRY_DELAY_S = 0.3
+
+
+def _is_transient_close(exc: Exception) -> bool:
+    """True for 'accepted then closed without a response' — a busy-LinkPlay signal."""
+    text = str(exc)
+    return "RemoteDisconnected" in text or "Connection aborted" in text or "Connection reset" in text
 
 # See the module docstring: verify=False here is a deliberate choice for a
 # self-signed, on-LAN-only device, not a suppressed mistake.
@@ -97,16 +110,27 @@ class WiiMDevice(PlaybackDevice):
     def _get(self, cmd: str, scheme: str) -> requests.Response:
         return self._session.get(self._url(cmd, scheme), timeout=_TIMEOUT_S, verify=scheme != "https")
 
+    def _get_with_retry(self, cmd: str, scheme: str) -> requests.Response:
+        """One GET, retried once on a transient 'closed without response' (busy LinkPlay)."""
+        try:
+            return self._get(cmd, scheme)
+        except requests.RequestException as exc:
+            if not _is_transient_close(exc):
+                raise
+            log.debug("%s: %s closed without response on %s; retrying once", self.host, cmd, scheme)
+            time.sleep(_RETRY_DELAY_S)
+            return self._get(cmd, scheme)
+
     def _command(self, cmd: str) -> str | dict[str, Any]:
         """GET ``httpapi.asp?command=<cmd>``, falling back http -> https once, then parse the body."""
         try:
-            response = self._get(cmd, self._scheme)
+            response = self._get_with_retry(cmd, self._scheme)
         except requests.RequestException as exc:
             if self._scheme == "https":
                 raise ProviderError(f"{self.host}: {cmd} failed: {exc}") from exc
             self._scheme = "https"
             try:
-                response = self._get(cmd, self._scheme)
+                response = self._get_with_retry(cmd, self._scheme)
             except requests.RequestException as exc2:
                 raise ProviderError(f"{self.host}: {cmd} failed over http and https: {exc2}") from exc2
         if not response.ok:

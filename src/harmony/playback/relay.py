@@ -113,7 +113,13 @@ def _spawn_adts_remux(source: StreamSource) -> subprocess.Popen[bytes]:
     request headers the CDN requires. Raises ``FileNotFoundError`` if ffmpeg
     isn't installed, which the caller treats as "fall back to a plain relay".
     """
-    args = ["ffmpeg", "-nostdin", "-loglevel", "error"]
+    # -reconnect* make ffmpeg re-open the HTTP fetch (resuming by byte offset) if
+    # the CDN throttles or drops a single long connection mid-song -- googlevideo
+    # does exactly that, which was truncating tracks partway through.
+    args = [
+        "ffmpeg", "-nostdin", "-loglevel", "error",
+        "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+    ]
     user_agent: str | None = None
     extra_headers: list[str] = []
     for key, value in source.headers.items():
@@ -127,22 +133,6 @@ def _spawn_adts_remux(source: StreamSource) -> subprocess.Popen[bytes]:
         args += ["-headers", "".join(f"{h}\r\n" for h in extra_headers)]
     args += ["-i", source.url, "-vn", "-c:a", "copy", "-f", "adts", "pipe:1"]
     return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-
-
-def _stop_process(proc: subprocess.Popen[bytes]) -> None:
-    for stream in (proc.stdout, proc.stderr):
-        if stream is not None:
-            try:
-                stream.close()
-            except OSError:
-                pass
-    if proc.poll() is None:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
 
 
 class RelayServer:
@@ -371,6 +361,7 @@ class _Handler(BaseHTTPRequestHandler):
         log.info("relay: remuxing %s to ADTS for the device", source.mime_type or "audio/mp4")
         self._icy_headers("audio/aac", entry)
         written = 0
+        client_gone = False
         try:
             assert proc.stdout is not None
 
@@ -382,31 +373,26 @@ class _Handler(BaseHTTPRequestHandler):
 
             self._write_icy(_counted(), _icy_metadata_block(entry.title, entry.artist))
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            client_gone = True  # device seeked/stopped; not an ffmpeg failure
         finally:
+            if client_gone and proc.poll() is None:
+                proc.terminate()  # stop the fetch rather than draining the whole CDN file
+            try:
+                _, err = proc.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                _, err = proc.communicate()
+            rc = proc.returncode
+            err_text = (err or b"").decode("utf-8", "replace").strip()[:500]
             if written == 0:
-                # ffmpeg produced no audio: terminate it and surface why.
-                if proc.poll() is None:
-                    proc.terminate()
-                    try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait()
-                err = b""
-                if proc.stderr is not None:
-                    try:
-                        err = proc.stderr.read() or b""
-                    except OSError:
-                        pass
+                log.warning("relay: ffmpeg produced no audio (rc=%s): %s", rc, err_text)
+            elif not client_gone and rc not in (0, None):
                 log.warning(
-                    "relay: ffmpeg remux produced no audio (rc=%s): %s",
-                    proc.returncode,
-                    err.decode("utf-8", "replace")[:500].strip(),
+                    "relay: ffmpeg exited rc=%s after %d bytes; the track may be truncated: %s",
+                    rc, written, err_text,
                 )
             else:
-                log.info("relay: streamed %d bytes of ADTS to the device", written)
-            _stop_process(proc)
+                log.info("relay: streamed %d bytes of ADTS (rc=%s)", written, rc)
 
     def _reply_icy(
         self, upstream: requests.Response, source: StreamSource, entry: _Entry, *, send_body: bool
