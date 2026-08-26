@@ -7,10 +7,36 @@ import os
 import sys
 
 
+def _log_file_handler() -> logging.Handler | None:
+    """A rotating log file under the user cache dir, so crashes/errors are easy
+    to retrieve (in the Flatpak: ~/.var/app/<app-id>/cache/harmony/harmony.log).
+    Best effort -- never let logging setup break startup."""
+    try:
+        import pathlib
+        from logging.handlers import RotatingFileHandler
+
+        import platformdirs
+
+        directory = pathlib.Path(platformdirs.user_cache_dir("harmony"))
+        directory.mkdir(parents=True, exist_ok=True)
+        handler = RotatingFileHandler(
+            directory / "harmony.log", maxBytes=1_000_000, backupCount=3, encoding="utf-8"
+        )
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)-8s %(name)s: %(message)s"))
+        return handler
+    except Exception:  # noqa: BLE001 - logging must never crash the app
+        return None
+
+
 def main() -> int:
+    handlers: list[logging.Handler] = [logging.StreamHandler()]
+    file_handler = _log_file_handler()
+    if file_handler is not None:
+        handlers.append(file_handler)
     logging.basicConfig(
         level=os.environ.get("HARMONY_LOG_LEVEL", "INFO").upper(),
         format="%(asctime)s %(levelname)-8s %(name)s: %(message)s",
+        handlers=handlers,
     )
 
     # Must happen before the first ``from gi.repository import Gtk/Adw`` anywhere

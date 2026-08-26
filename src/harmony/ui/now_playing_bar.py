@@ -254,16 +254,22 @@ class NowPlayingBar(Gtk.Box):
         self._art.set_from_icon_name("emblem-music-symbolic")
 
         def work() -> object:
+            # Only the network fetch + GdkPixbuf decode run here; GdkPixbuf is
+            # thread-safe, but the GdkTexture (a GDK object) must be created on
+            # the main thread -- building it on a worker thread segfaults GTK.
             import requests
-            from gi.repository import Gdk, GdkPixbuf
+            from gi.repository import GdkPixbuf
 
             data = requests.get(url, timeout=8).content
             loader = GdkPixbuf.PixbufLoader()
             loader.write(data)
             loader.close()
-            return Gdk.Texture.new_for_pixbuf(loader.get_pixbuf())
+            return loader.get_pixbuf()
 
-        def done(texture: object) -> None:
+        def done(pixbuf: object) -> None:
+            from gi.repository import Gdk
+
+            texture = Gdk.Texture.new_for_pixbuf(pixbuf)
             self._art_cache[url] = texture
             if self._art_url == url:  # still the current track
                 self._art.set_from_paintable(texture)

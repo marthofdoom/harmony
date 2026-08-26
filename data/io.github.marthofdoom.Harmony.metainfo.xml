@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.18" date="2026-08-26">
+      <description>
+        <p>Fixes a crash (segfault) that could happen while album art loaded in
+        the Now Playing bar: the artwork texture was being created on a worker
+        thread, which isn't safe for GTK. Also writes logs to a rotating file
+        (cache/harmony/harmony.log) so problems are easier to diagnose.</p>
+      </description>
+    </release>
     <release version="0.5.17" date="2026-08-26">
       <description>
         <p>A Route Audio receiver no longer keeps running after you close the
