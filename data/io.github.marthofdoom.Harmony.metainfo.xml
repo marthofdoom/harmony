@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.5" date="2026-08-26">
+      <description>
+        <p>Right-click context menus now cover collections: play a whole album,
+        artist, or playlist to a device, or add all of its tracks to a playlist,
+        in one action. Tracks in a playlist get the same full menu as search.</p>
+      </description>
+    </release>
     <release version="0.5.4" date="2026-08-26">
       <description>
         <p>Discover page overhaul: recommendation results are now actionable

@@ -321,7 +321,7 @@ def test_artist_row_actions_with_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._other_row_actions(artist)]
 
-    assert labels == ["Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_artist_row_actions_falls_back_to_other_provider(fake_state: AppState) -> None:
@@ -353,7 +353,7 @@ def test_album_row_actions_with_native_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._other_row_actions(album)]
 
-    assert labels == ["Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_album_row_actions_without_native_provider_omits_show_similar(fake_state: AppState) -> None:
@@ -375,7 +375,7 @@ def test_playlist_row_actions_with_native_provider(fake_state: AppState) -> None
 
     labels = [label for label, _cb in page._other_row_actions(playlist)]
 
-    assert labels == ["Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_playlist_row_actions_without_native_provider_omits_show_similar(fake_state: AppState) -> None:
@@ -399,7 +399,7 @@ def test_playlists_page_row_actions_with_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._playlist_row_actions(playlist, wrapper)]
 
-    assert labels == ["Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_playlists_page_row_actions_without_provider(fake_state: AppState) -> None:

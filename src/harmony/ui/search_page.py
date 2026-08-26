@@ -15,6 +15,10 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 from harmony.errors import NotSupportedError  # noqa: E402
 from harmony.models import Album, Artist, Playlist, SearchResults, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.collection_actions import (  # noqa: E402
+    add_collection_to_playlist,
+    play_collection_on_device,
+)
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
@@ -556,6 +560,29 @@ class SearchPage(Gtk.Box):
 
     def _other_row_actions(self, item: Album | Artist | Playlist) -> list[tuple[str, Callable[[], None]]]:
         actions: list[tuple[str, Callable[[], None]]] = []
+        # Play on Device / Add to Playlist need the item's own native
+        # provider -- get_album_tracks/get_artist_top_tracks/get_playlist_tracks
+        # only resolve against the service the id came from, no fallback.
+        native_provider = self.state.providers.get(item.service)
+        if isinstance(item, Artist):
+            label = item.name
+            fetch_tracks = (lambda p=native_provider: p.get_artist_top_tracks(item.id)) if native_provider else None
+        elif isinstance(item, Album):
+            label = item.title
+            fetch_tracks = (lambda p=native_provider: p.get_album_tracks(item.id)) if native_provider else None
+        else:
+            label = item.title
+            fetch_tracks = (lambda p=native_provider: p.get_playlist_tracks(item.id)) if native_provider else None
+        if fetch_tracks is not None:
+            actions.append((
+                "Play on Device",
+                lambda: play_collection_on_device(self.other_list, self.state, label=label, fetch_tracks=fetch_tracks),
+            ))
+            actions.append((
+                "Add to Playlist…",
+                lambda: add_collection_to_playlist(self.other_list, self.state, label=label, fetch_tracks=fetch_tracks),
+            ))
+
         if isinstance(item, Artist):
             provider = self._similar_target_provider(item.service)
             if provider is not None:
@@ -569,26 +596,24 @@ class SearchPage(Gtk.Box):
         elif isinstance(item, Album):
             # get_album_tracks needs the album's own native provider -- unlike
             # tracks/artists above, there is no sensible fallback here.
-            provider = self.state.providers.get(item.service)
-            if provider is not None:
+            if native_provider is not None:
                 actions.append((
                     "Show Similar",
                     lambda: self._open_similar(
                         f"Similar to {item.title}",
                         lambda: self.state.recommender.similar_to_tracks(
-                            provider.get_album_tracks(item.id), provider, limit=40
+                            native_provider.get_album_tracks(item.id), native_provider, limit=40
                         ),
                     ),
                 ))
         elif isinstance(item, Playlist):
-            provider = self.state.providers.get(item.service)
-            if provider is not None:
+            if native_provider is not None:
                 actions.append((
                     "Show Similar",
                     lambda: self._open_similar(
                         f"Similar to {item.title}",
                         lambda: self.state.recommender.expand_playlist(
-                            provider.get_playlist_tracks(item.id), provider, limit=40
+                            native_provider.get_playlist_tracks(item.id), native_provider, limit=40
                         ),
                     ),
                 ))

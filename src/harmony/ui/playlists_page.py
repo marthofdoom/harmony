@@ -16,6 +16,11 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.collection_actions import (  # noqa: E402
+    add_collection_to_playlist,
+    play_collection_on_device,
+    track_menu_actions,
+)
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
@@ -132,6 +137,22 @@ class PlaylistsPage(Gtk.Box):
         # fallback to another service makes sense here.
         provider = self.state.providers.get(playlist.service)
         if provider is not None:
+
+            def fetch_tracks(p: object = provider) -> list[Track]:
+                return p.get_playlist_tracks(playlist.id)
+
+            actions.append((
+                "Play on Device",
+                lambda: play_collection_on_device(
+                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks
+                ),
+            ))
+            actions.append((
+                "Add to Playlist…",
+                lambda: add_collection_to_playlist(
+                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks
+                ),
+            ))
             actions.append(("Show Similar", lambda: self._show_similar_for_playlist(playlist, provider)))
         actions.append(("Open", lambda: self.playlist_list.select_row(wrapper)))
         return actions
@@ -171,7 +192,9 @@ class PlaylistsPage(Gtk.Box):
                         description="Choose a playlist on the left to see its tracks."),
             "empty",
         )
-        self.column_view, self.track_store, self.track_selection = build_track_column_view()
+        self.column_view, self.track_store, self.track_selection = build_track_column_view(
+            on_row_menu=self._track_row_actions
+        )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")
         box.append(self.track_stack)
@@ -228,6 +251,10 @@ class PlaylistsPage(Gtk.Box):
             set_stack_status(self.track_stack, "empty", error_status_page(exc, title="Couldn't load tracks"))
 
         run_async(work, done, error)
+
+    def _track_row_actions(self, track: Track) -> list[tuple[str, Callable[[], None]]]:
+        """Right-click menu for a track row: same shape as Search's own track list."""
+        return track_menu_actions(self.column_view, self.state, track)
 
     # -- toolbar actions ------------------------------------------------------
 
