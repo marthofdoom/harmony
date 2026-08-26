@@ -7,6 +7,20 @@ and so a network source can be routed to a chosen sink.
 
 from __future__ import annotations
 
-from .pipewire import AudioNode, list_sinks, list_sources
+from .pipewire import (
+    AudioNode,
+    RocReceiver,
+    list_sinks,
+    list_sources,
+    roc_receiver_down,
+    roc_receiver_up,
+)
 
-__all__ = ["AudioNode", "list_sinks", "list_sources"]
+__all__ = [
+    "AudioNode",
+    "RocReceiver",
+    "list_sinks",
+    "list_sources",
+    "roc_receiver_down",
+    "roc_receiver_up",
+]
