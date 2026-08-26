@@ -29,6 +29,11 @@ class HarmonyApplication(Adw.Application):
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
         self.state = AppState()
+
+        from harmony.ui.theming import apply_theme
+
+        apply_theme(self.state.settings.theme)
+
         self._install_actions()
 
     def do_activate(self) -> None:

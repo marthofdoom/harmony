@@ -193,6 +193,7 @@ class Settings:
     window_height: int = 820
     window_maximized: bool = False
     last_page: str = "search"
+    theme: str = "system"                # id from harmony.ui.theming.THEMES
 
     # Devices (WiiM/LinkPlay playback renderers). Non-secret: host, a
     # user/device-supplied display name, and a backend discriminator

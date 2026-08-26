@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.1" date="2026-08-26">
+      <description>
+        <p>Adds selectable color themes (Appearance in Preferences), fixes
+        YouTube tracks cutting off partway through when playing to a device, and
+        makes the Devices page show the playing track reliably.</p>
+      </description>
+    </release>
     <release version="0.5.0" date="2026-08-26">
       <description>
         <p>Unified search and cross-service playlist sync across YouTube Music

@@ -23,12 +23,14 @@ from harmony import config  # noqa: E402
 from harmony.models import Service  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
+from harmony.ui.theming import THEMES, apply_theme, theme_index  # noqa: E402
 
 log = logging.getLogger(__name__)
 
 _YT_AUTH_KINDS = ["browser", "oauth"]
 _QOBUZ_AUTH_KINDS = ["password", "token"]
 _DIRECTIONS = ["mirror-a-to-b", "mirror-b-to-a", "two-way"]
+_THEME_IDS = [t.id for t in THEMES]
 
 
 class PreferencesDialog(Adw.PreferencesDialog):
@@ -42,6 +44,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self._debounce: dict[str, tuple[int, Callable[[], None]]] = {}
         self._syncing_thresholds = False
 
+        self.add(self._build_appearance_page())
         self.add(self._build_accounts_page())
         self.add(self._build_integrations_page())
         self.add(self._build_sync_page())
@@ -89,6 +92,30 @@ class PreferencesDialog(Adw.PreferencesDialog):
         """
         self._set_setting(name, value)
         self.state.apply_matching_settings()
+
+    # -- appearance ---------------------------------------------------------------
+
+    def _build_appearance_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(
+            title="Appearance", name="appearance", icon_name="applications-graphics-symbolic"
+        )
+
+        group = Adw.PreferencesGroup(
+            title="Theme", description="Pick a color theme for Harmony -- applied immediately."
+        )
+        self.theme_row = Adw.ComboRow(
+            title="Theme", model=Gtk.StringList.new([t.name for t in THEMES])
+        )
+        self.theme_row.set_selected(theme_index(self.settings.theme))
+        self.theme_row.connect("notify::selected", self._on_theme_changed)
+        group.add(self.theme_row)
+        page.add(group)
+        return page
+
+    def _on_theme_changed(self, row: Adw.ComboRow, _param: object) -> None:
+        theme_id = _THEME_IDS[row.get_selected()]
+        self._set_setting("theme", theme_id)
+        apply_theme(theme_id)
 
     # -- accounts ---------------------------------------------------------------
 
