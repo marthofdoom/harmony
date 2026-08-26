@@ -76,6 +76,9 @@ class AppState(GObject.Object):
         # show now-playing text even when the device reports none (a bare URL
         # carries no metadata unless the stream itself does).
         self._now_playing: dict[str, tuple[str, str]] = {}
+        # host -> UpnpRenderer|None, probed once per device (None = no
+        # AVTransport, use the httpapi path instead of re-probing every play).
+        self._upnp_cache: dict[str, Any] = {}
 
         self.reload_providers()
         self._init_recommender()
@@ -500,10 +503,63 @@ class AppState(GObject.Object):
             return cached["source"]
 
         relay = self._get_relay()
+        source = cached["source"]
+
+        # Prefer UPnP AVTransport: DIDL-Lite carries title/artist/album/art +
+        # duration (so the device's own screen shows the track and reports a
+        # progress/duration), and it plays a plain seekable file — so register
+        # the relay in passthrough mode (allow_icy=False). Fall back to the
+        # LinkPlay httpapi (+ best-effort ICY metadata) if there's no AVTransport.
+        renderer = self._upnp_renderer_for(device_host)
+        if renderer is not None:
+            token = relay.register(resolver, title=track.title, artist=track.artist_name, allow_icy=False)
+            url = relay.url_for(token, device_host)
+            try:
+                renderer.play_media(
+                    url,
+                    title=track.title,
+                    artist=track.artist_name,
+                    album=getattr(track, "album", None),
+                    art_url=getattr(track, "artwork_url", None),
+                    duration_s=getattr(track, "duration_s", None),
+                    mime=source.mime_type or "audio/mpeg",
+                )
+                self._now_playing[device_host] = (track.title, track.artist_name)
+                return
+            except Exception as exc:  # noqa: BLE001 - any UPnP failure -> httpapi fallback
+                log.warning("UPnP play to %s failed (%s); falling back to httpapi", device_host, exc)
+
         token = relay.register(resolver, title=track.title, artist=track.artist_name)
         url = relay.url_for(token, device_host)
         self.device_for(device_host).play_url(url)
         self._now_playing[device_host] = (track.title, track.artist_name)
+
+    def _upnp_renderer_for(self, host: str) -> Any:
+        """Return a cached ``UpnpRenderer`` for ``host``, or None if it has no AVTransport.
+
+        Probes once per host (SSDP + a description fetch, both on the caller's
+        worker thread) and caches the result — including a None for a device that
+        turned out not to speak UPnP, so an httpapi-only device isn't re-probed
+        on every play.
+        """
+        if host in self._upnp_cache:
+            return self._upnp_cache[host]
+        renderer = None
+        try:
+            from harmony.playback import upnp
+
+            if self._device_session is None:
+                import requests
+
+                self._device_session = requests.Session()
+            description = upnp.description_url_for(host)
+            service = upnp.find_avtransport(description, self._device_session) if description else None
+            if service is not None:
+                renderer = upnp.UpnpRenderer(service, session=self._device_session)
+        except Exception as exc:  # noqa: BLE001 - UPnP is optional; degrade to httpapi
+            log.debug("UPnP probe failed for %s: %s", host, exc)
+        self._upnp_cache[host] = renderer
+        return renderer
 
     def last_played_on(self, host: str | None) -> tuple[str, str] | None:
         """Return the (title, artist) last relayed to ``host`` via play-to-device, if any."""

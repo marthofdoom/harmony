@@ -20,6 +20,7 @@ pytest.importorskip("gi")
 from gi.repository import GObject  # noqa: E402
 
 from harmony import config as config_module  # noqa: E402
+from harmony.models import Service, StreamSource, Track  # noqa: E402
 from harmony.playback import DeviceInfo, WiiMDevice  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 
@@ -221,3 +222,98 @@ def test_add_device_survives_a_reload(monkeypatch: pytest.MonkeyPatch, tmp_path)
 
     reloaded = config_module.Settings.load()
     assert reloaded.known_devices == [{"host": "192.168.1.50", "name": "Living Room", "kind": "wiim"}]
+
+
+# -- play_track_on_device: UPnP-first with an httpapi fallback ----------------
+
+
+class _FakeProvider:
+    service = Service.YTMUSIC
+
+    def resolve_stream(self, track_id: str) -> StreamSource:
+        return StreamSource(url="http://cdn/stream", mime_type="audio/mp4", container="m4a")
+
+
+class _FakeRelay:
+    def __init__(self) -> None:
+        self.registered: list[dict] = []
+
+    def register(self, resolver, *, title=None, artist=None, allow_icy=True) -> str:
+        self.registered.append({"title": title, "artist": artist, "allow_icy": allow_icy})
+        return "tok"
+
+    def url_for(self, token: str, host: str) -> str:
+        return f"http://relay/{token}"
+
+
+def _ready_to_play(state: AppState) -> AppState:
+    state._relay = _FakeRelay()
+    state._now_playing = {}
+    state._upnp_cache = {}
+    state.providers = {Service.YTMUSIC: _FakeProvider()}
+    return state
+
+
+def _a_track() -> Track:
+    return Track(id="vid", title="Song", service=Service.YTMUSIC, artists=["Artist"],
+                 album="Album", duration_s=222, artwork_url="http://art")
+
+
+def test_play_uses_upnp_when_available(state: AppState, monkeypatch) -> None:
+    _ready_to_play(state)
+    played: dict = {}
+
+    class _Renderer:
+        def play_media(self, url, **kw):
+            played.update(url=url, **kw)
+
+    def _no_httpapi(host):
+        raise AssertionError("httpapi must not be used when UPnP works")
+
+    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: _Renderer())
+    monkeypatch.setattr(state, "device_for", _no_httpapi)
+
+    state.play_track_on_device(_a_track(), "192.168.1.9")
+
+    assert played["url"] == "http://relay/tok"
+    assert played["title"] == "Song" and played["artist"] == "Artist"
+    assert played["duration_s"] == 222 and played["mime"] == "audio/mp4"
+    assert state._relay.registered[-1]["allow_icy"] is False  # passthrough for UPnP
+    assert state._now_playing["192.168.1.9"] == ("Song", "Artist")
+
+
+def test_play_falls_back_to_httpapi_without_upnp(state: AppState, monkeypatch) -> None:
+    _ready_to_play(state)
+    played: dict = {}
+
+    class _Device:
+        def play_url(self, url):
+            played["url"] = url
+
+    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: None)
+    monkeypatch.setattr(state, "device_for", lambda host: _Device())
+
+    state.play_track_on_device(_a_track(), "192.168.1.9")
+
+    assert played["url"] == "http://relay/tok"
+    assert state._relay.registered[-1]["allow_icy"] is True  # ICY best-effort for httpapi
+
+
+def test_play_falls_back_when_upnp_raises(state: AppState, monkeypatch) -> None:
+    _ready_to_play(state)
+    played: dict = {}
+
+    class _BadRenderer:
+        def play_media(self, url, **kw):
+            raise RuntimeError("no route to device")
+
+    class _Device:
+        def play_url(self, url):
+            played["url"] = url
+
+    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: _BadRenderer())
+    monkeypatch.setattr(state, "device_for", lambda host: _Device())
+
+    state.play_track_on_device(_a_track(), "192.168.1.9")
+
+    assert played["url"] == "http://relay/tok"  # UPnP failed -> httpapi still played it

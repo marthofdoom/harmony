@@ -31,6 +31,16 @@ from harmony.ui.widgets import confirm_dialog, status_page  # noqa: E402
 log = logging.getLogger(__name__)
 
 _VOLUME_DEBOUNCE_MS = 300
+_POLL_INTERVAL_S = 2
+
+
+def _format_time(seconds: int | None) -> str:
+    total = max(0, int(seconds or 0))
+    minutes, secs = divmod(total, 60)
+    if minutes >= 60:
+        hours, minutes = divmod(minutes, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+    return f"{minutes}:{secs:02d}"
 
 
 class DevicesPage(Gtk.Box):
@@ -44,6 +54,9 @@ class DevicesPage(Gtk.Box):
         self._device_cache: dict[str, Any] = {}
         self._updating_from_status = False
         self._volume_debounce_id: int | None = None
+        # Quiet position-polling while a device is selected and playing.
+        self._poll_id: int | None = None
+        self._poll_in_flight = False
 
         self.append(self._build_top_bar())
 
@@ -116,6 +129,12 @@ class DevicesPage(Gtk.Box):
         now_playing.add(self.title_row)
         now_playing.add(self.artist_row)
         outer.append(now_playing)
+
+        # Playback position. Only meaningful once the device reports a duration
+        # (the UPnP/passthrough path provides one); hidden until then.
+        self.progress_bar = Gtk.ProgressBar(show_text=True, margin_top=4)
+        self.progress_bar.set_visible(False)
+        outer.append(self.progress_bar)
 
         controls = Adw.PreferencesGroup(title="Volume")
         volume_row = Adw.ActionRow(title="Volume")
@@ -305,6 +324,9 @@ class DevicesPage(Gtk.Box):
             self._updating_from_status = False
         self.play_pause_button.set_icon_name("media-playback-start-symbolic")
         self._set_controls_sensitive(False)
+        self.progress_bar.set_visible(False)
+        self.progress_bar.set_fraction(0.0)
+        self._stop_polling()
 
     def _apply_status(self, status: Any) -> None:
         self._last_status = status
@@ -330,6 +352,55 @@ class DevicesPage(Gtk.Box):
             "media-playback-pause-symbolic" if status.state == "playing" else "media-playback-start-symbolic"
         )
         self._set_controls_sensitive(True)
+        self._update_progress(status)
+        # Keep the position live while playing; stop hammering the device otherwise.
+        if status.state == "playing":
+            self._start_polling()
+        else:
+            self._stop_polling()
+
+    def _update_progress(self, status: Any) -> None:
+        position, duration = status.position_s, status.duration_s
+        if duration and duration > 0 and position is not None:
+            self.progress_bar.set_fraction(max(0.0, min(1.0, position / duration)))
+            self.progress_bar.set_text(f"{_format_time(position)} / {_format_time(duration)}")
+            self.progress_bar.set_visible(True)
+        else:
+            self.progress_bar.set_visible(False)
+
+    def _start_polling(self) -> None:
+        if self._poll_id is None:
+            self._poll_id = GLib.timeout_add_seconds(_POLL_INTERVAL_S, self._on_poll_tick)
+
+    def _stop_polling(self) -> None:
+        if self._poll_id is not None:
+            GLib.source_remove(self._poll_id)
+            self._poll_id = None
+
+    def _on_poll_tick(self) -> bool:
+        host = self._selected_host
+        if host is None:
+            self._poll_id = None
+            return GLib.SOURCE_REMOVE
+        if self._poll_in_flight:
+            return GLib.SOURCE_CONTINUE  # don't stack calls on a slow device
+        device = self._get_device(host)
+        self._poll_in_flight = True
+
+        def work() -> Any:
+            return device.status()
+
+        def done(status: Any) -> None:
+            self._poll_in_flight = False
+            if self._selected_host == host:
+                self._apply_status(status)
+
+        def error(_exc: BaseException) -> None:
+            # Quiet: a transient poll failure must not disturb the UI or toast.
+            self._poll_in_flight = False
+
+        run_async(work, done, error)
+        return GLib.SOURCE_CONTINUE
 
     def _refresh_status(self) -> None:
         host = self._selected_host

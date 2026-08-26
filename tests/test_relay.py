@@ -298,3 +298,21 @@ def test_mp4_source_is_remuxed_to_adts_with_icy(tmp_path, relay: RelayServer) ->
     finally:
         up.shutdown()
         up.server_close()
+
+
+def test_allow_icy_false_forces_passthrough_even_when_requested(relay: RelayServer, fake_upstream: ThreadingHTTPServer) -> None:
+    port = fake_upstream.server_address[1]
+
+    def resolver() -> StreamSource:
+        return StreamSource(url=f"http://127.0.0.1:{port}/audio", mime_type="audio/mp4", container="m4a")
+
+    # allow_icy=False (the UPnP path): even an AAC/MP4 source with metadata and a
+    # device asking for ICY must be served as a plain, length-known passthrough.
+    token = relay.register(resolver, title="T", artist="A", allow_icy=False)
+    resp = requests.get(
+        f"http://127.0.0.1:{relay.port}/play/{token}", headers={"Icy-MetaData": "1"}, timeout=5
+    )
+    assert resp.status_code == 200
+    assert "icy-metaint" not in resp.headers
+    assert resp.headers["Content-Type"] == "audio/mp4"
+    assert resp.content == PAYLOAD  # untouched bytes, no ADTS rewrap, no interleaving

@@ -65,11 +65,19 @@ _ICY_METAINT = 16384
 
 @dataclass(frozen=True)
 class _Entry:
-    """A registered playable: the per-fetch resolver plus static now-playing text."""
+    """A registered playable: the per-fetch resolver plus static now-playing text.
+
+    ``allow_icy`` gates the ADTS-rewrap/ICY-metadata path. It's on for httpapi
+    playback (where ICY is the only way to get a title onto the device), and off
+    for UPnP playback, which carries metadata via DIDL-Lite and wants a plain,
+    seekable, length-known file instead so the device can show a duration/
+    progress and seek.
+    """
 
     resolver: Resolver
     title: str | None = None
     artist: str | None = None
+    allow_icy: bool = True
 
 
 def _icy_stream_title(title: str | None, artist: str | None) -> str:
@@ -186,15 +194,24 @@ class RelayServer:
             raise RuntimeError("RelayServer has not been started")
         return self._server.server_address[1]
 
-    def register(self, resolver: Resolver, *, title: str | None = None, artist: str | None = None) -> str:
+    def register(
+        self,
+        resolver: Resolver,
+        *,
+        title: str | None = None,
+        artist: str | None = None,
+        allow_icy: bool = True,
+    ) -> str:
         """Register a resolver (with optional now-playing text) and return a token.
 
         ``title``/``artist`` are handed to a device via ICY stream metadata when
         it asks for it, so the renderer can show what's playing for a bare URL.
+        Pass ``allow_icy=False`` for UPnP playback (metadata comes via DIDL-Lite
+        there, and a plain length-known file is wanted for duration/seeking).
         """
         token = secrets.token_urlsafe(16)
         with self._lock:
-            self._entries[token] = _Entry(resolver=resolver, title=title, artist=artist)
+            self._entries[token] = _Entry(resolver=resolver, title=title, artist=artist, allow_icy=allow_icy)
             while len(self._entries) > _MAX_TOKENS:
                 self._entries.popitem(last=False)  # evict oldest
         return token
@@ -284,7 +301,11 @@ class _Handler(BaseHTTPRequestHandler):
         # Serve ICY in-stream metadata only when the device asks for it and we
         # have something to show. In that mode the body streams from the start
         # (no Range), so metadata blocks land at fixed offsets.
-        wants_icy = self.headers.get("Icy-MetaData") == "1" and bool(entry.title or entry.artist)
+        wants_icy = (
+            entry.allow_icy
+            and self.headers.get("Icy-MetaData") == "1"
+            and bool(entry.title or entry.artist)
+        )
 
         # AAC-in-MP4 (YouTube itag 140) is a file, not a stream: a renderer
         # reads its title from container tags (which the stream lacks) and

@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.3" date="2026-08-26">
+      <description>
+        <p>Play-to-device now uses UPnP so the renderer's own screen can show the
+        track (title, artist, album art) and report a duration, and the Devices
+        page shows a live progress bar. Falls back automatically to direct
+        control if a device has no UPnP support.</p>
+      </description>
+    </release>
     <release version="0.5.2" date="2026-08-26">
       <description>
         <p>Adds right-click context menus across tracks, artists, albums, and
