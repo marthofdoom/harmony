@@ -437,9 +437,105 @@ class TestQobuzChunkingAndErrors:
         with pytest.raises(NotSupportedError):
             qobuz_provider.similar_tracks(seed)
 
-    def test_get_artist_top_tracks_not_supported(self, qobuz_provider: QobuzProvider) -> None:
-        with pytest.raises(NotSupportedError):
-            qobuz_provider.get_artist_top_tracks("artist1")
+
+class TestQobuzArtistTopTracks:
+    """``get_artist_top_tracks`` via ``artist/page`` -- verified live against
+    Radiohead (artist_id 43840): top_tracks entries have ``performer: None``,
+    so the artist name must come from the payload's top-level ``name``.
+    """
+
+    def test_parses_realistic_payload_with_null_performer(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "id": 43840,
+            "name": "Radiohead",
+            "top_tracks": [
+                {
+                    "id": 33933680,
+                    "title": "Creep",
+                    "performer": None,
+                    "duration": 238,
+                    "parental_warning": False,
+                    "album": {
+                        "title": "Pablo Honey",
+                        "release_date_original": "1993-02-22",
+                        "image": {"large": "creep.jpg"},
+                    },
+                },
+                {
+                    "id": 33933681,
+                    "title": "Karma Police",
+                    "performer": None,
+                    "duration": 261,
+                    "album": {
+                        "title": "OK Computer",
+                        "release_date_original": "1997-05-21",
+                        "image": {"large": "kp.jpg"},
+                    },
+                },
+            ],
+        }
+        monkeypatch.setattr(qobuz_provider, "_request", lambda method, path, **kw: payload)
+
+        tracks = qobuz_provider.get_artist_top_tracks("43840")
+
+        assert len(tracks) == 2
+        assert tracks[0].id == "33933680"
+        assert isinstance(tracks[0].id, str)
+        assert tracks[0].title == "Creep"
+        assert tracks[0].service is Service.QOBUZ
+        assert tracks[0].artists == ["Radiohead"]  # filled from the payload's top-level name
+        assert tracks[0].album == "Pablo Honey"
+        assert tracks[0].year == 1993
+        assert tracks[1].artists == ["Radiohead"]
+
+    def test_respects_limit_by_slicing(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "name": "Radiohead",
+            "top_tracks": [{"id": i, "title": f"Track {i}", "performer": None} for i in range(25)],
+        }
+        monkeypatch.setattr(qobuz_provider, "_request", lambda method, path, **kw: payload)
+
+        tracks = qobuz_provider.get_artist_top_tracks("43840", limit=5)
+
+        assert [t.id for t in tracks] == ["0", "1", "2", "3", "4"]
+
+    def test_missing_top_tracks_key_returns_empty_list(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(qobuz_provider, "_request", lambda method, path, **kw: {"name": "Radiohead"})
+
+        assert qobuz_provider.get_artist_top_tracks("43840") == []
+
+    def test_empty_top_tracks_list_returns_empty_list(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {"name": "Radiohead", "top_tracks": []}
+        monkeypatch.setattr(qobuz_provider, "_request", lambda method, path, **kw: payload)
+
+        assert qobuz_provider.get_artist_top_tracks("43840") == []
+
+    def test_sends_expected_request(self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch) -> None:
+        captured: dict = {}
+
+        def fake_request(method, path, *, params=None, data=None, **kw):
+            captured["method"] = method
+            captured["path"] = path
+            captured["params"] = params
+            return {"name": "Radiohead", "top_tracks": []}
+
+        monkeypatch.setattr(qobuz_provider, "_request", fake_request)
+
+        qobuz_provider.get_artist_top_tracks("43840")
+
+        assert captured == {
+            "method": "GET",
+            "path": "artist/page",
+            "params": {"artist_id": "43840", "sort": "relevant"},
+        }
 
 
 class TestQobuzRequestSig:

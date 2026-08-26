@@ -11,6 +11,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
+from harmony.errors import NotSupportedError  # noqa: E402
 from harmony.models import Album, Artist, Playlist, SearchResults, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
@@ -39,6 +40,11 @@ class SearchPage(Gtk.Box):
         self._debounce_id: int | None = None
         self._showing_similar_to: Track | None = None
         self._last_results: SearchResults | None = None
+        # Artist drill-down state (search result -> artist -> albums, with an
+        # explicit "Most popular"/"Top songs" side trip into tracks). See
+        # ``_drill_into``/``_show_artist_albums``/`_on_show_artist_top_tracks_clicked``.
+        self._showing_artist: Artist | None = None
+        self._showing_artist_top_tracks_for: Artist | None = None
 
         self.append(self._build_controls())
 
@@ -65,8 +71,20 @@ class SearchPage(Gtk.Box):
 
         self.other_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         self.other_list.add_css_class("boxed-list")
+        other_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        self._other_back_bar = Gtk.Box(spacing=6, visible=False)
+        other_back_button = Gtk.Button(label="Back to search results")
+        other_back_button.connect("clicked", self._on_other_back_clicked)
+        self._other_back_bar.append(other_back_button)
+        self._other_header_label = Gtk.Label(xalign=0.0, hexpand=True)
+        self._other_back_bar.append(self._other_header_label)
+        self._other_popular_button = Gtk.Button(label="Most popular", visible=False)
+        self._other_popular_button.connect("clicked", self._on_show_artist_top_tracks_clicked)
+        self._other_back_bar.append(self._other_popular_button)
+        other_box.append(self._other_back_bar)
         other_scroller = Gtk.ScrolledWindow(child=self.other_list, vexpand=True)
-        self.content_stack.add_named(other_scroller, "other")
+        other_box.append(other_scroller)
+        self.content_stack.add_named(other_box, "other")
 
         self.content_stack.set_visible_child_name("empty")
         self.append(self.content_stack)
@@ -138,6 +156,10 @@ class SearchPage(Gtk.Box):
         query = self.search_entry.get_text().strip()
         self._back_bar.set_visible(False)
         self._showing_similar_to = None
+        self._showing_artist_top_tracks_for = None
+        self._other_back_bar.set_visible(False)
+        self._other_popular_button.set_visible(False)
+        self._showing_artist = None
         if not query:
             self.content_stack.set_visible_child_name("empty")
             return
@@ -191,6 +213,12 @@ class SearchPage(Gtk.Box):
         self.state.toast(f"Search failed: {exc}")
 
     def _show_other_kind(self, kind: str, results: SearchResults) -> None:
+        # A fresh set of search results, not an artist drill-down -- clear
+        # any artist context so its header/"Most popular" button don't leak
+        # into a plain albums/artists/playlists listing.
+        self._other_back_bar.set_visible(False)
+        self._other_popular_button.set_visible(False)
+        self._showing_artist = None
         while row := self.other_list.get_row_at_index(0):
             self.other_list.remove(row)
         items: list[Album | Artist | Playlist]
@@ -207,24 +235,108 @@ class SearchPage(Gtk.Box):
         self.content_stack.set_visible_child_name("other")
 
     def _drill_into(self, item: Album | Artist | Playlist) -> None:
-        """Row-activate on a non-track result: load its tracks into the track view."""
+        """Row-activate on a non-track result.
+
+        An ``Artist`` opens that artist's ALBUMS (not tracks) -- "most
+        popular"/"top songs" is a separate, explicit action from there (see
+        ``_show_artist_albums``). Albums/playlists still load straight into
+        the track view, same as before.
+        """
         provider = self.state.providers.get(item.service)
         if provider is None:
             self.state.toast(f"No provider configured for {item.service.label}")
             return
 
+        if isinstance(item, Artist):
+            self._show_artist_albums(item)
+            return
+
         def work() -> list[Track]:
             if isinstance(item, Album):
                 return provider.get_album_tracks(item.id)
-            if isinstance(item, Artist):
-                return provider.get_artist_top_tracks(item.id)
             return provider.get_playlist_tracks(item.id)
 
         run_async(work, self._on_drill_done, lambda exc: self.state.toast(f"Couldn't load tracks: {exc}"))
 
     def _on_drill_done(self, tracks: list[Track]) -> None:
+        # Plain album/playlist track drill-down carries no "similar" or
+        # "artist top tracks" context; clear both so a stale back bar from an
+        # earlier view can't linger into this one.
+        self._back_bar.set_visible(False)
+        self._showing_similar_to = None
+        self._showing_artist_top_tracks_for = None
         replace_tracks(self.track_store, tracks)
         self.content_stack.set_visible_child_name("tracks")
+
+    # -- artist drill-down: artist -> albums, with an explicit "most popular" ----
+
+    def _show_artist_albums(self, artist: Artist) -> None:
+        provider = self.state.providers.get(artist.service)
+        if provider is None:
+            self.state.toast(f"No provider configured for {artist.service.label}")
+            return
+
+        def work() -> list[Album]:
+            return provider.get_artist_albums(artist.id)
+
+        def done(albums: list[Album]) -> None:
+            self._showing_artist = artist
+            while row := self.other_list.get_row_at_index(0):
+                self.other_list.remove(row)
+            if albums:
+                for album in albums:
+                    subtitle = f"{album.artist_name} · {album.service.label}" if album.artist_name else album.service.label
+                    row = Adw.ActionRow(title=album.title, subtitle=subtitle)
+                    row.set_activatable(True)
+                    row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                    row.connect("activated", lambda _r, a=album: self._drill_into(a))
+                    self.other_list.append(row)
+            else:
+                self.other_list.append(Adw.ActionRow(title="No albums found", sensitive=False))
+            self._other_header_label.set_label(f"Albums by {artist.name}")
+            self._other_popular_button.set_label(
+                "Most popular" if artist.service == Service.QOBUZ else "Top songs"
+            )
+            self._other_popular_button.set_visible(True)
+            self._other_back_bar.set_visible(True)
+            self.content_stack.set_visible_child_name("other")
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't load albums: {exc}"))
+
+    def _on_show_artist_top_tracks_clicked(self, _button: Gtk.Button) -> None:
+        artist = self._showing_artist
+        if artist is None:
+            return
+        provider = self.state.providers.get(artist.service)
+        if provider is None:
+            self.state.toast(f"No provider configured for {artist.service.label}")
+            return
+
+        def work() -> list[Track]:
+            return provider.get_artist_top_tracks(artist.id)
+
+        def done(tracks: list[Track]) -> None:
+            self._showing_artist_top_tracks_for = artist
+            self._showing_similar_to = None
+            replace_tracks(self.track_store, tracks)
+            label = "Most popular" if artist.service == Service.QOBUZ else "Top songs"
+            self._similar_label.set_label(f"{label} · {artist.name}")
+            self._back_bar.set_visible(True)
+            self.content_stack.set_visible_child_name("tracks")
+
+        def on_error(exc: BaseException) -> None:
+            if isinstance(exc, NotSupportedError):
+                self.state.toast(f"{artist.service.label} doesn't support this for artists.")
+            else:
+                self.state.toast(f"Couldn't load top tracks: {exc}")
+
+        run_async(work, done, on_error)
+
+    def _on_other_back_clicked(self, _button: Gtk.Button) -> None:
+        self._other_back_bar.set_visible(False)
+        self._other_popular_button.set_visible(False)
+        self._showing_artist = None
+        self._restore_search_results()
 
     # -- track actions ------------------------------------------------------
 
@@ -327,6 +439,7 @@ class SearchPage(Gtk.Box):
 
         def done(similar: list[Track]) -> None:
             self._showing_similar_to = track
+            self._showing_artist_top_tracks_for = None
             replace_tracks(self.track_store, similar)
             self._similar_label.set_label(f"Similar to “{track.title}” by {track.artist_name}")
             self._back_bar.set_visible(True)
@@ -337,5 +450,24 @@ class SearchPage(Gtk.Box):
     def _on_back_to_results(self, _button: Gtk.Button) -> None:
         self._back_bar.set_visible(False)
         self._showing_similar_to = None
-        if self._last_results is not None:
+        # Top tracks are one step below the artist's album list in this
+        # view's hierarchy (artist -> albums -> most popular/top songs), so
+        # "back" from here returns to the albums, which has its own back bar
+        # all the way out to search results -- never a dead end either way.
+        if self._showing_artist_top_tracks_for is not None:
+            artist = self._showing_artist_top_tracks_for
+            self._showing_artist_top_tracks_for = None
+            self._show_artist_albums(artist)
+            return
+        self._restore_search_results()
+
+    def _restore_search_results(self) -> None:
+        if self._last_results is None:
+            self.content_stack.set_visible_child_name("empty")
+            return
+        kind = _KINDS[self.kind_dropdown.get_selected()]
+        if kind == "tracks":
             replace_tracks(self.track_store, self._last_results.tracks)
+            self.content_stack.set_visible_child_name("tracks")
+        else:
+            self._show_other_kind(kind, self._last_results)

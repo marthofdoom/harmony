@@ -389,7 +389,13 @@ class QobuzProvider(MusicProvider):
 
     # -- normalisation ----------------------------------------------------
 
-    def _track_from_raw(self, raw: dict[str, Any], *, album_ctx: dict[str, Any] | None = None) -> Track:
+    def _track_from_raw(
+        self,
+        raw: dict[str, Any],
+        *,
+        album_ctx: dict[str, Any] | None = None,
+        fallback_artist: str | None = None,
+    ) -> Track:
         track_id = raw.get("id")
         if track_id is None:
             raise ProviderError("Qobuz track payload is missing an id")
@@ -397,7 +403,12 @@ class QobuzProvider(MusicProvider):
         album = raw.get("album") or album_ctx or {}
         performer = raw.get("performer") or {}
         album_artist = album.get("artist") or {}
-        artist_name = performer.get("name") or album_artist.get("name")
+        # ``artist/page``'s ``top_tracks`` entries come back with
+        # ``performer: None`` (verified live against Radiohead, artist_id
+        # 43840) -- there's no per-track performer on that endpoint, so fall
+        # back to the artist name the caller already knows (the payload's
+        # own top-level ``name``) rather than leaving the track artist-less.
+        artist_name = performer.get("name") or album_artist.get("name") or fallback_artist
 
         return Track(
             id=str(track_id),
@@ -491,12 +502,17 @@ class QobuzProvider(MusicProvider):
         return [self._album_from_raw(a) for a in items[:limit]]
 
     def get_artist_top_tracks(self, artist_id: str, *, limit: int = 20) -> list[Track]:
-        # Qobuz's reverse-engineered API has no "top tracks" endpoint (only
-        # artist/get with extra=albums, which we already use for
-        # get_artist_albums). Approximating "top" from album order would be
-        # actively misleading downstream in matching/sync, so this is
-        # unsupported rather than silently wrong.
-        raise NotSupportedError("Qobuz has no top-tracks endpoint for artists.")
+        # Qobuz calls this "most popular" in the web player, surfaced via
+        # artist/page (not artist/get, which only carries extra=albums).
+        # Verified live against Radiohead (artist_id 43840): the payload's
+        # top-level "top_tracks" is a flat list of up to 25 track dicts with
+        # "performer": None on every entry, so _track_from_raw's
+        # fallback_artist picks up the payload's own top-level "name"
+        # instead. There's no limit param on this endpoint, so we slice.
+        data = self._request("GET", "artist/page", params={"artist_id": artist_id, "sort": "relevant"})
+        items = data.get("top_tracks") or []
+        artist_name = data.get("name")
+        return [self._track_from_raw(t, fallback_artist=artist_name) for t in items[:limit]]
 
     # -- playlists ----------------------------------------------------------
 
