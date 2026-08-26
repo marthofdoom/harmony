@@ -48,72 +48,59 @@ def test_bad_json_returns_empty(monkeypatch):
     assert pipewire.list_sinks() == []
 
 
-# -- ROC receiver up/down (pactl mocked) -------------------------------------
+# -- RTP receiver up/down (pactl mocked) -------------------------------------
 
 from harmony.audio import pipewire as pw  # noqa: E402
 from harmony.errors import ProviderError  # noqa: E402
 
 
 class _FakePactl:
-    """Records pactl calls; load-module returns incrementing module ids."""
-
-    def __init__(self, fail_on: str | None = None) -> None:
-        self.calls: list[list[str]] = []
-        self._next_id = 100
-        self._fail_on = fail_on  # substring of a load-module that should fail
+    def __init__(self, fail=False):
+        self.calls = []
+        self._fail = fail
 
     def run(self, argv, **kw):
-        args = argv[1:]  # drop "pactl"
+        args = argv[1:]
         self.calls.append(args)
         if args[0] == "load-module":
-            if self._fail_on and self._fail_on in " ".join(args):
+            if self._fail:
                 raise subprocess.CalledProcessError(1, argv, stderr="boom")
-            self._next_id += 1
-            return subprocess.CompletedProcess(argv, 0, stdout=str(self._next_id), stderr="")
+            return subprocess.CompletedProcess(argv, 0, stdout="536870916", stderr="")
         return subprocess.CompletedProcess(argv, 0, stdout="", stderr="")
 
 
-def test_roc_receiver_up_loads_source_then_loopback(monkeypatch):
+def test_rtp_receiver_up_loads_module_rtp_recv(monkeypatch):
     fake = _FakePactl()
     monkeypatch.setattr(pw.subprocess, "run", fake.run)
-
-    rx = pw.roc_receiver_up("alsa_output.usb-DAC", source_port=10001, latency_ms=25)
-
-    assert rx.source_module == 101 and rx.loopback_module == 102
-    assert fake.calls[0][:2] == ["load-module", "module-roc-source"]
-    assert "sess_latency_msec=25" in fake.calls[0]
-    assert "source_name=harmony-roc" in fake.calls[0]
-    assert fake.calls[1][:2] == ["load-module", "module-loopback"]
-    assert "source=harmony-roc" in fake.calls[1]
-    assert "sink=alsa_output.usb-DAC" in fake.calls[1]
+    rx = pw.rtp_receiver_up("alsa_output.usb-DAC", latency_ms=25)
+    assert rx.module == 536870916
+    assert fake.calls[0][:2] == ["load-module", "module-rtp-recv"]
+    assert "sink=alsa_output.usb-DAC" in fake.calls[0]
+    assert "latency_msec=25" in fake.calls[0]
 
 
-def test_roc_receiver_up_unloads_source_if_loopback_fails(monkeypatch):
-    fake = _FakePactl(fail_on="module-loopback")
+def test_rtp_receiver_down_unloads(monkeypatch):
+    fake = _FakePactl()
     monkeypatch.setattr(pw.subprocess, "run", fake.run)
+    pw.rtp_receiver_down(pw.RtpReceiver(module=42))
+    assert fake.calls == [["unload-module", "42"]]
 
+
+def test_rtp_up_raises_on_pactl_failure(monkeypatch):
+    monkeypatch.setattr(pw.subprocess, "run", _FakePactl(fail=True).run)
     try:
-        pw.roc_receiver_up("dac")
+        pw.rtp_receiver_up("dac")
         raise AssertionError("expected ProviderError")
     except ProviderError:
         pass
-    # source (id 101) must be unloaded so it isn't leaked
-    assert ["unload-module", "101"] in fake.calls
 
 
-def test_roc_receiver_down_unloads_loopback_then_source(monkeypatch):
-    fake = _FakePactl()
-    monkeypatch.setattr(pw.subprocess, "run", fake.run)
-    pw.roc_receiver_down(pw.RocReceiver(source_module=5, loopback_module=9))
-    assert fake.calls == [["unload-module", "9"], ["unload-module", "5"]]
-
-
-def test_roc_up_raises_without_pactl(monkeypatch):
+def test_rtp_up_raises_without_pactl(monkeypatch):
     def boom(*a, **k):
         raise FileNotFoundError
     monkeypatch.setattr(pw.subprocess, "run", boom)
     try:
-        pw.roc_receiver_up("dac")
+        pw.rtp_receiver_up("dac")
         raise AssertionError("expected ProviderError")
     except ProviderError:
         pass

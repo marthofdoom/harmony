@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.8" date="2026-08-26">
+      <description>
+        <p>New Route Audio page: receive a low-latency RTP audio stream from
+        another machine on your LAN (e.g. a Steam Deck) and play it out a chosen
+        local output device. Works in the Flatpak.</p>
+      </description>
+    </release>
     <release version="0.5.7" date="2026-08-26">
       <description>
         <p>Playlists can now export to and import from a plain, human-readable

@@ -1,15 +1,14 @@
-"""Route a network (ROC) audio source into a local output device.
+"""Route a network (RTP) audio source into a local output device.
 
-Receives a low-latency ROC stream (e.g. a Steam Deck's audio, exposed with one
-`module-roc-sink` command shown here) and plays it out a chosen local sink/DAC,
-via ``harmony.audio``. All pactl work runs off the main loop per the threading
-rule; the page only touches widgets in run_async callbacks.
+Receives an RTP/SAP network audio stream (e.g. a Steam Deck's audio, exposed
+with one `module-rtp-send` command shown here) and plays it out a chosen local
+sink/DAC, via ``harmony.audio``. RTP is used (not ROC) because the module ships
+in the Flatpak runtime. All pactl work runs off the main loop.
 """
 
 from __future__ import annotations
 
 import logging
-import socket
 
 import gi
 
@@ -23,21 +22,11 @@ from harmony.ui.state import AppState  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-_SOURCE_PORT = 10001
-_REPAIR_PORT = 10002
-
-
-def _local_ip() -> str:
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.connect(("8.8.8.8", 80))
-            return sock.getsockname()[0]
-    except OSError:
-        return "<this-machine-ip>"
+_SENDER_CMD = "pactl load-module module-rtp-send source=@DEFAULT_SINK@.monitor"
 
 
 class AudioRoutePage(Gtk.Box):
-    """Pick an output device and start/stop a ROC network-audio receiver."""
+    """Pick an output device and start/stop an RTP network-audio receiver."""
 
     def __init__(self, state: AppState) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -51,8 +40,8 @@ class AudioRoutePage(Gtk.Box):
         self.append(heading)
         self.append(Gtk.Label(
             xalign=0.0, wrap=True,
-            label="Receive a low-latency network audio stream (ROC) from another machine "
-                  "and play it out a local output device.",
+            label="Receive a low-latency network audio stream (RTP) from another machine "
+                  "on your LAN and play it out a local output device.",
         ))
 
         group = Adw.PreferencesGroup(title="Receiver")
@@ -80,14 +69,9 @@ class AudioRoutePage(Gtk.Box):
 
         sender = Adw.PreferencesGroup(
             title="On the sending machine (e.g. Steam Deck)",
-            description="Run this, then choose its ROC output as the audio device:",
+            description="Run this to broadcast its audio, then Start here:",
         )
-        cmd = Gtk.Label(
-            xalign=0.0, wrap=True, selectable=True,
-            label=f"pactl load-module module-roc-sink remote_ip={_local_ip()} "
-                  f"remote_source_port={_SOURCE_PORT} remote_repair_port={_REPAIR_PORT} "
-                  f"sess_latency_msec=20",
-        )
+        cmd = Gtk.Label(xalign=0.0, wrap=True, selectable=True, label=_SENDER_CMD)
         cmd.add_css_class("monospace")
         row = Adw.ActionRow()
         row.set_child(cmd)
@@ -95,8 +79,6 @@ class AudioRoutePage(Gtk.Box):
         self.append(sender)
 
         self._load_sinks()
-
-    # -- devices --------------------------------------------------------------
 
     def _load_sinks(self) -> None:
         self.refresh_button.set_sensitive(False)
@@ -119,8 +101,6 @@ class AudioRoutePage(Gtk.Box):
 
         run_async(work, done, error)
 
-    # -- start / stop ---------------------------------------------------------
-
     def _on_start(self, _button: Gtk.Button) -> None:
         index = self.sink_row.get_selected()
         if not (0 <= index < len(self._sinks)):
@@ -129,19 +109,18 @@ class AudioRoutePage(Gtk.Box):
         sink = self._sinks[index]
         latency = int(self.latency_row.get_value())
         self.start_button.set_sensitive(False)
-        self.status_label.set_label(f"Starting receiver on port {_SOURCE_PORT} → {sink.description}…")
+        self.status_label.set_label(f"Starting RTP receiver → {sink.description}…")
 
-        def work():  # noqa: ANN202 - RocReceiver
-            from harmony.audio import roc_receiver_up
+        def work():  # noqa: ANN202 - RtpReceiver
+            from harmony.audio import rtp_receiver_up
 
-            return roc_receiver_up(sink.name, source_port=_SOURCE_PORT,
-                                   repair_port=_REPAIR_PORT, latency_ms=latency)
+            return rtp_receiver_up(sink.name, latency_ms=latency)
 
         def done(receiver: object) -> None:
             self._receiver = receiver
             self.stop_button.set_sensitive(True)
             self.status_label.set_label(
-                f"Receiving on port {_SOURCE_PORT} → {sink.description}. Play audio on the sender."
+                f"Receiving RTP → {sink.description}. Start sending on the other machine."
             )
 
         def error(exc: BaseException) -> None:
@@ -158,9 +137,9 @@ class AudioRoutePage(Gtk.Box):
         self.stop_button.set_sensitive(False)
 
         def work() -> None:
-            from harmony.audio import roc_receiver_down
+            from harmony.audio import rtp_receiver_down
 
-            roc_receiver_down(receiver)
+            rtp_receiver_down(receiver)
 
         def done(_result: None) -> None:
             self._receiver = None

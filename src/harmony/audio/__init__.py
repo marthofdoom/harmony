@@ -9,18 +9,18 @@ from __future__ import annotations
 
 from .pipewire import (
     AudioNode,
-    RocReceiver,
+    RtpReceiver,
     list_sinks,
     list_sources,
-    roc_receiver_down,
-    roc_receiver_up,
+    rtp_receiver_down,
+    rtp_receiver_up,
 )
 
 __all__ = [
     "AudioNode",
-    "RocReceiver",
+    "RtpReceiver",
     "list_sinks",
     "list_sources",
-    "roc_receiver_down",
-    "roc_receiver_up",
+    "rtp_receiver_down",
+    "rtp_receiver_up",
 ]
