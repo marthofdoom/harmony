@@ -938,6 +938,7 @@ class TestQobuzWarmUpCost:
     def test_warm_up_skips_unconfigured_provider_with_zero_http(
         self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        pytest.importorskip("gi")  # AppState lives in the GTK layer
         from harmony.ui.state import AppState
 
         def boom(*a, **kw):
@@ -983,6 +984,7 @@ class TestQobuzWarmUpCost:
     def test_warm_up_with_cached_token_does_not_issue_login_request(
         self, credentials: FakeCredentialStore, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        pytest.importorskip("gi")  # AppState lives in the GTK layer
         from harmony import config as config_module
         from harmony.ui.state import AppState
 

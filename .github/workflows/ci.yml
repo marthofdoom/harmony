@@ -111,7 +111,7 @@ jobs:
         run: |
           python3 -m venv --system-site-packages .venv
           .venv/bin/python -m pip install --upgrade pip
-          .venv/bin/python -m pip install -e ".[ai]"
+          .venv/bin/python -m pip install -e ".[ai,dev]"
 
       - name: Verify GTK bindings are importable
         run: |
@@ -176,6 +176,12 @@ jobs:
               raise SystemExit("activate produced no window")
           print(f"application constructed {seen['windows']} window(s) and shut down cleanly")
           PY
+
+      - name: Run the full test suite with GTK present
+        # The offline `test` matrix runs on multiple Pythons with no GTK, so it
+        # skips the PyGObject-dependent tests (Devices/AppState). This runner
+        # has GTK, so it actually executes them.
+        run: xvfb-run -a .venv/bin/python -m pytest -q
 
   build:
     name: Build distribution

@@ -12,11 +12,16 @@ result would, and this file never calls any of those.
 from __future__ import annotations
 
 import pytest
-from gi.repository import GObject
 
-from harmony import config as config_module
-from harmony.playback import DeviceInfo, WiiMDevice
-from harmony.ui.state import AppState
+# These exercise the UI state layer, which imports PyGObject. The multi-version
+# offline CI job has no GTK, so skip cleanly there; the GTK ui-smoke job runs them.
+pytest.importorskip("gi")
+
+from gi.repository import GObject  # noqa: E402
+
+from harmony import config as config_module  # noqa: E402
+from harmony.playback import DeviceInfo, WiiMDevice  # noqa: E402
+from harmony.ui.state import AppState  # noqa: E402
 
 
 @pytest.fixture
