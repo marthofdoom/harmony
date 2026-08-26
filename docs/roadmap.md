@@ -1,7 +1,8 @@
 # Roadmap & status
 
 A snapshot of what exists and the intended sequence. Honest maturity, not
-aspiration — see the legend in the [docs index](README.md).
+aspiration — see the legend in the [docs index](README.md). Current release:
+**0.5.0**.
 
 ## Done
 
@@ -16,13 +17,18 @@ aspiration — see the legend in the [docs index](README.md).
   password works only for non-social accounts.
 - **Flatpak packaging.** *Built & verified* (builds, installs, launches; WebKit
   and secrets portal confirmed in-sandbox).
+- **WiiM/LinkPlay device control** (`harmony/playback/` + Devices page).
+  *Built & verified* (offline test suite) — add-by-IP, best-effort SSDP
+  discovery, and transport/volume/mute/now-playing from the UI. Controls what a
+  device is already playing; pushing a library track *to* a device is not yet
+  wired (that's play-to-device, below). See [playback](design/playback.md).
+- **Account-setup bootstrapper** (`scripts/harmony-setup.py`). *Built & verified*
+  (offline test suite) — standalone interactive tool that obtains YT Music and
+  Qobuz credentials (browser-cookie extraction, OAuth device flow, token paste)
+  and seeds them into a source or Flatpak install.
 
 ## In progress
 
-- **WiiM/LinkPlay playback backend** (`harmony/playback/`). *Built & verified*
-  (offline test suite) — device control (status/play/pause/volume/mute/skip)
-  and best-effort SSDP discovery, no UI wiring yet. See
-  [playback](design/playback.md).
 - **Embedded WebKit Qobuz login.** *Built, token capture unverified* — needs one
   real interactive login to confirm the `localStorage` extraction; token paste
   is the reliable method until then. See [auth](design/auth.md#qobuz).
@@ -40,14 +46,21 @@ aspiration — see the legend in the [docs index](README.md).
 4. **Android client** — native app against the engine API.
 5. **[Federation](design/federation.md)** — instance-to-client auth so a client
    can point at a trusted instance; the credential-custody answer.
-6. **[Play-to-device](design/playback.md)** — WiiM/LinkPlay + UPnP; push streams
-   to renderers rather than decoding in-app.
+6. **[Play-to-device](design/playback.md)** — push a resolved library track to a
+   renderer. Design decided (**passive relay**: Harmony forwards the bytes and
+   selects the per-device codec; the device only talks to Harmony). Backend
+   `play_url()` and device control already exist; what's left is the relay
+   endpoint + a "play here" action wiring them together. Doubles as a federation
+   primitive (a spoke pulls playback from the credential-holding instance).
 
 ## Known loose ends
 
-- This session's later commits (artist navigation, Preferences reachability,
-  WebKit login, Flatpak) have **not been diff-reviewed** yet; every prior batch
-  this session surfaced a seam defect on review.
-- `Settings.auto_accept_high` and match thresholds are now wired; re-confirm
-  against live accounts (a mirror sync of a real 50+ track playlist — count the
-  removals in the preview before applying).
+- **Live-auth verification.** The YT OAuth "Sign in with Google" device flow and
+  the Qobuz WebKit token capture have not been confirmed against real logins;
+  token/header paste remains the reliable fallback.
+- **Sync against live accounts.** `Settings.auto_accept_high` and match
+  thresholds are wired but want a real-world pass — mirror a 50+ track playlist
+  and count the removals in the preview before applying.
+- **Device control against real hardware.** The WiiM backend is covered by the
+  offline suite but should be exercised against a physical Mini (discovery,
+  transport, and a direct `play_url` with a real stream URL).

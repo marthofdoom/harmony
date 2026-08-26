@@ -32,8 +32,10 @@ Harmony's differentiators:
 ## In scope over time
 
 - Providers beyond YT Music and Qobuz.
-- [Play-to-device](playback.md): WiiM/LinkPlay, UPnP/DLNA, AirPlay, Chromecast —
-  push a stream to a renderer rather than decoding audio in-app.
+- [Play-to-device](playback.md): WiiM/LinkPlay device control ships in 0.5.0;
+  pushing a library track to a renderer (UPnP/DLNA, AirPlay, Chromecast too) is
+  designed as a **passive relay** that doubles as a federation primitive — a
+  spoke pulls playback from the credential-holding instance.
 - Discovery/recommendation blending (already present in the engine).
 
 ## Explicitly not committed

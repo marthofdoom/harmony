@@ -1,9 +1,10 @@
 # Harmony documentation
 
 Harmony is a cross-service music hub: aggregate streaming providers into one
-library, manage and sync playlists across them, and (planned) play to devices.
-It ships as standalone apps that can also federate — point one at another and it
-uses that instance as a backend.
+library, manage and sync playlists across them, control playback devices, and
+(planned) play tracks from your library to them. It ships as standalone apps
+that can also federate — point one at another and it uses that instance as a
+backend.
 
 This directory is the map. Start with whichever matches what you're doing.
 
@@ -24,8 +25,8 @@ This directory is the map. Start with whichever matches what you're doing.
   another; "login via another instance"; how this solves credential custody.
 - [`design/auth.md`](design/auth.md) — authentication per service, the Qobuz
   token/WebKit story, and where credentials live.
-- [`design/playback.md`](design/playback.md) — play-to-device (WiiM, UPnP)
-  rather than in-app decode.
+- [`design/playback.md`](design/playback.md) — device control (shipped) and the
+  passive-relay play-to-device design (WiiM, UPnP) rather than in-app decode.
 
 ## Operations
 

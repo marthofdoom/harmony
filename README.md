@@ -4,9 +4,11 @@ A GTK4/libadwaita desktop app for Linux that creates and syncs playlists across
 **YouTube Music** and **Qobuz**, with unified search, cross-service track
 matching, and recommendation tooling.
 
-> **Status:** early. The sync engine, matching, and UI are functional; treat
-> two-way sync against playlists you care about as experimental and keep the
-> automatic snapshots turned on.
+> **Status:** 0.5.0 — first tagged release. The sync engine, matching, search,
+> discovery, and the desktop UI are functional, and WiiM/LinkPlay devices can be
+> controlled from the app. Treat two-way sync against playlists you care about as
+> experimental and keep the automatic snapshots turned on. Playing a track from
+> your library *to* a device is not wired up yet (see [roadmap](docs/roadmap.md)).
 
 > **Unofficial — use at your own risk.** Harmony is not affiliated with,
 > endorsed by, or connected to YouTube Music, Qobuz, or any other service it
@@ -35,6 +37,13 @@ matching, and recommendation tooling.
 - **Natural-language playlist building** (optional) — describe a playlist and
   have Claude plan it; every suggestion is then resolved against the real
   catalog, so nothing invented ever ends up in your library.
+- **Device control** — discover WiiM/LinkPlay renderers on your network and
+  control them (play/pause, skip, stop, volume, mute, now-playing) from the
+  **Devices** page. Pushing a track from your library to a device is planned,
+  not yet wired.
+- **Guided account setup** — a standalone [`harmony-setup.py`](scripts/harmony-setup.py)
+  that interactively obtains your YouTube Music and Qobuz credentials and seeds
+  them where a source or Flatpak install reads them (see below).
 
 ## Requirements
 
@@ -61,6 +70,18 @@ bindings against your system GTK, and pip-installing it into an isolated venv
 usually fails or produces a mismatched build.
 
 ## Accounts
+
+**Easiest path — the setup tool.** Rather than pasting headers by hand, run the
+standalone bootstrapper, which walks you through both services and writes the
+credentials where your install expects them:
+
+```bash
+uv run scripts/harmony-setup.py --target source     # or: --target flatpak / auto
+```
+
+It has no dependency on the app (constants are inlined), imports its heavier
+dependencies lazily, and offers a throwaway virtualenv if any are missing. The
+manual per-service steps below still work and are what the tool automates.
 
 ### YouTube Music
 
