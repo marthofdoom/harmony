@@ -827,7 +827,7 @@ def ytmusic_oauth_device_flow(config_dir: Path, client_id: str, client_secret: s
 # --------------------------------------------------------------------------
 
 
-def scrape_qobuz_app_credentials() -> tuple[str, str]:
+def scrape_qobuz_app_credentials() -> tuple[str, list[str]]:
     req = urllib.request.Request(QOBUZ_LOGIN_PAGE_URL, headers={"User-Agent": DESKTOP_USER_AGENT})
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310 - fixed https URL
@@ -854,18 +854,24 @@ def scrape_qobuz_app_credentials() -> tuple[str, str]:
     app_id = app_id_match.group("app_id")
 
     seeds = {m.group("timezone").lower(): m.group("seed") for m in _SEED_RE.finditer(text)}
-    secret = ""
+    secrets: list[str] = []
     for m in _INFO_RE.finditer(text):
         seed = seeds.get(m.group("timezone").lower())
         if not seed:
             continue
         candidate = seed + m.group("info") + m.group("extras")
         try:
-            decoded = base64.b64decode(candidate)[:-_SECRET_SUFFIX_LEN].decode("utf-8")
+            # Strip the 44-char suffix from the base64 STRING, THEN decode.
+            # Decoding the whole candidate (suffix included) raises, which is why
+            # this previously yielded an empty secret. Several timezones each
+            # produce a 32-char candidate but only one is the real app secret --
+            # the caller validates them against a signed request.
+            decoded = base64.b64decode(candidate[:-_SECRET_SUFFIX_LEN]).decode("utf-8")
         except (binascii.Error, UnicodeDecodeError):
             continue
-        secret = decoded
-    return app_id, secret
+        if decoded and decoded not in secrets:
+            secrets.append(decoded)
+    return app_id, secrets
 
 
 def _qobuz_error_message(body: str) -> str | None:
@@ -933,6 +939,64 @@ def verify_qobuz_token(app_id: str, token: str) -> tuple[bool, str, str | None]:
     if not isinstance(user, dict) or not user.get("id"):
         return False, "Qobuz did not return a user for this token", None
     return True, "ok", user.get("display_name")
+
+
+def _qobuz_secret_signs_ok(app_id: str, secret: str, token: str) -> bool:
+    """Whether ``secret`` produces a signature Qobuz accepts for track/getFileUrl.
+
+    The bundle yields several 32-char candidates but only one is the real app
+    secret; the others sign to "Invalid Request Signature". With a valid token,
+    the correct secret gets past signature checking (a 200, or any error other
+    than an invalid-signature one), so that's the test.
+    """
+    ts = int(time.time())
+    params = {"format_id": 6, "intent": "stream", "track_id": "5966783"}
+    payload = "trackgetFileUrl" + "".join(f"{k}{v}" for k, v in sorted(params.items())) + str(ts) + secret
+    sig = hashlib.md5(payload.encode("utf-8")).hexdigest()  # noqa: S324 - Qobuz's scheme
+    query = urllib.parse.urlencode({**params, "app_id": app_id, "request_ts": ts, "request_sig": sig})
+    req = urllib.request.Request(
+        QOBUZ_BASE_URL + "track/getFileUrl?" + query,
+        headers={"X-App-Id": app_id, "X-User-Auth-Token": token, "User-Agent": DESKTOP_USER_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15):  # noqa: S310 - fixed https URL
+            return True  # 200: signature + token both accepted
+    except urllib.error.HTTPError as exc:
+        body = ""
+        try:
+            body = exc.read().decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - best effort
+            pass
+        return "Invalid Request Signature" not in body
+    except urllib.error.URLError:
+        return False
+
+
+def find_working_qobuz_secret(app_id: str, secrets: list[str], token: str) -> str | None:
+    """Return the first candidate secret whose signature Qobuz accepts, or None."""
+    for secret in secrets:
+        if _qobuz_secret_signs_ok(app_id, secret, token):
+            return secret
+    return None
+
+
+def _seed_qobuz_secret(target: Target, app_id: str, secrets: list[str], token: str) -> None:
+    """Validate the scraped candidate secrets against ``token`` and seed the real one."""
+    if not secrets:
+        print("Warning: couldn't find a streaming secret in the web player bundle; "
+              "playback may fail with 'secret unavailable'.")
+        return
+    working = find_working_qobuz_secret(app_id, secrets, token)
+    secret = working or secrets[0]
+    try:
+        seed_secret(target, QOBUZ_APP_SECRET, secret)
+    except Exception:  # noqa: BLE001 - the token still works for browsing without the secret
+        print("Warning: couldn't save the streaming secret.")
+        return
+    if working:
+        print("Streaming secret verified and saved.")
+    else:
+        print("Warning: streaming secret couldn't be verified; playback may fail.")
 
 
 def _deep_search_token(node, depth: int = 0) -> str | None:
@@ -1270,28 +1334,25 @@ def ytmusic_menu(target: Target) -> None:
 # --------------------------------------------------------------------------
 
 
-def _get_or_scrape_qobuz_app_id(target: Target) -> str | None:
+def _get_or_scrape_qobuz_app_id(target: Target) -> tuple[str | None, list[str]]:
+    """Return ``(app_id, secret_candidates)`` from the web player bundle.
+
+    The caller seeds the *validated* secret once it has a token (see
+    ``_seed_qobuz_secret``), so this no longer seeds a possibly-wrong secret.
+    """
     existing = read_settings(target.config_dir).get("qobuz_app_id")
-    # Always scrape, even when the app_id is already known: the app SECRET (used
-    # to sign streaming requests) must be seeded too, and an earlier run may have
-    # saved the id without it -> "app secret unavailable" when playing a track.
     print("Looking up Qobuz's app credentials from the web player...")
     try:
-        app_id, secret = scrape_qobuz_app_credentials()
+        app_id, secrets = scrape_qobuz_app_credentials()
     except Exception as exc:  # noqa: BLE001
         if existing:
-            return existing  # keep the known app_id; its secret may already be seeded
+            return existing, []  # keep the known app_id; its secret may already be seeded
         print(f"Could not auto-detect app_id ({exc}).")
         app_id = input("Enter a Qobuz app_id manually (or leave blank to cancel): ").strip()
         if not app_id:
-            return None
-        secret = ""
-    if secret:
-        try:
-            seed_secret(target, QOBUZ_APP_SECRET, secret)
-        except Exception:  # noqa: BLE001 - the app_id alone is still useful without the secret
-            pass
-    return app_id or existing
+            return None, []
+        secrets = []
+    return (app_id or existing), secrets
 
 
 def _qobuz_password_login(target: Target) -> None:
@@ -1303,7 +1364,7 @@ def _qobuz_password_login(target: Target) -> None:
         print("Email and password are required.")
         return
 
-    app_id = _get_or_scrape_qobuz_app_id(target)
+    app_id, secrets = _get_or_scrape_qobuz_app_id(target)
     if not app_id:
         return
 
@@ -1319,6 +1380,8 @@ def _qobuz_password_login(target: Target) -> None:
     if not ok:
         print(f"Verification failed ({detail}); nothing was saved.")
         return
+
+    _seed_qobuz_secret(target, app_id, secrets, token)
 
     try:
         seed_secret(target, QOBUZ_TOKEN, token)
@@ -1355,7 +1418,7 @@ def _qobuz_paste_token(target: Target) -> None:
         print("Nothing pasted; aborting.")
         return
 
-    app_id = _get_or_scrape_qobuz_app_id(target)
+    app_id, secrets = _get_or_scrape_qobuz_app_id(target)
     if not app_id:
         return
 
@@ -1370,6 +1433,8 @@ def _qobuz_paste_token(target: Target) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"Could not save the token ({exc}).")
         return
+
+    _seed_qobuz_secret(target, app_id, secrets, token)
 
     email = input("Qobuz email (optional, just for display): ").strip()
     updates = {"qobuz_auth_kind": "token", "qobuz_token_saved": True, "qobuz_app_id": app_id}
@@ -1417,7 +1482,7 @@ def _qobuz_browser_autograb(target: Target) -> None:
         print("at play.qobuz.com, then try again, or use the paste-token option.")
         return
 
-    app_id = _get_or_scrape_qobuz_app_id(target)
+    app_id, secrets = _get_or_scrape_qobuz_app_id(target)
     if not app_id:
         return
 
@@ -1434,6 +1499,8 @@ def _qobuz_browser_autograb(target: Target) -> None:
     except Exception as exc:  # noqa: BLE001
         print(f"Could not save the token ({exc}).")
         return
+
+    _seed_qobuz_secret(target, app_id, secrets, token)
 
     merge_settings(
         target.config_dir, {"qobuz_auth_kind": "token", "qobuz_token_saved": True, "qobuz_app_id": app_id}
