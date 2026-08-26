@@ -1283,3 +1283,4 @@ def test_build_providers_returns_both_services(credentials: FakeCredentialStore)
     assert set(providers) == {Service.YTMUSIC, Service.QOBUZ}
     assert isinstance(providers[Service.YTMUSIC], YP)
     assert isinstance(providers[Service.QOBUZ], QP)
+

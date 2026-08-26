@@ -1,14 +1,17 @@
-"""Route a network (RTP) audio source into a local output device.
+"""Route a network audio source into a local output device.
 
-Receives an RTP/SAP network audio stream (e.g. a Steam Deck's audio, exposed
-with one `module-rtp-send` command shown here) and plays it out a chosen local
-sink/DAC, via ``harmony.audio``. RTP is used (not ROC) because the module ships
-in the Flatpak runtime. All pactl work runs off the main loop.
+Receives a low-latency network audio stream from another machine on the LAN
+(e.g. a Steam Deck) and plays it out a chosen local sink/DAC, via
+``harmony.audio``. Prefers **ROC** (forward error correction + adaptive latency,
+via the bundled ``roc-recv``) and falls back to plain **RTP** (a PipeWire module)
+when roc-recv isn't present. The page shows the matching command to run on the
+sending machine. All device / process work runs off the main loop.
 """
 
 from __future__ import annotations
 
 import logging
+import socket
 
 import gi
 
@@ -22,11 +25,25 @@ from harmony.ui.state import AppState  # noqa: E402
 
 log = logging.getLogger(__name__)
 
-_SENDER_CMD = "pactl load-module module-rtp-send source=@DEFAULT_SINK@.monitor"
+# Must match harmony.audio.pipewire's ROC endpoint defaults.
+_ROC_PORTS = (10001, 10002, 10003)
+
+
+def _local_ip() -> str:
+    """This machine's LAN IP (best effort) so the sender knows where to send."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.connect(("8.8.8.8", 80))
+            return sock.getsockname()[0]
+        finally:
+            sock.close()
+    except OSError:
+        return "<this-computer-ip>"
 
 
 class AudioRoutePage(Gtk.Box):
-    """Pick an output device and start/stop an RTP network-audio receiver."""
+    """Pick an output device and start/stop a ROC (or RTP) network-audio receiver."""
 
     def __init__(self, state: AppState) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=12,
@@ -35,21 +52,25 @@ class AudioRoutePage(Gtk.Box):
         self._sinks: list = []
         self._receiver = None
 
+        from harmony.audio import roc_available
+        self._roc = roc_available()
+        transport = "ROC (FEC, low-latency)" if self._roc else "RTP"
+
         heading = Gtk.Label(xalign=0.0, label="Route Audio")
         heading.add_css_class("title-2")
         self.append(heading)
         self.append(Gtk.Label(
             xalign=0.0, wrap=True,
-            label="Receive a low-latency network audio stream (RTP) from another machine "
-                  "on your LAN and play it out a local output device.",
+            label=f"Receive a low-latency network audio stream ({transport}) from another "
+                  "machine on your LAN and play it out a local output device.",
         ))
 
         group = Adw.PreferencesGroup(title="Receiver")
         self.sink_row = Adw.ComboRow(title="Output device")
         group.add(self.sink_row)
-        self.latency_row = Adw.SpinRow.new_with_range(5, 200, 5)
+        self.latency_row = Adw.SpinRow.new_with_range(20, 200, 5)
         self.latency_row.set_title("Target latency (ms)")
-        self.latency_row.set_value(20)
+        self.latency_row.set_value(60 if self._roc else 40)
         group.add(self.latency_row)
         self.append(group)
 
@@ -67,18 +88,32 @@ class AudioRoutePage(Gtk.Box):
         self.status_label = Gtk.Label(xalign=0.0, wrap=True)
         self.append(self.status_label)
 
-        sender = Adw.PreferencesGroup(
-            title="On the sending machine (e.g. Steam Deck)",
-            description="Run this to broadcast its audio, then Start here:",
-        )
-        cmd = Gtk.Label(xalign=0.0, wrap=True, selectable=True, label=_SENDER_CMD)
-        cmd.add_css_class("monospace")
+        note = ("Run this on the sender to broadcast its audio, then Start here. "
+                "The Steam Deck needs roc-toolkit installed for ROC."
+                if self._roc else
+                "Run this on the sender to broadcast its audio, then Start here.")
+        sender = Adw.PreferencesGroup(title="On the sending machine (e.g. Steam Deck)",
+                                      description=note)
+        self.sender_label = Gtk.Label(xalign=0.0, wrap=True, selectable=True,
+                                      label=self._sender_command())
+        self.sender_label.add_css_class("monospace")
         row = Adw.ActionRow()
-        row.set_child(cmd)
+        row.set_child(self.sender_label)
         sender.add(row)
         self.append(sender)
 
         self._load_sinks()
+
+    def _sender_command(self, ip: str | None = None) -> str:
+        """The command to run on the sender, for the active transport."""
+        if not self._roc:
+            return "pactl load-module module-rtp-send source=@DEFAULT_SINK@.monitor"
+        host = ip or "<this-computer-ip>"
+        src, rpr, ctl = _ROC_PORTS
+        return (
+            f"roc-send -i pulse://$(pactl get-default-sink).monitor "
+            f"-s rtp+rs8m://{host}:{src} -r rs8m://{host}:{rpr} -c rtcp://{host}:{ctl}"
+        )
 
     def _load_sinks(self) -> None:
         self.refresh_button.set_sensitive(False)
@@ -108,10 +143,16 @@ class AudioRoutePage(Gtk.Box):
             return
         sink = self._sinks[index]
         latency = int(self.latency_row.get_value())
+        use_roc = self._roc
         self.start_button.set_sensitive(False)
-        self.status_label.set_label(f"Starting RTP receiver → {sink.description}…")
+        kind = "ROC" if use_roc else "RTP"
+        self.status_label.set_label(f"Starting {kind} receiver → {sink.description}…")
 
-        def work():  # noqa: ANN202 - RtpReceiver
+        def work():  # noqa: ANN202 - receiver handle
+            if use_roc:
+                from harmony.audio import roc_receiver_up
+
+                return roc_receiver_up(sink.name, target_latency_ms=latency)
             from harmony.audio import rtp_receiver_up
 
             return rtp_receiver_up(sink.name, latency_ms=latency)
@@ -119,8 +160,9 @@ class AudioRoutePage(Gtk.Box):
         def done(receiver: object) -> None:
             self._receiver = receiver
             self.stop_button.set_sensitive(True)
+            self.sender_label.set_label(self._sender_command(_local_ip()))
             self.status_label.set_label(
-                f"Receiving RTP → {sink.description}. Start sending on the other machine."
+                f"Receiving {kind} → {sink.description}. Start sending on the other machine."
             )
 
         def error(exc: BaseException) -> None:
@@ -134,9 +176,15 @@ class AudioRoutePage(Gtk.Box):
         receiver = self._receiver
         if receiver is None:
             return
+        use_roc = self._roc
         self.stop_button.set_sensitive(False)
 
         def work() -> None:
+            if use_roc:
+                from harmony.audio import roc_receiver_down
+
+                roc_receiver_down(receiver)
+                return
             from harmony.audio import rtp_receiver_down
 
             rtp_receiver_down(receiver)

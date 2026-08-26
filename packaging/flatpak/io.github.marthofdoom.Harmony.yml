@@ -43,6 +43,33 @@ modules:
   # compiler, Rust, or network). Regenerate with packaging/flatpak/regen-deps.sh.
   - python3-deps.json
 
+  # roc-toolkit: provides roc-recv for the Route Audio page's ROC transport
+  # (forward error correction + adaptive latency -- glitch-free at far lower
+  # latency than plain RTP over Wi-Fi). roc-recv runs in-process and outputs to
+  # a sink via the PulseAudio socket. Built with network access so roc fetches
+  # its own pinned 3rd-party (libuv, openfec, ragel, gengetopt); the SDK already
+  # provides libpulse/alsa/speexdsp/sndfile. scons is installed into a throwaway
+  # prefix. The cmake-policy patch lets OpenFEC's pre-3.5 CMakeLists configure
+  # under modern cmake.
+  - name: roc-toolkit
+    buildsystem: simple
+    build-options:
+      build-args:
+        - --share=network
+    build-commands:
+      - |
+        set -eux
+        T="$PWD/_tools"
+        pip3 install --prefix="$T" scons
+        export PATH="$T/bin:$PATH"
+        export PYTHONPATH="$(ls -d "$T"/lib/python*/site-packages | head -1)"
+        python3 -c "p='scripts/scons_helpers/build-3rdparty.py'; s=open(p).read(); s=s.replace('    if not args:\n        args = []\n', '    if not args:\n        args = []\n    args += [\"-DCMAKE_POLICY_VERSION_MINIMUM=3.5\"]\n', 1); open(p,'w').write(s)"
+        scons -Q --build-3rdparty=libuv,openfec,ragel,gengetopt --disable-sox --prefix=/app install
+    sources:
+      - type: archive
+        url: https://github.com/roc-streaming/roc-toolkit/archive/refs/tags/v0.4.0.tar.gz
+        sha256: 60501dfdc8c0de385898dbd1eb8239d93ef962667ddb064ad796b887a41a1a46
+
   - name: harmony
     buildsystem: simple
     build-commands:

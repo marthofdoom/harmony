@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import json
 import logging
+import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
@@ -117,3 +119,99 @@ def rtp_receiver_up(sink: str, *, latency_ms: int = 20) -> RtpReceiver:
 def rtp_receiver_down(receiver: RtpReceiver) -> None:
     """Tear down an RTP receiver."""
     _unload(receiver.module)
+
+
+# --------------------------------------------------------------------------
+# ROC network receiver: run roc-recv (FEC + adaptive latency) into a sink
+# --------------------------------------------------------------------------
+#
+# ROC is the preferred transport: forward error correction and an adaptive
+# latency tuner keep it glitch-free at far lower latency than plain RTP over a
+# lossy (Wi-Fi) LAN. It isn't a PipeWire module loaded over the socket -- that
+# would run in the *host's* PipeWire, which has no ROC module -- so we run the
+# bundled ``roc-recv`` binary in-process and let it output to a sink through the
+# PulseAudio socket (``pulse://<sink>``). The sender runs ``roc-send``.
+
+# roc-recv's three endpoints: audio (source), FEC repair, and RTCP control.
+_ROC_SOURCE_PORT = 10001
+_ROC_REPAIR_PORT = 10002
+_ROC_CONTROL_PORT = 10003
+
+
+@dataclass(frozen=True)
+class RocReceiver:
+    """Handle to a live ROC receiver (a running ``roc-recv`` process)."""
+
+    process: subprocess.Popen
+    source_port: int
+    repair_port: int
+    control_port: int
+
+
+def roc_available() -> bool:
+    """Whether the ``roc-recv`` binary is on PATH (bundled in the Flatpak)."""
+    return shutil.which("roc-recv") is not None
+
+
+def roc_receiver_up(
+    sink: str,
+    *,
+    target_latency_ms: int = 60,
+    source_port: int = _ROC_SOURCE_PORT,
+    repair_port: int = _ROC_REPAIR_PORT,
+    control_port: int = _ROC_CONTROL_PORT,
+) -> RocReceiver:
+    """Receive a ROC network audio stream and play it into ``sink``.
+
+    Spawns ``roc-recv`` bound to the ROC source/repair/control endpoints,
+    outputting to ``pulse://<sink>`` with the given target latency (ROC's tuner
+    holds close to it). Returns a handle to tear it down. Raises
+    ``ProviderError`` if roc-recv is missing or dies on startup (e.g. a bad sink
+    name or a port already in use).
+    """
+    exe = shutil.which("roc-recv")
+    if exe is None:
+        raise ProviderError(
+            "roc-recv not found -- install roc-toolkit (bundled in the Flatpak) "
+            "for FEC / low-latency receive."
+        )
+    argv = [
+        exe,
+        "-s", f"rtp+rs8m://0.0.0.0:{source_port}",
+        "-r", f"rs8m://0.0.0.0:{repair_port}",
+        "-c", f"rtcp://0.0.0.0:{control_port}",
+        "-o", f"pulse://{sink}",
+        f"--target-latency={target_latency_ms}ms",
+    ]
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+        )
+    except OSError as exc:
+        raise ProviderError(f"couldn't start roc-recv: {exc}") from exc
+    # roc-recv opens the output device immediately, so a fast exit means a real
+    # error (bad sink, port taken). Give it a moment, then check it's alive.
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        err = ""
+        if proc.stderr is not None:
+            err = (proc.stderr.read() or b"").decode(errors="replace").strip()
+        raise ProviderError(f"roc-recv exited immediately: {err or f'code {proc.returncode}'}")
+    return RocReceiver(
+        process=proc,
+        source_port=source_port,
+        repair_port=repair_port,
+        control_port=control_port,
+    )
+
+
+def roc_receiver_down(receiver: RocReceiver) -> None:
+    """Stop a ROC receiver (terminate the roc-recv process)."""
+    proc = receiver.process
+    if proc.poll() is not None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        proc.kill()

@@ -104,3 +104,85 @@ def test_rtp_up_raises_without_pactl(monkeypatch):
         raise AssertionError("expected ProviderError")
     except ProviderError:
         pass
+
+
+# -- ROC receiver up/down (roc-recv subprocess mocked) -----------------------
+
+
+class _FakeProc:
+    def __init__(self, alive=True):
+        self._alive = alive
+        self.terminated = False
+        self.killed = False
+        self.stderr = None if alive else _FakeStderr()
+
+    def poll(self):
+        return None if self._alive else 1
+
+    def terminate(self):
+        self.terminated = True
+        self._alive = False
+
+    def wait(self, timeout=None):
+        return 0
+
+    def kill(self):
+        self.killed = True
+
+
+class _FakeStderr:
+    def read(self):
+        return b"bad sink"
+
+
+def test_roc_available(monkeypatch):
+    monkeypatch.setattr(pw.shutil, "which", lambda _n: "/app/bin/roc-recv")
+    assert pw.roc_available() is True
+    monkeypatch.setattr(pw.shutil, "which", lambda _n: None)
+    assert pw.roc_available() is False
+
+
+def test_roc_receiver_up_spawns_roc_recv(monkeypatch):
+    captured = {}
+
+    def fake_popen(argv, **kw):
+        captured["argv"] = argv
+        return _FakeProc(alive=True)
+
+    monkeypatch.setattr(pw.shutil, "which", lambda _n: "/app/bin/roc-recv")
+    monkeypatch.setattr(pw.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(pw.time, "sleep", lambda _s: None)
+    rx = pw.roc_receiver_up("alsa_output.usb-DAC", target_latency_ms=80)
+    argv = captured["argv"]
+    assert argv[0] == "/app/bin/roc-recv"
+    assert "-o" in argv and "pulse://alsa_output.usb-DAC" in argv
+    assert "--target-latency=80ms" in argv
+    assert any(a.startswith("rtp+rs8m://0.0.0.0:") for a in argv)  # source endpoint
+    assert any(a.startswith("rs8m://0.0.0.0:") for a in argv)      # FEC repair endpoint
+    assert rx.source_port == 10001
+
+
+def test_roc_receiver_up_raises_without_binary(monkeypatch):
+    monkeypatch.setattr(pw.shutil, "which", lambda _n: None)
+    try:
+        pw.roc_receiver_up("dac")
+        raise AssertionError("expected ProviderError")
+    except ProviderError:
+        pass
+
+
+def test_roc_receiver_up_raises_if_process_dies(monkeypatch):
+    monkeypatch.setattr(pw.shutil, "which", lambda _n: "/app/bin/roc-recv")
+    monkeypatch.setattr(pw.subprocess, "Popen", lambda *a, **k: _FakeProc(alive=False))
+    monkeypatch.setattr(pw.time, "sleep", lambda _s: None)
+    try:
+        pw.roc_receiver_up("dac")
+        raise AssertionError("expected ProviderError")
+    except ProviderError as exc:
+        assert "bad sink" in str(exc)
+
+
+def test_roc_receiver_down_terminates(monkeypatch):
+    proc = _FakeProc(alive=True)
+    pw.roc_receiver_down(pw.RocReceiver(process=proc, source_port=1, repair_port=2, control_port=3))
+    assert proc.terminated
