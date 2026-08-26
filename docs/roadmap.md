@@ -19,6 +19,10 @@ aspiration — see the legend in the [docs index](README.md).
 
 ## In progress
 
+- **WiiM/LinkPlay playback backend** (`harmony/playback/`). *Built & verified*
+  (offline test suite) — device control (status/play/pause/volume/mute/skip)
+  and best-effort SSDP discovery, no UI wiring yet. See
+  [playback](design/playback.md).
 - **Embedded WebKit Qobuz login.** *Built, token capture unverified* — needs one
   real interactive login to confirm the `localStorage` extraction; token paste
   is the reliable method until then. See [auth](design/auth.md#qobuz).
