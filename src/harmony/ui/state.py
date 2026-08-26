@@ -19,11 +19,14 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import GObject  # noqa: E402
+from gi.repository import GLib, GObject  # noqa: E402
 
 from harmony.config import CredentialStore, Settings  # noqa: E402
 from harmony.models import Playlist, Service  # noqa: E402
-from harmony.tasks import run_async  # noqa: E402
+from harmony.tasks import on_main, run_async  # noqa: E402
+
+# How often the queue poller checks a device for a track ending, in seconds.
+_QUEUE_POLL_S = 3
 
 log = logging.getLogger(__name__)
 
@@ -79,6 +82,12 @@ class AppState(GObject.Object):
         # host -> UpnpRenderer|None, probed once per device (None = no
         # AVTransport, use the httpapi path instead of re-probing every play).
         self._upnp_cache: dict[str, Any] = {}
+        # Play-to-device queues (for playing an album/artist/playlist as a
+        # sequence). host -> remaining tracks; a per-host main-loop poller
+        # advances to the next track when the current one ends.
+        self._queues: dict[str, list[Any]] = {}
+        self._queue_prev_state: dict[str, str] = {}
+        self._queue_poll_ids: dict[str, int] = {}
 
         self.reload_providers()
         self._init_recommender()
@@ -479,15 +488,86 @@ class AppState(GObject.Object):
         return self._relay
 
     def play_track_on_device(self, track: Any, device_host: str) -> None:
-        """Resolve ``track``'s stream, register it with the relay, and play it on the device.
+        """Play a single track on a device, superseding any active queue for it.
 
-        Blocking — MUST run on a worker thread via ``run_async`` (it does
-        provider *and* device network I/O). The stream is resolved once up
-        front so auth/subscription/codec failures surface immediately (before a
-        URL reaches the device), then wrapped in a resolver the relay re-invokes
-        per fetch, re-resolving only once the provider's time-limited URL is old
-        enough to have expired — so a later seek gets a fresh URL without a
-        redundant resolve on the first play.
+        Blocking — MUST run on a worker thread via ``run_async``. A single-track
+        play cancels an in-progress album/playlist queue on the same device (the
+        queue-teardown is marshalled to the main loop, where its poller lives).
+        """
+        on_main(self._stop_queue, device_host)
+        self._play_one(track, device_host)
+
+    def play_tracks_on_device(self, tracks: list[Any], device_host: str) -> None:
+        """Play a sequence of tracks (an album/artist/playlist) on a device.
+
+        Blocking — MUST run on a worker thread (it plays the first track). The
+        rest are advanced by a main-loop poller that watches for each track to
+        finish. Replaces any existing queue on that device; an empty list is a
+        no-op.
+        """
+        tracks = list(tracks)
+        if not tracks:
+            return
+        self._queues[device_host] = tracks
+        self._queue_prev_state[device_host] = ""
+        self._play_one(tracks[0], device_host)
+        on_main(self._start_queue_poller, device_host)
+
+    def _start_queue_poller(self, host: str) -> None:
+        if host not in self._queue_poll_ids:
+            self._queue_poll_ids[host] = GLib.timeout_add_seconds(_QUEUE_POLL_S, self._poll_queue, host)
+
+    def _stop_queue(self, host: str) -> None:
+        """Forget a device's queue and stop its poller (main loop only)."""
+        self._queues.pop(host, None)
+        self._queue_prev_state.pop(host, None)
+        source_id = self._queue_poll_ids.pop(host, None)
+        if source_id is not None:
+            GLib.source_remove(source_id)
+
+    def _next_after_status(self, host: str, state: str) -> Any:
+        """Advance the queue if the current track just ended; return the next track or None.
+
+        "Ended" = the device was ``playing`` and is now ``stopped``. Pure enough
+        to unit-test: only touches the in-memory queue dicts, no I/O.
+        """
+        prev = self._queue_prev_state.get(host, "")
+        self._queue_prev_state[host] = state or ""
+        queue = self._queues.get(host)
+        if not queue:
+            return None
+        if prev == "playing" and state == "stopped":
+            queue.pop(0)
+            if queue:
+                return queue[0]
+            self._stop_queue(host)
+        return None
+
+    def _poll_queue(self, host: str) -> bool:
+        if host not in self._queues:
+            self._queue_poll_ids.pop(host, None)
+            return GLib.SOURCE_REMOVE
+        device = self.device_for(host)
+
+        def done(status: Any) -> None:
+            next_track = self._next_after_status(host, status.state or "")
+            if next_track is not None:
+                run_async(
+                    lambda: self._play_one(next_track, host),
+                    None,
+                    lambda exc: log.warning("Queue advance on %s failed: %s", host, exc),
+                )
+
+        run_async(device.status, done, lambda _exc: None)  # transient poll errors ignored
+        return GLib.SOURCE_CONTINUE
+
+    def _play_one(self, track: Any, device_host: str) -> None:
+        """Resolve ``track``'s stream, register it with the relay, and play it (queue-agnostic).
+
+        The stream is resolved once up front so auth/subscription/codec failures
+        surface immediately (before a URL reaches the device), then wrapped in a
+        resolver the relay re-invokes per fetch, re-resolving only once the
+        provider's time-limited URL is old enough to have expired.
         """
         provider = self.providers.get(track.service)
         if provider is None:

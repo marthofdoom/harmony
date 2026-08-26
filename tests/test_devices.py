@@ -317,3 +317,60 @@ def test_play_falls_back_when_upnp_raises(state: AppState, monkeypatch) -> None:
     state.play_track_on_device(_a_track(), "192.168.1.9")
 
     assert played["url"] == "http://relay/tok"  # UPnP failed -> httpapi still played it
+
+
+# -- play_tracks_on_device: album/playlist queue advance ----------------------
+
+
+def _track_n(n: int) -> Track:
+    return Track(id=f"t{n}", title=f"Song {n}", service=Service.YTMUSIC, artists=["A"])
+
+
+def test_queue_advances_to_next_track_on_end(state: AppState) -> None:
+    state._queues = {"h": [_track_n(1), _track_n(2), _track_n(3)]}
+    state._queue_prev_state = {"h": "playing"}
+    state._queue_poll_ids = {}
+
+    nxt = state._next_after_status("h", "stopped")  # track 1 ended
+
+    assert nxt is not None and nxt.id == "t2"
+    assert [t.id for t in state._queues["h"]] == ["t2", "t3"]  # t1 popped
+
+
+def test_queue_does_not_advance_while_still_playing(state: AppState) -> None:
+    state._queues = {"h": [_track_n(1), _track_n(2)]}
+    state._queue_prev_state = {"h": "playing"}
+    state._queue_poll_ids = {}
+
+    assert state._next_after_status("h", "playing") is None
+    assert len(state._queues["h"]) == 2
+
+
+def test_queue_clears_after_last_track(state: AppState) -> None:
+    state._queues = {"h": [_track_n(1)]}
+    state._queue_prev_state = {"h": "playing"}
+    state._queue_poll_ids = {}
+
+    assert state._next_after_status("h", "stopped") is None
+    assert "h" not in state._queues  # emptied and cleared
+
+
+def test_play_tracks_sets_queue_and_plays_head(state: AppState, monkeypatch) -> None:
+    state._queues = {}
+    state._queue_prev_state = {}
+    state._queue_poll_ids = {}
+    played: list = []
+    monkeypatch.setattr(state, "_play_one", lambda t, h: played.append((t.id, h)))
+    monkeypatch.setattr("harmony.ui.state.on_main", lambda fn, *a: None)  # don't start the real poller
+
+    state.play_tracks_on_device([_track_n(1), _track_n(2), _track_n(3)], "192.168.1.9")
+
+    assert played == [("t1", "192.168.1.9")]  # only the head plays synchronously
+    assert [t.id for t in state._queues["192.168.1.9"]] == ["t1", "t2", "t3"]
+
+
+def test_play_empty_track_list_is_a_noop(state: AppState, monkeypatch) -> None:
+    state._queues = {}
+    monkeypatch.setattr(state, "_play_one", lambda t, h: (_ for _ in ()).throw(AssertionError("must not play")))
+    state.play_tracks_on_device([], "192.168.1.9")
+    assert state._queues == {}
