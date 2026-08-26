@@ -309,11 +309,11 @@ class DevicesPage(Gtk.Box):
     def _apply_status(self, status: Any) -> None:
         self._last_status = status
         self.state_row.set_subtitle((status.state or "unknown").capitalize())
-        # A bare relay URL carries no metadata, so the device often reports an
-        # empty title/artist even while playing. Fall back to what we relayed
-        # to this device so the UI still shows the track.
+        # A bare relay URL carries no metadata, so the device reports either an
+        # empty title or the URL itself while playing what we relayed. In both
+        # cases fall back to what we sent it so the UI shows the real track.
         title, artist = status.title or "", status.artist or ""
-        if not title:
+        if not title or title.startswith(("http://", "https://")):
             remembered = self.state.last_played_on(self._selected_host)
             if remembered is not None:
                 title, artist = remembered

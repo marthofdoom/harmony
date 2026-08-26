@@ -126,15 +126,16 @@ def _spawn_adts_remux(source: StreamSource) -> subprocess.Popen[bytes]:
     if extra_headers:
         args += ["-headers", "".join(f"{h}\r\n" for h in extra_headers)]
     args += ["-i", source.url, "-vn", "-c:a", "copy", "-f", "adts", "pipe:1"]
-    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
 
 
 def _stop_process(proc: subprocess.Popen[bytes]) -> None:
-    if proc.stdout is not None:
-        try:
-            proc.stdout.close()
-        except OSError:
-            pass
+    for stream in (proc.stdout, proc.stderr):
+        if stream is not None:
+            try:
+                stream.close()
+            except OSError:
+                pass
     if proc.poll() is None:
         proc.terminate()
         try:
@@ -367,13 +368,44 @@ class _Handler(BaseHTTPRequestHandler):
                     pass
             return
 
+        log.info("relay: remuxing %s to ADTS for the device", source.mime_type or "audio/mp4")
         self._icy_headers("audio/aac", entry)
+        written = 0
         try:
             assert proc.stdout is not None
-            self._write_icy(_read_chunks(proc.stdout), _icy_metadata_block(entry.title, entry.artist))
+
+            def _counted() -> Iterator[bytes]:
+                nonlocal written
+                for chunk in _read_chunks(proc.stdout):
+                    written += len(chunk)
+                    yield chunk
+
+            self._write_icy(_counted(), _icy_metadata_block(entry.title, entry.artist))
         except (BrokenPipeError, ConnectionResetError):
             pass
         finally:
+            if written == 0:
+                # ffmpeg produced no audio: terminate it and surface why.
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait()
+                err = b""
+                if proc.stderr is not None:
+                    try:
+                        err = proc.stderr.read() or b""
+                    except OSError:
+                        pass
+                log.warning(
+                    "relay: ffmpeg remux produced no audio (rc=%s): %s",
+                    proc.returncode,
+                    err.decode("utf-8", "replace")[:500].strip(),
+                )
+            else:
+                log.info("relay: streamed %d bytes of ADTS to the device", written)
             _stop_process(proc)
 
     def _reply_icy(
