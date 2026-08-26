@@ -1493,11 +1493,31 @@ def reattach_tty_stdin() -> None:
         ) from None
 
 
+_ALL_DEPS = ["requests", "ytmusicapi", "cryptography", "keyring", "secretstorage"]
+
+
+def ensure_dependencies() -> None:
+    """Front-load every dependency once, so no flow prompts for one mid-way.
+
+    Offers to install into the current venv (or a throwaway) and re-execs with
+    them present. Declining is allowed — individual flows still degrade — but
+    the default is a complete environment.
+    """
+    missing = [d for d in _ALL_DEPS if try_import(d) is None]
+    if not missing:
+        return
+    print(f"\nHarmony setup uses: {', '.join(missing)}.")
+    if offer_venv_bootstrap(missing):
+        return  # process is being replaced
+    print("Continuing without them — some options may be unavailable.\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = build_arg_parser()
     args = parser.parse_args(argv)
     print(BANNER)
     reattach_tty_stdin()
+    ensure_dependencies()
     try:
         target = resolve_target(args)
         print(f"Setting up: {target.kind} install -> {target.config_dir}\n")
