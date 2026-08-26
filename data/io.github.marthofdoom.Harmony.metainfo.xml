@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.5.2" date="2026-08-26">
+      <description>
+        <p>Adds right-click context menus across tracks, artists, albums, and
+        playlists, and a "Show Similar" music action that opens a recommendations
+        view you can play or turn into a playlist.</p>
+      </description>
+    </release>
     <release version="0.5.1" date="2026-08-26">
       <description>
         <p>Adds selectable color themes (Appearance in Preferences), fixes

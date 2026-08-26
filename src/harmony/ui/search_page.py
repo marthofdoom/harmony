@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 
 import gi
 
@@ -14,8 +15,10 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 from harmony.errors import NotSupportedError  # noqa: E402
 from harmony.models import Album, Artist, Playlist, SearchResults, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
+    attach_context_menu,
     build_track_column_view,
     error_status_page,
     replace_tracks,
@@ -54,7 +57,9 @@ class SearchPage(Gtk.Box):
                         description="Find tracks, albums, artists, and playlists across your services."),
             "empty",
         )
-        self.column_view, self.track_store, self.track_selection = build_track_column_view()
+        self.column_view, self.track_store, self.track_selection = build_track_column_view(
+            on_row_menu=self._track_row_actions
+        )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_action_sensitivity())
         tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         self._back_bar = Gtk.Box(spacing=6, visible=False)
@@ -233,6 +238,7 @@ class SearchPage(Gtk.Box):
             row.set_activatable(True)
             row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
             row.connect("activated", lambda _r, it=item: self._drill_into(it))
+            attach_context_menu(row, lambda it=item: self._other_row_actions(it))
             self.other_list.append(row)
         self.content_stack.set_visible_child_name("other")
 
@@ -292,6 +298,7 @@ class SearchPage(Gtk.Box):
                     row.set_activatable(True)
                     row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
                     row.connect("activated", lambda _r, a=album: self._drill_into(a))
+                    attach_context_menu(row, lambda a=album: self._other_row_actions(a))
                     self.other_list.append(row)
             else:
                 self.other_list.append(Adw.ActionRow(title="No albums found", sensitive=False))
@@ -454,7 +461,9 @@ class SearchPage(Gtk.Box):
         tracks = selected_tracks(self.track_selection)
         if len(tracks) != 1:
             return
-        source = tracks[0]
+        self._find_other_for_track(tracks[0])
+
+    def _find_other_for_track(self, source: Track) -> None:
         other = Service.QOBUZ if source.service == Service.YTMUSIC else Service.YTMUSIC
         target_provider = self.state.providers.get(other)
         if target_provider is None:
@@ -498,6 +507,93 @@ class SearchPage(Gtk.Box):
             self.content_stack.set_visible_child_name("tracks")
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't find similar tracks: {exc}"))
+
+    # -- context menus: right-click actions for tracks and other-kind rows -------
+    #
+    # Additive to the toolbar buttons above, not a replacement -- these open
+    # the shared recommender-backed "Similar music" dialog (similar_dialog.py)
+    # rather than reusing this page's own inline similar-tracks view, since
+    # that view is keyed to the single-selection toolbar flow and its
+    # provider-native `similar_tracks` call, not the recommender.
+
+    def _similar_target_provider(self, service: Service) -> object | None:
+        """The entity's own provider if configured, else the first available one.
+
+        Used where the fetch only needs *somewhere* to resolve candidate
+        matches against (tracks, artists) -- as opposed to album/playlist
+        rows, whose fetch must call ``get_album_tracks``/``get_playlist_tracks``
+        against the entity's own native provider and so cannot fall back.
+        """
+        provider = self.state.providers.get(service)
+        if provider is not None:
+            return provider
+        return next(iter(self.state.providers.values()), None)
+
+    def _open_similar(self, title: str, fetch: Callable[[], list]) -> None:
+        if self.state.recommender is None:
+            self.state.toast("Recommendations aren't available.")
+            return
+        present_similar(self, self.state, title=title, fetch=fetch)
+
+    def _track_row_actions(self, track: Track) -> list[tuple[str, Callable[[], None]]]:
+        actions: list[tuple[str, Callable[[], None]]] = [
+            ("Play on Device", lambda: self._open_device_popover(self.column_view, track)),
+            ("Add to Playlist…", lambda: self._open_playlist_popover(self.column_view, [track])),
+        ]
+        provider = self._similar_target_provider(track.service)
+        if provider is not None:
+            actions.append((
+                "Show Similar",
+                lambda: self._open_similar(
+                    f"Similar to {track.title}",
+                    lambda: self.state.recommender.similar_to_tracks([track], provider, limit=40),
+                ),
+            ))
+        other = Service.QOBUZ if track.service == Service.YTMUSIC else Service.YTMUSIC
+        if other in self.state.providers:
+            actions.append(("Find on Other Service", lambda: self._find_other_for_track(track)))
+        return actions
+
+    def _other_row_actions(self, item: Album | Artist | Playlist) -> list[tuple[str, Callable[[], None]]]:
+        actions: list[tuple[str, Callable[[], None]]] = []
+        if isinstance(item, Artist):
+            provider = self._similar_target_provider(item.service)
+            if provider is not None:
+                actions.append((
+                    "Show Similar",
+                    lambda: self._open_similar(
+                        f"Similar to {item.name}",
+                        lambda: self.state.recommender.similar_to_artist(item.name, provider, limit=40),
+                    ),
+                ))
+        elif isinstance(item, Album):
+            # get_album_tracks needs the album's own native provider -- unlike
+            # tracks/artists above, there is no sensible fallback here.
+            provider = self.state.providers.get(item.service)
+            if provider is not None:
+                actions.append((
+                    "Show Similar",
+                    lambda: self._open_similar(
+                        f"Similar to {item.title}",
+                        lambda: self.state.recommender.similar_to_tracks(
+                            provider.get_album_tracks(item.id), provider, limit=40
+                        ),
+                    ),
+                ))
+        elif isinstance(item, Playlist):
+            provider = self.state.providers.get(item.service)
+            if provider is not None:
+                actions.append((
+                    "Show Similar",
+                    lambda: self._open_similar(
+                        f"Similar to {item.title}",
+                        lambda: self.state.recommender.expand_playlist(
+                            provider.get_playlist_tracks(item.id), provider, limit=40
+                        ),
+                    ),
+                ))
+        actions.append(("Open", lambda: self._drill_into(item)))
+        return actions
 
     def _on_back_to_results(self, _button: Gtk.Button) -> None:
         self._back_bar.set_visible(False)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,9 +16,11 @@ from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     ProgressDialog,
+    attach_context_menu,
     build_track_column_view,
     confirm_dialog,
     error_status_page,
@@ -116,11 +119,35 @@ class PlaylistsPage(Gtk.Box):
                 row.playlist = playlist  # type: ignore[attr-defined]
                 wrapper = Gtk.ListBoxRow(child=row)
                 wrapper.playlist = playlist  # type: ignore[attr-defined]
+                attach_context_menu(row, lambda p=playlist, w=wrapper: self._playlist_row_actions(p, w))
                 self.playlist_list.append(wrapper)
                 if selected_id is not None and playlist.id == selected_id and playlist.service == self._selected_playlist.service:  # type: ignore[union-attr]
                     reselect = wrapper
         if reselect is not None:
             self.playlist_list.select_row(reselect)
+
+    def _playlist_row_actions(self, playlist: Playlist, wrapper: Gtk.ListBoxRow) -> list[tuple[str, Callable[[], None]]]:
+        actions: list[tuple[str, Callable[[], None]]] = []
+        # get_playlist_tracks needs the playlist's own native provider -- no
+        # fallback to another service makes sense here.
+        provider = self.state.providers.get(playlist.service)
+        if provider is not None:
+            actions.append(("Show Similar", lambda: self._show_similar_for_playlist(playlist, provider)))
+        actions.append(("Open", lambda: self.playlist_list.select_row(wrapper)))
+        return actions
+
+    def _show_similar_for_playlist(self, playlist: Playlist, provider: object) -> None:
+        if self.state.recommender is None:
+            self.state.toast("Recommendations aren't available.")
+            return
+        present_similar(
+            self,
+            self.state,
+            title=f"Similar to {playlist.title}",
+            fetch=lambda: self.state.recommender.expand_playlist(
+                provider.get_playlist_tracks(playlist.id), provider, limit=40
+            ),
+        )
 
     def _on_playlist_selected(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         playlist = getattr(row, "playlist", None) if row is not None else None

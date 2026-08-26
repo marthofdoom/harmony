@@ -16,11 +16,61 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gio, GLib, GObject, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Track  # noqa: E402
 
 log = logging.getLogger(__name__)
+
+
+def attach_context_menu(
+    widget: Gtk.Widget, build_actions: Callable[[], list[tuple[str, Callable[[], None]]]]
+) -> None:
+    """Right-click / long-press `widget` -> a popover of (label, callback) actions.
+
+    ``build_actions`` is called at click time so the menu reflects current
+    state; returning ``[]`` shows nothing (no empty popover flashes up).
+    Mirrors the existing ad-hoc popover idiom used for the playlist/device
+    pickers elsewhere in this module: a ``Gtk.Popover`` over a
+    ``Gtk.ListBox`` of activatable ``Adw.ActionRow``s, parented to ``widget``
+    and unparented on close. A ``Gtk.GestureClick`` (secondary/right button)
+    and a ``Gtk.GestureLongPress`` (touch) share one opener so both input
+    styles work; the popover is pointed at the click/press position so it
+    appears under the pointer rather than at the widget's origin.
+    """
+
+    def _open(x: float, y: float) -> None:
+        actions = build_actions()
+        if not actions:
+            return
+        popover = Gtk.Popover()
+        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        listbox.add_css_class("boxed-list")
+        for label, callback in actions:
+            row = Adw.ActionRow(title=label)
+            row.set_activatable(True)
+
+            def _activate(_row: Adw.ActionRow, cb: Callable[[], None] = callback, pop: Gtk.Popover = popover) -> None:
+                pop.popdown()
+                cb()
+
+            row.connect("activated", _activate)
+            listbox.append(row)
+        popover.set_child(listbox)
+        popover.set_parent(widget)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        popover.set_pointing_to(rect)
+        popover.connect("closed", lambda p: p.unparent())
+        popover.popup()
+
+    click = Gtk.GestureClick(button=3)
+    click.connect("pressed", lambda _g, _n, x, y: _open(x, y))
+    widget.add_controller(click)
+
+    long_press = Gtk.GestureLongPress()
+    long_press.connect("pressed", lambda _g, x, y: _open(x, y))
+    widget.add_controller(long_press)
 
 
 class TrackObject(GObject.Object):
@@ -63,12 +113,29 @@ _TRACK_COLUMNS: list[tuple[str, Callable[[Track], str], bool]] = [
 ]
 
 
-def _label_factory(getter: Callable[[Track], str]) -> Gtk.SignalListItemFactory:
+def _label_factory(
+    getter: Callable[[Track], str],
+    on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None,
+) -> Gtk.SignalListItemFactory:
     factory = Gtk.SignalListItemFactory()
 
     def setup(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
         label = Gtk.Label(xalign=0.0, ellipsize=3)  # PANGO_ELLIPSIZE_END
         item.set_child(label)
+        if on_row_menu is not None:
+            # Attached once per (recycled) cell widget in setup, not bind, so
+            # a single gesture serves every row this widget is ever rebound
+            # to. ``item`` itself is stable across rebinds, so resolving the
+            # track from ``item.get_item()`` here (rather than closing over
+            # the track from the enclosing ``bind`` call) always reflects
+            # whichever row this cell currently displays at click time.
+            def build_actions() -> list[tuple[str, Callable[[], None]]]:
+                track_obj = item.get_item()
+                if not isinstance(track_obj, TrackObject):
+                    return []
+                return on_row_menu(track_obj.track)
+
+            attach_context_menu(label, build_actions)
 
     def bind(_factory: Gtk.SignalListItemFactory, item: Gtk.ListItem) -> None:
         label = item.get_child()
@@ -81,11 +148,21 @@ def _label_factory(getter: Callable[[Track], str]) -> Gtk.SignalListItemFactory:
     return factory
 
 
-def build_track_column_view() -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
+def build_track_column_view(
+    on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None = None,
+) -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
     """Build a multi-select ``Gtk.ColumnView`` for track lists.
 
     Returns the view plus the backing store and selection model so callers can
     populate rows and read the current selection.
+
+    ``on_row_menu``, if given, is called with a row's ``Track`` when the user
+    right-clicks/long-presses any cell in that row, and should return the
+    context-menu actions for it (see ``attach_context_menu``). This targets
+    the specific row under the pointer, independent of the current
+    selection -- a ``Gtk.ColumnView`` has no single per-row widget (each
+    column binds its own cell), so the gesture is attached to every column's
+    cell; whichever cell was clicked resolves its own row's track.
     """
     store = Gio.ListStore(item_type=TrackObject)
     selection = Gtk.MultiSelection(model=store)
@@ -93,7 +170,7 @@ def build_track_column_view() -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiS
     column_view.add_css_class("data-table")
     column_view.set_show_row_separators(True)
     for title, getter, expand in _TRACK_COLUMNS:
-        column = Gtk.ColumnViewColumn(title=title, factory=_label_factory(getter))
+        column = Gtk.ColumnViewColumn(title=title, factory=_label_factory(getter, on_row_menu))
         column.set_expand(expand)
         column_view.append_column(column)
     return column_view, store, selection
