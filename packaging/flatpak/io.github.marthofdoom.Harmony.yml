@@ -20,6 +20,11 @@ finish-args:
   - --socket=wayland
   - --socket=fallback-x11
   - --device=dri
+  # Local audio playback / network-source routing (Route Audio page) talks to
+  # PipeWire. Note: the pactl CLI it currently shells out to isn't in the
+  # runtime yet — the feature works from a source checkout; bundling
+  # pipewire tools (or switching to pw-cli) is a packaging TODO.
+  - --socket=pipewire
   # Credentials go to the Secret Service via the keyring package. Nothing is
   # written to a host path — import/export uses the file-chooser portal, so no
   # filesystem access is granted here.

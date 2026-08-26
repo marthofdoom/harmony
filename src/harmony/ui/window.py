@@ -23,6 +23,7 @@ _PAGES: list[tuple[str, str, str]] = [
     ("sync", "Sync", "emblem-synchronizing-symbolic"),
     ("discover", "Discover", "starred-symbolic"),
     ("devices", "Devices", "audio-speakers-symbolic"),
+    ("audio_route", "Route Audio", "network-transmit-receive-symbolic"),
 ]
 _TITLES = {name: title for name, title, _ in _PAGES}
 
@@ -174,6 +175,10 @@ class HarmonyWindow(Adw.ApplicationWindow):
                 from harmony.ui.devices_page import DevicesPage
 
                 return DevicesPage(self.state)
+            if name == "audio_route":
+                from harmony.ui.audio_route_page import AudioRoutePage
+
+                return AudioRoutePage(self.state)
         except Exception:
             log.exception("Failed to build page %r", name)
         return Adw.StatusPage(

@@ -140,6 +140,7 @@ jobs:
               "harmony.ui.playlists_page",
               "harmony.ui.sync_page",
               "harmony.ui.discover_page",
+              "harmony.ui.audio_route_page",
               "harmony.ui.prefs",
               "harmony.app",
               "harmony.__main__",
