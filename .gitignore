@@ -22,3 +22,7 @@ secrets.json
 
 # Claude Code local session data
 .claude/
+
+# Flatpak build artifacts
+packaging/flatpak/build/
+packaging/flatpak/.flatpak-builder/
