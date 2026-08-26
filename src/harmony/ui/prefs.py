@@ -247,9 +247,9 @@ class PreferencesDialog(Adw.PreferencesDialog):
         from harmony.ui import qobuz_login
 
         self.qb_browser_login_row = Adw.ActionRow(
-            title="Sign in with browser",
-            subtitle="Opens Qobuz's own login — Google sign-in included — and captures the "
-            "session token for you. No devtools needed.",
+            title="Sign in with embedded browser",
+            subtitle="Opens Qobuz's own login in-app and captures the session token for you. "
+            "No devtools needed — but Google/social sign-in won't work here (see below).",
         )
         browser_login_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER,
                                           css_classes=["suggested-action"])
@@ -257,6 +257,20 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.qb_browser_login_row.add_suffix(browser_login_button)
         self._webkit_login_available = qobuz_login.AVAILABLE
         qb_group.add(self.qb_browser_login_row)
+
+        # For Google/social-login accounts, which Google refuses to sign in
+        # inside any embedded webview: walks the user through running a
+        # bookmarklet in their real browser instead. Always available — no
+        # WebKit needed, since the sign-in itself never happens in-app.
+        self.qb_browser_assist_row = Adw.ActionRow(
+            title="Sign in via your browser",
+            subtitle="For Google/social Qobuz accounts — opens Qobuz in your real browser "
+            "and helps you grab the token.",
+        )
+        browser_assist_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER)
+        browser_assist_button.connect("clicked", self._on_qobuz_browser_assist)
+        self.qb_browser_assist_row.add_suffix(browser_assist_button)
+        qb_group.add(self.qb_browser_assist_row)
 
         self.qb_token_row = Adw.PasswordEntryRow(
             title="Session token", text=self.credentials.get(config.QOBUZ_TOKEN) or ""
@@ -267,7 +281,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         qb_group.add(self.qb_token_row)
 
         self.qb_token_help_row = Adw.ActionRow(
-            title="Or paste a token manually",
+            title="Or paste a token manually (devtools)",
             subtitle="Sign in at play.qobuz.com, open devtools → Network, click any request to "
             "www.qobuz.com/api.json/0.2/, and copy the X-User-Auth-Token request header "
             "(the X-App-Id header on that same request goes in App ID below, if auto-detection "
@@ -306,9 +320,13 @@ class PreferencesDialog(Adw.PreferencesDialog):
         is_token = self.settings.qobuz_auth_kind == "token"
         self.qb_email_row.set_visible(not is_token)
         self.qb_password_row.set_visible(not is_token)
-        # The browser-login button only makes sense in token mode, and only
-        # when WebKit is actually there to open a webview.
+        # The embedded browser-login button only makes sense in token mode,
+        # and only when WebKit is actually there to open a webview.
         self.qb_browser_login_row.set_visible(is_token and self._webkit_login_available)
+        # The browser-assist flow needs no WebKit at all — the sign-in
+        # happens in the user's real, external browser — so it's offered in
+        # token mode regardless of embedded-webview availability.
+        self.qb_browser_assist_row.set_visible(is_token)
         self.qb_token_row.set_visible(is_token)
         self.qb_token_help_row.set_visible(is_token)
 
@@ -325,6 +343,20 @@ class PreferencesDialog(Adw.PreferencesDialog):
             self.state.toast("Signed in to Qobuz.")
 
         qobuz_login.present_login(self.get_root(), handle)
+
+    def _on_qobuz_browser_assist(self, _button: Gtk.Button) -> None:
+        from harmony.ui import qobuz_login
+
+        def handle(token: str | None) -> None:
+            if not token:
+                self.state.toast("Cancelled.")
+                return
+            self.credentials.set(config.QOBUZ_TOKEN, token)
+            self.qb_token_row.set_text(token)  # reflect it in the manual field
+            self._set_account_setting("qobuz_token_saved", True)
+            self.state.toast("Signed in to Qobuz.")
+
+        qobuz_login.present_browser_assist(self.get_root(), handle)
 
     def _on_qobuz_token_changed(self, value: str) -> None:
         self.credentials.set(config.QOBUZ_TOKEN, value)

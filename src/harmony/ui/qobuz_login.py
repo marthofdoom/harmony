@@ -23,7 +23,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, GLib, GObject, Gtk  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -99,6 +99,65 @@ _EXTRACT_TOKEN_JS = """
   return null;
 })();
 """
+
+# For accounts the embedded webview can't serve at all (Google blocks OAuth
+# inside any embedded browser, full stop — no user-agent trick gets around
+# it), the only way in is the user's *real* browser: open play.qobuz.com
+# there, run this as a bookmarklet while signed in, and paste back what it
+# shows. Same extraction logic as ``_EXTRACT_TOKEN_JS`` above (localuser
+# first, re-parse double-encoded JSON, match /token|auth/i fields >20 chars,
+# fall back to auth-ish cookies) — kept in sync by hand since one runs inside
+# WebKitGTK's evaluate_javascript and the other has to survive being pasted
+# into a browser's bookmark URL field as a single line.
+BOOKMARKLET = (
+    "javascript:(function(){"
+    "function deep(node,depth){"
+    "if(node==null||depth>8)return null;"
+    "if(typeof node==='string'){try{return deep(JSON.parse(node),depth+1);}catch(e){return null;}}"
+    "if(typeof node!=='object')return null;"
+    "for(var k in node){"
+    "var v=node[k];"
+    "if(typeof v==='string'&&v.length>20&&/token|auth/i.test(k))return v;"
+    "var found=deep(v,depth+1);"
+    "if(found)return found;"
+    "}"
+    "return null;"
+    "}"
+    "function findToken(){"
+    "var order=['localuser'];"
+    "for(var i=0;i<localStorage.length;i++){"
+    "var key=localStorage.key(i);"
+    "if(order.indexOf(key)<0)order.push(key);"
+    "}"
+    "for(var n=0;n<order.length;n++){"
+    "var raw=localStorage.getItem(order[n]);"
+    "if(!raw)continue;"
+    "var val;"
+    "try{val=JSON.parse(raw);}catch(e){val=raw;}"
+    "var token=deep(val,0);"
+    "if(token)return token;"
+    "}"
+    "var cookies=document.cookie.split(';');"
+    "for(var j=0;j<cookies.length;j++){"
+    "var parts=cookies[j].split('=');"
+    "var name=(parts[0]||'').trim();"
+    "var value=(parts.slice(1).join('=')||'').trim();"
+    "if(/token|auth/i.test(name)&&value.length>20)return decodeURIComponent(value);"
+    "}"
+    "return null;"
+    "}"
+    "try{"
+    "var token=findToken();"
+    "if(token){"
+    "try{navigator.clipboard.writeText(token);}catch(e){}"
+    "prompt('Qobuz token (already copied to your clipboard) - paste this into Harmony:',token);"
+    "}else{"
+    "alert('Could not find a Qobuz token on this page. Make sure you are signed in at "
+    "play.qobuz.com, then click this bookmark again.');"
+    "}"
+    "}catch(e){alert('Qobuz token extraction failed: '+e);}"
+    "})();"
+)
 
 _POLL_INTERVAL_MS = 1500
 
@@ -232,3 +291,149 @@ def present_login(parent: Gtk.Window, on_token: Callable[[str | None], None]) ->
         on_token(None)
         return
     QobuzLoginDialog(parent, on_token).present()
+
+
+class QobuzBrowserAssistDialog(Adw.Window):
+    """Walks a Google/social Qobuz account through the bookmarklet dance.
+
+    No WebKit involved at all -- the sign-in happens in the user's real
+    browser, where Google's embedded-webview block doesn't apply. This just
+    explains the three steps, hands over the bookmarklet, and takes the token
+    back. ``on_token`` fires once, on the main loop: with the pasted token on
+    Save, or ``None`` if the window is closed first.
+    """
+
+    def __init__(self, parent: Gtk.Window, on_token: Callable[[str | None], None]) -> None:
+        super().__init__(
+            title="Sign in to Qobuz via your browser",
+            modal=True,
+            transient_for=parent,
+            default_width=560,
+            default_height=560,
+        )
+        self._on_token = on_token
+        self._settled = False
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=16,
+            margin_top=20, margin_bottom=20, margin_start=20, margin_end=20,
+        )
+
+        intro = Gtk.Label(
+            wrap=True, xalign=0.0,
+            label="For accounts signed up with Google or another social login, Qobuz's "
+            "own sign-in refuses to run inside an embedded browser -- it has to happen "
+            "in your real one. This walks you through grabbing the session token from "
+            "there instead.",
+        )
+        box.append(intro)
+
+        step1 = Gtk.Label(
+            wrap=True, xalign=0.0, use_markup=True,
+            label="<b>1.</b> Open Qobuz in your browser and sign in as usual.",
+        )
+        box.append(step1)
+        open_button = Gtk.Button(
+            label="Open Qobuz in your browser", halign=Gtk.Align.START,
+            css_classes=["suggested-action"],
+        )
+        open_button.connect("clicked", self._on_open_qobuz)
+        box.append(open_button)
+
+        step2 = Gtk.Label(
+            wrap=True, xalign=0.0, use_markup=True,
+            label="<b>2.</b> Make a new bookmark in that browser using the snippet below "
+            "as its URL (any name is fine), then, while the Qobuz tab is open and you're "
+            "signed in, click that bookmark. It will show your token and copy it to the "
+            "clipboard.",
+        )
+        box.append(step2)
+
+        snippet_frame = Gtk.Frame()
+        snippet_scroller = Gtk.ScrolledWindow(
+            hscrollbar_policy=Gtk.PolicyType.NEVER,
+            min_content_height=100, max_content_height=140, vexpand=False,
+        )
+        self._snippet_view = Gtk.TextView(
+            editable=False, cursor_visible=False, wrap_mode=Gtk.WrapMode.CHAR,
+            monospace=True,
+            top_margin=8, bottom_margin=8, left_margin=8, right_margin=8,
+        )
+        self._snippet_view.get_buffer().set_text(BOOKMARKLET)
+        snippet_scroller.set_child(self._snippet_view)
+        snippet_frame.set_child(snippet_scroller)
+        box.append(snippet_frame)
+
+        copy_button = Gtk.Button(label="Copy snippet", halign=Gtk.Align.START)
+        copy_button.connect("clicked", self._on_copy_snippet)
+        box.append(copy_button)
+
+        step3 = Gtk.Label(
+            wrap=True, xalign=0.0, use_markup=True,
+            label="<b>3.</b> Paste the token it gave you here.",
+        )
+        box.append(step3)
+
+        self._token_row = Adw.PasswordEntryRow(title="Paste token here")
+        self._token_row.connect("entry-activated", self._on_save)
+        box.append(self._token_row)
+
+        save_button = Gtk.Button(
+            label="Save", halign=Gtk.Align.START, css_classes=["suggested-action"],
+        )
+        save_button.connect("clicked", self._on_save)
+        box.append(save_button)
+
+        scroller = Gtk.ScrolledWindow(child=box, vexpand=True)
+        toolbar.set_content(scroller)
+        self.set_content(toolbar)
+
+        self.connect("close-request", self._on_close_request)
+
+    def _on_open_qobuz(self, _button: Gtk.Button) -> None:
+        try:
+            Gtk.UriLauncher.new("https://play.qobuz.com").launch(self, None, None)
+        except Exception:  # noqa: BLE001 - non-fatal; the URL is also named in the intro text
+            log.debug("Could not open play.qobuz.com automatically", exc_info=True)
+
+    def _on_copy_snippet(self, _button: Gtk.Button) -> None:
+        try:
+            clipboard = self.get_clipboard()
+            provider = Gdk.ContentProvider.new_for_value(
+                GObject.Value(GObject.TYPE_STRING, BOOKMARKLET)
+            )
+            clipboard.set_content(provider)
+        except Exception:  # noqa: BLE001 - the snippet is still visible/selectable to copy by hand
+            log.debug("Could not copy bookmarklet to clipboard", exc_info=True)
+
+    def _on_save(self, _widget: Gtk.Widget) -> None:
+        token = self._token_row.get_text().strip()
+        if not token:
+            return
+        self._settle(token)
+
+    def _settle(self, token: str | None) -> None:
+        if self._settled:
+            return
+        self._settled = True
+        GLib.idle_add(lambda: (self._on_token(token), False)[1])
+        self.close()
+
+    def _on_close_request(self, _window: object) -> bool:
+        if not self._settled:
+            self._settled = True
+            GLib.idle_add(lambda: (self._on_token(None), False)[1])
+        return False  # allow the close to proceed
+
+
+def present_browser_assist(parent: Gtk.Window, on_token: Callable[[str | None], None]) -> None:
+    """Open the bookmarklet-assisted external-browser sign-in flow.
+
+    Unlike ``present_login`` this never needs WebKitGTK -- the sign-in itself
+    happens in the user's real, external browser -- so it's always available,
+    even on a source checkout with no ``webkitgtk6.0``.
+    """
+    QobuzBrowserAssistDialog(parent, on_token).present()
