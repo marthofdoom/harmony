@@ -22,6 +22,7 @@ from harmony.ui.collection_actions import (  # noqa: E402
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
+    SegmentedToggle,
     attach_context_menu,
     build_track_column_view,
     error_status_page,
@@ -112,12 +113,13 @@ class SearchPage(Gtk.Box):
         self.kind_dropdown.connect("notify::selected", lambda *_a: self._run_search(immediate=True))
         box.append(self.kind_dropdown)
 
-        self.service_toggle = Adw.ToggleGroup()
-        self.service_toggle.add(Adw.Toggle(name="both", label="Both"))
-        self.service_toggle.add(Adw.Toggle(name=Service.YTMUSIC.value, label="YouTube Music"))
-        self.service_toggle.add(Adw.Toggle(name=Service.QOBUZ.value, label="Qobuz"))
-        self.service_toggle.set_active_name("both")
-        self.service_toggle.connect("notify::active-name", lambda *_a: self._run_search(immediate=True))
+        self.service_toggle = SegmentedToggle(
+            [("both", "Both"),
+             (Service.YTMUSIC.value, "YouTube Music"),
+             (Service.QOBUZ.value, "Qobuz")],
+            active="both",
+        )
+        self.service_toggle.connect("changed", lambda *_a: self._run_search(immediate=True))
         box.append(self.service_toggle)
         return box
 

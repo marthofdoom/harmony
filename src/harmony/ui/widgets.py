@@ -23,6 +23,63 @@ from harmony.models import Playlist, Track  # noqa: E402
 log = logging.getLogger(__name__)
 
 
+class SegmentedToggle(Gtk.Box):
+    """A single-select segmented control (name/label options).
+
+    Uses ``Adw.ToggleGroup`` where available (libadwaita >= 1.7) and falls back
+    to a linked row of ``Gtk.ToggleButton``s otherwise, so Harmony runs on
+    stable distros with an older libadwaita (and the offline CI, which has one)
+    rather than crashing at construction. Emits ``changed`` when the active
+    option changes; use ``get_active_name`` / ``set_active_name``.
+    """
+
+    __gsignals__ = {"changed": (GObject.SignalFlags.RUN_FIRST, None, ())}
+
+    def __init__(self, options: list[tuple[str, str]], active: str | None = None) -> None:
+        super().__init__(orientation=Gtk.Orientation.HORIZONTAL)
+        self._group = None
+        self._buttons: dict[str, Gtk.ToggleButton] = {}
+        if hasattr(Adw, "ToggleGroup"):
+            group = Adw.ToggleGroup()
+            for name, label in options:
+                group.add(Adw.Toggle(name=name, label=label))
+            group.connect("notify::active-name", lambda *_a: self.emit("changed"))
+            self.append(group)
+            self._group = group
+        else:
+            self.add_css_class("linked")
+            leader: Gtk.ToggleButton | None = None
+            for name, label in options:
+                button = Gtk.ToggleButton(label=label)
+                if leader is None:
+                    leader = button
+                else:
+                    button.set_group(leader)
+                button.connect("toggled", self._on_toggled)
+                self.append(button)
+                self._buttons[name] = button
+        if active is not None:
+            self.set_active_name(active)
+
+    def _on_toggled(self, button: Gtk.ToggleButton) -> None:
+        if button.get_active():  # fire once, on the newly-selected button
+            self.emit("changed")
+
+    def get_active_name(self) -> str | None:
+        if self._group is not None:
+            return self._group.get_active_name()
+        for name, button in self._buttons.items():
+            if button.get_active():
+                return name
+        return None
+
+    def set_active_name(self, name: str) -> None:
+        if self._group is not None:
+            self._group.set_active_name(name)
+        elif name in self._buttons:
+            self._buttons[name].set_active(True)
+
+
 def attach_context_menu(
     widget: Gtk.Widget, build_actions: Callable[[], list[tuple[str, Callable[[], None]]]]
 ) -> None:

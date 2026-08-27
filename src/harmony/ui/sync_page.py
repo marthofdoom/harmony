@@ -14,7 +14,12 @@ from gi.repository import Adw, Gtk  # noqa: E402
 from harmony.models import Playlist, Service  # noqa: E402
 from harmony.tasks import CancelToken, on_main, run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
-from harmony.ui.widgets import ProgressDialog, missing_layer_status_page, status_page  # noqa: E402
+from harmony.ui.widgets import (  # noqa: E402
+    ProgressDialog,
+    SegmentedToggle,
+    missing_layer_status_page,
+    status_page,
+)
 
 log = logging.getLogger(__name__)
 
@@ -103,11 +108,8 @@ class SyncPage(Gtk.Box):
         box.append(row)
 
         direction_row = Gtk.Box(spacing=8)
-        self.direction_toggle = Adw.ToggleGroup()
-        for name, label in _DIRECTIONS:
-            self.direction_toggle.add(Adw.Toggle(name=name, label=label))
         default_name = _SETTINGS_DIRECTION_TO_ENUM.get(self.state.settings.default_direction, "TWO_WAY")
-        self.direction_toggle.set_active_name(default_name)
+        self.direction_toggle = SegmentedToggle(list(_DIRECTIONS), active=default_name)
         direction_row.append(self.direction_toggle)
         box.append(direction_row)
 
