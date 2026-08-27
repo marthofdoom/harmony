@@ -17,13 +17,26 @@ import logging
 from collections.abc import Callable
 from typing import NamedTuple
 
-import gi
-
-gi.require_version("Gst", "1.0")
-
-from gi.repository import Gst  # noqa: E402
-
 log = logging.getLogger(__name__)
+
+# GStreamer is loaded lazily on first LocalPlayer construction, not at import
+# time: the module must stay importable where GStreamer's typelib is absent
+# (e.g. the offline CI smoke test), and "This computer" playback is optional.
+Gst = None
+
+
+def _ensure_gst() -> object:
+    """Import + init GStreamer once, exposing it as the module-level ``Gst``."""
+    global Gst
+    if Gst is None:
+        import gi
+
+        gi.require_version("Gst", "1.0")
+        from gi.repository import Gst as _Gst
+
+        _Gst.init(None)
+        Gst = _Gst
+    return Gst
 
 
 class LocalStatus(NamedTuple):
@@ -44,7 +57,7 @@ class LocalPlayer:
         on_eos: Callable[[], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> None:
-        Gst.init(None)
+        _ensure_gst()
         self._on_eos = on_eos
         self._on_error = on_error
         self._headers: dict[str, str] = {}
