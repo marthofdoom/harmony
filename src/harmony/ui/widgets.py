@@ -31,7 +31,10 @@ from harmony.models import Playlist, Track  # noqa: E402
 # opens, refreshed on every right-click; the timestamp guards against a stale
 # entry anchoring a much-later picker (e.g. a toolbar button).
 _last_context: tuple[Gtk.Widget, Gdk.Rectangle, float] | None = None
-_CONTEXT_TTL_S = 1.5
+# Generous: a context menu can sit open while the user reads it before picking
+# an action that opens a picker. Still one-shot + refreshed per right-click, so a
+# stale entry can't hijack a later picker.
+_CONTEXT_TTL_S = 30.0
 
 log = logging.getLogger(__name__)
 
@@ -203,6 +206,13 @@ def open_list_popover(
     popover.set_parent(anchor)
     if rect is not None:
         popover.set_pointing_to(rect)
+    else:
+        # No click anchor (a stale context, or a picker opened from a toolbar
+        # button): point at the TOP of the parent so a tall parent can never
+        # push the popover off the bottom of the screen.
+        top = Gdk.Rectangle()
+        top.x, top.y, top.width, top.height = max(1, anchor.get_width() // 2), 1, 1, 1
+        popover.set_pointing_to(top)
     popover.connect("closed", lambda p: p.unparent())
     popover.popup()
 
