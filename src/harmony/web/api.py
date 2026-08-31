@@ -191,10 +191,9 @@ class Engine:
         "ytmusic_auth_kind", "ytmusic_oauth_client_id",
     )
 
-    def export_credentials(self) -> dict[str, Any]:
+    def _collect_credentials(self) -> dict[str, Any]:
         """Everything a full instance needs to become an independent credential
-        holder. Sensitive — the route only serves this to a key-matching caller,
-        and refuses entirely when no personal key is set."""
+        holder: the secrets, provider settings, and the YouTube auth file."""
         from pathlib import Path
 
         from harmony.config import CredentialStore, Settings
@@ -210,6 +209,19 @@ class Engine:
                 pass
         settings = {f: getattr(s, f) for f in self._CRED_SETTINGS if hasattr(s, f)}
         return {"secrets": secrets, "settings": settings, "ytmusic_auth": yt_auth}
+
+    def export_credentials(self) -> dict[str, Any]:
+        """Encrypted envelope of the credentials, keyed by the personal key — so
+        the secrets are confidential on the wire even over plain HTTP. Only a
+        holder of the matching key can decrypt it (and the route already refuses
+        callers without it)."""
+        from harmony.config import Settings
+        from harmony.cryptobox import encrypt_json
+
+        key = Settings.load().personal_key
+        if not key:
+            raise ProviderError("a personal key is required to share credentials")
+        return encrypt_json(self._collect_credentials(), key)
 
     def import_credentials(self, data: dict[str, Any]) -> dict[str, Any]:
         """Write credentials pulled from a peer into this instance's own store."""
@@ -233,22 +245,31 @@ class Engine:
         return {"ok": True, "imported": sorted((data.get("secrets") or {}).keys())}
 
     def adopt_from_peer(self, host: str, port: int) -> dict[str, Any]:
-        """Pull a peer's credentials (presenting our key) and store them locally."""
+        """Pull a peer's (encrypted) credentials, decrypt with our personal key,
+        and store them locally."""
         import requests
 
         from harmony.config import Settings
+        from harmony.cryptobox import decrypt_json
 
         key = Settings.load().personal_key or None
-        headers = {"X-Harmony-Key": key} if key else {}
+        if not key:
+            raise ProviderError("set a personal key before adopting credentials.")
         try:
             resp = requests.get(f"http://{host}:{port}/api/credentials/export",
-                                headers=headers, timeout=10)
+                                headers={"X-Harmony-Key": key}, timeout=10)
         except requests.RequestException as exc:
             raise ProviderError(f"couldn't reach peer {host}:{port}: {exc}") from exc
         if resp.status_code in (401, 403):
             raise ProviderError("peer refused — set the same personal key on both instances.")
         resp.raise_for_status()
-        return self.import_credentials(resp.json())
+        try:
+            payload = decrypt_json(resp.json(), key)
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(
+                "couldn't decrypt the peer's credentials — the personal keys don't match."
+            ) from exc
+        return self.import_credentials(payload)
 
     def maybe_adopt_credentials(self) -> dict[str, Any]:
         """If this instance has a key but no working accounts, adopt from the
