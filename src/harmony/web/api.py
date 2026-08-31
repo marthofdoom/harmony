@@ -216,6 +216,48 @@ class Engine:
             tracks = prov.get_playlist_tracks(playlist_id)
         return {"tracks": [track_to_dict(t) for t in tracks]}
 
+    # -- playlist editing ---------------------------------------------------
+
+    def create_playlist(self, service_value: str, title: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            pl = prov.create_playlist(title)
+        return {"playlist": playlist_to_dict(pl)}
+
+    def add_tracks(self, service_value: str, playlist_id: str, track_ids: list[str]) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            prov.add_tracks(playlist_id, track_ids)
+        return {"ok": True, "added": len(track_ids)}
+
+    def remove_tracks(self, service_value: str, playlist_id: str, track_ids: list[str]) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            prov.remove_tracks(playlist_id, track_ids)
+        return {"ok": True, "removed": len(track_ids)}
+
+    def rename_playlist(self, service_value: str, playlist_id: str, title: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            prov.rename_playlist(playlist_id, title)
+        return {"ok": True, "title": title}
+
+    def delete_playlist(self, service_value: str, playlist_id: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            prov.delete_playlist(playlist_id)
+        return {"ok": True}
+
     # -- streaming ----------------------------------------------------------
 
     def resolve(self, service_value: str, track_id: str) -> dict[str, Any]:

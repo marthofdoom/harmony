@@ -109,6 +109,25 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             if parts == ["api", "preferences"]:
                 self._send_json(engine.set_preferences(personal_key=body.get("personal_key")))
+            elif parts == ["api", "playlists"]:
+                service = (body.get("service") or "").strip()
+                title = (body.get("title") or "").strip()
+                if not service or not title:
+                    self._send_json({"error": "missing service or title"}, status=400)
+                    return
+                self._send_json(engine.create_playlist(service, title))
+            elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] in ("add", "remove"):
+                ids = body.get("track_ids") or []
+                op = engine.add_tracks if parts[4] == "add" else engine.remove_tracks
+                self._send_json(op(parts[2], parts[3], ids))
+            elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "rename":
+                title = (body.get("title") or "").strip()
+                if not title:
+                    self._send_json({"error": "missing title"}, status=400)
+                    return
+                self._send_json(engine.rename_playlist(parts[2], parts[3], title))
+            elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "delete":
+                self._send_json(engine.delete_playlist(parts[2], parts[3]))
             elif parts == ["api", "accounts", "qobuz", "token"]:
                 token = (body.get("token") or "").strip()
                 if not token:
