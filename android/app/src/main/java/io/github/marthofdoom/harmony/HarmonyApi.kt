@@ -4,6 +4,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -24,6 +25,16 @@ data class Track(
 )
 
 data class Account(val service: String, val authenticated: Boolean, val account: String?, val stale: Boolean)
+
+data class Playlist(val service: String, val id: String, val title: String,
+                    val trackCount: Int?, val artworkUrl: String?)
+
+data class Device(val host: String, val name: String, val kind: String)
+
+data class SyncPlan(val token: String?, val adds: Int, val removes: Int,
+                    val unmatched: Int, val notes: List<String>)
+
+data class SyncResult(val added: Int, val removed: Int, val failed: Int)
 
 /** Blocking HTTP client for a Harmony instance's API. Call from a background
  *  dispatcher. Every request carries the personal key (if set) so a key-gated
@@ -123,6 +134,83 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         val keyParam = key?.takeIf { it.isNotEmpty() }?.let { "?key=" + URLEncoder.encode(it, "UTF-8") } ?: ""
         return url("/api/audio/monitor$keyParam")
     }
+
+    // -- playlists / library ------------------------------------------------
+
+    fun playlists(): List<Playlist> {
+        val arr = JSONObject(get("/api/playlists")).optJSONArray("playlists") ?: return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Playlist(o.getString("service"), o.getString("id"), o.optString("title"),
+                if (o.isNull("track_count")) null else o.optInt("track_count"),
+                o.optString("artwork_url").ifEmpty { null })
+        }
+    }
+
+    fun createPlaylist(service: String, title: String) {
+        post("/api/playlists", JSONObject().put("service", service).put("title", title))
+    }
+
+    fun renamePlaylist(service: String, id: String, title: String) {
+        post("/api/playlists/${enc(service)}/${enc(id)}/rename", JSONObject().put("title", title))
+    }
+
+    fun deletePlaylist(service: String, id: String) {
+        post("/api/playlists/${enc(service)}/${enc(id)}/delete", JSONObject())
+    }
+
+    fun addTracks(service: String, id: String, trackIds: List<String>) {
+        post("/api/playlists/${enc(service)}/${enc(id)}/add", JSONObject().put("track_ids", JSONArray(trackIds)))
+    }
+
+    fun removeTracks(service: String, id: String, trackIds: List<String>) {
+        post("/api/playlists/${enc(service)}/${enc(id)}/remove", JSONObject().put("track_ids", JSONArray(trackIds)))
+    }
+
+    // -- sync ---------------------------------------------------------------
+
+    fun syncPlan(src: Pair<String, String>, tgt: Pair<String, String>, direction: String): SyncPlan {
+        val body = JSONObject()
+            .put("source", JSONObject().put("service", src.first).put("id", src.second))
+            .put("target", JSONObject().put("service", tgt.first).put("id", tgt.second))
+            .put("direction", direction)
+        val o = JSONObject(post("/api/sync/plan", body))
+        val notes = o.optJSONArray("notes")?.let { (0 until it.length()).map { i -> it.getString(i) } } ?: emptyList()
+        return SyncPlan(o.optString("token").ifEmpty { null }, o.optInt("adds"),
+            o.optInt("removes"), o.optInt("unmatched"), notes)
+    }
+
+    fun syncApply(token: String): SyncResult {
+        val o = JSONObject(post("/api/sync/apply", JSONObject().put("token", token)))
+        return SyncResult(o.optInt("added"), o.optInt("removed"), o.optInt("failed"))
+    }
+
+    // -- cast to a hub device ----------------------------------------------
+
+    fun devices(): List<Device> {
+        val arr = JSONObject(get("/api/devices")).optJSONArray("devices") ?: return emptyList()
+        return (0 until arr.length()).map { i ->
+            val o = arr.getJSONObject(i)
+            Device(o.getString("host"), o.optString("name").ifEmpty { o.getString("host") },
+                o.optString("kind").ifEmpty { "device" })
+        }
+    }
+
+    fun castPlay(host: String, track: Track) {
+        val meta = JSONObject().put("title", track.title).put("artist", track.artist)
+            .put("album", track.album ?: JSONObject.NULL).put("art_url", track.artworkUrl ?: JSONObject.NULL)
+            .put("duration_s", track.durationS ?: JSONObject.NULL)
+        post("/api/devices/${enc(host)}/play",
+            JSONObject().put("service", track.service).put("id", track.id).put("meta", meta))
+    }
+
+    fun deviceControl(host: String, action: String, level: Int? = null) {
+        val body = JSONObject()
+        if (level != null) body.put("level", level)
+        post("/api/devices/${enc(host)}/$action", body)
+    }
+
+    private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
     private fun parseTracks(arr: org.json.JSONArray?): List<Track> {
         if (arr == null) return emptyList()
