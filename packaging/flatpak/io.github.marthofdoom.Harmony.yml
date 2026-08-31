@@ -31,6 +31,8 @@ finish-args:
   # written to a host path — import/export uses the file-chooser portal, so no
   # filesystem access is granted here.
   - --talk-name=org.freedesktop.secrets
+  # System-tray icon (StatusNotifierItem): register with the tray host / watcher.
+  - --talk-name=org.kde.StatusNotifierWatcher
   # One-click "Connect YouTube" reads the user's own browser cookies (read-only)
   # to auto-detect a signed-in session -- no DevTools paste. Firefox works
   # directly; Chromium-family cookies are additionally encrypted with a key from

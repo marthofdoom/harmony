@@ -261,8 +261,12 @@ class HarmonyWindow(Adw.ApplicationWindow):
         if route_page is not None and hasattr(route_page, "shutdown"):
             route_page.shutdown()
         # The API server is always on (it's the mesh backend), so closing the
-        # window keeps the app running and serving rather than quitting: minimize
-        # instead of destroy. Re-launching (single-instance) or app.activate
-        # restores it; "Quit" (Ctrl+Q / the primary menu) actually exits.
-        self.minimize()
+        # window keeps the app running rather than quitting. With a system tray,
+        # hide to the tray (right-click → Quit); without one, minimize so it
+        # stays reachable. "Quit" (Ctrl+Q / the primary menu) always exits.
+        app = self.get_application()
+        if app is not None and getattr(app, "has_tray", False):
+            self.set_visible(False)
+        else:
+            self.minimize()
         return True
