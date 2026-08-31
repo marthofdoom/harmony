@@ -75,8 +75,21 @@ class Engine:
             from harmony.providers import build_providers
 
             providers = build_providers(Settings.load(), CredentialStore())
+            # build_providers constructs but does not authenticate; load each
+            # provider's stored credentials (e.g. the Qobuz token) so search and
+            # streaming work -- the desktop does the same warm-up at startup.
+            for svc, prov in providers.items():
+                try:
+                    if prov.has_credentials():
+                        prov.authenticate()
+                except Exception as exc:  # noqa: BLE001 - one service failing is isolated
+                    log.warning("auth warm-up failed for %s: %s", svc.value, exc)
             self._providers = providers
-            log.info("providers ready: %s", [s.value for s in providers])
+            log.info(
+                "providers ready: %s",
+                [f"{s.value}={'authed' if p.is_authenticated else 'signed-out'}"
+                 for s, p in providers.items()],
+            )
         return self._providers
 
     def _provider(self, service_value: str) -> Any | None:
