@@ -24,15 +24,27 @@ const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])));
 const serviceLabel = (s) => ({ ytmusic: "YT Music", qobuz: "Qobuz" }[s] || s);
 
-async function api(path) {
-  const r = await fetch(path);
+let harmonyKey = "";
+try { harmonyKey = localStorage.getItem("harmonyKey") || ""; } catch { harmonyKey = ""; }
+const keyHeaders = (extra) => Object.assign(harmonyKey ? { "X-Harmony-Key": harmonyKey } : {}, extra || {});
+const keyParam = () => (harmonyKey ? `?key=${encodeURIComponent(harmonyKey)}` : "");
+function promptKey() {
+  const k = prompt("This Harmony instance requires a personal key:");
+  if (k) { harmonyKey = k.trim(); try { localStorage.setItem("harmonyKey", harmonyKey); } catch { /* ignore */ } return true; }
+  return false;
+}
+
+async function api(path, _retry) {
+  const r = await fetch(path, { headers: keyHeaders() });
+  if (r.status === 401 && !_retry && promptKey()) return api(path, true);
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
 }
 
-async function apiPost(path, body) {
-  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+async function apiPost(path, body, _retry) {
+  const r = await fetch(path, { method: "POST", headers: keyHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body || {}) });
+  if (r.status === 401 && !_retry && promptKey()) return apiPost(path, body, true);
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
@@ -337,7 +349,7 @@ async function playAt(i) {
       $("np-play").textContent = "⏸";
     } else {
       const r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`);
-      audio.src = `/stream/${r.token}`;
+      audio.src = `/stream/${r.token}${keyParam()}`;
       await audio.play();
     }
   } catch (e) {

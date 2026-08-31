@@ -136,6 +136,19 @@ class Engine:
         s = Settings.load()
         return {"personal_key": s.personal_key}
 
+    def check_key(self, provided: str | None) -> bool:
+        """Authorize a request against the instance's personal key.
+
+        Open when no key is set (the default -- fully public on a trusted
+        network). When a key is set, a client must present the matching key
+        (the mesh's credential-sharing gate); this is how a signed-out app uses
+        an instance whose key it has been given.
+        """
+        from harmony.config import Settings
+
+        required = Settings.load().personal_key
+        return not required or provided == required
+
     def set_preferences(self, personal_key: str | None = None) -> dict[str, Any]:
         from harmony.config import Settings
 
