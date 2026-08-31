@@ -8,6 +8,7 @@ const audio = $("audio");
 const state = {
   queue: [],      // list of track objects currently loaded (search or playlist)
   index: -1,      // index of the playing track within queue
+  playlist: null, // {service, id, title} when viewing an editable playlist, else null
 };
 
 const fmtTime = (s) => {
@@ -37,31 +38,97 @@ async function apiPost(path, body) {
 
 function renderTracks(tracks) {
   const list = $("list");
-  if (!tracks.length) { list.innerHTML = `<p class="hint">No tracks.</p>`; return; }
+  const pl = state.playlist;
+  const toolbar = pl ? `
+    <div class="toolbar-row">
+      <button class="act ghost" id="pl-rename">Rename</button>
+      <button class="act ghost" id="pl-delete">Delete</button>
+    </div>` : "";
+  if (!tracks.length) { list.innerHTML = toolbar + `<p class="hint">No tracks.</p>`; wirePlaylistToolbar(); return; }
   const rows = tracks.map((t, i) => `
     <div class="trow" data-i="${i}">
       <button class="play" title="Play">▶</button>
       <div class="title">${esc(t.title)}<span class="badge">${serviceLabel(t.service)}</span></div>
       <div class="artist">${esc(t.artist)}</div>
       <div class="dur">${fmtTime(t.duration_s)}</div>
+      <div class="rowacts">
+        <button class="mini add" title="Add to playlist">＋</button>
+        ${pl ? `<button class="mini rem" title="Remove from this playlist">✕</button>` : ""}
+      </div>
     </div>`).join("");
-  list.innerHTML = `<div class="tracks">${rows}</div>`;
+  list.innerHTML = toolbar + `<div class="tracks">${rows}</div>`;
   state.queue = tracks;
   list.querySelectorAll(".trow").forEach((row) => {
-    row.querySelector(".play").addEventListener("click", () => playAt(Number(row.dataset.i)));
+    const i = Number(row.dataset.i);
+    row.querySelector(".play").addEventListener("click", () => playAt(i));
+    row.querySelector(".add").addEventListener("click", (e) => openAddMenu(e.currentTarget, tracks[i]));
+    const rem = row.querySelector(".rem");
+    if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
   });
+  wirePlaylistToolbar();
   highlightPlaying();
+}
+
+function wirePlaylistToolbar() {
+  const pl = state.playlist;
+  if (!pl) return;
+  if ($("pl-rename")) $("pl-rename").onclick = async () => {
+    const title = prompt("Rename playlist to:", pl.title); if (!title) return;
+    try { await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/rename`, { title });
+      pl.title = title; $("view-title").textContent = title; loadPlaylistsSilently(); }
+    catch (e) { alert("Rename failed: " + e.message); }
+  };
+  if ($("pl-delete")) $("pl-delete").onclick = async () => {
+    if (!confirm(`Delete playlist “${pl.title}”?`)) return;
+    try { await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/delete`, {});
+      state.playlist = null; setView("playlists"); }
+    catch (e) { alert("Delete failed: " + e.message); }
+  };
+}
+
+async function removeFromPlaylist(track, i) {
+  const pl = state.playlist; if (!pl) return;
+  try {
+    await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/remove`, { track_ids: [track.id] });
+    const rest = state.queue.slice(0, i).concat(state.queue.slice(i + 1));
+    renderTracks(rest);
+  } catch (e) { alert("Remove failed: " + e.message); }
+}
+
+let _playlistCache = null;
+async function loadPlaylistsSilently() { try { _playlistCache = (await api("/api/playlists")).playlists || []; } catch { /* ignore */ } }
+
+async function openAddMenu(anchor, track) {
+  if (!_playlistCache) await loadPlaylistsSilently();
+  document.querySelectorAll(".addmenu").forEach((m) => m.remove());
+  const menu = document.createElement("div");
+  menu.className = "addmenu";
+  menu.innerHTML = (_playlistCache || []).map((p) =>
+    `<div data-service="${esc(p.service)}" data-id="${esc(p.id)}">${esc(p.title)} <span class="s">${serviceLabel(p.service)}</span></div>`).join("")
+    || `<div class="s">No playlists</div>`;
+  document.body.appendChild(menu);
+  const r = anchor.getBoundingClientRect();
+  menu.style.top = `${Math.min(r.bottom, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.max(8, r.left - 180)}px`;
+  menu.querySelectorAll("div[data-service]").forEach((row) => row.addEventListener("click", async () => {
+    try { await apiPost(`/api/playlists/${encodeURIComponent(row.dataset.service)}/${encodeURIComponent(row.dataset.id)}/add`, { track_ids: [track.id] }); }
+    catch (e) { alert("Add failed: " + e.message); }
+    menu.remove();
+  }));
+  setTimeout(() => document.addEventListener("click", () => menu.remove(), { once: true }), 0);
 }
 
 function renderPlaylists(playlists) {
   const list = $("list");
-  if (!playlists.length) { list.innerHTML = `<p class="hint">No playlists. Sign the server in to a service.</p>`; return; }
-  list.innerHTML = `<div class="plgrid">${playlists.map((p) => `
+  const bar = `<div class="toolbar-row"><button class="act" id="pl-new">＋ New playlist</button></div>`;
+  if (!playlists.length) { list.innerHTML = bar + `<p class="hint">No playlists yet.</p>`; $("pl-new").onclick = newPlaylist; return; }
+  list.innerHTML = bar + `<div class="plgrid">${playlists.map((p) => `
     <div class="plcard" data-service="${esc(p.service)}" data-id="${esc(p.id)}">
       ${p.artwork_url ? `<img class="art" src="${esc(p.artwork_url)}" alt="" />` : `<div class="art"></div>`}
       <div class="t">${esc(p.title)}</div>
       <div class="s">${serviceLabel(p.service)} · ${p.track_count ?? "?"} tracks</div>
     </div>`).join("")}</div>`;
+  $("pl-new").onclick = newPlaylist;
   list.querySelectorAll(".plcard").forEach((card) => {
     card.addEventListener("click", () => openPlaylist(card.dataset.service, card.dataset.id, card.querySelector(".t").textContent));
   });
@@ -149,6 +216,7 @@ async function renderAccounts() {
 }
 
 async function doSearch(q) {
+  state.playlist = null;
   $("view-title").textContent = "Search";
   $("list").innerHTML = `<p class="hint">Searching…</p>`;
   try {
@@ -160,16 +228,27 @@ async function doSearch(q) {
 }
 
 async function loadPlaylists() {
+  state.playlist = null;
   $("list").innerHTML = `<p class="hint">Loading playlists…</p>`;
-  try { renderPlaylists((await api("/api/playlists")).playlists || []); }
-  catch (e) { $("list").innerHTML = `<p class="hint">Couldn't load playlists: ${esc(e.message)}</p>`; }
+  try {
+    _playlistCache = (await api("/api/playlists")).playlists || [];
+    renderPlaylists(_playlistCache);
+  } catch (e) { $("list").innerHTML = `<p class="hint">Couldn't load playlists: ${esc(e.message)}</p>`; }
 }
 
 async function openPlaylist(service, id, title) {
+  state.playlist = { service, id, title };
   $("view-title").textContent = title || "Playlist";
   $("list").innerHTML = `<p class="hint">Loading tracks…</p>`;
   try { renderTracks((await api(`/api/playlists/${encodeURIComponent(service)}/${encodeURIComponent(id)}/tracks`)).tracks || []); }
   catch (e) { $("list").innerHTML = `<p class="hint">Couldn't load tracks: ${esc(e.message)}</p>`; }
+}
+
+async function newPlaylist() {
+  const title = prompt("New playlist title:"); if (!title) return;
+  const service = prompt("Service (qobuz or ytmusic):", "qobuz"); if (!service) return;
+  try { await apiPost("/api/playlists", { service: service.trim(), title: title.trim() }); loadPlaylists(); }
+  catch (e) { alert("Create failed: " + e.message); }
 }
 
 async function loadAccounts() {

@@ -140,6 +140,26 @@ class _FakeEngine:
     def resolve(self, service, track_id):
         return {"token": "tok123", "mime": "audio/flac", "label": "FLAC 24/96kHz"}
 
+    def create_playlist(self, service, title):
+        self.calls.append(("create", service, title))
+        return {"playlist": {"id": "new", "title": title, "service": service}}
+
+    def add_tracks(self, service, pid, ids):
+        self.calls.append(("add", service, pid, tuple(ids)))
+        return {"ok": True, "added": len(ids)}
+
+    def remove_tracks(self, service, pid, ids):
+        self.calls.append(("remove", service, pid, tuple(ids)))
+        return {"ok": True, "removed": len(ids)}
+
+    def rename_playlist(self, service, pid, title):
+        self.calls.append(("rename", service, pid, title))
+        return {"ok": True, "title": title}
+
+    def delete_playlist(self, service, pid):
+        self.calls.append(("delete", service, pid))
+        return {"ok": True}
+
     def stream_for(self, token):
         return None  # exercised token path returns 404 in these tests
 
@@ -218,6 +238,38 @@ def test_settings_has_personal_key_field() -> None:
     from harmony.config import Settings
 
     assert Settings().personal_key == ""  # present, empty by default, on all versions
+
+
+# -- playlist editing (POST) -----------------------------------------------------
+
+
+def test_create_playlist(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, body = _post(api_url + "/api/playlists", {"service": "qobuz", "title": "Road"})
+    assert status == 200
+    assert json.loads(body)["playlist"]["title"] == "Road"
+    assert ("create", "qobuz", "Road") in srv._engine.calls
+
+
+def test_create_playlist_missing_title_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/playlists", {"service": "qobuz"})
+    assert exc.value.code == 400
+
+
+def test_add_remove_rename_delete_routes(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _post(api_url + "/api/playlists/qobuz/p1/add", {"track_ids": ["t1", "t2"]})
+    _post(api_url + "/api/playlists/qobuz/p1/remove", {"track_ids": ["t1"]})
+    _post(api_url + "/api/playlists/qobuz/p1/rename", {"title": "New Name"})
+    _post(api_url + "/api/playlists/qobuz/p1/delete", {})
+    calls = srv._engine.calls
+    assert ("add", "qobuz", "p1", ("t1", "t2")) in calls
+    assert ("remove", "qobuz", "p1", ("t1",)) in calls
+    assert ("rename", "qobuz", "p1", "New Name") in calls
+    assert ("delete", "qobuz", "p1") in calls
 
 
 # -- credential management (POST) ------------------------------------------------
