@@ -363,15 +363,26 @@ class Engine:
 
     # -- LAN mesh -----------------------------------------------------------
 
-    def start_mesh(self, port: int, name: str | None = None) -> None:
-        """Advertise this instance and start discovering peers (best-effort)."""
+    def start_mesh(self, port: int, name: str | None = None,
+                   bind_host: str = "0.0.0.0") -> None:  # noqa: S104
+        """Advertise this instance and start discovering peers (best-effort).
+
+        A server bound to loopback isn't reachable on the LAN, so it must not
+        advertise its LAN IP on the mesh (that would make clients discover a
+        dead address). The advertised name includes the port so two instances
+        on one host don't collide on the same mDNS service name.
+        """
         if self._mesh is not None:
             return
         import socket
 
+        if bind_host in ("127.0.0.1", "::1", "localhost"):
+            log.info("server bound to loopback (%s); not advertising on the LAN mesh", bind_host)
+            return
+
         from harmony.mesh import Mesh
 
-        self._mesh = Mesh(name or f"harmony-{socket.gethostname()}", port)
+        self._mesh = Mesh(name or f"harmony-{socket.gethostname()}-{port}", port)
         self._mesh.start()
 
     def instances(self) -> dict[str, Any]:
