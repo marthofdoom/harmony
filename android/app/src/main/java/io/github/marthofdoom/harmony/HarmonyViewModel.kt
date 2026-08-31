@@ -36,12 +36,17 @@ data class UiState(
     val peers: List<Instance> = emptyList(),
     val playingHere: Boolean = false,
     val routeStatus: String? = null,
+    // phone-bridge: relay a hub track to a renderer on the phone's local network
+    val renderers: List<UpnpRenderer> = emptyList(),
+    val discoveringRenderers: Boolean = false,
+    val bridgingTo: String? = null,
 )
 
 class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = Prefs(app)
     private val discovery = Discovery(app)
     private val rtp = RtpReceiver()
+    private val relay = LocalRelay()
     private var api: HarmonyApi? = null
 
     private val _state = MutableStateFlow(UiState())
@@ -91,13 +96,14 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect() {
-        rtp.stop()
+        rtp.stop(); relay.stop()
         api = null
         prefs.baseUrl = null
         player.stop(); player.clearMediaItems()
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
             results = emptyList(), query = "", playback = Playback(),
-            peers = emptyList(), playingHere = false, routeStatus = null)
+            peers = emptyList(), playingHere = false, routeStatus = null,
+            renderers = emptyList(), bridgingTo = null)
     }
 
     fun setQuery(q: String) { _state.value = _state.value.copy(query = q) }
@@ -190,6 +196,68 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // -- phone-bridge: cast a hub track to a local-network renderer ---------
+
+    fun discoverRenderers() {
+        _state.value = _state.value.copy(discoveringRenderers = true)
+        viewModelScope.launch {
+            val found = withContext(Dispatchers.IO) {
+                val wifi = getApplication<Application>()
+                    .getSystemService(android.content.Context.WIFI_SERVICE) as android.net.wifi.WifiManager
+                val lock = wifi.createMulticastLock("harmony-ssdp").apply {
+                    setReferenceCounted(false); acquire()
+                }
+                try { Upnp.discover() } finally { runCatching { lock.release() } }
+            }
+            _state.value = _state.value.copy(renderers = found, discoveringRenderers = false)
+        }
+    }
+
+    /** Relay the current track through the phone to a local renderer, so it plays
+     *  on a device on the phone's LAN even when the hub is VPN-remote. */
+    fun bridgeToRenderer(renderer: UpnpRenderer) {
+        val client = api ?: return
+        val track = _state.value.playback.track
+        if (track == null) {
+            _state.value = _state.value.copy(routeStatus = "Play a track first, then bridge it.")
+            return
+        }
+        player.pause()
+        _state.value = _state.value.copy(routeStatus = "Bridging to ${renderer.name}…")
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val streamUrl = client.streamUrl(track)
+                    val port = relay.start(streamUrl)
+                    val ip = localIpTowards(renderer.host)
+                    if (ip.isEmpty()) error("no local route to ${renderer.host}")
+                    if (!Upnp.setUriAndPlay(renderer, "http://$ip:$port/stream")) {
+                        error("the renderer rejected the stream")
+                    }
+                }
+            }
+            res.onSuccess {
+                _state.value = _state.value.copy(bridgingTo = renderer.name,
+                    routeStatus = "Playing on ${renderer.name}.")
+            }.onFailure {
+                relay.stop()
+                _state.value = _state.value.copy(bridgingTo = null,
+                    routeStatus = "Bridge failed: ${it.message}")
+            }
+        }
+    }
+
+    fun stopBridge() {
+        val target = _state.value.bridgingTo?.let { name -> _state.value.renderers.firstOrNull { it.name == name } }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                target?.let { runCatching { Upnp.stop(it) } }
+                relay.stop()
+            }
+            _state.value = _state.value.copy(bridgingTo = null, routeStatus = "Bridge stopped.")
+        }
+    }
+
     private fun hostOf(baseUrl: String): String =
         baseUrl.removePrefix("http://").removePrefix("https://").substringBefore(":").substringBefore("/")
 
@@ -219,6 +287,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     override fun onCleared() {
         rtp.stop()
+        relay.stop()
         discovery.stop()
         player.release()
         super.onCleared()

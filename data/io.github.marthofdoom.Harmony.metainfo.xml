@@ -43,6 +43,23 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.9b" date="2026-08-31">
+      <description>
+        <p>Alpha follow-up — federation fixes, a polished phone client, and the
+        phone audio bridge:</p>
+        <ul>
+          <li>The Android client shows album art, has a cleaner Now Playing and
+          search, and can bridge audio: play a hub track on a UPnP/DLNA device
+          on the phone's own network by relaying the stream through the phone —
+          so it works even when the hub is reached over a VPN.</li>
+          <li>Fixes: "Play on this phone" now actually works (the RTP sender was
+          mis-configured); instances advertise all their addresses (LAN + VPN)
+          so roaming clients find a reachable one; expired stream URLs are
+          re-resolved instead of failing a late seek; inter-instance routing
+          negotiates a matching transport.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.9a" date="2026-08-31">
       <description>
         <p>Alpha bundle — first release carrying every client + package
