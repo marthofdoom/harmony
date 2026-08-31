@@ -4,63 +4,51 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Harmony</title>
-  <style>
-    :root { color-scheme: light dark; --bg:#fafafb; --fg:#1d1d20; --muted:#6b6b72;
-            --card:#ffffff; --accent:#3584e4; --border:#e0e0e3; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg:#1d1d20; --fg:#f2f2f4; --muted:#a0a0a8; --card:#2a2a2e; --border:#3a3a40; }
-    }
-    * { box-sizing: border-box; }
-    body { margin:0; font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;
-           background:var(--bg); color:var(--fg); }
-    header { display:flex; align-items:center; gap:.6rem; padding:1rem 1.25rem;
-             border-bottom:1px solid var(--border); }
-    header h1 { font-size:1.1rem; margin:0; font-weight:650; }
-    header .dot { width:.6rem; height:.6rem; border-radius:50%; background:var(--muted); }
-    header .dot.ok { background:#2ec27e; }
-    header .dot.bad { background:#e01b24; }
-    main { max-width:820px; margin:0 auto; padding:1.5rem 1.25rem; }
-    .card { background:var(--card); border:1px solid var(--border); border-radius:12px;
-            padding:1.1rem 1.25rem; margin-bottom:1rem; }
-    .muted { color:var(--muted); }
-    code { background:rgba(128,128,128,.15); padding:.1em .4em; border-radius:5px; }
-    h2 { font-size:.95rem; margin:0 0 .5rem; }
-  </style>
+  <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
-  <header>
-    <span class="dot" id="status-dot" title="server status"></span>
-    <h1>Harmony</h1>
-    <span class="muted" id="version"></span>
-  </header>
-  <main>
-    <div class="card">
-      <h2>Server is running</h2>
-      <p class="muted">This is the Harmony web client shell (slice 1). Search,
-      playlists, and in-browser playback land in the next slices — each backed by
-      the same HTTP API the mobile app will use.</p>
+  <nav id="sidebar">
+    <div class="brand"><span class="logo">🎵</span> Harmony</div>
+    <ul id="nav">
+      <li data-view="search" class="active">🔍 Search</li>
+      <li data-view="playlists">≣ Playlists</li>
+      <li class="disabled">✧ Discover</li>
+      <li class="disabled">⟳ Sync</li>
+      <li class="disabled">📻 Devices</li>
+    </ul>
+    <div id="accounts"></div>
+  </nav>
+
+  <section id="content">
+    <div id="topbar">
+      <h2 id="view-title">Search</h2>
+      <form id="search" autocomplete="off">
+        <input id="search-input" type="search" placeholder="Search songs, playlists…" />
+      </form>
     </div>
-    <div class="card">
-      <h2>Status</h2>
-      <p id="health" class="muted">checking…</p>
+    <div id="list"><p class="hint">Search for a song, or open your playlists.</p></div>
+  </section>
+
+  <footer id="nowplaying" class="empty">
+    <img id="np-art" alt="" />
+    <div id="np-meta">
+      <div id="np-title">Nothing playing</div>
+      <div id="np-artist"></div>
     </div>
-  </main>
-  <script>
-    async function refresh() {
-      const dot = document.getElementById('status-dot');
-      try {
-        const r = await fetch('/healthz');
-        const j = await r.json();
-        dot.classList.add('ok');
-        document.getElementById('version').textContent = 'v' + j.version;
-        document.getElementById('health').textContent =
-          `${j.service} ${j.version} — ${j.status}`;
-      } catch (e) {
-        dot.classList.add('bad');
-        document.getElementById('health').textContent = 'unreachable: ' + e;
-      }
-    }
-    refresh();
-  </script>
+    <div id="np-transport">
+      <button id="np-prev" title="Previous">⏮</button>
+      <button id="np-play" class="play" title="Play/Pause">▶</button>
+      <button id="np-next" title="Next">⏭</button>
+    </div>
+    <div id="np-seekwrap">
+      <span class="time" id="np-pos">0:00</span>
+      <input id="np-seek" type="range" min="0" max="1" step="1" value="0" />
+      <span class="time" id="np-dur">0:00</span>
+    </div>
+    <input id="np-vol" type="range" min="0" max="100" value="100" title="Volume" />
+    <audio id="audio"></audio>
+  </footer>
+
+  <script src="/app.js"></script>
 </body>
 </html>

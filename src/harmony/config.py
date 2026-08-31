@@ -268,6 +268,14 @@ class CredentialStore:
         return self._backend_ok
 
     def get(self, key: str) -> str | None:
+        # Environment injection wins: a server/container can supply secrets as
+        # ``HARMONY_<KEY>`` without a keyring or a file on disk (used to seed a
+        # headless instance). The credential keys use dotted names
+        # (``qobuz.user_auth_token``); the env var uppercases them and replaces
+        # ``.``/``-`` with ``_`` → ``HARMONY_QOBUZ_USER_AUTH_TOKEN``.
+        env = os.environ.get("HARMONY_" + key.upper().replace(".", "_").replace("-", "_"))
+        if env:
+            return env
         if self._backend_ok:
             try:
                 import keyring

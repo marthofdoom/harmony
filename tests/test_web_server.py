@@ -52,10 +52,10 @@ def test_root_serves_the_web_app_shell(base_url: str) -> None:
     assert b"<title>Harmony</title>" in body
 
 
-def test_unknown_api_route_is_501_not_implemented(base_url: str) -> None:
+def test_unknown_api_route_is_404(base_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
-        _get(base_url + "/api/search")
-    assert exc.value.code == 501
+        _get(base_url + "/api/bogus")
+    assert exc.value.code == 404
 
 
 def test_path_traversal_is_blocked(base_url: str) -> None:
@@ -82,3 +82,109 @@ def test_is_public_bind() -> None:
     assert _is_public_bind("::")
     assert not _is_public_bind("127.0.0.1")
     assert not _is_public_bind("100.64.0.1")  # a Tailscale address is not "all interfaces"
+
+
+# -- API routing (fake engine, no providers/network) -----------------------------
+
+
+class _FakeEngine:
+    def accounts(self):
+        return {"accounts": [{"service": "qobuz", "authenticated": True, "account": "me"}]}
+
+    def search(self, q, kinds, limit=25):
+        return {"tracks": [{"id": "t1", "title": f"hit for {q}", "service": "qobuz",
+                            "artist": "A", "album": "Alb", "duration_s": 200, "artwork_url": None}],
+                "albums": [], "artists": [], "playlists": []}
+
+    def playlists(self):
+        return {"playlists": [{"id": "p1", "title": "Fav", "service": "qobuz",
+                               "track_count": 3, "owner": "me", "artwork_url": None}]}
+
+    def playlist_tracks(self, service, pid):
+        if service != "qobuz":
+            raise KeyError(service)
+        return {"tracks": [{"id": "t1", "title": "Song", "service": "qobuz",
+                            "artist": "A", "album": None, "duration_s": 100, "artwork_url": None}]}
+
+    def resolve(self, service, track_id):
+        return {"token": "tok123", "mime": "audio/flac", "label": "FLAC 24/96kHz"}
+
+    def stream_for(self, token):
+        return None  # exercised token path returns 404 in these tests
+
+
+@pytest.fixture
+def api_url(monkeypatch: pytest.MonkeyPatch):
+    import harmony.web.server as srv
+
+    monkeypatch.setattr(srv, "_engine", _FakeEngine())
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), srv.HarmonyHTTPRequestHandler)
+    httpd.daemon_threads = True
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    host, port = httpd.server_address
+    try:
+        yield f"http://{host}:{port}"
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+def test_api_search_returns_tracks(api_url: str) -> None:
+    status, ctype, body = _get(api_url + "/api/search?q=hello")
+    assert status == 200
+    payload = json.loads(body)
+    assert payload["tracks"][0]["title"] == "hit for hello"
+    assert payload["tracks"][0]["service"] == "qobuz"
+
+
+def test_api_search_without_query_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _get(api_url + "/api/search")
+    assert exc.value.code == 400
+
+
+def test_api_accounts_and_playlists(api_url: str) -> None:
+    _, _, acc = _get(api_url + "/api/accounts")
+    assert json.loads(acc)["accounts"][0]["account"] == "me"
+    _, _, pls = _get(api_url + "/api/playlists")
+    assert json.loads(pls)["playlists"][0]["title"] == "Fav"
+
+
+def test_api_playlist_tracks_routing(api_url: str) -> None:
+    _, _, body = _get(api_url + "/api/playlists/qobuz/p1/tracks")
+    assert json.loads(body)["tracks"][0]["id"] == "t1"
+
+
+def test_api_resolve_returns_a_token(api_url: str) -> None:
+    _, _, body = _get(api_url + "/api/resolve?service=qobuz&id=t1")
+    assert json.loads(body)["token"] == "tok123"
+
+
+def test_stream_unknown_token_is_404(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _get(api_url + "/stream/nope")
+    assert exc.value.code == 404
+
+
+# -- serialization ---------------------------------------------------------------
+
+
+def test_credential_store_env_injection(monkeypatch: pytest.MonkeyPatch) -> None:
+    from harmony.config import QOBUZ_TOKEN, CredentialStore
+
+    monkeypatch.setenv("HARMONY_QOBUZ_USER_AUTH_TOKEN", "env-token")
+    assert CredentialStore().get(QOBUZ_TOKEN) == "env-token"  # env wins over keyring/file
+
+
+def test_track_to_dict_shape() -> None:
+    from types import SimpleNamespace
+
+    from harmony.models import Service
+    from harmony.web.api import track_to_dict
+
+    t = SimpleNamespace(id="x", title="T", service=Service.QOBUZ, artist_name="A",
+                        album="Al", duration_s=123, artwork_url="u")
+    d = track_to_dict(t)
+    assert d == {"id": "x", "title": "T", "service": "qobuz", "artist": "A",
+                 "album": "Al", "duration_s": 123, "artwork_url": "u"}
