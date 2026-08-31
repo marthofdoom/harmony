@@ -40,19 +40,18 @@ aspiration — see the legend in the [docs index](README.md). Current release:
 
 ## Planned (sequence)
 
-0. **[Headless server + browser GUI](design/headless-server.md)** — *current top
-   priority.* Run Harmony on a server, holding the credentials, operated from a
-   browser by serving the existing GTK GUI via GTK's Broadway backend (no
-   rewrite). Distributed as a GHCR container, an Arch AUR package, and a `.deb`
-   (not Flatpak, which stays the desktop path). Delivers the credential-holding
-   [federation](design/federation.md) instance first; the Engine HTTP API below
-   moves to its phase 2 (needed only for native/multi-user clients).
+0. **[Harmony server: engine HTTP API + web client](design/headless-server.md)**
+   — *current top priority.* A headless server that holds the credentials and is
+   the backend the **mobile app** (its main use case) and a **web client**
+   authenticate to — the [federation](design/federation.md) home instance. It
+   exposes Harmony's **full featureset** over an HTTP API (the base required by
+   every client) and ships a web GUI on that API with browser audio (the relay
+   already emits browser-playable streams). Distributed as a GHCR container, an
+   Arch AUR package, and a `.deb` (not Flatpak — the desktop path). Absorbs the
+   old "Engine HTTP API" and "Web client" items below.
 1. **Confirm/repair the WebKit token capture** against a live login; add
    cookie/IndexedDB/network-header fallbacks if `localStorage` scanning misses.
-2. **Engine HTTP API** — expose the engine interface over HTTP so a client can
-   consume a remote instance identically to a local one. Precondition for the
-   native/multi-user clients below (phase 2 of the headless server).
-   See [layering](architecture/layering.md).
+2. ~~**Engine HTTP API**~~ — folded into item 0 above.
 3. **Web client** — hosted frontend against the engine API. (Qobuz login there
    is a browser extension or token paste, not embedded WebKit — see
    [auth](design/auth.md).)

@@ -1,205 +1,154 @@
-# Headless server + browser GUI
+# Harmony server: engine HTTP API + web client
 
-**Status: Planned.** Scope for running Harmony as a headless service on a server,
-operated through its **existing GTK GUI served to a browser**, with credentials
-held centrally. This is the reprioritized top of the [roadmap](../roadmap.md):
-the credential-holding instance from [federation](federation.md) built first,
-with a browser-reachable frontend, ahead of further desktop-only work.
+**Status: Planned (current top priority).** A headless server whose primary job
+is to be the **credential-holding backend that the mobile app (and other
+clients) authenticate to** — the [federation](federation.md) "home instance." It
+exposes Harmony's **full current featureset over an HTTP API**, and ships a
+**web client** on that same API so the server is fully usable from a browser,
+audio included. Distributed as a container (GHCR), an Arch AUR package, and a
+`.deb` — not Flatpak, which stays the desktop path.
 
-## Goal
+Supersedes the earlier Broadway idea (serving the GTK GUI to a browser): Broadway
+can't carry audio and can't serve the mobile app, so it's dropped.
 
-Run on a server with no attached display, **hold the Qobuz/YT credentials**, do
-all provider/sync/playback work, cast to LAN devices — and be operated from any
-browser by **mirroring the Flatpak's GUI** (not a separate frontend). It doubles
-as the [federation](federation.md) "home instance" once the native remote clients
-arrive (phase 2).
+## Principles
 
-## The key decision: serve the real GUI, don't rebuild it
+- **The current featureset is the base, required for every client.** Search,
+  playlists (browse + edit), cross-service matching, sync, discover/recommend,
+  enrichment, play/queue, device control — the API must cover all of it so no
+  client (web, mobile, desktop) is second-class. The API surface *is* the engine
+  interface ([ADR 0001](../decisions/0001-engine-frontend-separation.md)).
+- **Credential custody is the point.** Only the server stores Qobuz/YT tokens.
+  Clients authenticate *to the server* and never hold streaming credentials —
+  the [federation](federation.md) model ([ADR 0004](../decisions/0004-federation-for-credential-custody.md)).
+- **Clients own playback.** Each client plays the resolved stream itself (phone
+  audio, browser `<audio>`), so the server stays a stateless-ish facade and we
+  **avoid extracting the playback orchestration out of `AppState`** — the one
+  genuinely hard refactor. Queue/shuffle/repeat/position live client-side.
 
-GTK ships an **HTML5 backend, Broadway** (`broadwayd` + `GDK_BACKEND=broadway`).
-It renders any GTK4/libadwaita app in a browser over a websocket, with **no X or
-Wayland** and **no application changes** — the app connects to `broadwayd` as its
-display, the browser connects to `broadwayd`'s port. So the browser frontend *is*
-the Flatpak GUI, literally.
-
-This makes phase 1 **light on build effort** (no TUI, no web rewrite, no engine
-extraction) and only moderately heavier at runtime (the image carries the GTK
-stack). It's the direct answer to "mirror the Flatpak GUI, and it shouldn't be a
-heavy build."
-
-Frontend options, in order:
-
-1. **GTK Broadway (recommended).** The existing GUI, unchanged, served to the
-   browser. Lightest possible dev effort.
-   - *Caveats to design around:* Broadway is **single-session** (multiple
-     browsers share one mirrored session — fine for a solo home hub, not
-     multi-user); it has **no built-in authentication**; and it's smooth on
-     LAN/Tailscale but sluggish over high-latency links. WebKitGTK (the embedded
-     Qobuz login) may render poorly under Broadway — keep token paste as the
-     reliable path.
-2. **Headless compositor + VNC/noVNC (fallback).** Run the GUI under a headless
-   Wayland compositor (`cage`/`weston --headless`) or `Xvfb`, expose via
-   `wayvnc`/`x11vnc`, and serve `noVNC` in the browser. Heavier (a VNC stack) but
-   robust and multi-session-friendly; still the real GUI. Use if Broadway's
-   limits bite.
-3. **TUI (last resort).** A Textual TUI against the engine, served with
-   `textual serve`. Only if serving the GUI proves genuinely too heavy — Broadway
-   means it shouldn't, so this drops to a contingency, not the plan.
-
-## How it slots into what exists
-
-- [ADR 0001](../decisions/0001-engine-frontend-separation.md) keeps the engine
-  GTK-free, so providers/sync/playback already run headless. Broadway means we
-  **don't need to touch that seam for phase 1** — the whole GTK app (engine +
-  `AppState` + UI) runs as-is under `broadwayd`.
-- Credentials already degrade without a keyring: `CredentialStore` falls back to
-  a `0600` JSON file (see [auth](auth.md)). That's the seam the server hardens.
-- The EngineCore extraction + HTTP API (roadmap item 2, and the precondition for
-  *native* remote clients and multi-user) moves to **phase 2** — no longer on the
-  critical path for "run it on a server, operate from a browser."
-
-## Architecture (phase 1)
+## Architecture
 
 ```
-   browser ── https (proxy/Tailscale) ──▶ broadwayd  ── connects ──▶  Harmony GTK app
-                                          (HTML5 GTK        (unchanged: engine +
-                                           display)          AppState + UI, creds,
-                                                             relay → WiiM/UPnP)
+   web client (browser)  ─┐
+   mobile app            ─┼─ HTTP/WS API ─▶  Harmony server
+   (future) desktop      ─┘   (auth'd)        ├─ engine: providers, matching,
+                                              │   sync, discover, enrich, db
+                                              ├─ relay → stream bytes (Range)
+                                              └─ credentials (server-only)
+                                                   │
+                                            Qobuz / YouTube Music
 ```
 
-`harmony serve` boots `broadwayd` and launches the existing GTK app against it
-(`GDK_BACKEND=broadway`), plus the auth front (below). No new UI code.
+- The API is a **thin HTTP facade over the already-GTK-free engine modules**
+  (`providers`, `sync`, `matching`, `db`, `enrich`, `recommender`, `playback`).
+  Mostly mechanical wrapping, not a rewrite.
+- **Audio:** the relay already emits browser-/client-playable streams (Qobuz
+  FLAC, YouTube AAC/Opus). The server proxies those bytes **same-origin and
+  Range-aware** (the relay already supports Range), so a client points its audio
+  element / player at `GET /stream/<token>` and plays. No transcoding for the
+  common cases.
+- **Casting to LAN devices** (WiiM/UPnP) stays a *server-side* operation via the
+  existing relay + `playback/` — exposed as an API action. The multi-track cast
+  queue (today in `AppState`) is a later slice; single-track cast is trivial.
 
-## Credentials on a server
+## Stack
 
-No Secret Service on a headless box, so the file fallback is the default — but a
-plaintext `0600` file is too weak for a server holding paid-service tokens:
+Chosen for simple distribution (AUR/.deb/container) and local testability:
 
-- **Encrypted secrets backend.** Encrypt the fallback store with a key from
-  `HARMONY_SECRET_KEY` (raw key or scrypt-derived passphrase), a mounted key
-  file, a `systemd` credential, or a Docker/Podman secret. Add it behind
-  `CredentialStore`'s existing `get/set/delete` so no caller changes.
-- **Direct env injection** for container use — `HARMONY_QOBUZ_TOKEN`,
-  `HARMONY_YTMUSIC_HEADERS` — read at startup so a token can come from
-  orchestration and never touch disk.
-- **Onboarding in the served GUI.** Because the real GUI is what's in the
-  browser, existing Preferences → Accounts (token paste, YT OAuth/header paste)
-  works as-is. Embedded WebKit login is best-effort under Broadway; token paste
-  stays the reliable route. A `harmony login` CLI (reusing
-  `scripts/harmony-setup.py`) covers pre-seeding before first boot.
+- **Server:** Python **stdlib threaded HTTP** for the first cut — zero heavy
+  deps, fully unit-testable headless, trivial to package. (Deliberately *not*
+  FastAPI/pydantic: it adds compiled deps that complicate packaging and can't
+  even be built on some dev boxes.) Swap in an ASGI framework later only if scale
+  demands it; the handlers stay small.
+- **Frontend:** **build-free** vanilla JS + CSS (no npm/webpack), so the Python
+  package just ships static assets. Styled to echo the Adwaita look.
+- **Audio:** HTML5 `<audio>` ← the same-origin stream proxy.
+- **Auth:** a server login issuing a client token; every API call and stream
+  fetch is token-gated. This is the [federation](federation.md) instance↔client
+  auth, now on the critical path (was an open question).
 
-## Playback on a headless box
+## API surface (the full featureset)
 
-- Usually **no audio sink**, so "This computer" local playback is off by default
-  (enabled only if a PipeWire/ALSA sink exists).
-- The real path is **casting to LAN devices** via the existing relay
-  (`playback/relay.py`) — headless-friendly, needs `ffmpeg` (YouTube stream-copy)
-  and LAN reachability to the devices.
-- **Route-audio (ROC)** stays optional (heavy native build + needs a sink):
-  a separate image variant / package extra, not the base.
+Grouped; all under `/api`, token-authenticated. Shapes mirror `harmony.models`.
 
-## Auth & exposure (security)
+- **auth** — `POST /auth/login` (→ client token), logout, token check.
+- **accounts** — provider status (authed? account name), and the headless login
+  flows (Qobuz token paste / YT header/OAuth) so the *server* can be seeded.
+- **search** — `GET /search?q=&kinds=` → tracks/albums/artists/playlists.
+- **catalog** — track/album/artist detail, album tracks, artist top/albums.
+- **playlists** — list, get, tracks, create, add, remove, rename, delete.
+- **matching** — find-on-other-service for a track.
+- **sync** — plan (preview) and apply (mirror/clone), with progress over WS/SSE.
+- **discover / recommend / enrich** — similar tracks/artists, recommendations.
+- **stream** — `POST /resolve` (track → playable token + format) and
+  `GET /stream/<token>` (Range-aware byte proxy of the relay).
+- **devices** — list known devices, control (transport/volume), cast a
+  track/collection to a device.
+- **now-playing** — client-owned; the server exposes only device-cast status.
 
-The browser GUI grants full control of the user's accounts, and **Broadway has no
-auth of its own**, so exposure must be gated externally:
+## Slices (each shippable; all permanent, all consumed by mobile too)
 
-- **Front it** with a reverse proxy doing auth + TLS (Caddy/nginx: basic-auth or
-  forward-auth, automatic HTTPS), or run it **only over Tailscale** (bind to the
-  tailnet interface — the expected home-hub deployment, which the user already
-  runs). Never bind `broadwayd` to a public interface directly.
-- Default bind is localhost; `harmony serve --bind` to choose the interface.
-- `redact_secrets` already exists — keep it on all log paths.
+1. **Listen in the browser, end to end.** API: auth, search, `resolve`+`stream`,
+   list/get playlist. Web client: log in → search → browse a playlist → **play a
+   track in the browser** with a real transport bar (play/pause/seek/next,
+   client-side queue). Proves the API + credential custody + browser audio.
+2. **Manage, sync, cast.** Playlist editing, find-on-other, sync plan/apply with
+   progress, cast-to-device; client-side shuffle/repeat/queue.
+3. **Parity.** Discover, AI planner, accounts/prefs management, polish.
 
-## Install & distribution
+The **mobile app** is a separate client built against this same API (its own
+effort), in parallel with or after slice 1 — the server is the shared backend.
 
-Flatpak stays the **desktop** story. Server/native distribution, all **pulling
-full runtime dependencies** (GTK4, libadwaita, PyGObject, gdk broadway backend,
-ffmpeg, yt-dlp, requests/rapidfuzz/ytmusicapi/keyring):
+## Distribution
 
-1. **OCI container → GHCR (primary).** Multi-stage image (Fedora/Debian base with
-   the GTK4 + broadway + libadwaita stack) running `broadwayd` + `harmony serve`
-   + relay deps. One `/data` volume (config, sqlite, encrypted secrets), one port,
-   secrets via env/secret. Published to `ghcr.io/marthofdoom/harmony` from CI on
-   tag; Podman/rootless-friendly; ship a `compose.yaml`:
-   ```
-   docker run -d --name harmony \
-     -p 8085:8085 -v harmony-data:/data \
-     -e HARMONY_SECRET_KEY=... \
-     ghcr.io/marthofdoom/harmony:latest
-   ```
-   A `:route-audio` variant adds the ROC build.
-2. **Arch AUR.** A `PKGBUILD` (`harmony` from the release tarball, and/or
-   `harmony-git`) with full `depends=(python gtk4 libadwaita python-gobject
-   python-ytmusicapi python-requests python-rapidfuzz python-keyring
-   python-platformdirs yt-dlp ffmpeg ...)`, installing the console scripts and a
-   `harmony.service` user unit. Standard native install for Arch servers/desktops.
-3. **Debian `.deb`.** Built in CI (`dpkg-buildpackage` or `fpm`) with proper
-   `Depends:` (`python3, python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1,
-   gir1.2-gdkpixbuf-2.0, ffmpeg, yt-dlp, python3-requests, python3-rapidfuzz,
-   python3-keyring, python3-platformdirs, ...`) so `apt install ./harmony.deb`
-   pulls everything. Ships the systemd unit + desktop file. Publish the `.deb` as
-   a release asset (and optionally an apt repo later).
-4. **pipx (convenience).** `pipx install "harmony[server]"` for non-packaged
-   distros; requires the system GTK4/ffmpeg present. Documented, not primary.
+Full runtime deps in every package (the engine's: ytmusicapi, requests,
+rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
 
-Packaging work: `harmony serve`/`harmony login` console scripts; a `server`
-extra; `Dockerfile` + `compose.yaml`; `PKGBUILD`(s); Debian packaging
-(`debian/` or an `fpm` recipe); the systemd unit; CI jobs to build & publish the
-container (GHCR) and the `.deb` (release asset) on tag. (AUR PKGBUILDs live in the
-AUR, updated per release; CI can lint them.)
+1. **GHCR container (primary)** — `python:3.x-slim` + `ffmpeg` + the engine;
+   runs `harmony serve` (the web+API server). `/data` volume (config, sqlite,
+   encrypted secrets), one port, secrets via env/secret. Published on tag;
+   Podman/rootless; `compose.yaml`.
+2. **Arch AUR** — `PKGBUILD` (`harmony` / `harmony-git`) with full `depends` +
+   a `harmony.service` user unit.
+3. **Debian `.deb`** — built in CI with full `Depends:`; published as a release
+   asset.
+4. **pipx** — convenience for unpackaged distros.
 
-## Config
+`harmony serve` = the web+API server (`--port/--address/--data-dir`, TLS opts).
 
-File + env (no separate headless config UI needed — the GUI is the config UI).
-`Settings` is JSON-backed; add `HARMONY_*` env overrides and a documented `/data`
-layout so a container mount is self-describing. `harmony serve --port/--bind/--data-dir`.
+## Credentials & security
 
-## Phasing
+- **Server-side secrets:** encrypt the keyring-less fallback store with a key
+  from `HARMONY_SECRET_KEY` (passphrase/keyfile/systemd-cred/Docker-secret);
+  allow direct env token injection (`HARMONY_QOBUZ_TOKEN`, …). Headless seeding
+  via the accounts API / a `harmony login` CLI.
+- **Exposure:** the server holds real credentials and controls accounts — require
+  the login token on every call, bind localhost by default, and front with TLS
+  (Caddy/nginx) or run over a private network (Tailscale, which the user runs).
+  `redact_secrets` on all log paths; rate-limit login.
 
-- **Phase 1 — served GUI + native packaging.** `harmony serve` (broadwayd + the
-  existing GTK app); encrypted secrets + env injection; auth/exposure defaults +
-  Tailscale/reverse-proxy docs; GHCR image, AUR PKGBUILD, `.deb`. Delivers the
-  whole "run on a server, holds the creds, operate from a browser (mirroring the
-  Flatpak GUI)" goal with **no new frontend and no engine surgery.**
-- **Phase 2 — engine API + native/multi-user clients.** Extract EngineCore from
-  `AppState` (gi-free orchestrator) and put an HTTP/WebSocket surface in front
-  (roadmap item 2). Then the GTK desktop and a future phone client point at the
-  same server — the [federation](federation.md) model — and multi-user / true
-  web-client become possible beyond Broadway's single-session limit. Instance↔
-  client auth is the open work ([ADR 0004](../decisions/0004-federation-for-credential-custody.md)).
+## What we explicitly avoid (and why it stays small)
+
+- **No `AppState`/EngineCore extraction for client playback** — clients own
+  playback, so the hard orchestration refactor isn't on the critical path. (It
+  returns only if/when the *server itself* needs a rich multi-track cast queue.)
+- **No GTK in the server** — enforced by the existing layering fence; the API
+  imports only engine modules.
+- **No frontend build toolchain** — static assets ship in the package.
 
 ## Testing / CI
 
-- The engine already tests headless (offline job). No new frontend to test in
-  phase 1.
-- Add a **container smoke test**: boot the image, confirm `broadwayd` serves and
-  the GTK app connects (health-check the Broadway HTTP port), on tag.
-- Lint the `PKGBUILD` (`namcap`) and validate the `.deb` (`lintian`) in CI;
-  publish both on tag.
+- API handlers are gi-free and stdlib → unit-testable in the existing offline
+  (no-GTK) job; the layering fence covers the new `harmony/web` (or `harmony/api`)
+  package.
+- Container smoke test (`harmony serve` boots, `/healthz` + an unauthenticated
+  API call respond) on tag; `PKGBUILD`/`.deb` lint.
 
-## Risks & open questions
+## Open questions
 
-- **Broadway single-session + no auth** — fine for a solo home hub behind
-  Tailscale/a proxy; multi-user needs phase 2. Get the exposure defaults right and
-  document them loudly before anyone points it at the internet.
-- **Broadway performance** over high-latency links is mediocre; acceptable on
-  LAN/tailnet. If it's a dealbreaker, the VNC/noVNC fallback is the next rung.
-- **Image size** — carrying GTK4 + libadwaita (+ optional WebKitGTK) is a few
-  hundred MB. Heavier than a TUI image, still a normal app image; keep WebKit and
-  ROC to optional variants.
-- **WebKit embedded login under Broadway** may be janky — token paste is the
-  documented fallback for the server.
-- **Open (phase 2):** EngineCore extraction, instance↔client auth, multi-user —
-  tracked in [federation](federation.md) / ADR 0004.
-
-## Deliverables checklist (phase 1)
-
-- [ ] `harmony serve` — launches `broadwayd` + the GTK app (`GDK_BACKEND=broadway`)
-- [ ] `harmony login` — pre-seed credentials headlessly (reuses `harmony-setup.py`)
-- [ ] encrypted secrets backend + env-injection + `HARMONY_SECRET_KEY`
-- [ ] auth/exposure: bind defaults, reverse-proxy + Tailscale deployment docs
-- [ ] gate "This computer" local playback when no audio sink is present
-- [ ] `Dockerfile` (+ `:route-audio` variant) + `compose.yaml` + GHCR publish CI
-- [ ] Arch `PKGBUILD` (`harmony` / `harmony-git`) with full deps + systemd unit
-- [ ] Debian packaging + `.deb` built and published as a release asset (full `Depends:`)
-- [ ] container smoke test + PKGBUILD/`.deb` lint in CI
+- **Client↔server auth model** — accounts (single-user vs multi), token
+  issuance/revocation, pairing/consent for a phone. Start single-user (one login
+  token) and grow. See [federation](federation.md).
+- **Server-side cast queue** — reuse a small extracted queue helper when slice 2
+  adds multi-track casting from the API.
+- **Discovery** — manual URL first; mDNS for the phone to find a home instance later.

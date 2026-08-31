@@ -39,8 +39,8 @@ def main() -> int:
         handlers=handlers,
     )
 
-    # ``harmony serve``: run headless under GTK's Broadway backend (browser GUI).
-    # Dispatched before importing gi so the serve path controls GDK_BACKEND.
+    # ``harmony serve``: run the headless web + HTTP API server (no GTK).
+    # Dispatched before importing gi so a headless box needs no display stack.
     if len(sys.argv) > 1 and sys.argv[1] == "serve":
         from harmony.server import serve
 
