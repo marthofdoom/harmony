@@ -152,6 +152,8 @@ body {
 #np-seek { flex: 1; accent-color: var(--accent); }
 .time { color: var(--muted); font-size: 12px; font-variant-numeric: tabular-nums; min-width: 2.6rem; }
 #np-vol { width: 90px; accent-color: var(--accent); }
+#np-device { background: var(--card); color: var(--fg); border: 1px solid var(--border);
+             border-radius: 8px; padding: .3rem .4rem; font: inherit; max-width: 140px; }
 #nowplaying.empty { color: var(--muted); }
 
 @media (max-width: 720px) {
