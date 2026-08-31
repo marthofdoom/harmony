@@ -192,9 +192,8 @@ class Settings:
     # discovers instances on the LAN and may use one as its backend (sharing its
     # held credentials) only if the personal keys match. Blank = no key set.
     personal_key: str = ""
-    # Desktop-as-server: run the web/API server + join the LAN mesh from the
-    # desktop app, and keep running (window hidden) when closed. See docs.
-    server_enabled: bool = False
+    # The API server (always on; the mesh backend) binds this port. Changing it
+    # takes effect on next launch.
     server_port: int = 8080
 
     # UI

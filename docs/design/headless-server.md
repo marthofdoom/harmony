@@ -149,12 +149,15 @@ rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
 The GTK desktop app is a first-class server + mesh node, so a desktop box people
 leave running *is* a Harmony instance:
 
-- **Preferences → Network → "Run as a server"** (+ port + personal key) starts the
-  same web/API server in a background thread (`web.server.start_background`) and
-  joins the mesh — identical credential powers to the headless server.
-- **Closing the window keeps it running** (hidden, app `hold()`-ed) while sharing
-  is on; re-launching (single-instance) or activating re-shows it, and **Quit
-  (Ctrl+Q)** actually exits. Off = normal close/quit.
+- **The API server is always on** — the desktop starts it on launch
+  (`web.server.start_background`) and joins the mesh, so a credential-holding
+  desktop is a backend other clients (a phone, another instance) can discover and
+  use. No opt-in toggle; **Preferences → Network** just exposes the port + the
+  personal key. (The desktop stays a native GTK app — the server merely exposes
+  the API; the web UI the same server also serves is incidental to the desktop.)
+- **Closing the window keeps it running** (minimized, app `hold()`-ed) so it keeps
+  serving; re-launching (single-instance) or activating restores it, and **Quit
+  (Ctrl+Q)** exits.
 - The Flatpak grants **read-only browser-profile access** so one-click YouTube
   auto-detect works on the desktop (Firefox directly; Chromium via the login
   keyring). **`zeroconf` must be vendored into the Flatpak manifest** (a
