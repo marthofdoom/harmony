@@ -39,7 +39,7 @@ from harmony.ui.collection_actions import (  # noqa: E402
 )
 from harmony.ui.playlists_page import PlaylistsPage  # noqa: E402
 from harmony.ui.search_page import SearchPage  # noqa: E402
-from harmony.ui.state import AppState  # noqa: E402
+from harmony.ui.state import AppState, PlaybackState  # noqa: E402
 
 # -- shared fixtures --------------------------------------------------------------
 
@@ -90,7 +90,11 @@ class FakeState:
         self._playlists: dict[Service, list[Playlist]] = {}
         self.toasts: list[str] = []
         self.play_calls: list[tuple[list[Track], str]] = []
+        self.emitted: list[tuple] = []
         self.refreshed = False
+
+    def emit(self, name: str, *args: object) -> None:
+        self.emitted.append((name, *args))
 
     def toast(self, text: str) -> None:
         self.toasts.append(text)
@@ -107,7 +111,9 @@ class FakeState:
             self.refreshed = True
         return self._playlists
 
-    def play_tracks_on_device(self, tracks: list[Track], host: str) -> None:
+    def play_tracks_on_device(
+        self, tracks: list[Track], host: str, collection_key: object = None
+    ) -> None:
         self.play_calls.append((list(tracks), host))
 
 
@@ -362,6 +368,7 @@ def fake_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     state._device_session = None
     state._relay = None
     state._now_playing = {}
+    state.playback = PlaybackState()
     state.toasts: list[str] = []
     state.connect("toast", lambda _s, text: state.toasts.append(text))
     return state

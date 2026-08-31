@@ -16,7 +16,7 @@ import gi
 
 gi.require_version("Gtk", "4.0")
 
-from gi.repository import Gtk  # noqa: E402
+from gi.repository import GLib, Gtk  # noqa: E402
 
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
@@ -43,6 +43,11 @@ class NowPlayingBar(Gtk.Box):
         self._track_key: object = None
         self._seeking = False
         self._syncing = False  # guard programmatic set_value against the change handlers
+        self._pending_seek: int | None = None
+        self._seek_commit_id = 0
+        # Locally-interpolated position so the seek bar advances every second
+        # instead of jumping on the ~3s device poll (reconciled on each poll).
+        self._interp_pos: float | None = None
         self._devices: list = []
         self._art_cache: dict[str, object] = {}
 
@@ -84,11 +89,11 @@ class NowPlayingBar(Gtk.Box):
         self._seek = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 1, 1)
         self._seek.set_hexpand(True)
         self._seek.set_draw_value(False)
+        # ``change-value`` fires for every user interaction (drag, trough click,
+        # scroll, keyboard) with the proposed value, and -- unlike a competing
+        # GestureClick -- never gets swallowed by the scale's own drag gesture.
+        # We debounce the actual seek so a drag doesn't spam the device.
         self._seek.connect("change-value", self._on_seek_change)
-        click = Gtk.GestureClick()
-        click.connect("pressed", lambda *_a: setattr(self, "_seeking", True))
-        click.connect("released", self._on_seek_released)
-        self._seek.add_controller(click)
         self.append(self._seek)
         self._dur = Gtk.Label(label="0:00")
         self._dur.add_css_class("caption")
@@ -128,6 +133,9 @@ class NowPlayingBar(Gtk.Box):
         state.connect("devices-changed", lambda *_a: self._reload_devices())
         self._reload_devices()
         self._render()
+        # Advance the seek bar once a second between device polls so time reads
+        # smooth and monotonic instead of stepping every ~3s.
+        GLib.timeout_add_seconds(1, self._tick)
 
     # -- device selector ----------------------------------------------------
 
@@ -154,12 +162,44 @@ class NowPlayingBar(Gtk.Box):
     # -- user actions -------------------------------------------------------
 
     def _on_seek_change(self, _scale: Gtk.Scale, _scroll: object, value: float) -> bool:
-        self._pos.set_label(_fmt(int(value)))  # live label while dragging
-        return False
+        # While the user is scrubbing, keep the label live and hold off the
+        # render loop (``_seeking``); commit the real seek once they settle so a
+        # drag across the bar issues one seek, not one per pixel.
+        self._seeking = True
+        self._pending_seek = int(value)
+        self._interp_pos = float(int(value))
+        self._pos.set_label(_fmt(int(value)))
+        if self._seek_commit_id:
+            GLib.source_remove(self._seek_commit_id)
+        self._seek_commit_id = GLib.timeout_add(220, self._commit_seek)
+        return False  # let the scale move to the new value
 
-    def _on_seek_released(self, *_a: object) -> None:
+    def _commit_seek(self) -> bool:
+        self._seek_commit_id = 0
         self._seeking = False
-        self.state.playback_seek(int(self._seek.get_value()))
+        if self._pending_seek is not None:
+            self.state.playback_seek(self._pending_seek)
+            self._pending_seek = None
+        return GLib.SOURCE_REMOVE
+
+    def _tick(self) -> bool:
+        """Advance the seek bar ~1s/second while playing, between device polls."""
+        pb = self.state.playback
+        if (
+            self._seeking
+            or pb.state != "playing"
+            or pb.track is None
+            or not pb.duration_s
+            or self._interp_pos is None
+        ):
+            return GLib.SOURCE_CONTINUE
+        self._interp_pos = min(self._interp_pos + 1.0, float(pb.duration_s))
+        pos = int(self._interp_pos)
+        self._syncing = True
+        self._seek.set_value(pos)
+        self._syncing = False
+        self._pos.set_label(_fmt(pos))
+        return GLib.SOURCE_CONTINUE
 
     def _on_volume_change(self, _scale: Gtk.Scale, _scroll: object, value: float) -> bool:
         if not self._syncing:
@@ -191,6 +231,11 @@ class NowPlayingBar(Gtk.Box):
             self._artist.set_label(track.artist_name or "")
             self._load_art(getattr(track, "artwork_url", None))
 
+        # Show what "This computer" is actually outputting (bit depth / rate),
+        # a live readout of the highest-quality-stream + bit-perfect work.
+        quality = self.state.local_audio_label()
+        self._art.set_tooltip_text(f"Output: {quality}" if quality else None)
+
         playing = pb.state == "playing"
         self._play.set_icon_name(
             "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
@@ -199,15 +244,19 @@ class NowPlayingBar(Gtk.Box):
         self._prev.set_sensitive(pb.has_prev)
         self._next.set_sensitive(pb.has_next)
 
-        # seek bar (don't fight the user mid-drag)
+        # seek bar (don't fight the user mid-drag). Reconcile the local
+        # interpolation baseline to the freshly-polled position so drift from
+        # the 1s ticker is corrected every poll.
         if not self._seeking:
             duration = pb.duration_s or 0
+            position = pb.position_s or 0
+            self._interp_pos = float(position)
             self._syncing = True
             self._seek.set_range(0, max(1, duration))
-            self._seek.set_value(min(pb.position_s or 0, duration or (pb.position_s or 0)))
+            self._seek.set_value(min(position, duration or position))
             self._syncing = False
             self._seek.set_sensitive(duration > 0)
-            self._pos.set_label(_fmt(pb.position_s))
+            self._pos.set_label(_fmt(position))
             self._dur.set_label(_fmt(pb.duration_s))
 
         # shuffle + repeat

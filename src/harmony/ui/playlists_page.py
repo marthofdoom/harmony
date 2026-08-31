@@ -73,6 +73,9 @@ class PlaylistsPage(Gtk.Box):
         super().__init__(orientation=Gtk.Orientation.VERTICAL)
         self.state = state
         self._selected_playlist: Playlist | None = None
+        # (service, id) -> the playing-indicator icon on that playlist's sidebar
+        # row, so the collection currently feeding the Now Playing bar lights up.
+        self._collection_indicators: dict[tuple[Service, str], Gtk.Widget] = {}
 
         self.paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True,
                                 shrink_start_child=False, shrink_end_child=False)
@@ -82,6 +85,8 @@ class PlaylistsPage(Gtk.Box):
         self.append(self.paned)
 
         self.state.connect("playlists-changed", lambda *_a: self._refresh_playlist_list())
+        self.state.connect("playlist-tracks-changed", self._on_playlist_tracks_changed)
+        self.state.connect("playback-changed", lambda *_a: self._refresh_playing_collection())
         self._refresh_playlist_list()
 
     # -- left pane: playlist list ------------------------------------------
@@ -109,6 +114,7 @@ class PlaylistsPage(Gtk.Box):
         selected_id = self._selected_playlist.id if self._selected_playlist else None
         while row := self.playlist_list.get_row_at_index(0):
             self.playlist_list.remove(row)
+        self._collection_indicators.clear()
         reselect: Gtk.ListBoxRow | None = None
         for service in Service:
             playlists = by_service.get(service, [])
@@ -122,6 +128,11 @@ class PlaylistsPage(Gtk.Box):
             for playlist in playlists:
                 row = Adw.ActionRow(title=playlist.title, subtitle=f"{playlist.track_count or 0} tracks")
                 row.playlist = playlist  # type: ignore[attr-defined]
+                indicator = Gtk.Image.new_from_icon_name("media-playback-start-symbolic")
+                indicator.add_css_class("accent")
+                indicator.set_visible(False)
+                row.add_prefix(indicator)
+                self._collection_indicators[(playlist.service, playlist.id)] = indicator
                 wrapper = Gtk.ListBoxRow(child=row)
                 wrapper.playlist = playlist  # type: ignore[attr-defined]
                 attach_context_menu(row, lambda p=playlist, w=wrapper: self._playlist_row_actions(p, w))
@@ -130,6 +141,13 @@ class PlaylistsPage(Gtk.Box):
                     reselect = wrapper
         if reselect is not None:
             self.playlist_list.select_row(reselect)
+        self._refresh_playing_collection()
+
+    def _refresh_playing_collection(self) -> None:
+        """Light up the sidebar row whose playlist is feeding playback."""
+        active = self.state.playback.collection_key
+        for key, indicator in self._collection_indicators.items():
+            indicator.set_visible(key == active)
 
     def _playlist_row_actions(self, playlist: Playlist, wrapper: Gtk.ListBoxRow) -> list[tuple[str, Callable[[], None]]]:
         actions: list[tuple[str, Callable[[], None]]] = []
@@ -144,7 +162,8 @@ class PlaylistsPage(Gtk.Box):
             actions.append((
                 "Play on Device",
                 lambda: play_collection_on_device(
-                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks
+                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks,
+                    collection_key=(playlist.service, playlist.id),
                 ),
             ))
             actions.append((
@@ -169,6 +188,17 @@ class PlaylistsPage(Gtk.Box):
                 provider.get_playlist_tracks(playlist.id), provider, limit=40
             ),
         )
+
+    def _on_playlist_tracks_changed(self, _state: AppState, playlist: Playlist) -> None:
+        """Reload the tracks pane when the open playlist gains tracks elsewhere."""
+        selected = self._selected_playlist
+        if (
+            selected is not None
+            and playlist is not None
+            and selected.id == playlist.id
+            and selected.service == playlist.service
+        ):
+            self._load_tracks(selected)
 
     def _on_playlist_selected(self, _list: Gtk.ListBox, row: Gtk.ListBoxRow | None) -> None:
         playlist = getattr(row, "playlist", None) if row is not None else None

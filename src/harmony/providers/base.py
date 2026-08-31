@@ -142,12 +142,17 @@ class MusicProvider(ABC):
     @abstractmethod
     def liked_tracks(self, *, limit: int = 500) -> list[Track]: ...
 
-    def resolve_stream(self, track_id: str) -> StreamSource:
+    def resolve_stream(self, track_id: str, *, max_quality: bool = False) -> StreamSource:
         """Resolve a directly-fetchable, device-friendly audio stream for a track.
 
         Returns a time-limited provider URL plus the container/mime and any headers
         the CDN fetch needs. Consumed by the playback relay. Providers that can't
         stream raise NotSupportedError.
+
+        ``max_quality`` asks for the highest tier the track/subscription allows
+        (e.g. Qobuz hi-res FLAC, YouTube's best audio-only stream) rather than
+        the LAN-compatible default. The in-app local player passes it; casting
+        keeps the conservative default so every renderer can decode the result.
         """
         raise NotSupportedError(f"{type(self).__name__} does not support stream resolution")
 

@@ -35,7 +35,7 @@ from harmony.ui import similar_dialog as similar_dialog_module  # noqa: E402
 from harmony.ui.playlists_page import PlaylistsPage  # noqa: E402
 from harmony.ui.search_page import SearchPage  # noqa: E402
 from harmony.ui.similar_dialog import _SimilarDialog, present_similar  # noqa: E402
-from harmony.ui.state import AppState  # noqa: E402
+from harmony.ui.state import AppState, PlaybackState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     TrackObject,
     attach_context_menu,
@@ -76,6 +76,7 @@ def fake_state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     state._device_session = None
     state._relay = None
     state._now_playing = {}
+    state.playback = PlaybackState()
     state.toasts: list[str] = []
     state.connect("toast", lambda _s, text: state.toasts.append(text))
     return state

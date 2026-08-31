@@ -19,6 +19,7 @@ from harmony.ui.widgets import (  # noqa: E402
     attach_context_menu,
     error_status_page,
     missing_layer_status_page,
+    open_list_popover,
     set_stack_status,
     status_page,
 )
@@ -443,12 +444,7 @@ class DiscoverPage(Gtk.Box):
                 found = True
         if not found:
             listbox.append(Adw.ActionRow(title="No playlists yet", sensitive=False))
-        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
-                                       propagate_natural_height=True, width_request=280)
-        popover.set_child(scroller)
-        popover.set_parent(parent)
-        popover.connect("closed", lambda p: p.unparent())
-        popover.popup()
+        open_list_popover(popover, parent, listbox)
 
     def _add_track_to_playlist(self, track: Track, playlist: Playlist) -> None:
         provider = self.state.providers.get(playlist.service)
@@ -489,12 +485,7 @@ class DiscoverPage(Gtk.Box):
 
             row.connect("activated", _pick)
             listbox.append(row)
-        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
-                                       propagate_natural_height=True, width_request=280)
-        popover.set_child(scroller)
-        popover.set_parent(parent)
-        popover.connect("closed", lambda p: p.unparent())
-        popover.popup()
+        open_list_popover(popover, parent, listbox)
 
     def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
         self.state.toast(f"Starting “{track.title}” on {name}…")

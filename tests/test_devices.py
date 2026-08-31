@@ -244,7 +244,7 @@ def test_add_device_survives_a_reload(monkeypatch: pytest.MonkeyPatch, tmp_path)
 class _FakeProvider:
     service = Service.YTMUSIC
 
-    def resolve_stream(self, track_id: str) -> StreamSource:
+    def resolve_stream(self, track_id: str, *, max_quality: bool = False) -> StreamSource:
         return StreamSource(url="http://cdn/stream", mime_type="audio/mp4", container="m4a")
 
 

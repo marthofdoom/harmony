@@ -26,7 +26,7 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 from harmony.errors import NotSupportedError, ProviderError  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
-from harmony.ui.widgets import confirm_dialog, status_page  # noqa: E402
+from harmony.ui.widgets import confirm_dialog, open_list_popover, status_page  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -290,12 +290,7 @@ class DevicesPage(Gtk.Box):
 
             row.connect("activated", _pick)
             listbox.append(row)
-        scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320,
-                                       propagate_natural_height=True, width_request=280)
-        popover.set_child(scroller)
-        popover.set_parent(self.discover_button)
-        popover.connect("closed", lambda p: p.unparent())
-        popover.popup()
+        open_list_popover(popover, self.discover_button, listbox)
 
     # -- status / controls ----------------------------------------------------
 

@@ -49,6 +49,39 @@ class LocalStatus(NamedTuple):
     volume: int | None
 
 
+def _bits_from_format(fmt: str) -> int | None:
+    """Sample width in bits from a GStreamer raw-audio format (S16LE, S24_32LE,
+    F32LE, ...): the first run of digits is the significant bit depth."""
+    digits = ""
+    for ch in fmt:
+        if ch.isdigit():
+            digits += ch
+        elif digits:
+            break
+    return int(digits) if digits else None
+
+
+def _describe_caps(caps: object) -> str | None:
+    """Human-readable summary of a negotiated raw-audio caps, e.g.
+    ``"44.1 kHz · 24-bit · 2ch"``. Returns None if the caps aren't parseable."""
+    if caps is None or caps.get_size() == 0:
+        return None
+    st = caps.get_structure(0)
+    ok_rate, rate = st.get_int("rate")
+    ok_ch, channels = st.get_int("channels")
+    fmt = st.get_string("format") or ""
+    parts: list[str] = []
+    if ok_rate and rate:
+        parts.append(f"{rate / 1000:g} kHz")
+    bits = _bits_from_format(fmt)
+    if bits:
+        kind = "float" if fmt.startswith("F") else "bit"
+        parts.append(f"{bits}-{kind}")
+    if ok_ch and channels:
+        parts.append(f"{channels}ch")
+    return " · ".join(parts) or None
+
+
 class LocalPlayer:
     """A minimal GStreamer ``playbin`` wrapped for Harmony's playback model."""
 
@@ -61,14 +94,16 @@ class LocalPlayer:
         self._on_eos = on_eos
         self._on_error = on_error
         self._headers: dict[str, str] = {}
+        self._sink: object | None = None
+        self._logged_format = False
         self._playbin = Gst.ElementFactory.make("playbin", "harmony-local")
         if self._playbin is None:
             raise RuntimeError("GStreamer playbin is unavailable")
         # Prefer a direct PipeWire sink for the bit-perfect path; fall back to
         # playbin's default (autoaudiosink) if pipewiresink isn't present.
-        sink = Gst.ElementFactory.make("pipewiresink", "harmony-sink")
-        if sink is not None:
-            self._playbin.set_property("audio-sink", sink)
+        self._sink = Gst.ElementFactory.make("pipewiresink", "harmony-sink")
+        if self._sink is not None:
+            self._playbin.set_property("audio-sink", self._sink)
         else:
             log.info("pipewiresink unavailable; using GStreamer's default audio sink")
         self._playbin.connect("source-setup", self._on_source_setup)
@@ -76,6 +111,7 @@ class LocalPlayer:
         bus.add_signal_watch()
         bus.connect("message::eos", self._handle_eos)
         bus.connect("message::error", self._handle_error)
+        bus.connect("message::state-changed", self._handle_state_changed)
 
     def _on_source_setup(self, _playbin: Gst.Element, source: Gst.Element) -> None:
         # Pass any CDN request headers (e.g. a YouTube User-Agent) to the HTTP
@@ -97,10 +133,46 @@ class LocalPlayer:
         if self._on_error is not None:
             self._on_error(str(err))
 
+    def _handle_state_changed(self, _bus: Gst.Bus, msg: Gst.Message) -> None:
+        # Once the top-level pipeline reaches PLAYING the audio format is
+        # negotiated: log the output format once so "highest quality" and any
+        # resampling are verifiable from the log (see audio_info()).
+        if msg.src is not self._playbin or self._logged_format:
+            return
+        _old, new, _pending = msg.parse_state_changed()
+        if new != Gst.State.PLAYING:
+            return
+        info = self.audio_info()
+        if info is not None:
+            self._logged_format = True
+            log.info("Local output negotiated: %s", info)
+
+    def _output_caps(self) -> object | None:
+        """The raw-audio caps actually negotiated into the audio sink -- what's
+        handed to PipeWire. Prefer the real sink pad; fall back to playbin's
+        decoded audio pad if a default sink was substituted."""
+        pad = None
+        if self._sink is not None:
+            pad = self._sink.get_static_pad("sink")
+        if pad is None:
+            try:
+                pad = self._playbin.emit("get-audio-pad", 0)
+            except (TypeError, AttributeError):
+                pad = None
+        if pad is None:
+            return None
+        return pad.get_current_caps()
+
+    def audio_info(self) -> str | None:
+        """Negotiated output format summary (e.g. ``"44.1 kHz · 24-bit · 2ch"``),
+        or None if nothing is playing / caps aren't available yet."""
+        return _describe_caps(self._output_caps())
+
     # -- transport ----------------------------------------------------------
 
     def load_and_play(self, url: str, headers: dict[str, str] | None = None) -> None:
         self._headers = dict(headers or {})
+        self._logged_format = False
         self._playbin.set_state(Gst.State.NULL)
         self._playbin.set_property("uri", url)
         self._playbin.set_state(Gst.State.PLAYING)
