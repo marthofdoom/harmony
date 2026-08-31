@@ -43,6 +43,24 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.6.1" date="2026-08-30">
+      <description>
+        <p>Playback and UI polish:</p>
+        <ul>
+          <li>The Now Playing seek bar now works reliably, with smooth
+          second-by-second progress and a clear message when a track can't be
+          seeked.</li>
+          <li>Right-click pickers (Play on Device / Add to Playlist) open under
+          the pointer and stay on-screen, including for songs inside a
+          playlist.</li>
+          <li>Local playback ("This computer") requests the highest-quality
+          stream a track allows — Qobuz hi-res FLAC, YouTube's best audio — and
+          shows the negotiated output format.</li>
+          <li>Now-playing indicators light up the playlist a track is playing
+          from; a playlist's track view refreshes when tracks are added to it.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.0" date="2026-08-26">
       <description>
         <p>Milestone release. Harmony is now a full music hub, not just a
