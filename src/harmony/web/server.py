@@ -107,7 +107,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         engine = get_engine()
         parts = [unquote(p) for p in parsed.path.strip("/").split("/")]
         try:
-            if parts == ["api", "accounts", "qobuz", "token"]:
+            if parts == ["api", "preferences"]:
+                self._send_json(engine.set_preferences(personal_key=body.get("personal_key")))
+            elif parts == ["api", "accounts", "qobuz", "token"]:
                 token = (body.get("token") or "").strip()
                 if not token:
                     self._send_json({"error": "missing token"}, status=400)
@@ -135,6 +137,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             if parts == ["api", "accounts"]:
                 self._send_json(engine.accounts())
+            elif parts == ["api", "preferences"]:
+                self._send_json(engine.preferences())
             elif parts == ["api", "search"]:
                 q = (query.get("q") or [""])[0].strip()
                 if not q:

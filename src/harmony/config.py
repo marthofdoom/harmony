@@ -187,6 +187,11 @@ class Settings:
     ai_enabled: bool = False
     ai_model: str = "claude-opus-5"
     contact_email: str = ""              # used in the MusicBrainz User-Agent
+    # Personal key: a shared secret the user sets identically on all their
+    # Harmony instances/apps. In the federated mesh, a signed-out client
+    # discovers instances on the LAN and may use one as its backend (sharing its
+    # held credentials) only if the personal keys match. Blank = no key set.
+    personal_key: str = ""
 
     # UI
     window_width: int = 1280

@@ -158,7 +158,17 @@ Beyond the client↔server model, instances should form a **mesh on the LAN**:
 
 - **Discovery** — instances advertise and auto-detect each other on the same
   network (mDNS/zeroconf), so a client (or another instance) finds a home
-  instance without a typed URL.
+  instance without a typed URL. **Active-seeking:** a signed-out app looks for
+  instances on the LAN and offers to use one as its backend.
+- **Personal-key pairing** — the credential-custody control. Every instance/app
+  has a **personal key** in preferences (`Settings.personal_key`) — a shared
+  secret the user sets identically across their devices. An instance shares its
+  held credentials (acts as another client's backend) **only when the personal
+  keys match**. An app with no built-in auth (the default) prompts the user for
+  the key they set on their server/desktop instance. This is on **all versions**
+  and is the resolution of federation's open "pairing/consent" question: a single
+  user-chosen shared secret, not per-user accounts. (The key field ships now; the
+  discovery + match-enforcement lands with the mesh.)
 - **Inter-instance audio routing** — a **Route Audio** tab lets the user toggle
   audio routing *to and from another instance's sinks* (full sinks), reusing the
   existing ROC path (`audio/pipewire.py`, the desktop's route-audio) as a

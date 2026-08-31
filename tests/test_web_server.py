@@ -101,6 +101,13 @@ class _FakeEngine:
     def accounts(self):
         return {"accounts": [{"service": "qobuz", "authenticated": True, "account": "me"}]}
 
+    def preferences(self):
+        return {"personal_key": "k"}
+
+    def set_preferences(self, personal_key=None):
+        self.calls.append(("prefs", personal_key))
+        return {"personal_key": personal_key}
+
     def set_qobuz_token(self, token):
         self.calls.append(("qobuz_token", token))
         return self.accounts()
@@ -189,6 +196,28 @@ def test_stream_unknown_token_is_404(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _get(api_url + "/stream/nope")
     assert exc.value.code == 404
+
+
+# -- preferences (personal key) --------------------------------------------------
+
+
+def test_get_preferences(api_url: str) -> None:
+    _, _, body = _get(api_url + "/api/preferences")
+    assert json.loads(body)["personal_key"] == "k"
+
+
+def test_post_preferences_sets_personal_key(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, _ = _post(api_url + "/api/preferences", {"personal_key": "shared-secret"})
+    assert status == 200
+    assert ("prefs", "shared-secret") in srv._engine.calls
+
+
+def test_settings_has_personal_key_field() -> None:
+    from harmony.config import Settings
+
+    assert Settings().personal_key == ""  # present, empty by default, on all versions
 
 
 # -- credential management (POST) ------------------------------------------------
