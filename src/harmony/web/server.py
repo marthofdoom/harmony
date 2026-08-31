@@ -128,6 +128,18 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.rename_playlist(parts[2], parts[3], title))
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "delete":
                 self._send_json(engine.delete_playlist(parts[2], parts[3]))
+            elif parts == ["api", "sync", "plan"]:
+                src, tgt = body.get("source") or {}, body.get("target") or {}
+                if not src.get("service") or not src.get("id") or not tgt.get("service") or not tgt.get("id"):
+                    self._send_json({"error": "missing source/target service+id"}, status=400)
+                    return
+                self._send_json(engine.sync_plan(src, tgt, body.get("direction") or "a_to_b"))
+            elif parts == ["api", "sync", "apply"]:
+                token = (body.get("token") or "").strip()
+                if not token:
+                    self._send_json({"error": "missing token"}, status=400)
+                    return
+                self._send_json(engine.sync_apply(token))
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "play":
                 service = (body.get("service") or "").strip()
                 track_id = (body.get("id") or "").strip()

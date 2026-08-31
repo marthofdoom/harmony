@@ -150,6 +150,54 @@ function setView(view) {
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
   else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
+  else if (view === "sync") { $("view-title").textContent = "Sync"; renderSync(); }
+}
+
+async function renderSync() {
+  const list = $("list");
+  list.innerHTML = `<p class="hint">Loading playlists…</p>`;
+  let pls = [];
+  try { pls = (await api("/api/playlists")).playlists || []; } catch (e) { list.innerHTML = `<p class="hint">${esc(e.message)}</p>`; return; }
+  const opts = pls.map((p) => `<option value="${esc(p.service)}::${esc(p.id)}">${esc(p.title)} — ${serviceLabel(p.service)}</option>`).join("");
+  list.innerHTML = `
+    <div class="card" style="max-width:640px">
+      <h2>Sync playlists</h2>
+      <p class="muted">Match tracks across services and mirror one playlist onto another.
+      Preview first — nothing is written until you apply.</p>
+      <label class="muted">Source</label><select id="sy-src" style="width:100%">${opts}</select>
+      <label class="muted" style="margin-top:.5rem;display:block">Target</label><select id="sy-tgt" style="width:100%">${opts}</select>
+      <label class="muted" style="margin-top:.5rem;display:block">Direction</label>
+      <select id="sy-dir" style="width:100%">
+        <option value="a_to_b">Mirror source → target</option>
+        <option value="b_to_a">Mirror target → source</option>
+        <option value="two_way">Two-way</option>
+      </select>
+      <div style="margin-top:.75rem;display:flex;gap:.5rem">
+        <button class="act" id="sy-plan">Preview</button>
+        <button class="act" id="sy-apply" disabled>Apply</button>
+      </div>
+      <p id="sy-msg" class="muted"></p>
+    </div>`;
+  let token = null;
+  const parse = (v) => ({ service: v.split("::")[0], id: v.split("::").slice(1).join("::") });
+  $("sy-plan").onclick = async () => {
+    $("sy-msg").textContent = "Planning…"; $("sy-apply").disabled = true; token = null;
+    try {
+      const r = await apiPost("/api/sync/plan", { source: parse($("sy-src").value), target: parse($("sy-tgt").value), direction: $("sy-dir").value });
+      token = r.token;
+      $("sy-msg").textContent = `${r.adds} to add, ${r.removes} to remove, ${r.unmatched} unmatched.` + (r.notes.length ? " " + r.notes.join(" ") : "");
+      $("sy-apply").disabled = false;
+    } catch (e) { $("sy-msg").textContent = "Plan failed: " + e.message; }
+  };
+  $("sy-apply").onclick = async () => {
+    if (!token) return;
+    $("sy-msg").textContent = "Applying…"; $("sy-apply").disabled = true;
+    try {
+      const r = await apiPost("/api/sync/apply", { token });
+      $("sy-msg").textContent = `Added ${r.added}, removed ${r.removed}${r.failed ? ", " + r.failed + " failed" : ""}.`;
+    } catch (e) { $("sy-msg").textContent = "Apply failed: " + e.message; }
+    token = null;
+  };
 }
 
 async function renderAccounts() {
