@@ -36,6 +36,30 @@ def _primary_ipv4() -> str:
         sock.close()
 
 
+def _all_ipv4() -> list[str]:
+    """Every non-loopback IPv4 on this host, so a multi-homed/VPN'd instance
+    advertises all the addresses a client might reach it on — not just the
+    default-route one (which can be the wrong interface). Falls back to the
+    primary address if interface enumeration isn't available."""
+    addrs: list[str] = []
+    try:
+        import ifaddr  # ships with python-zeroconf
+
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                # ifaddr represents IPv4 as a str, IPv6 as a tuple.
+                if isinstance(ip.ip, str) and not ip.ip.startswith("127."):
+                    if ip.ip not in addrs:
+                        addrs.append(ip.ip)
+    except Exception:  # noqa: BLE001
+        pass
+    if not addrs:
+        primary = _primary_ipv4()
+        if primary != "127.0.0.1":
+            addrs.append(primary)
+    return addrs
+
+
 class Mesh:
     """Advertises this instance on ``_harmony._tcp`` and tracks discovered peers.
 
@@ -63,10 +87,11 @@ class Mesh:
             return
         try:
             self._zc = Zeroconf()
+            addresses = [socket.inet_aton(a) for a in _all_ipv4()] or [socket.inet_aton("127.0.0.1")]
             self._info = ServiceInfo(
                 SERVICE_TYPE,
                 self._service_name,
-                addresses=[socket.inet_aton(_primary_ipv4())],
+                addresses=addresses,
                 port=self._port,
                 properties={"name": self._name, "version": __version__},
             )

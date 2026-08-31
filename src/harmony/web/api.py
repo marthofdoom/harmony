@@ -350,9 +350,27 @@ class Engine:
             "headers": dict(source.headers),
             "mime": source.mime_type,
             "at": time.monotonic(),
+            # Keep the source ref so an expired provider/CDN URL (they're signed
+            # for ~minutes) can be re-resolved on a late seek instead of 403ing.
+            "service": service_value,
+            "id": track_id,
         }
         self._prune()
         return {"token": token, "mime": source.mime_type, "label": source.label}
+
+    def refresh_stream(self, token: str) -> dict[str, Any] | None:
+        """Re-resolve a token's provider URL (its CDN URL expired mid-playback)."""
+        meta = self._streams.get(token)
+        if meta is None:
+            return None
+        try:
+            source = self._resolve_source(meta["service"], meta["id"])
+        except Exception as exc:  # noqa: BLE001
+            log.warning("stream refresh failed for %s: %s", meta.get("service"), exc)
+            return None
+        meta.update(url=source.url, headers=dict(source.headers), mime=source.mime_type,
+                    at=time.monotonic())
+        return meta
 
     def _resolve_source(self, service_value: str, track_id: str) -> Any:
         prov = self._provider(service_value)
