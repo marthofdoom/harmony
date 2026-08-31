@@ -59,7 +59,34 @@ class Onboarding:
         self._on_change()
         return self._status()
 
-    # -- YouTube Music: OAuth device-flow (primary, durable) ----------------
+    # -- YouTube Music: auto-detect from a browser on this box (primary) ----
+
+    def ytmusic_autodetect(self, browser: str | None = None) -> dict[str, Any]:
+        """One-click sign-in: grab the session from a signed-in browser on the
+        server's machine (the desktop-as-server case). No Google setup, no paste."""
+        import ytmusicapi
+
+        from harmony import config
+        from harmony.config import Settings
+        from harmony.providers.ytmusic_cookies import autodetect_headers
+
+        headers = autodetect_headers(browser)
+        if not headers:
+            raise RuntimeError(
+                "No signed-in YouTube session found in a browser on this machine. "
+                "Sign in to music.youtube.com in a browser here, then retry -- or "
+                "paste headers under Advanced."
+            )
+        s = Settings.load()
+        path = str(config.config_dir() / "browser.json")
+        ytmusicapi.setup(filepath=path, headers_raw=headers)
+        s.ytmusic_auth_file = path
+        s.ytmusic_auth_kind = "browser"
+        s.save()
+        self._on_change()
+        return self._status()
+
+    # -- YouTube Music: OAuth device-flow (durable, needs a Google client) --
 
     def set_ytmusic_oauth_client(self, client_id: str, client_secret: str) -> dict[str, Any]:
         from harmony import config

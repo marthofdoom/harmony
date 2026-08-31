@@ -129,6 +129,10 @@ class _FakeEngine:
         self.calls.append(("signout", service))
         return self.accounts()
 
+    def ytmusic_autodetect(self, browser=None):
+        self.calls.append(("autodetect", browser))
+        return self.accounts()
+
     def set_ytmusic_oauth_client(self, cid, cs):
         self.calls.append(("oauth_client", cid, cs))
         return {"ok": True}
@@ -446,6 +450,24 @@ def test_post_ytmusic_browser_seeds(api_url: str) -> None:
     status, _ = _post(api_url + "/api/accounts/ytmusic/browser", {"headers": "Cookie: x"})
     assert status == 200
     assert ("yt_browser", "Cookie: x") in srv._engine.calls
+
+
+def test_ytmusic_autodetect_route(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, _ = _post(api_url + "/api/accounts/ytmusic/autodetect", {})
+    assert status == 200
+    assert ("autodetect", None) in srv._engine.calls
+
+
+def test_build_headers_raw_shape() -> None:
+    from harmony.providers.ytmusic_cookies import build_headers_raw
+
+    assert build_headers_raw({"foo": "bar"}) is None  # no SAPISID -> not browser auth
+    h = build_headers_raw({"SAPISID": "xyz", "HSID": "h"})
+    assert "Authorization: SAPISIDHASH " in h
+    assert "Cookie: SAPISID=xyz; HSID=h" in h
+    assert "https://music.youtube.com" in h
 
 
 def test_ytmusic_oauth_flow_routes(api_url: str) -> None:

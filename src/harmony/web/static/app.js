@@ -237,23 +237,23 @@ async function renderAccounts() {
 
       <div class="card">
         <h2>YouTube Music <span class="badge">${y.stale ? "session expired — reconnect" : (y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out")}</span></h2>
-        <p class="muted">Recommended: connect with Google — a durable sign-in that
-        won't silently expire. One-time setup: create a “TV and Limited Input” OAuth
-        client in a Google Cloud project with the YouTube Data API enabled
-        (<a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">open console</a>).</p>
-        <details><summary class="muted">Google OAuth client (one-time)</summary>
-          <input id="yt-cid" type="text" placeholder="Client ID" style="width:100%;margin-top:.4rem" />
-          <input id="yt-cs" type="text" placeholder="Client secret" style="width:100%;margin-top:.4rem" />
-          <div style="margin-top:.4rem"><button class="act ghost" id="yt-client-save">Save client</button></div>
-        </details>
+        <p class="muted">One click — Harmony detects a signed-in YouTube session from
+        a browser on <em>the server's machine</em>. No setup, no pasting. (First,
+        sign in to music.youtube.com in a browser on that machine.)</p>
         <div id="yt-code" class="muted" style="margin:.6rem 0"></div>
         <div style="display:flex;gap:.5rem">
-          <button class="act" id="yt-connect">${y.stale ? "Reconnect" : "Connect YouTube"}</button>
+          <button class="act" id="yt-detect">${y.stale ? "Reconnect" : "Connect YouTube"}</button>
           ${y.authenticated ? `<button class="act ghost" id="yt-out">Sign out</button>` : ""}
         </div>
-        <details style="margin-top:.6rem"><summary class="muted">Advanced: paste browser headers</summary>
-          <textarea id="yt-headers" rows="4" style="width:100%;margin-top:.4rem;font-family:monospace;font-size:12px" placeholder="Cookie: …"></textarea>
+        <details style="margin-top:.6rem"><summary class="muted">Advanced sign-in options</summary>
+          <p class="muted" style="margin-top:.5rem">Paste request headers from a logged-in music.youtube.com tab (DevTools → a request → copy request headers):</p>
+          <textarea id="yt-headers" rows="3" style="width:100%;font-family:monospace;font-size:12px" placeholder="Cookie: …"></textarea>
           <div style="margin-top:.4rem"><button class="act ghost" id="yt-save">Save headers</button></div>
+          <p class="muted" style="margin-top:.7rem">Or Google OAuth — durable, but needs a one-time Google Cloud “TV and Limited Input” client
+          (<a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">console</a>):</p>
+          <input id="yt-cid" type="text" placeholder="Client ID" style="width:100%;margin-top:.3rem" />
+          <input id="yt-cs" type="text" placeholder="Client secret" style="width:100%;margin-top:.3rem" />
+          <div style="margin-top:.4rem;display:flex;gap:.5rem"><button class="act ghost" id="yt-client-save">Save client</button><button class="act ghost" id="yt-connect">Connect via OAuth</button></div>
         </details>
       </div>
 
@@ -280,6 +280,11 @@ async function renderAccounts() {
     const h = $("yt-headers").value.trim(); if (!h) return msg("Paste headers first.");
     try { await apiPost("/api/accounts/ytmusic/browser", { headers: h }); msg("YouTube Music saved.", true); after(); }
     catch (e) { msg("Failed: " + e.message); }
+  };
+  $("yt-detect").onclick = async () => {
+    $("yt-code").textContent = "Detecting a signed-in browser on the server…";
+    try { await apiPost("/api/accounts/ytmusic/autodetect", {}); $("yt-code").textContent = "Connected! ✓"; loadAccounts(); setTimeout(renderAccounts, 800); }
+    catch (e) { $("yt-code").textContent = e.message; }
   };
   $("yt-client-save").onclick = async () => {
     try { await apiPost("/api/accounts/ytmusic/oauth/client", { client_id: $("yt-cid").value, client_secret: $("yt-cs").value }); msg("OAuth client saved.", true); }
