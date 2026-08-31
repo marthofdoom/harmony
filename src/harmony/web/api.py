@@ -70,6 +70,7 @@ class Engine:
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
+        self._onboard: Any | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -159,50 +160,35 @@ class Engine:
         s.save()
         return self.preferences()
 
-    # -- credential management (seed the server; clients share these) -------
+    # -- account onboarding (delegated to harmony.web.onboarding) -----------
+
+    def _onboarding(self) -> Any:
+        if self._onboard is None:
+            from harmony.web.onboarding import Onboarding
+
+            self._onboard = Onboarding(on_change=self._reset_providers, status=self.accounts)
+        return self._onboard
+
+    def _reset_providers(self) -> None:
+        self._providers = None  # force a re-warm with freshly-saved credentials
 
     def set_qobuz_token(self, token: str) -> dict[str, Any]:
-        from harmony import config
-        from harmony.config import CredentialStore, Settings
-
-        settings = Settings.load()
-        settings.qobuz_auth_kind = "token"
-        settings.qobuz_token_saved = True
-        settings.save()
-        CredentialStore().set(config.QOBUZ_TOKEN, token.strip())
-        self._providers = None  # re-warm with the new credential
-        return self.accounts()
+        return self._onboarding().set_qobuz_token(token)
 
     def set_ytmusic_browser(self, headers_raw: str) -> dict[str, Any]:
-        import ytmusicapi
+        return self._onboarding().set_ytmusic_browser(headers_raw)
 
-        from harmony import config
-        from harmony.config import Settings
+    def set_ytmusic_oauth_client(self, client_id: str, client_secret: str) -> dict[str, Any]:
+        return self._onboarding().set_ytmusic_oauth_client(client_id, client_secret)
 
-        settings = Settings.load()
-        path = settings.ytmusic_auth_file or str(config.config_dir() / "browser.json")
-        ytmusicapi.setup(filepath=path, headers_raw=headers_raw)
-        settings.ytmusic_auth_file = path
-        settings.ytmusic_auth_kind = "browser"
-        settings.save()
-        self._providers = None
-        return self.accounts()
+    def ytmusic_oauth_start(self) -> dict[str, Any]:
+        return self._onboarding().ytmusic_oauth_start()
+
+    def ytmusic_oauth_poll(self, poll_token: str) -> dict[str, Any]:
+        return self._onboarding().ytmusic_oauth_poll(poll_token)
 
     def signout(self, service_value: str) -> dict[str, Any]:
-        from harmony import config
-        from harmony.config import CredentialStore, Settings
-
-        settings = Settings.load()
-        if service_value == "qobuz":
-            settings.qobuz_token_saved = False
-            CredentialStore().delete(config.QOBUZ_TOKEN)
-        elif service_value == "ytmusic":
-            settings.ytmusic_auth_file = ""
-        else:
-            raise KeyError(service_value)
-        settings.save()
-        self._providers = None
-        return self.accounts()
+        return self._onboarding().signout(service_value)
 
     # -- queries ------------------------------------------------------------
 

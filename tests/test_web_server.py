@@ -129,6 +129,19 @@ class _FakeEngine:
         self.calls.append(("signout", service))
         return self.accounts()
 
+    def set_ytmusic_oauth_client(self, cid, cs):
+        self.calls.append(("oauth_client", cid, cs))
+        return {"ok": True}
+
+    def ytmusic_oauth_start(self):
+        self.calls.append(("oauth_start",))
+        return {"poll_token": "pt", "user_code": "ABCD-1234", "verification_url": "https://g",
+                "full_url": "https://g?x", "interval": 5, "expires_in": 300}
+
+    def ytmusic_oauth_poll(self, token):
+        self.calls.append(("oauth_poll", token))
+        return {"status": "done", "accounts": []}
+
     def search(self, q, kinds, limit=25):
         return {"tracks": [{"id": "t1", "title": f"hit for {q}", "service": "qobuz",
                             "artist": "A", "album": "Alb", "duration_s": 200, "artwork_url": None}],
@@ -433,6 +446,43 @@ def test_post_ytmusic_browser_seeds(api_url: str) -> None:
     status, _ = _post(api_url + "/api/accounts/ytmusic/browser", {"headers": "Cookie: x"})
     assert status == 200
     assert ("yt_browser", "Cookie: x") in srv._engine.calls
+
+
+def test_ytmusic_oauth_flow_routes(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _post(api_url + "/api/accounts/ytmusic/oauth/client", {"client_id": "cid", "client_secret": "cs"})
+    _, sbody = _post(api_url + "/api/accounts/ytmusic/oauth/start", {})
+    assert json.loads(sbody)["user_code"] == "ABCD-1234"
+    _, pbody = _post(api_url + "/api/accounts/ytmusic/oauth/poll", {"poll_token": "pt"})
+    assert json.loads(pbody)["status"] == "done"
+    calls = srv._engine.calls
+    assert ("oauth_client", "cid", "cs") in calls
+    assert ("oauth_start",) in calls
+    assert ("oauth_poll", "pt") in calls
+
+
+def test_ytmusic_oauth_client_missing_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/accounts/ytmusic/oauth/client", {"client_id": "cid"})
+    assert exc.value.code == 400
+
+
+def test_ytmusic_oauth_poll_once_pending_then_success() -> None:
+    """The shared device-flow poller: None while pending, raw token on success."""
+    from harmony.providers import ytmusic_oauth
+
+    class _Creds:
+        def __init__(self):
+            self.calls = 0
+
+        def token_from_code(self, device_code):
+            self.calls += 1
+            return {"error": "authorization_pending"} if self.calls == 1 else {"access_token": "a"}
+
+    creds = _Creds()
+    assert ytmusic_oauth.poll_once(creds, "dc") is None       # pending
+    assert ytmusic_oauth.poll_once(creds, "dc") == {"access_token": "a"}  # done
 
 
 def test_post_signout_routes_service(api_url: str) -> None:
