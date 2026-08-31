@@ -104,7 +104,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_json({"error": "personal key required"}, status=401)
                 return
-            if path.startswith("/api/"):
+            if path == "/api/audio/monitor":
+                self._handle_monitor()
+            elif path.startswith("/api/"):
                 self._handle_api(path, parse_qs(parsed.query))
             else:
                 self._handle_stream(unquote(path[len("/stream/"):]))
@@ -273,6 +275,43 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - surface engine errors as JSON, don't 500-crash
             log.warning("API error on %s: %s", path, exc)
             self._send_json({"error": str(exc)}, status=502)
+
+    def _handle_monitor(self) -> None:
+        """Stream this machine's live audio output as MP3 (ffmpeg from the
+        default sink's monitor). A light client pulls this to play the hub's
+        audio — reliable over any network, unlike pushed UDP."""
+        import subprocess
+
+        argv = get_engine().audio_monitor_argv()
+        if argv is None:
+            self._send_json({"error": "ffmpeg or a default sink is unavailable"}, status=503)
+            return
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        except OSError as exc:
+            log.warning("monitor ffmpeg failed to start: %s", exc)
+            self._send_json({"error": "couldn't start the audio capture"}, status=502)
+            return
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "audio/mpeg")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            assert proc.stdout is not None
+            while True:
+                chunk = proc.stdout.read(8192)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # client stopped listening
+        finally:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
     def _handle_stream(self, token: str) -> None:
         import requests

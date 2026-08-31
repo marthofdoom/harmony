@@ -117,6 +117,13 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
 
     fun audioStop() { post("/api/audio/stop", JSONObject()) }
 
+    /** Same-origin URL that streams the hub's live audio output as MP3, for the
+     *  phone to pull and play (reliable over any network, unlike pushed UDP). */
+    fun monitorUrl(): String {
+        val keyParam = key?.takeIf { it.isNotEmpty() }?.let { "?key=" + URLEncoder.encode(it, "UTF-8") } ?: ""
+        return url("/api/audio/monitor$keyParam")
+    }
+
     private fun parseTracks(arr: org.json.JSONArray?): List<Track> {
         if (arr == null) return emptyList()
         return (0 until arr.length()).map { i ->

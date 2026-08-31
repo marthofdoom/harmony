@@ -68,6 +68,31 @@ def default_sink() -> str | None:
     return name or None
 
 
+def monitor_ffmpeg_argv(source: str | None = None) -> list[str] | None:
+    """ffmpeg command that captures this machine's live output and encodes it to
+    a streamable MP3 on stdout — the robust way for a light client to *pull* the
+    hub's audio over HTTP (outbound, ExoPlayer-buffered, VPN-friendly) instead of
+    the hub pushing fragile inbound UDP. Returns None if ffmpeg or a sink is
+    missing."""
+    import shutil
+
+    exe = shutil.which("ffmpeg")
+    if exe is None:
+        return None
+    monitor = source
+    if not monitor:
+        sink = default_sink()
+        if not sink:
+            return None
+        monitor = f"{sink}.monitor"
+    return [
+        exe, "-loglevel", "error",
+        "-f", "pulse", "-i", monitor,
+        "-f", "mp3", "-c:a", "libmp3lame", "-b:a", "192k",
+        "-fflags", "+nobuffer", "-",
+    ]
+
+
 def list_sources() -> list[AudioNode]:
     """Input devices (mics, monitors, and network sources once ROC/RTP is up)."""
     return _list("sources")
