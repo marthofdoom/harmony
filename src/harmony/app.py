@@ -25,7 +25,9 @@ class HarmonyApplication(Adw.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.state: AppState | None = None
         self._window: HarmonyWindow | None = None
-        self._httpd: object | None = None  # embedded web server when sharing is on
+        self._httpd: object | None = None  # embedded API server (always on)
+        self._tray: object | None = None
+        self.has_tray = False
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -37,6 +39,22 @@ class HarmonyApplication(Adw.Application):
 
         self._install_actions()
         self.start_server()
+        self._start_tray()
+
+    def _start_tray(self) -> None:
+        try:
+            from harmony.ui.tray import Tray
+
+            self._tray = Tray(APP_ID, APP_NAME, on_activate=self._show_window, on_quit=self.quit)
+            self.has_tray = self._tray.start()
+        except Exception:  # noqa: BLE001 - tray is best-effort
+            log.debug("tray unavailable", exc_info=True)
+            self.has_tray = False
+
+    def _show_window(self) -> None:
+        if self._window is not None:
+            self._window.set_visible(True)
+            self._window.present()
 
     # -- embedded API server (always on; the mesh backend) -------------------
 
@@ -79,6 +97,8 @@ class HarmonyApplication(Adw.Application):
         from harmony import tasks
 
         self.stop_server()
+        if self._tray is not None:
+            self._tray.stop()
         tasks.shutdown(wait=False)
         Adw.Application.do_shutdown(self)
 
