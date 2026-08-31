@@ -43,6 +43,25 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.9a" date="2026-08-31">
+      <description>
+        <p>Alpha bundle — first release carrying every client + package
+        together (desktop &amp; server Flatpak, Debian server package, Android
+        APK):</p>
+        <ul>
+          <li>Inter-instance audio routing: send or receive full system audio
+          between instances over the mesh, with a Music-default / Gaming latency
+          preset. Play another machine's audio here, or send this machine's to
+          it.</li>
+          <li>The web client is now a mobile-friendly, installable PWA — a phone
+          bottom-nav, touch controls, and offline app shell.</li>
+          <li>A headless-server Debian package that runs Harmony as a systemd
+          service.</li>
+          <li>Fix: one unavailable track (no videoId) no longer fails a whole
+          YouTube Music playlist.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.0" date="2026-08-31">
       <description>
         <p>The mesh milestone. Harmony instances now find each other and share
