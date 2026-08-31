@@ -100,17 +100,12 @@ class PreferencesDialog(Adw.PreferencesDialog):
         page = Adw.PreferencesPage(title="Network", name="network",
                                    icon_name="network-server-symbolic")
         group = Adw.PreferencesGroup(
-            title="Share on your network",
-            description="Run Harmony's web + API server so other devices — a phone, a "
-            "browser, another Harmony instance — can use this one as a backend and find "
-            "it on the LAN. Closing the window keeps it running in the background; Quit "
-            "(Ctrl+Q) exits. Keep it on a trusted network or set a personal key.",
+            title="API server",
+            description="Harmony always runs its API server so other devices — a phone, "
+            "another Harmony instance — can discover this one on the LAN and use it as a "
+            "backend. Closing the window keeps it running; Quit (Ctrl+Q) exits. Keep it on "
+            "a trusted network, or set a personal key that clients must present.",
         )
-        self.server_switch = Adw.SwitchRow(title="Run as a server",
-                                           active=self.settings.server_enabled)
-        self.server_switch.connect("notify::active", self._on_server_toggled)
-        group.add(self.server_switch)
-
         self.server_port_row = Adw.SpinRow.new_with_range(1024, 65535, 1)
         self.server_port_row.set_title("Port")
         self.server_port_row.set_value(self.settings.server_port or 8080)
@@ -131,18 +126,6 @@ class PreferencesDialog(Adw.PreferencesDialog):
         group.add(self.personal_key_row)
         page.add(group)
         return page
-
-    def _on_server_toggled(self, row: Adw.SwitchRow, _param: object) -> None:
-        enabled = row.get_active()
-        self.settings.server_enabled = enabled
-        self.settings.save()
-        app = Gtk.Application.get_default()
-        if app is None:
-            return
-        if enabled and hasattr(app, "start_server"):
-            app.start_server()
-        elif not enabled and hasattr(app, "stop_server"):
-            app.stop_server()
 
     def _build_appearance_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(

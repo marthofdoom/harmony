@@ -36,17 +36,18 @@ class HarmonyApplication(Adw.Application):
         apply_theme(self.state.settings.theme)
 
         self._install_actions()
-        if self.state.settings.server_enabled:
-            self.start_server()
+        self.start_server()
 
-    # -- embedded server (desktop-as-server) ---------------------------------
+    # -- embedded API server (always on; the mesh backend) -------------------
 
     def server_running(self) -> bool:
         return self._httpd is not None
 
     def start_server(self) -> None:
-        """Run the web/API server + join the mesh; hold the app so it keeps
-        running when the window is closed."""
+        """Run the HTTP API server + join the LAN mesh. Always on: a
+        credential-holding client is a backend other clients (mobile, another
+        instance) can discover and use. ``hold()`` keeps the app alive so it
+        keeps serving when the window is closed."""
         if self._httpd is not None:
             return
         try:
@@ -54,10 +55,9 @@ class HarmonyApplication(Adw.Application):
 
             port = int(self.state.settings.server_port or 8080)
             self._httpd = start_background("0.0.0.0", port)  # noqa: S104 - reachable-by-default
-            self.hold()  # stay alive with the window hidden
+            self.hold()
         except Exception:
-            log.exception("Failed to start the embedded server")
-            self.state.toast("Couldn't start the server.")
+            log.exception("Failed to start the API server")
 
     def stop_server(self) -> None:
         if self._httpd is None:
@@ -66,7 +66,7 @@ class HarmonyApplication(Adw.Application):
             self._httpd.shutdown()
             self._httpd.server_close()
         except Exception:  # noqa: BLE001
-            log.debug("error stopping embedded server", exc_info=True)
+            log.debug("error stopping API server", exc_info=True)
         self._httpd = None
         self.release()
 
