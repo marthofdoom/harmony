@@ -196,6 +196,17 @@ class TestYTMusicNormalisation:
         with pytest.raises(ProviderError):
             yt_provider._track_from_raw({"title": "No id"})
 
+    def test_tracks_from_raw_list_skips_unavailable(self, yt_provider: YTMusicProvider) -> None:
+        # A playlist row with no videoId (deleted/region-blocked) must be skipped,
+        # not raised — one bad row shouldn't fail the whole playlist.
+        raws = [
+            {"videoId": "v1", "title": "Good"},
+            {"title": "Unavailable"},  # no videoId
+            {"videoId": "v2", "title": "Also good"},
+        ]
+        tracks = yt_provider._tracks_from_raw_list(raws)
+        assert [t.id for t in tracks] == ["v1", "v2"]
+
     def test_album_from_raw(self, yt_provider: YTMusicProvider) -> None:
         raw = {
             "browseId": "MPREb_x",

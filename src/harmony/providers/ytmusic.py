@@ -275,6 +275,30 @@ class YTMusicProvider(MusicProvider):
             raw=raw,
         )
 
+    def _tracks_from_raw_list(
+        self, raws: list[dict[str, Any]], *, fallback_artist: str | None = None
+    ) -> list[Track]:
+        """Map a list of raw entries to tracks, skipping unplayable ones.
+
+        YouTube Music playlists/lists can contain entries with no ``videoId`` --
+        deleted, region-blocked, or otherwise unavailable songs. Those can't be
+        played or matched, so drop them rather than let one bad row raise and
+        fail the whole list.
+        """
+        tracks: list[Track] = []
+        skipped = 0
+        for raw in raws:
+            if not (raw.get("videoId") or raw.get("id")):
+                skipped += 1
+                continue
+            try:
+                tracks.append(self._track_from_raw(raw, fallback_artist=fallback_artist))
+            except ProviderError:
+                skipped += 1
+        if skipped:
+            log.info("Skipped %d unavailable YouTube Music track(s) with no videoId", skipped)
+        return tracks
+
     def _album_from_raw(self, raw: dict[str, Any], *, fallback_artist: str | None = None) -> Album:
         browse_id = raw.get("browseId") or raw.get("id")
         artists = _artist_names(raw.get("artists"))
@@ -358,6 +382,8 @@ class YTMusicProvider(MusicProvider):
         album = self._call(self._yt.get_album, album_id)
         tracks = []
         for raw in album.get("tracks", []):
+            if not (raw.get("videoId") or raw.get("id")):
+                continue  # unavailable album track — can't play or match it
             track = self._track_from_raw(raw, fallback_artist=_album_artist_name(album))
             if track.artwork_url is None:
                 track.artwork_url = _largest_thumbnail(album.get("thumbnails"))
@@ -391,8 +417,7 @@ class YTMusicProvider(MusicProvider):
             raw_tracks = self._call(self._yt.get_playlist, songs["browseId"], limit=limit).get("tracks", [])
         else:
             raw_tracks = songs.get("results", [])
-        tracks = [self._track_from_raw(r, fallback_artist=artist_name) for r in raw_tracks]
-        return tracks[:limit]
+        return self._tracks_from_raw_list(raw_tracks, fallback_artist=artist_name)[:limit]
 
     # -- playlists ----------------------------------------------------------
 
@@ -408,7 +433,7 @@ class YTMusicProvider(MusicProvider):
 
     def get_playlist_tracks(self, playlist_id: str) -> list[Track]:
         raw = self._call(self._yt.get_playlist, playlist_id, limit=None)
-        return [self._track_from_raw(t) for t in raw.get("tracks", [])]
+        return self._tracks_from_raw_list(raw.get("tracks", []))
 
     def create_playlist(self, title: str, description: str = "", public: bool = False) -> Playlist:
         privacy_status = "PUBLIC" if public else "PRIVATE"
@@ -463,7 +488,7 @@ class YTMusicProvider(MusicProvider):
         if not self._authenticated:
             raise AuthError("Sign in to YouTube Music to view your liked songs.")
         raw = self._call(self._yt.get_liked_songs, limit=limit)
-        return [self._track_from_raw(t) for t in raw.get("tracks", [])]
+        return self._tracks_from_raw_list(raw.get("tracks", []))
 
     # -- streaming --------------------------------------------------------
 
