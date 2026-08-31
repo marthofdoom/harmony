@@ -3,9 +3,14 @@
 #
 # A .deb is an `ar` archive of three members, in order: debian-binary,
 # control.tar.gz, data.tar.gz. We assemble it by hand so it builds on any host
-# with binutils + tar (no dpkg-deb needed). The package ships the app source and
-# a systemd unit; postinst builds a private virtualenv and pip-installs the app
-# (Architecture: all — pip fetches the right dep wheels on the target).
+# with binutils + tar (no dpkg-deb needed).
+#
+# Like the Flatpak, the package *vendors its Python dependencies as wheels* so
+# the install is self-contained (offline) — no pip-from-PyPI on the target. We
+# bundle wheels for the common server targets (CPython 3.11/3.12/3.13, x86_64);
+# postinst installs them with `pip --no-index`, and falls back to PyPI if the
+# target's Python/arch isn't among the bundled wheels. Building the wheel set
+# needs network + a pip (bootstrapped here via venv); installing the .deb does not.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -14,7 +19,37 @@ version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' "$root/src/harmony/__init__.p
 stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
-# -- data tree: the installable app source, the unit, a manual wrapper --------
+# Dependencies to vendor (runtime + the [server] extra). pip resolves the
+# transitive set (urllib3, certifi, cryptography, SecretStorage, …).
+DEPS="ytmusicapi requests rapidfuzz platformdirs keyring yt-dlp zeroconf"
+PYVERS="3.11 3.12 3.13"
+PLATFORMS="manylinux2014_x86_64 manylinux_2_17_x86_64 manylinux_2_28_x86_64"
+
+# -- bootstrap a pip (host pythons here ship none) ----------------------------
+python3 -m venv "$stage/pipenv"
+PIP="$stage/pipenv/bin/pip"
+"$PIP" install --quiet --upgrade pip >/dev/null 2>&1 || true
+
+# -- vendor wheels: the app itself + all deps for each target ------------------
+wheels="$stage/data/usr/share/harmony/wheels"
+mkdir -p "$wheels"
+echo "Building the harmony wheel…"
+"$PIP" wheel --no-deps -w "$wheels" "$root" >/dev/null
+for pv in $PYVERS; do
+    abi="cp${pv//./}"
+    echo "Downloading dependency wheels for CPython $pv (x86_64)…"
+    plat_args=""
+    for p in $PLATFORMS; do plat_args="$plat_args --platform $p"; done
+    # shellcheck disable=SC2086
+    "$PIP" download -d "$wheels" --only-binary=:all: \
+        --python-version "$pv" --implementation cp \
+        --abi "$abi" --abi abi3 --abi none \
+        $plat_args \
+        $DEPS >/dev/null
+done
+echo "Vendored $(find "$wheels" -name '*.whl' | wc -l) wheels."
+
+# -- data tree: app source (online-fallback), the unit, a manual wrapper -------
 app="$stage/data/usr/share/harmony/app"
 mkdir -p "$app/src" "$stage/data/lib/systemd/system" "$stage/data/usr/bin"
 cp "$root/pyproject.toml" "$root/README.md" "$root/LICENSE" "$app/"
@@ -47,4 +82,4 @@ out="$here/harmony-server_${version}_all.deb"
 printf '2.0\n' > "$stage/debian-binary"
 rm -f "$out"
 ( cd "$stage" && ar q "$out" debian-binary control.tar.gz data.tar.gz ) 2>/dev/null
-echo "Wrote $out"
+echo "Wrote $out ($(du -h "$out" | cut -f1))"
