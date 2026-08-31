@@ -18,6 +18,9 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.MusicNote
@@ -54,6 +57,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -195,19 +199,15 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
 @Composable
 private fun RouteScreen(vm: HarmonyViewModel, state: UiState) {
     Column(Modifier.fillMaxSize()) {
-        TopAppBar(
-            title = { Text("Route audio") },
-            actions = { TextButton(onClick = { vm.refreshPeers() }) { Text("Refresh") } },
-        )
-        Column(Modifier.fillMaxSize().padding(16.dp)) {
-            // Play the connected hub's audio on this phone (RTP → the speaker).
+        TopAppBar(title = { Text("Route audio") })
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+
+            // 1) Play the connected hub's audio on this phone (RTP → the speaker).
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp)) {
                     Text("Play on this phone", style = MaterialTheme.typography.titleMedium)
-                    Text(
-                        "Stream ${state.instanceName ?: "this hub"}'s audio to your phone and play it here.",
-                        style = MaterialTheme.typography.bodySmall,
-                    )
+                    Text("Stream ${state.instanceName ?: "this hub"}'s audio to your phone.",
+                        style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(12.dp))
                     if (state.playingHere) {
                         Button(onClick = { vm.stopPlayHere() }, modifier = Modifier.fillMaxWidth()) {
@@ -221,29 +221,71 @@ private fun RouteScreen(vm: HarmonyViewModel, state: UiState) {
                 }
             }
 
+            // 2) Bridge: play the current track on a device on the phone's LAN,
+            //    relaying through the phone (works even when the hub is remote).
             Spacer(Modifier.height(16.dp))
-            Text("Route between hubs", style = MaterialTheme.typography.titleMedium)
-            Text(
-                "Send this hub's audio to another Harmony instance on your network, or play theirs on it.",
-                style = MaterialTheme.typography.bodySmall,
-            )
-            Spacer(Modifier.height(8.dp))
-            if (state.peers.isEmpty()) {
-                Text("No other instances found.", style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(vertical = 8.dp))
-            } else {
-                LazyColumn(Modifier.weight(1f, fill = false)) {
-                    items(state.peers) { peer ->
-                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                            Column(Modifier.padding(12.dp)) {
-                                Text(peer.name, style = MaterialTheme.typography.bodyLarge)
-                                Text("${peer.host}:${peer.port}", style = MaterialTheme.typography.bodySmall)
-                                Spacer(Modifier.height(8.dp))
-                                Row {
-                                    TextButton(onClick = { vm.route("send", peer) }) { Text("Send to") }
-                                    Spacer(Modifier.width(8.dp))
-                                    TextButton(onClick = { vm.route("receive", peer) }) { Text("Play theirs") }
-                                }
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Play on a local device", style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f))
+                        TextButton(onClick = { vm.discoverRenderers() },
+                            enabled = !state.discoveringRenderers) { Text("Find") }
+                    }
+                    Text("Cast the current track to a speaker/TV on this phone's network.",
+                        style = MaterialTheme.typography.bodySmall)
+                    if (state.discoveringRenderers) {
+                        Spacer(Modifier.height(8.dp))
+                        CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                    }
+                    state.renderers.forEach { r ->
+                        Row(Modifier.fillMaxWidth().clickable { vm.bridgeToRenderer(r) }
+                            .padding(vertical = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                            Icon(Icons.Filled.Speaker, null)
+                            Spacer(Modifier.width(12.dp))
+                            Text(r.name, modifier = Modifier.weight(1f))
+                            if (state.bridgingTo == r.name) Text("playing",
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.primary)
+                        }
+                    }
+                    if (state.renderers.isEmpty() && !state.discoveringRenderers) {
+                        Text("No devices found yet — tap Find.", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp))
+                    }
+                    if (state.bridgingTo != null) {
+                        Spacer(Modifier.height(8.dp))
+                        Button(onClick = { vm.stopBridge() }, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Filled.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop")
+                        }
+                    }
+                }
+            }
+
+            // 3) Route between two Harmony hubs.
+            Spacer(Modifier.height(16.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text("Route between hubs", style = MaterialTheme.typography.titleMedium,
+                            modifier = Modifier.weight(1f))
+                        TextButton(onClick = { vm.refreshPeers() }) { Text("Refresh") }
+                    }
+                    if (state.peers.isEmpty()) {
+                        Text("No other instances found.", style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.padding(top = 8.dp))
+                    }
+                    state.peers.forEach { peer ->
+                        Column(Modifier.padding(vertical = 8.dp)) {
+                            Text(peer.name, style = MaterialTheme.typography.bodyLarge)
+                            Text("${peer.host}:${peer.port}", style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                            Row {
+                                TextButton(onClick = { vm.route("send", peer) }) { Text("Send to") }
+                                Spacer(Modifier.width(8.dp))
+                                TextButton(onClick = { vm.route("receive", peer) }) { Text("Play theirs") }
                             }
                         }
                     }
@@ -280,20 +322,31 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
                 CircularProgressIndicator()
             }
         }
+        if (state.results.isEmpty() && !state.searching) {
+            Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Text(if (state.query.isBlank()) "Search for a song" else "No results",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+        }
         LazyColumn(Modifier.fillMaxSize()) {
             items(state.results) { t ->
                 Row(
-                    Modifier.fillMaxWidth().clickable { vm.play(t) }.padding(horizontal = 16.dp, vertical = 10.dp),
+                    Modifier.fillMaxWidth().clickable { vm.play(t) }.padding(horizontal = 16.dp, vertical = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
+                    NetworkImage(t.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
+                    Spacer(Modifier.width(12.dp))
                     Column(Modifier.weight(1f)) {
                         Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
                             style = MaterialTheme.typography.bodyLarge)
                         Text(listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · "),
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall)
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
-                    Text(t.service.uppercase().take(3), style = MaterialTheme.typography.labelSmall)
+                    Text(t.service.uppercase().take(3), style = MaterialTheme.typography.labelSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
         }
@@ -309,16 +362,10 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.Center,
     ) {
-        Box(
-            Modifier.size(220.dp).padding(bottom = 24.dp),
-            contentAlignment = Alignment.Center,
-        ) {
-            Surface(color = MaterialTheme.colorScheme.surfaceVariant, modifier = Modifier.fillMaxSize()) {
-                Box(contentAlignment = Alignment.Center) {
-                    Icon(Icons.Filled.MusicNote, null, Modifier.size(64.dp))
-                }
-            }
-        }
+        NetworkImage(
+            pb.track?.artworkUrl,
+            Modifier.size(240.dp).padding(bottom = 24.dp).clip(RoundedCornerShape(14.dp)),
+        )
         Text(pb.track?.title ?: "Nothing playing", style = MaterialTheme.typography.titleLarge,
             maxLines = 1, overflow = TextOverflow.Ellipsis)
         Text(pb.track?.artist ?: "", style = MaterialTheme.typography.bodyMedium,
