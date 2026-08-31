@@ -32,6 +32,7 @@ from gi.repository import Adw, GLib, GObject, Gtk  # noqa: E402
 from harmony import config as config_module  # noqa: E402
 from harmony.models import Album, Artist, Playlist, Service, Track  # noqa: E402
 from harmony.ui import similar_dialog as similar_dialog_module  # noqa: E402
+from harmony.ui import widgets as widgets_module  # noqa: E402
 from harmony.ui.playlists_page import PlaylistsPage  # noqa: E402
 from harmony.ui.search_page import SearchPage  # noqa: E402
 from harmony.ui.similar_dialog import _SimilarDialog, present_similar  # noqa: E402
@@ -40,6 +41,7 @@ from harmony.ui.widgets import (  # noqa: E402
     TrackObject,
     attach_context_menu,
     build_track_column_view,
+    open_list_popover,
 )
 
 # -- shared fixtures --------------------------------------------------------------
@@ -264,6 +266,107 @@ def test_track_column_view_row_menu_targets_the_clicked_row(monkeypatch: pytest.
 
     assert captured == [track_b]
     assert len(pops) == 1
+    window.destroy()
+
+
+def _find_label(root: Gtk.Widget, text: str) -> Gtk.Label | None:
+    found: list[Gtk.Label] = []
+
+    def walk(widget: Gtk.Widget) -> None:
+        if isinstance(widget, Gtk.Label) and widget.get_label() == text:
+            found.append(widget)
+        child = widget.get_first_child()
+        while child is not None:
+            walk(child)
+            child = child.get_next_sibling()
+
+    walk(root)
+    return found[0] if found else None
+
+
+def test_context_picker_anchors_to_clicked_cell_not_page_container(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Right-clicking a track cell, then invoking a picker action, must anchor
+    the picker to the clicked cell -- not the page-sized ColumnView the caller
+    passes as parent, which would place the popover off the bottom of the
+    screen. This is the regression the user hit for songs inside a playlist.
+    """
+    widgets_module._last_context = None
+
+    column_view, store, _selection = build_track_column_view(
+        on_row_menu=lambda track: [("Add to Playlist…", lambda: None)]
+    )
+    store.append(TrackObject(Track(id="a", title="Song A", service=Service.YTMUSIC, artists=["X"])))
+
+    window = Gtk.Window()
+    window.set_child(column_view)
+    window.set_default_size(400, 300)
+    monkeypatch.setattr(Gtk.Popover, "popup", lambda self: None)
+    window.present()
+
+    if not _pump(lambda: _find_label(column_view, "Song A") is not None):
+        window.destroy()
+        pytest.skip("ColumnView never realized its rows -- no usable display in this environment")
+
+    cell = _find_label(column_view, "Song A")
+    gesture = _find_gesture(cell, Gtk.GestureClick, button=3)
+    assert gesture is not None
+    gesture.emit("pressed", 1, 2.0, 2.0)
+
+    # The right-click recorded the actual clicked cell.
+    assert widgets_module._last_context is not None
+    assert widgets_module._last_context[0] is cell
+
+    # A picker opened with the page-sized column_view as parent still anchors to
+    # the clicked cell (under the pointer), keeping it on-screen.
+    popover = Gtk.Popover()
+    listbox = Gtk.ListBox()
+    listbox.append(Adw.ActionRow(title="My Playlist"))
+    open_list_popover(popover, column_view, listbox)
+    assert popover.get_parent() is cell
+    assert widgets_module._last_context is None  # consumed one-shot
+
+    window.destroy()
+
+
+def test_open_list_popover_falls_back_to_parent_without_recent_context() -> None:
+    """A picker opened cold (no preceding right-click) anchors to its parent."""
+    widgets_module._last_context = None
+    parent = Gtk.Box()
+    window = Gtk.Window()
+    window.set_child(parent)
+    popover = Gtk.Popover()
+    listbox = Gtk.ListBox()
+    listbox.append(Adw.ActionRow(title="Device"))
+    open_list_popover(popover, parent, listbox)
+    assert popover.get_parent() is parent
+    window.destroy()
+
+
+def test_open_list_popover_ignores_stale_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A context recorded too long ago (or on an unmapped widget) is ignored, so
+    a later toolbar-button picker anchors to its own parent, not a stale row."""
+    import time as _time
+
+    parent = Gtk.Box()
+    stale = Gtk.Label(label="old")
+    window = Gtk.Window()
+    box = Gtk.Box()
+    box.append(parent)
+    box.append(stale)
+    window.set_child(box)
+    window.present()
+    _pump(lambda: stale.get_mapped(), timeout=1.0)
+
+    rect = widgets_module.Gdk.Rectangle()
+    rect.x, rect.y, rect.width, rect.height = 1, 1, 1, 1
+    # Recorded well outside the TTL window.
+    widgets_module._last_context = (stale, rect, _time.monotonic() - widgets_module._CONTEXT_TTL_S - 1.0)
+
+    popover = Gtk.Popover()
+    listbox = Gtk.ListBox()
+    listbox.append(Adw.ActionRow(title="Device"))
+    open_list_popover(popover, parent, listbox)
+    assert popover.get_parent() is parent
     window.destroy()
 
 
