@@ -15,6 +15,8 @@ import threading
 import time
 from typing import Any
 
+from harmony.errors import ProviderError
+
 log = logging.getLogger(__name__)
 
 # Resolved provider stream URLs expire (Qobuz/YouTube sign them for ~minutes),
@@ -166,10 +168,111 @@ class Engine:
         from harmony.config import Settings
 
         s = Settings.load()
+        key_changed = personal_key is not None and personal_key.strip() != s.personal_key
         if personal_key is not None:
             s.personal_key = personal_key.strip()
         s.save()
+        # A full instance with a fresh matching key and no accounts of its own
+        # pulls credentials from a peer — the "full clients copy creds" model.
+        if key_changed and s.personal_key:
+            import threading
+
+            threading.Thread(target=self.maybe_adopt_credentials, daemon=True).start()
         return self.preferences()
+
+    # -- credential custody: full instances copy creds when keys match ------
+
+    _CRED_KEYS = (
+        "qobuz.user_auth_token", "qobuz.app_secret", "qobuz.password",
+        "ytmusic.oauth_client_secret", "lastfm.api_key", "anthropic.api_key",
+    )
+    _CRED_SETTINGS = (
+        "qobuz_auth_kind", "qobuz_token_saved",
+        "ytmusic_auth_kind", "ytmusic_oauth_client_id",
+    )
+
+    def export_credentials(self) -> dict[str, Any]:
+        """Everything a full instance needs to become an independent credential
+        holder. Sensitive — the route only serves this to a key-matching caller,
+        and refuses entirely when no personal key is set."""
+        from pathlib import Path
+
+        from harmony.config import CredentialStore, Settings
+
+        cs = CredentialStore()
+        s = Settings.load()
+        secrets = {k: v for k in self._CRED_KEYS if (v := cs.get(k))}
+        yt_auth = None
+        if s.ytmusic_auth_file:
+            try:
+                yt_auth = Path(s.ytmusic_auth_file).read_text("utf-8")
+            except OSError:
+                pass
+        settings = {f: getattr(s, f) for f in self._CRED_SETTINGS if hasattr(s, f)}
+        return {"secrets": secrets, "settings": settings, "ytmusic_auth": yt_auth}
+
+    def import_credentials(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Write credentials pulled from a peer into this instance's own store."""
+        from harmony.config import CredentialStore, Settings, config_dir
+
+        cs = CredentialStore()
+        for key, value in (data.get("secrets") or {}).items():
+            if value:
+                cs.set(key, value)
+        s = Settings.load()
+        for field, value in (data.get("settings") or {}).items():
+            if hasattr(s, field):
+                setattr(s, field, value)
+        yt_auth = data.get("ytmusic_auth")
+        if yt_auth:
+            path = config_dir() / "ytmusic-auth.json"
+            path.write_text(yt_auth, "utf-8")
+            s.ytmusic_auth_file = str(path)
+        s.save()
+        self._reset_providers()
+        return {"ok": True, "imported": sorted((data.get("secrets") or {}).keys())}
+
+    def adopt_from_peer(self, host: str, port: int) -> dict[str, Any]:
+        """Pull a peer's credentials (presenting our key) and store them locally."""
+        import requests
+
+        from harmony.config import Settings
+
+        key = Settings.load().personal_key or None
+        headers = {"X-Harmony-Key": key} if key else {}
+        try:
+            resp = requests.get(f"http://{host}:{port}/api/credentials/export",
+                                headers=headers, timeout=10)
+        except requests.RequestException as exc:
+            raise ProviderError(f"couldn't reach peer {host}:{port}: {exc}") from exc
+        if resp.status_code in (401, 403):
+            raise ProviderError("peer refused — set the same personal key on both instances.")
+        resp.raise_for_status()
+        return self.import_credentials(resp.json())
+
+    def maybe_adopt_credentials(self) -> dict[str, Any]:
+        """If this instance has a key but no working accounts, adopt from the
+        first key-matching peer that has them."""
+        from harmony.config import Settings
+
+        if not Settings.load().personal_key:
+            return {"ok": False, "reason": "no personal key set"}
+        try:
+            if any(a["authenticated"] and not a["stale"] for a in self.accounts()["accounts"]):
+                return {"ok": False, "reason": "already have accounts"}
+        except Exception:  # noqa: BLE001
+            pass
+        for peer in self.instances().get("instances", []):
+            host, port = peer.get("host"), peer.get("port")
+            if not host or not port:
+                continue
+            try:
+                result = self.adopt_from_peer(host, int(port))
+                log.info("adopted credentials from peer %s:%s", host, port)
+                return result
+            except Exception as exc:  # noqa: BLE001 - try the next peer
+                log.debug("adopt from %s:%s failed: %s", host, port, exc)
+        return {"ok": False, "reason": "no peer with matching key and accounts found"}
 
     # -- account onboarding (delegated to harmony.web.onboarding) -----------
 

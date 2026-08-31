@@ -10,12 +10,28 @@ against. **A combination that is missing from the matrix below is a bug in this
 doc, not an implicit "no."** (That omission is exactly how the phone-bridge case
 was missed.)
 
-## The credential-custody model (why federation exists)
+## The credential model — use vs. copy
 
-Only the **one credential-holding instance** stores Qobuz/YT tokens. Other nodes
-authenticate *to that instance* with a shared **personal key** and never custody
-streaming credentials. A phone that loses its session exposes nothing about the
-user's Qobuz account. See [auth](auth.md) and
+The **personal key** is the trust boundary. How a node relates to credentials
+depends on whether it's a *light client* or a *full instance*:
+
+- **Light clients** (phone, web) **use** the hub's credentials over the API and
+  never custody them. A phone that loses its session exposes nothing about the
+  user's Qobuz account.
+- **Full instances** (a second desktop, a headless server) **copy** the
+  credentials from a key-matching peer, becoming *independent* credential
+  holders. This is what makes a fresh headless `.deb` server usable — it can't
+  do the browser/OAuth onboarding dance, so on first boot, if it has the
+  matching personal key but no accounts, it pulls them from a peer.
+
+The mechanism: `GET /api/credentials/export` serves the secrets + provider
+settings + the YouTube auth file **only** to a caller presenting the matching
+key (and never from an instance with no key set). `POST /api/credentials/adopt`
+pulls from a named peer (or auto-picks a key-matching one); a full instance also
+tries this automatically when its key is set or on startup. Because a *copy*
+crosses the network, keep the mesh on a trusted network/tailnet.
+
+See [auth](auth.md) and
 [ADR 0004](../decisions/0004-federation-for-credential-custody.md).
 
 ## Roles a node can play
