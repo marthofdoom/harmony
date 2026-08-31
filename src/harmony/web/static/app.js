@@ -236,14 +236,25 @@ async function renderAccounts() {
       </div>
 
       <div class="card">
-        <h2>YouTube Music <span class="badge">${y.stale ? "session expired — re-authenticate" : (y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out")}</span></h2>
-        <p class="muted">Paste the request headers from a logged-in music.youtube.com tab
-        (DevTools → Network → a request → Copy → Copy request headers).</p>
-        <textarea id="yt-headers" rows="5" style="width:100%;font-family:monospace;font-size:12px" placeholder="Cookie: …\nX-Goog-…"></textarea>
-        <div style="margin-top:.5rem;display:flex;gap:.5rem">
-          <button class="act" id="yt-save">Save</button>
+        <h2>YouTube Music <span class="badge">${y.stale ? "session expired — reconnect" : (y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out")}</span></h2>
+        <p class="muted">Recommended: connect with Google — a durable sign-in that
+        won't silently expire. One-time setup: create a “TV and Limited Input” OAuth
+        client in a Google Cloud project with the YouTube Data API enabled
+        (<a href="https://console.cloud.google.com/apis/credentials" target="_blank" rel="noopener">open console</a>).</p>
+        <details><summary class="muted">Google OAuth client (one-time)</summary>
+          <input id="yt-cid" type="text" placeholder="Client ID" style="width:100%;margin-top:.4rem" />
+          <input id="yt-cs" type="text" placeholder="Client secret" style="width:100%;margin-top:.4rem" />
+          <div style="margin-top:.4rem"><button class="act ghost" id="yt-client-save">Save client</button></div>
+        </details>
+        <div id="yt-code" class="muted" style="margin:.6rem 0"></div>
+        <div style="display:flex;gap:.5rem">
+          <button class="act" id="yt-connect">${y.stale ? "Reconnect" : "Connect YouTube"}</button>
           ${y.authenticated ? `<button class="act ghost" id="yt-out">Sign out</button>` : ""}
         </div>
+        <details style="margin-top:.6rem"><summary class="muted">Advanced: paste browser headers</summary>
+          <textarea id="yt-headers" rows="4" style="width:100%;margin-top:.4rem;font-family:monospace;font-size:12px" placeholder="Cookie: …"></textarea>
+          <div style="margin-top:.4rem"><button class="act ghost" id="yt-save">Save headers</button></div>
+        </details>
       </div>
 
       <div class="card">
@@ -269,6 +280,25 @@ async function renderAccounts() {
     const h = $("yt-headers").value.trim(); if (!h) return msg("Paste headers first.");
     try { await apiPost("/api/accounts/ytmusic/browser", { headers: h }); msg("YouTube Music saved.", true); after(); }
     catch (e) { msg("Failed: " + e.message); }
+  };
+  $("yt-client-save").onclick = async () => {
+    try { await apiPost("/api/accounts/ytmusic/oauth/client", { client_id: $("yt-cid").value, client_secret: $("yt-cs").value }); msg("OAuth client saved.", true); }
+    catch (e) { msg("Failed: " + e.message); }
+  };
+  let ytPoll = null;
+  $("yt-connect").onclick = async () => {
+    if (ytPoll) { clearInterval(ytPoll); ytPoll = null; }
+    $("yt-code").textContent = "Starting…";
+    let r;
+    try { r = await apiPost("/api/accounts/ytmusic/oauth/start", {}); }
+    catch (e) { $("yt-code").textContent = "Couldn't start: " + e.message + " (set up the OAuth client above first)"; return; }
+    $("yt-code").innerHTML = `Open <a href="${esc(r.full_url)}" target="_blank" rel="noopener">${esc(r.verification_url)}</a> and enter code <b style="font-size:1.3em">${esc(r.user_code)}</b>, then approve.`;
+    ytPoll = setInterval(async () => {
+      let p;
+      try { p = await apiPost("/api/accounts/ytmusic/oauth/poll", { poll_token: r.poll_token }); }
+      catch (e) { clearInterval(ytPoll); ytPoll = null; $("yt-code").textContent = "Failed: " + e.message; return; }
+      if (p.status === "done") { clearInterval(ytPoll); ytPoll = null; $("yt-code").textContent = "Connected! ✓"; loadAccounts(); setTimeout(renderAccounts, 800); }
+    }, (r.interval || 5) * 1000);
   };
   $("qb-save").onclick = async () => {
     const t = $("qb-token").value.trim(); if (!t) return msg("Paste a token first.");

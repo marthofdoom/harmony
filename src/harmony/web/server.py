@@ -175,6 +175,21 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "missing headers"}, status=400)
                     return
                 self._send_json(engine.set_ytmusic_browser(headers_raw))
+            elif parts == ["api", "accounts", "ytmusic", "oauth", "client"]:
+                cid = (body.get("client_id") or "").strip()
+                secret = (body.get("client_secret") or "").strip()
+                if not cid or not secret:
+                    self._send_json({"error": "missing client_id or client_secret"}, status=400)
+                    return
+                self._send_json(engine.set_ytmusic_oauth_client(cid, secret))
+            elif parts == ["api", "accounts", "ytmusic", "oauth", "start"]:
+                self._send_json(engine.ytmusic_oauth_start())
+            elif parts == ["api", "accounts", "ytmusic", "oauth", "poll"]:
+                token = (body.get("poll_token") or "").strip()
+                if not token:
+                    self._send_json({"error": "missing poll_token"}, status=400)
+                    return
+                self._send_json(engine.ytmusic_oauth_poll(token))
             elif len(parts) == 4 and parts[0:2] == ["api", "accounts"] and parts[3] == "signout":
                 self._send_json(engine.signout(parts[2]))
             else:
