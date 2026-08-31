@@ -281,12 +281,23 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         if meta is None:
             self._send_json({"error": "unknown or expired stream token"}, status=404)
             return
-        headers = dict(meta["headers"])
         client_range = self.headers.get("Range")
-        if client_range:
-            headers["Range"] = client_range
+
+        def fetch(m: dict[str, object]) -> object:
+            headers = dict(m["headers"])
+            if client_range:
+                headers["Range"] = client_range
+            return requests.get(m["url"], headers=headers, stream=True, timeout=20)
+
         try:
-            upstream = requests.get(meta["url"], headers=headers, stream=True, timeout=20)
+            upstream = fetch(meta)
+            # A CDN URL signed for ~minutes can expire before a late seek; the
+            # provider then 403/410s. Re-resolve the token once and retry.
+            if upstream.status_code in (403, 410):
+                refreshed = get_engine().refresh_stream(token)
+                if refreshed is not None:
+                    upstream.close()
+                    upstream = fetch(refreshed)
         except Exception as exc:  # noqa: BLE001
             log.warning("stream upstream failed: %s", exc)
             self._send_json({"error": "upstream fetch failed"}, status=502)
