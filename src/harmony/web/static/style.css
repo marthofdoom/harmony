@@ -156,8 +156,68 @@ body {
              border-radius: 8px; padding: .3rem .4rem; font: inherit; max-width: 140px; }
 #nowplaying.empty { color: var(--muted); }
 
+/* -- shared blocks (accounts / sync cards, muted text) -------------------- */
+.muted { color: var(--muted); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 12px;
+        padding: 1rem; margin-bottom: 1rem; }
+.card h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
+.card label { display: block; }
+
+/* -- modal + toast (replace native prompt/confirm/alert) ------------------ */
+.modal-back { position: fixed; inset: 0; background: #0007; z-index: 100;
+              display: flex; align-items: center; justify-content: center; padding: 1rem; }
+.modal { background: var(--card); color: var(--fg); border: 1px solid var(--border);
+         border-radius: 14px; padding: 1.1rem 1.2rem; width: 100%; max-width: 420px;
+         box-shadow: 0 12px 40px #0006; }
+.modal h2 { margin: 0 0 .6rem; font-size: 1.05rem; }
+.modal label { margin: .55rem 0 .2rem; color: var(--muted); }
+.modal input, .modal select { width: 100%; background: var(--bg); color: var(--fg);
+         border: 1px solid var(--border); border-radius: 8px; padding: .55rem; font: inherit; }
+.modal-acts { display: flex; justify-content: flex-end; gap: .5rem; margin-top: 1rem; }
+#toast { position: fixed; left: 50%; bottom: 5.5rem; transform: translateX(-50%) translateY(1rem);
+         background: var(--fg); color: var(--bg); padding: .6rem 1rem; border-radius: 10px;
+         opacity: 0; pointer-events: none; transition: opacity .2s, transform .2s; z-index: 120;
+         max-width: 90vw; box-shadow: 0 8px 24px #0005; }
+#toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+#toast.ok { background: #2ec27e; color: #fff; }
+
+/* -- mobile bottom nav (hidden on desktop) -------------------------------- */
+#mobilenav { display: none; }
+#mobilenav button {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: .15rem;
+  border: none; background: none; color: var(--muted); cursor: pointer;
+  padding: .5rem 0 calc(.5rem + env(safe-area-inset-bottom, 0px)); font: inherit;
+}
+#mobilenav button .i { font-size: 1.15rem; line-height: 1; }
+#mobilenav button .l { font-size: 11px; }
+#mobilenav button.active { color: var(--accent); }
+
+/* -- phone layout --------------------------------------------------------- */
 @media (max-width: 720px) {
-  body { grid-template-columns: 1fr; grid-template-areas: "content" "nowplaying"; }
+  body {
+    grid-template-columns: 1fr;
+    grid-template-rows: 1fr auto auto;
+    grid-template-areas: "content" "nowplaying" "mobilenav";
+  }
   #sidebar { display: none; }
-  #np-meta { display: none; }
+  #mobilenav { grid-area: mobilenav; display: flex; background: var(--bar);
+               border-top: 1px solid var(--border); }
+
+  /* topbar: title above a full-width search field */
+  #topbar { flex-wrap: wrap; }
+  #search { flex-basis: 100%; max-width: none; margin-left: 0; }
+
+  /* track rows: drop the separate artist/duration columns for width */
+  .trow { grid-template-columns: 2rem 1fr auto; }
+  .trow .artist, .trow .dur { display: none; }
+  .rowacts { opacity: 1; }               /* no hover on touch — always show */
+
+  /* now playing: art + meta + transport on row 1, seek full-width on row 2 */
+  #nowplaying { flex-wrap: wrap; gap: .4rem .6rem; padding: .5rem .75rem; }
+  #np-art { width: 40px; height: 40px; }
+  #np-meta { display: block; flex: 1 1 auto; min-width: 0; max-width: none; }
+  #np-transport { order: 3; }
+  #np-device { order: 2; max-width: 130px; }
+  #np-seekwrap { order: 4; flex-basis: 100%; }
+  #np-vol { display: none; }              /* phones use hardware volume */
 }

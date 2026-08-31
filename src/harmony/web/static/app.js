@@ -24,19 +24,72 @@ const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])));
 const serviceLabel = (s) => ({ ytmusic: "YT Music", qobuz: "Qobuz" }[s] || s);
 
+// -- in-page dialogs (replace native prompt/confirm/alert; touch-friendly) --
+
+function toast(text, ok) {
+  let t = $("toast");
+  if (!t) { t = document.createElement("div"); t.id = "toast"; document.body.appendChild(t); }
+  t.textContent = text; t.className = "show" + (ok ? " ok" : "");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 3000);
+}
+
+function _modal(inner) {
+  const root = document.createElement("div");
+  root.className = "modal-back";
+  root.innerHTML = `<div class="modal">${inner}</div>`;
+  document.body.appendChild(root);
+  const close = () => root.remove();
+  root.addEventListener("click", (e) => { if (e.target === root) close(); });
+  return { root, close };
+}
+
+// Resolves to a string (single field), an object (when `fields` given), or null.
+function modalPrompt({ title, label, value = "", placeholder = "", okText = "OK", fields }) {
+  return new Promise((resolve) => {
+    const flds = fields || [{ name: "value", label, value, placeholder, type: "text" }];
+    const html = flds.map((f) => f.type === "select"
+      ? `<label>${esc(f.label)}</label><select data-name="${esc(f.name)}">${(f.options || []).map((o) =>
+          `<option value="${esc(o.value)}"${o.value === f.value ? " selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`
+      : `<label>${esc(f.label)}</label><input data-name="${esc(f.name)}" type="text" value="${esc(f.value || "")}" placeholder="${esc(f.placeholder || "")}" />`
+    ).join("");
+    const m = _modal(`<h2>${esc(title)}</h2>${html}<div class="modal-acts">` +
+      `<button class="act ghost" data-x>Cancel</button><button class="act" data-ok>${esc(okText)}</button></div>`);
+    const read = () => { const o = {}; m.root.querySelectorAll("[data-name]").forEach((el) => o[el.dataset.name] = el.value.trim()); return o; };
+    const ok = () => { const o = read(); m.close(); resolve(fields ? o : o.value); };
+    const cancel = () => { m.close(); resolve(null); };
+    m.root.querySelector("[data-ok]").onclick = ok;
+    m.root.querySelector("[data-x]").onclick = cancel;
+    m.root.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); ok(); }
+      else if (e.key === "Escape") { cancel(); }
+    });
+    const first = m.root.querySelector("[data-name]"); if (first) first.focus();
+  });
+}
+
+function modalConfirm(title, body) {
+  return new Promise((resolve) => {
+    const m = _modal(`<h2>${esc(title)}</h2>${body ? `<p class="muted">${esc(body)}</p>` : ""}` +
+      `<div class="modal-acts"><button class="act ghost" data-x>Cancel</button><button class="act" data-ok>OK</button></div>`);
+    m.root.querySelector("[data-ok]").onclick = () => { m.close(); resolve(true); };
+    m.root.querySelector("[data-x]").onclick = () => { m.close(); resolve(false); };
+  });
+}
+
 let harmonyKey = "";
 try { harmonyKey = localStorage.getItem("harmonyKey") || ""; } catch { harmonyKey = ""; }
 const keyHeaders = (extra) => Object.assign(harmonyKey ? { "X-Harmony-Key": harmonyKey } : {}, extra || {});
 const keyParam = () => (harmonyKey ? `?key=${encodeURIComponent(harmonyKey)}` : "");
-function promptKey() {
-  const k = prompt("This Harmony instance requires a personal key:");
+async function promptKey() {
+  const k = await modalPrompt({ title: "Personal key required",
+    label: "This Harmony instance requires a personal key:", placeholder: "personal key" });
   if (k) { harmonyKey = k.trim(); try { localStorage.setItem("harmonyKey", harmonyKey); } catch { /* ignore */ } return true; }
   return false;
 }
 
 async function api(path, _retry) {
   const r = await fetch(path, { headers: keyHeaders() });
-  if (r.status === 401 && !_retry && promptKey()) return api(path, true);
+  if (r.status === 401 && !_retry && await promptKey()) return api(path, true);
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
@@ -44,7 +97,7 @@ async function api(path, _retry) {
 
 async function apiPost(path, body, _retry) {
   const r = await fetch(path, { method: "POST", headers: keyHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body || {}) });
-  if (r.status === 401 && !_retry && promptKey()) return apiPost(path, body, true);
+  if (r.status === 401 && !_retry && await promptKey()) return apiPost(path, body, true);
   const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
   if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
   return j;
@@ -89,16 +142,17 @@ function wirePlaylistToolbar() {
   const pl = state.playlist;
   if (!pl) return;
   if ($("pl-rename")) $("pl-rename").onclick = async () => {
-    const title = prompt("Rename playlist to:", pl.title); if (!title) return;
+    const title = await modalPrompt({ title: "Rename playlist", label: "New name", value: pl.title, okText: "Rename" });
+    if (!title) return;
     try { await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/rename`, { title });
       pl.title = title; $("view-title").textContent = title; loadPlaylistsSilently(); }
-    catch (e) { alert("Rename failed: " + e.message); }
+    catch (e) { toast("Rename failed: " + e.message); }
   };
   if ($("pl-delete")) $("pl-delete").onclick = async () => {
-    if (!confirm(`Delete playlist “${pl.title}”?`)) return;
+    if (!(await modalConfirm("Delete playlist", `Delete “${pl.title}”? This can’t be undone.`))) return;
     try { await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/delete`, {});
       state.playlist = null; setView("playlists"); }
-    catch (e) { alert("Delete failed: " + e.message); }
+    catch (e) { toast("Delete failed: " + e.message); }
   };
 }
 
@@ -108,7 +162,7 @@ async function removeFromPlaylist(track, i) {
     await apiPost(`/api/playlists/${encodeURIComponent(pl.service)}/${encodeURIComponent(pl.id)}/remove`, { track_ids: [track.id] });
     const rest = state.queue.slice(0, i).concat(state.queue.slice(i + 1));
     renderTracks(rest);
-  } catch (e) { alert("Remove failed: " + e.message); }
+  } catch (e) { toast("Remove failed: " + e.message); }
 }
 
 let _playlistCache = null;
@@ -127,8 +181,8 @@ async function openAddMenu(anchor, track) {
   menu.style.top = `${Math.min(r.bottom, window.innerHeight - menu.offsetHeight - 8)}px`;
   menu.style.left = `${Math.max(8, r.left - 180)}px`;
   menu.querySelectorAll("div[data-service]").forEach((row) => row.addEventListener("click", async () => {
-    try { await apiPost(`/api/playlists/${encodeURIComponent(row.dataset.service)}/${encodeURIComponent(row.dataset.id)}/add`, { track_ids: [track.id] }); }
-    catch (e) { alert("Add failed: " + e.message); }
+    try { await apiPost(`/api/playlists/${encodeURIComponent(row.dataset.service)}/${encodeURIComponent(row.dataset.id)}/add`, { track_ids: [track.id] }); toast("Added.", true); }
+    catch (e) { toast("Add failed: " + e.message); }
     menu.remove();
   }));
   setTimeout(() => document.addEventListener("click", () => menu.remove(), { once: true }), 0);
@@ -158,7 +212,8 @@ function highlightPlaying() {
 // -- views ------------------------------------------------------------------
 
 function setView(view) {
-  document.querySelectorAll("#nav li").forEach((li) => li.classList.toggle("active", li.dataset.view === view));
+  document.querySelectorAll("#nav li[data-view], #mobilenav button").forEach((el) =>
+    el.classList.toggle("active", el.dataset.view === view));
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
   else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
@@ -344,10 +399,14 @@ async function openPlaylist(service, id, title) {
 }
 
 async function newPlaylist() {
-  const title = prompt("New playlist title:"); if (!title) return;
-  const service = prompt("Service (qobuz or ytmusic):", "qobuz"); if (!service) return;
-  try { await apiPost("/api/playlists", { service: service.trim(), title: title.trim() }); loadPlaylists(); }
-  catch (e) { alert("Create failed: " + e.message); }
+  const r = await modalPrompt({ title: "New playlist", okText: "Create", fields: [
+    { name: "title", label: "Title", type: "text", placeholder: "Playlist name" },
+    { name: "service", label: "Service", type: "select", value: "qobuz",
+      options: [{ value: "qobuz", label: "Qobuz" }, { value: "ytmusic", label: "YT Music" }] },
+  ] });
+  if (!r || !r.title) return;
+  try { await apiPost("/api/playlists", { service: r.service, title: r.title }); loadPlaylists(); }
+  catch (e) { toast("Create failed: " + e.message); }
 }
 
 function acctStatusText(a) {
@@ -444,7 +503,12 @@ async function loadDevices() {
 // -- wiring -----------------------------------------------------------------
 
 $("search").addEventListener("submit", (e) => { e.preventDefault(); const q = $("search-input").value.trim(); if (q) doSearch(q); });
-document.querySelectorAll("#nav li[data-view]").forEach((li) => li.addEventListener("click", () => setView(li.dataset.view)));
+document.querySelectorAll("#nav li[data-view], #mobilenav button").forEach((el) => el.addEventListener("click", () => setView(el.dataset.view)));
 $("accounts").addEventListener("click", () => setView("accounts"));
 loadAccounts();
 loadDevices();
+
+// Progressive web app: install + offline shell.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", () => navigator.serviceWorker.register("/sw.js").catch(() => { /* non-fatal */ }));
+}

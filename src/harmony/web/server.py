@@ -24,6 +24,14 @@ from harmony.web.api import Engine
 
 log = logging.getLogger(__name__)
 
+# Pin the content-types the PWA depends on. A service worker is refused unless
+# its script is served with a JS type, and `.webmanifest` is unknown to the
+# stdlib map on some minimal hosts (→ application/octet-stream) — register both
+# explicitly so the app installs regardless of the host's /etc/mime.types.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+mimetypes.add_type("text/javascript", ".js")
+mimetypes.add_type("image/svg+xml", ".svg")
+
 _engine: Engine | None = None
 
 
