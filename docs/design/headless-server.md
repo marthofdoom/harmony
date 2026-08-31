@@ -63,9 +63,15 @@ Chosen for simple distribution (AUR/.deb/container) and local testability:
 - **Frontend:** **build-free** vanilla JS + CSS (no npm/webpack), so the Python
   package just ships static assets. Styled to echo the Adwaita look.
 - **Audio:** HTML5 `<audio>` ← the same-origin stream proxy.
-- **Auth:** a server login issuing a client token; every API call and stream
-  fetch is token-gated. This is the [federation](federation.md) instance↔client
-  auth, now on the critical path (was an open question).
+- **Auth: off by default, opt-in; reachable by default.** No login screen out of
+  the box, and the server binds all interfaces (`0.0.0.0`) by default — a home
+  hub should Just Work on the LAN/Tailnet without config. The **network is the
+  security boundary**: keep it on a trusted network or behind an authenticating
+  proxy (a startup line says so; it does not block). Enabling auth (a configured
+  password/token) turns on the web login and gates every API call and stream
+  fetch on a client token (the [federation](federation.md) instance↔client auth;
+  a mobile client presents the same token). `--address 127.0.0.1` restricts to
+  localhost for anyone who wants it.
 
 ## API surface (the full featureset)
 
@@ -122,10 +128,12 @@ rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
   from `HARMONY_SECRET_KEY` (passphrase/keyfile/systemd-cred/Docker-secret);
   allow direct env token injection (`HARMONY_QOBUZ_TOKEN`, …). Headless seeding
   via the accounts API / a `harmony login` CLI.
-- **Exposure:** the server holds real credentials and controls accounts — require
-  the login token on every call, bind localhost by default, and front with TLS
-  (Caddy/nginx) or run over a private network (Tailscale, which the user runs).
-  `redact_secrets` on all log paths; rate-limit login.
+- **Exposure:** the server holds real credentials and controls accounts. Auth is
+  off by default and it binds all interfaces by default (see Stack), so the
+  network is the security boundary — keep it on a trusted network (LAN/Tailnet)
+  or front it with TLS + auth (Caddy/nginx). A startup line notes the no-auth
+  state; it does not block. When auth is enabled, rate-limit login.
+  `redact_secrets` on all log paths.
 
 ## What we explicitly avoid (and why it stays small)
 
@@ -146,9 +154,10 @@ rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
 
 ## Open questions
 
-- **Client↔server auth model** — accounts (single-user vs multi), token
-  issuance/revocation, pairing/consent for a phone. Start single-user (one login
-  token) and grow. See [federation](federation.md).
+- **Client↔server auth model (when enabled)** — accounts (single-user vs multi),
+  token issuance/revocation, pairing/consent for a phone. Start single-user (one
+  optional login token) and grow. Auth is off by default. See
+  [federation](federation.md).
 - **Server-side cast queue** — reuse a small extracted queue helper when slice 2
   adds multi-track casting from the API.
 - **Discovery** — manual URL first; mDNS for the phone to find a home instance later.

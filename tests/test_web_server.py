@@ -62,3 +62,23 @@ def test_path_traversal_is_blocked(base_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _get(base_url + "/../../../../etc/passwd")
     assert exc.value.code == 404
+
+
+# -- serve() defaults: public + no auth (reachable out of the box) ---------------
+
+
+def test_serve_defaults_to_public_bind() -> None:
+    from harmony.server import _build_parser
+
+    args = _build_parser().parse_args([])
+    assert args.address == "0.0.0.0"  # all interfaces, reachable by default
+    assert args.port == 8080
+
+
+def test_is_public_bind() -> None:
+    from harmony.server import _is_public_bind
+
+    assert _is_public_bind("0.0.0.0")
+    assert _is_public_bind("::")
+    assert not _is_public_bind("127.0.0.1")
+    assert not _is_public_bind("100.64.0.1")  # a Tailscale address is not "all interfaces"

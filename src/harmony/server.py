@@ -27,9 +27,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--port", type=int, default=8080, help="HTTP port (default 8080)")
     parser.add_argument(
         "--address",
-        default="127.0.0.1",
-        help="interface to bind (default 127.0.0.1). The server holds credentials "
-        "and has no auth yet: only expose it behind a proxy or a private network.",
+        default="0.0.0.0",  # noqa: S104 - reachable-by-default is the intended UX
+        help="interface to bind (default 0.0.0.0, all interfaces). Set 127.0.0.1 "
+        "to restrict to localhost. The server has no auth by default -- keep it on "
+        "a trusted network (LAN/Tailnet) or behind an authenticating proxy.",
     )
     parser.add_argument(
         "--data-dir",
@@ -37,6 +38,10 @@ def _build_parser() -> argparse.ArgumentParser:
         "Point this at a mounted volume in a container.",
     )
     return parser
+
+
+def _is_public_bind(address: str) -> bool:
+    return address in ("0.0.0.0", "::", "")
 
 
 def serve(argv: list[str]) -> int:
@@ -52,11 +57,13 @@ def serve(argv: list[str]) -> int:
         os.environ.setdefault("XDG_DATA_HOME", args.data_dir)
         os.environ.setdefault("XDG_CACHE_HOME", args.data_dir)
 
-    if args.address in ("0.0.0.0", "::", ""):
+    # Auth is off by default and the server binds all interfaces by default, so
+    # the network is the security boundary. One concise notice; not a blocker.
+    if _is_public_bind(args.address):
         log.warning(
-            "Binding a public interface with no built-in authentication. Put the "
-            "server behind an authenticating reverse proxy or restrict it to a "
-            "private network (e.g. Tailscale) before exposing it."
+            "No authentication and bound to all interfaces (%s:%s). Keep this on a "
+            "trusted network (LAN/Tailnet) or behind an authenticating proxy.",
+            args.address or "::", args.port,
         )
 
     from harmony.web.server import serve as web_serve
