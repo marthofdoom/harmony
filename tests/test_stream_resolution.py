@@ -119,7 +119,7 @@ class TestQobuzResolveStream:
             "url": "https://qobuz.example/stream.flac",
             "mime_type": "audio/flac",
             "bit_depth": 16,
-            "sampling_rate": 44100,
+            "sampling_rate": 44.1,  # Qobuz reports kHz, not Hz
         }
         captured: dict[str, Any] = {}
 
@@ -137,7 +137,7 @@ class TestQobuzResolveStream:
         assert source.url == "https://qobuz.example/stream.flac"
         assert source.mime_type == "audio/flac"
         assert source.container == "flac"
-        assert source.label == "FLAC 16/44100"
+        assert source.label == "FLAC 16/44.1kHz"
         assert source.headers == {}
 
         assert captured["method"] == "GET"
@@ -154,14 +154,14 @@ class TestQobuzResolveStream:
         def fake_request(method, path, *, params=None, data=None, **kw):
             captured["params"] = params
             return {"url": "https://qobuz.example/hires.flac", "mime_type": "audio/flac",
-                    "bit_depth": 24, "sampling_rate": 96000}
+                    "bit_depth": 24, "sampling_rate": 96.0}
 
         monkeypatch.setattr(qobuz_provider, "_request", fake_request)
 
         source = qobuz_provider.resolve_stream("123", max_quality=True)
 
         assert captured["params"]["format_id"] == 27  # FLAC hi-res tier
-        assert source.label == "FLAC 24/96000"
+        assert source.label == "FLAC 24/96kHz"
 
     def test_request_signature_matches_request_sig(
         self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch

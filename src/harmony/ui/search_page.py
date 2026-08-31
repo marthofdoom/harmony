@@ -245,7 +245,7 @@ class SearchPage(Gtk.Box):
             row.set_activatable(True)
             row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
             row.connect("activated", lambda _r, it=item: self._drill_into(it))
-            attach_context_menu(row, lambda it=item: self._other_row_actions(it))
+            attach_context_menu(row, lambda it=item, r=row: self._other_row_actions(it, r))
             self.other_list.append(row)
         self.content_stack.set_visible_child_name("other")
 
@@ -305,7 +305,7 @@ class SearchPage(Gtk.Box):
                     row.set_activatable(True)
                     row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
                     row.connect("activated", lambda _r, a=album: self._drill_into(a))
-                    attach_context_menu(row, lambda a=album: self._other_row_actions(a))
+                    attach_context_menu(row, lambda a=album, r=row: self._other_row_actions(a, r))
                     self.other_list.append(row)
             else:
                 self.other_list.append(Adw.ActionRow(title="No albums found", sensitive=False))
@@ -407,6 +407,7 @@ class SearchPage(Gtk.Box):
         def done(_result: None) -> None:
             self.state.toast(f"Added {len(ids)} track(s) to {playlist.title}")
             self.state.all_playlists(refresh=True)
+            self.state.emit("playlist-tracks-changed", playlist)
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't add tracks: {exc}"))
 
@@ -554,7 +555,12 @@ class SearchPage(Gtk.Box):
             actions.append(("Find on Other Service", lambda: self._find_other_for_track(track)))
         return actions
 
-    def _other_row_actions(self, item: Album | Artist | Playlist) -> list[tuple[str, Callable[[], None]]]:
+    def _other_row_actions(
+        self, item: Album | Artist | Playlist, anchor: Gtk.Widget | None = None
+    ) -> list[tuple[str, Callable[[], None]]]:
+        # ``anchor`` is the right-clicked row; pickers parent to it (not the
+        # page-sized results list) so they open under the pointer, in bounds.
+        anchor = anchor or self.other_list
         actions: list[tuple[str, Callable[[], None]]] = []
         # Play on Device / Add to Playlist need the item's own native
         # provider -- get_album_tracks/get_artist_top_tracks/get_playlist_tracks
@@ -572,11 +578,11 @@ class SearchPage(Gtk.Box):
         if fetch_tracks is not None:
             actions.append((
                 "Play on Device",
-                lambda: play_collection_on_device(self.other_list, self.state, label=label, fetch_tracks=fetch_tracks),
+                lambda: play_collection_on_device(anchor, self.state, label=label, fetch_tracks=fetch_tracks),
             ))
             actions.append((
                 "Add to Playlist…",
-                lambda: add_collection_to_playlist(self.other_list, self.state, label=label, fetch_tracks=fetch_tracks),
+                lambda: add_collection_to_playlist(anchor, self.state, label=label, fetch_tracks=fetch_tracks),
             ))
 
         if isinstance(item, Artist):

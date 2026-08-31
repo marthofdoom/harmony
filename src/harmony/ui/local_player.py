@@ -186,12 +186,19 @@ class LocalPlayer:
     def stop(self) -> None:
         self._playbin.set_state(Gst.State.NULL)
 
-    def seek(self, position_s: int) -> None:
-        self._playbin.seek_simple(
+    def seek(self, position_s: int) -> bool:
+        """Seek to ``position_s``. Returns False when GStreamer refuses (e.g. a
+        non-seekable HTTP source that serves no byte ranges), so the caller can
+        surface it instead of leaving the bar parked at a position that never
+        took."""
+        ok = self._playbin.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
             max(0, int(position_s)) * Gst.SECOND,
         )
+        if not ok:
+            log.warning("local seek to %ss refused (stream not seekable)", position_s)
+        return bool(ok)
 
     def set_volume(self, level: int) -> None:
         self._playbin.set_property("volume", max(0, min(100, int(level))) / 100.0)

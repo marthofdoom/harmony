@@ -154,6 +154,12 @@ class AppState(GObject.Object):
         self._history: dict[str, list[Any]] = {}
         # The one app-wide playback model the Now Playing bar reflects/controls.
         self.playback = PlaybackState()
+        # After a seek, hold the optimistic position until the device/player
+        # actually converges: an in-flight status poll started before the seek
+        # would otherwise write the pre-seek position back and snap the bar (and
+        # the perceived play head) back to where it was.
+        self._seek_settle_until = 0.0
+        self._seek_target_s = 0
         # The in-app GStreamer player ("This computer"); created on first use.
         self._local_player: Any | None = None
 
@@ -799,7 +805,18 @@ class AppState(GObject.Object):
         pb = self.playback
         pb.state = status.state or pb.state
         if status.position_s is not None:
-            pb.position_s = status.position_s
+            # A poll that predates a just-issued seek still reports the old
+            # position; ignore it until the reported position converges on the
+            # seek target (or the settle window lapses), so the bar doesn't snap
+            # back to where the user seeked away from.
+            if (
+                time.monotonic() < self._seek_settle_until
+                and abs(status.position_s - self._seek_target_s) > 5
+            ):
+                pass
+            else:
+                self._seek_settle_until = 0.0
+                pb.position_s = status.position_s
         if status.duration_s is not None:
             pb.duration_s = status.duration_s
         pb.volume = status.volume
@@ -978,9 +995,13 @@ class AppState(GObject.Object):
         if not host:
             return
         self.playback.position_s = int(position_s)
+        self._seek_target_s = int(position_s)
+        self._seek_settle_until = time.monotonic() + 4.0  # ride out one stale poll
         self.emit("playback-changed")
         if host == LOCAL_HOST:
-            self._get_local_player().seek(int(position_s))
+            if not self._get_local_player().seek(int(position_s)):
+                self._seek_settle_until = 0.0
+                self.toast("This track can't be seeked.")
             return
 
         def work() -> None:
