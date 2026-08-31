@@ -48,6 +48,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.add(self._build_accounts_page())
         self.add(self._build_integrations_page())
         self.add(self._build_sync_page())
+        self.add(self._build_network_page())
         self.connect("closed", lambda *_a: self._flush_pending())
 
     # -- debounced persistence -------------------------------------------------
@@ -94,6 +95,54 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.state.apply_matching_settings()
 
     # -- appearance ---------------------------------------------------------------
+
+    def _build_network_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title="Network", name="network",
+                                   icon_name="network-server-symbolic")
+        group = Adw.PreferencesGroup(
+            title="Share on your network",
+            description="Run Harmony's web + API server so other devices — a phone, a "
+            "browser, another Harmony instance — can use this one as a backend and find "
+            "it on the LAN. Closing the window keeps it running in the background; Quit "
+            "(Ctrl+Q) exits. Keep it on a trusted network or set a personal key.",
+        )
+        self.server_switch = Adw.SwitchRow(title="Run as a server",
+                                           active=self.settings.server_enabled)
+        self.server_switch.connect("notify::active", self._on_server_toggled)
+        group.add(self.server_switch)
+
+        self.server_port_row = Adw.SpinRow.new_with_range(1024, 65535, 1)
+        self.server_port_row.set_title("Port")
+        self.server_port_row.set_value(self.settings.server_port or 8080)
+        self.server_port_row.connect(
+            "notify::value",
+            lambda r, _p: self._set_account_setting("server_port", int(r.get_value())),
+        )
+        group.add(self.server_port_row)
+
+        self.personal_key_row = Adw.EntryRow(title="Personal key",
+                                             text=self.settings.personal_key)
+        self.personal_key_row.connect(
+            "notify::text",
+            lambda r, _p: self._schedule(
+                "personal_key", lambda: self._set_account_setting("personal_key", r.get_text())
+            ),
+        )
+        group.add(self.personal_key_row)
+        page.add(group)
+        return page
+
+    def _on_server_toggled(self, row: Adw.SwitchRow, _param: object) -> None:
+        enabled = row.get_active()
+        self.settings.server_enabled = enabled
+        self.settings.save()
+        app = Gtk.Application.get_default()
+        if app is None:
+            return
+        if enabled and hasattr(app, "start_server"):
+            app.start_server()
+        elif not enabled and hasattr(app, "stop_server"):
+            app.stop_server()
 
     def _build_appearance_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(
