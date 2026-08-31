@@ -36,11 +36,19 @@ finish-args:
   # directly; Chromium-family cookies are additionally encrypted with a key from
   # the login keyring (reached via the secrets portal above). Only the user's
   # own profiles on their own machine are read.
+  # Native browsers:
   - --filesystem=~/.mozilla/firefox:ro
   - --filesystem=~/.config/google-chrome:ro
   - --filesystem=~/.config/chromium:ro
   - --filesystem=~/.config/BraveSoftware:ro
+  - --filesystem=~/.config/microsoft-edge:ro
+  # Flatpak browsers keep profiles under ~/.var/app/<id>/:
   - --filesystem=~/.var/app/org.mozilla.firefox/.mozilla/firefox:ro
+  - --filesystem=~/.var/app/com.google.Chrome/config:ro
+  - --filesystem=~/.var/app/org.chromium.Chromium/config:ro
+  - --filesystem=~/.var/app/com.brave.Browser/config:ro
+  - --filesystem=~/.var/app/com.microsoft.Edge/config:ro
+  - --filesystem=~/.var/app/com.vivaldi.Vivaldi/config:ro
 
 cleanup:
   - '/include'
