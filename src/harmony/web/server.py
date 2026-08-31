@@ -191,6 +191,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         try:
             if parts == ["api", "accounts"]:
                 self._send_json(engine.accounts())
+            elif parts == ["api", "instances"]:
+                self._send_json(engine.instances())
             elif parts == ["api", "preferences"]:
                 self._send_json(engine.preferences())
             elif parts == ["api", "search"]:
@@ -266,6 +268,7 @@ def serve(host: str, port: int) -> int:
     """Run the web server until interrupted."""
     httpd = ThreadingHTTPServer((host, port), HarmonyHTTPRequestHandler)
     httpd.daemon_threads = True
+    get_engine().start_mesh(port)  # advertise on the LAN + discover peers (best-effort)
     log.info("Harmony server listening on http://%s:%s/", host, port)
     try:
         httpd.serve_forever()

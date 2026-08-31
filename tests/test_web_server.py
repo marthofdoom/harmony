@@ -102,6 +102,9 @@ class _FakeEngine:
     def check_key(self, provided):
         return not self.key or provided == self.key
 
+    def instances(self):
+        return {"instances": [{"name": "harmony-desk", "host": "192.168.1.5", "port": 8080, "version": "0.6.1"}]}
+
     def accounts(self):
         return {"accounts": [{"service": "qobuz", "authenticated": True, "account": "me"}]}
 
@@ -242,6 +245,35 @@ def test_stream_unknown_token_is_404(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _get(api_url + "/stream/nope")
     assert exc.value.code == 404
+
+
+# -- mesh (LAN discovery) --------------------------------------------------------
+
+
+def test_api_instances_lists_discovered_peers(api_url: str) -> None:
+    _, _, body = _get(api_url + "/api/instances")
+    assert json.loads(body)["instances"][0]["name"] == "harmony-desk"
+
+
+def test_mesh_degrades_without_zeroconf(monkeypatch: pytest.MonkeyPatch) -> None:
+    # With python-zeroconf absent, the mesh is a no-op: start() doesn't raise and
+    # peers() is empty -- the app must run regardless.
+    import builtins
+
+    from harmony.mesh import Mesh
+
+    real_import = builtins.__import__
+
+    def no_zeroconf(name, *a, **k):
+        if name == "zeroconf" or name.startswith("zeroconf."):
+            raise ImportError("zeroconf disabled for test")
+        return real_import(name, *a, **k)
+
+    monkeypatch.setattr(builtins, "__import__", no_zeroconf)
+    mesh = Mesh("harmony-test", 8080)
+    mesh.start()
+    assert mesh.peers() == []
+    mesh.stop()
 
 
 # -- personal-key gate (mesh credential sharing) ---------------------------------
