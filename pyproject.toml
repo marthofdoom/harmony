@@ -13,7 +13,7 @@ license = { text = "GPL-3.0-or-later" }
 dependencies = [
     "ytmusicapi>=1.10",
     "requests>=2.31",
-    "rapidfuzz>=3.0",
+    "rapidfuzz>=3.14.5",
     "platformdirs>=4.0",
     "keyring>=24.0",
     # Resolves a playable YouTube audio stream URL for play-to-device (the
