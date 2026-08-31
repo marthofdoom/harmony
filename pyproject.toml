@@ -16,6 +16,9 @@ dependencies = [
     "rapidfuzz>=3.0",
     "platformdirs>=4.0",
     "keyring>=24.0",
+    # LAN mesh discovery (mDNS). Pure-Python; soft-imported in harmony.mesh so a
+    # build without it still runs (discovery just disabled).
+    "zeroconf>=0.130",
     # Resolves a playable YouTube audio stream URL for play-to-device (the
     # relay). Imported lazily in the YT provider so a minimal install still
     # works — it just can't stream YouTube to a device without this.

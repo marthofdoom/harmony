@@ -69,6 +69,7 @@ class Engine:
         self._cast: Any | None = None
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
+        self._mesh: Any | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -359,6 +360,25 @@ class Engine:
             raise KeyError(service_value)
         with self._lock:
             return prov.resolve_stream(track_id, max_quality=True)
+
+    # -- LAN mesh -----------------------------------------------------------
+
+    def start_mesh(self, port: int, name: str | None = None) -> None:
+        """Advertise this instance and start discovering peers (best-effort)."""
+        if self._mesh is not None:
+            return
+        import socket
+
+        from harmony.mesh import Mesh
+
+        self._mesh = Mesh(name or f"harmony-{socket.gethostname()}", port)
+        self._mesh.start()
+
+    def instances(self) -> dict[str, Any]:
+        """Other Harmony instances discovered on the LAN (empty if mesh is off)."""
+        if self._mesh is None:
+            return {"instances": []}
+        return {"instances": self._mesh.peers()}
 
     # -- cast to LAN devices ------------------------------------------------
 
