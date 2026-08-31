@@ -119,6 +119,23 @@ class Engine:
                 out.append({"service": svc.value, "authenticated": authed, "account": name})
         return {"accounts": out}
 
+    # -- preferences --------------------------------------------------------
+
+    def preferences(self) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        s = Settings.load()
+        return {"personal_key": s.personal_key}
+
+    def set_preferences(self, personal_key: str | None = None) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        s = Settings.load()
+        if personal_key is not None:
+            s.personal_key = personal_key.strip()
+        s.save()
+        return self.preferences()
+
     # -- credential management (seed the server; clients share these) -------
 
     def set_qobuz_token(self, token: str) -> dict[str, Any]:

@@ -84,8 +84,9 @@ function setView(view) {
 async function renderAccounts() {
   const list = $("list");
   list.innerHTML = `<p class="hint">Loading accounts…</p>`;
-  let accounts = [];
+  let accounts = [], prefs = { personal_key: "" };
   try { accounts = (await api("/api/accounts")).accounts || []; } catch { /* show forms anyway */ }
+  try { prefs = await api("/api/preferences"); } catch { /* ignore */ }
   const status = (svc) => accounts.find((a) => a.service === svc) || { authenticated: false };
   const q = status("qobuz"), y = status("ytmusic");
   list.innerHTML = `
@@ -93,6 +94,15 @@ async function renderAccounts() {
       <p class="hint" style="text-align:left;padding:.5rem 0">
         The server holds these credentials on behalf of every client (this browser
         and the mobile app) — clients never store them.</p>
+
+      <div class="card">
+        <h2>Personal key</h2>
+        <p class="muted">A shared secret you set identically on all your Harmony
+        instances and apps. A signed-out app finds instances on your network and
+        may use one — sharing its credentials — only when the keys match.</p>
+        <input id="pk" type="text" style="width:100%;font-family:monospace" placeholder="your personal key" value="${esc(prefs.personal_key || "")}" />
+        <div style="margin-top:.5rem"><button class="act" id="pk-save">Save key</button></div>
+      </div>
 
       <div class="card">
         <h2>YouTube Music <span class="badge">${y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out"}</span></h2>
@@ -120,6 +130,10 @@ async function renderAccounts() {
 
   const msg = (t, ok) => { const m = $("acct-msg"); m.textContent = t; m.style.color = ok ? "#2ec27e" : "var(--muted)"; };
   const after = () => { loadAccounts(); renderAccounts(); };
+  $("pk-save").onclick = async () => {
+    try { await apiPost("/api/preferences", { personal_key: $("pk").value }); msg("Personal key saved.", true); }
+    catch (e) { msg("Failed: " + e.message); }
+  };
   $("yt-save").onclick = async () => {
     const h = $("yt-headers").value.trim(); if (!h) return msg("Paste headers first.");
     try { await apiPost("/api/accounts/ytmusic/browser", { headers: h }); msg("YouTube Music saved.", true); after(); }
