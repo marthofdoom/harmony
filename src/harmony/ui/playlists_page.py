@@ -135,7 +135,7 @@ class PlaylistsPage(Gtk.Box):
                 self._collection_indicators[(playlist.service, playlist.id)] = indicator
                 wrapper = Gtk.ListBoxRow(child=row)
                 wrapper.playlist = playlist  # type: ignore[attr-defined]
-                attach_context_menu(row, lambda p=playlist, w=wrapper: self._playlist_row_actions(p, w))
+                attach_context_menu(row, lambda p=playlist, w=wrapper, a=row: self._playlist_row_actions(p, w, a))
                 self.playlist_list.append(wrapper)
                 if selected_id is not None and playlist.id == selected_id and playlist.service == self._selected_playlist.service:  # type: ignore[union-attr]
                     reselect = wrapper
@@ -149,7 +149,12 @@ class PlaylistsPage(Gtk.Box):
         for key, indicator in self._collection_indicators.items():
             indicator.set_visible(key == active)
 
-    def _playlist_row_actions(self, playlist: Playlist, wrapper: Gtk.ListBoxRow) -> list[tuple[str, Callable[[], None]]]:
+    def _playlist_row_actions(
+        self, playlist: Playlist, wrapper: Gtk.ListBoxRow, anchor: Gtk.Widget | None = None
+    ) -> list[tuple[str, Callable[[], None]]]:
+        # ``anchor`` is the right-clicked row; the pickers parent to it (not the
+        # page-sized sidebar list) so they open under the pointer, in bounds.
+        anchor = anchor or self.playlist_list
         actions: list[tuple[str, Callable[[], None]]] = []
         # get_playlist_tracks needs the playlist's own native provider -- no
         # fallback to another service makes sense here.
@@ -162,14 +167,14 @@ class PlaylistsPage(Gtk.Box):
             actions.append((
                 "Play on Device",
                 lambda: play_collection_on_device(
-                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks,
+                    anchor, self.state, label=playlist.title, fetch_tracks=fetch_tracks,
                     collection_key=(playlist.service, playlist.id),
                 ),
             ))
             actions.append((
                 "Add to Playlist…",
                 lambda: add_collection_to_playlist(
-                    self.playlist_list, self.state, label=playlist.title, fetch_tracks=fetch_tracks
+                    anchor, self.state, label=playlist.title, fetch_tracks=fetch_tracks
                 ),
             ))
             actions.append(("Show Similar", lambda: self._show_similar_for_playlist(playlist, provider)))

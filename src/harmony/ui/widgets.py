@@ -118,6 +118,10 @@ def attach_context_menu(
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
         popover.set_pointing_to(rect)
+        # Remember where this menu was invoked so a picker opened from one of
+        # its actions (e.g. "Add to Playlist…") can anchor to the same point
+        # instead of a page-sized container's origin (see open_list_popover).
+        widget._last_context_rect = rect  # type: ignore[attr-defined]
         popover.connect("closed", lambda p: p.unparent())
         popover.popup()
 
@@ -140,24 +144,43 @@ def open_list_popover(
 ) -> None:
     """Wrap ``listbox`` in a bounds-capped scroller, parent, and pop up ``popover``.
 
-    Shared by every device/playlist picker. GTK keeps a popover inside the
-    monitor only if its content advertises a bounded size, so this pins the
-    width (min == max, horizontal scrollbar off, so a long hostname/IP or
-    playlist title ellipsizes within the row instead of stretching the popover
-    off-screen) and caps the height with a vertical scrollbar. ``popover`` is
-    created by the caller so its row callbacks can capture it to ``popdown()``.
+    Shared by every device/playlist picker. Two things keep it on-screen and
+    legible:
+
+    * **Width** is pinned with ``set_size_request`` -- ``min/max_content_width``
+      are silently ignored while the horizontal scrollbar is ``NEVER`` (the
+      scroller then reports the child's *minimum* width and collapses to a
+      sliver, wrapping every ``Adw.ActionRow`` title/subtitle character by
+      character). With the scrollbar off, each row is forced to one ellipsized
+      line so a long hostname/IP or playlist title truncates instead of
+      wrapping.
+    * **Placement** points at ``parent``'s last recorded context-click
+      rectangle when it has one (set by ``attach_context_menu``); otherwise GTK
+      anchors to the widget's allocation. Callers that open from a right-click
+      should pass the actual clicked row so the popover appears under the
+      pointer rather than at a page-sized container's origin (off-screen).
+
+    ``popover`` is created by the caller so its row callbacks can ``popdown()``.
     """
+    index = 0
+    while (row := listbox.get_row_at_index(index)) is not None:
+        if isinstance(row, Adw.ActionRow):
+            row.set_title_lines(1)
+            row.set_subtitle_lines(1)
+        index += 1
     scroller = Gtk.ScrolledWindow(
         child=listbox,
         propagate_natural_height=True,
         max_content_height=max_height,
-        min_content_width=width,
-        max_content_width=width,
         hscrollbar_policy=Gtk.PolicyType.NEVER,
         vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
     )
+    scroller.set_size_request(width, -1)
     popover.set_child(scroller)
     popover.set_parent(parent)
+    rect = getattr(parent, "_last_context_rect", None)
+    if rect is not None:
+        popover.set_pointing_to(rect)
     popover.connect("closed", lambda p: p.unparent())
     popover.popup()
 

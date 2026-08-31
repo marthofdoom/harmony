@@ -459,6 +459,7 @@ class DiscoverPage(Gtk.Box):
         def done(_result: None) -> None:
             self.state.toast(f"Added “{track.title}” to {playlist.title}")
             self.state.all_playlists(refresh=True)
+            self.state.emit("playlist-tracks-changed", playlist)
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't add track: {exc}"))
 

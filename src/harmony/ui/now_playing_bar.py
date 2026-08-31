@@ -135,7 +135,16 @@ class NowPlayingBar(Gtk.Box):
         self._render()
         # Advance the seek bar once a second between device polls so time reads
         # smooth and monotonic instead of stepping every ~3s.
-        GLib.timeout_add_seconds(1, self._tick)
+        self._tick_id = GLib.timeout_add_seconds(1, self._tick)
+        self.connect("unrealize", self._on_unrealize)
+
+    def _on_unrealize(self, *_a: object) -> None:
+        if self._tick_id:
+            GLib.source_remove(self._tick_id)
+            self._tick_id = 0
+        if self._seek_commit_id:
+            GLib.source_remove(self._seek_commit_id)
+            self._seek_commit_id = 0
 
     # -- device selector ----------------------------------------------------
 
@@ -166,9 +175,13 @@ class NowPlayingBar(Gtk.Box):
         # render loop (``_seeking``); commit the real seek once they settle so a
         # drag across the bar issues one seek, not one per pixel.
         self._seeking = True
-        self._pending_seek = int(value)
-        self._interp_pos = float(int(value))
-        self._pos.set_label(_fmt(int(value)))
+        duration = self.state.playback.duration_s or 0
+        target = int(value)
+        if duration:
+            target = min(target, duration)
+        self._pending_seek = target
+        self._interp_pos = float(target)
+        self._pos.set_label(_fmt(target))
         if self._seek_commit_id:
             GLib.source_remove(self._seek_commit_id)
         self._seek_commit_id = GLib.timeout_add(220, self._commit_seek)
@@ -195,6 +208,11 @@ class NowPlayingBar(Gtk.Box):
             return GLib.SOURCE_CONTINUE
         self._interp_pos = min(self._interp_pos + 1.0, float(pb.duration_s))
         pos = int(self._interp_pos)
+        # Mirror the interpolated position into the model so an unrelated
+        # ``playback-changed`` (e.g. a shuffle/repeat toggle) re-rendering from
+        # ``pb.position_s`` doesn't rewind the bar to the last poll; real device
+        # polls still overwrite this.
+        pb.position_s = pos
         self._syncing = True
         self._seek.set_value(pos)
         self._syncing = False
