@@ -10,6 +10,7 @@
         android:allowBackup="true"
         android:label="Harmony"
         android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
         android:theme="@style/Theme.Harmony">
         <activity
             android:name=".MainActivity"

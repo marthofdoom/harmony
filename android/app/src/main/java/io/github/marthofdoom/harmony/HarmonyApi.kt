@@ -9,7 +9,8 @@ import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
 data class Instance(val name: String, val host: String, val port: Int) {
-    val baseUrl get() = "http://$host:$port"
+    // Bracket IPv6 literals so the URL is well-formed (http://[::1]:8080).
+    val baseUrl get() = "http://${if (host.contains(':')) "[$host]" else host}:$port"
 }
 
 data class Track(

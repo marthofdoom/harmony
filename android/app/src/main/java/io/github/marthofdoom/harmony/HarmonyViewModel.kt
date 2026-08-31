@@ -74,9 +74,10 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(conn = ConnState.CONNECTING, message = null)
         viewModelScope.launch {
             val client = HarmonyApi(baseUrl, key)
-            val result = withContext(Dispatchers.IO) {
-                runCatching { if (!client.health()) error("No Harmony server at $baseUrl"); client.accounts() }
-            }
+            // Hit the API directly so the real failure surfaces (a blocked
+            // cleartext call, a refused connection, or a 401 for a wrong key)
+            // instead of a generic "not found".
+            val result = withContext(Dispatchers.IO) { runCatching { client.accounts() } }
             result.onSuccess {
                 api = client
                 prefs.baseUrl = baseUrl; prefs.key = key
