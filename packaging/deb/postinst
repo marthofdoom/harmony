@@ -1,0 +1,35 @@
+#!/bin/sh
+# Build the app's private virtualenv and register the service. Needs network
+# once (pip pulls the deps' wheels from PyPI).
+set -e
+
+APP=/usr/share/harmony/app
+VENV=/opt/harmony/venv
+DATA=/var/lib/harmony
+
+if [ "$1" = configure ] || [ -z "$1" ]; then
+    # A dedicated system user owns the data dir and runs the service.
+    if ! getent passwd harmony >/dev/null 2>&1; then
+        adduser --system --group --home "$DATA" --no-create-home --quiet harmony \
+            || useradd --system --home-dir "$DATA" --shell /usr/sbin/nologin harmony \
+            || true
+    fi
+    mkdir -p "$DATA"
+    chown -R harmony:harmony "$DATA" 2>/dev/null || true
+
+    if [ ! -x "$VENV/bin/python" ]; then
+        python3 -m venv "$VENV"
+    fi
+    "$VENV/bin/pip" install --quiet --upgrade pip
+    # Quote the whole spec so the shell doesn't glob the "[server]" extra.
+    "$VENV/bin/pip" install --quiet "${APP}[server]"
+
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload || true
+        systemctl enable harmony.service || true
+        echo "Harmony server installed. Start it with:  sudo systemctl start harmony"
+        echo "It will listen on 0.0.0.0:8080 (no auth by default — set a personal key)."
+    fi
+fi
+
+exit 0

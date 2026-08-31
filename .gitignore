@@ -28,3 +28,6 @@ packaging/flatpak/build/
 packaging/flatpak/.flatpak-builder/
 packaging/flatpak/repo/
 packaging/flatpak/*.flatpak
+
+# Built server package artifact (see packaging/deb/build-deb.sh)
+packaging/deb/*.deb

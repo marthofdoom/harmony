@@ -1,0 +1,18 @@
+Package: harmony-server
+Version: 0.0.0
+Architecture: all
+Maintainer: marthofdoom <marthofdoom@users.noreply.github.com>
+Depends: python3 (>= 3.11), python3-venv, python3-pip, ffmpeg
+Recommends: pipewire | pulseaudio-utils
+Section: sound
+Priority: optional
+Homepage: https://github.com/marthofdoom/harmony
+Description: Harmony music hub — headless server
+ A federated, self-hosted music hub: an always-on HTTP API and mDNS mesh node
+ that the desktop, web, and mobile clients talk to. This package runs Harmony
+ headless as a systemd service (no GTK), installing the app into a private
+ virtualenv under /opt/harmony.
+ .
+ For inter-instance audio routing you also need roc-toolkit (or the RTP
+ fallback) and a PipeWire/PulseAudio stack on this host; the mesh, HTTP API,
+ accounts, search, and streaming work without them.

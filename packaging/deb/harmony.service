@@ -1,0 +1,22 @@
+[Unit]
+Description=Harmony music hub (headless server)
+Documentation=https://github.com/marthofdoom/harmony
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=harmony
+Group=harmony
+# One volume for config, the sqlite db, and the keyring-less secrets fallback.
+Environment=XDG_CONFIG_HOME=/var/lib/harmony
+Environment=XDG_DATA_HOME=/var/lib/harmony
+Environment=XDG_CACHE_HOME=/var/lib/harmony
+# Binds all interfaces with no auth by default — keep it on a trusted network
+# (LAN/Tailnet) or behind an authenticating proxy, and set a personal key.
+ExecStart=/opt/harmony/venv/bin/harmony serve --address 0.0.0.0 --port 8080 --data-dir /var/lib/harmony
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
