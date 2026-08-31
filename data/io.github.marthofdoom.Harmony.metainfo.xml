@@ -43,6 +43,30 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.0" date="2026-08-31">
+      <description>
+        <p>The mesh milestone. Harmony instances now find each other and share
+        a single account, and there is a mobile client:</p>
+        <ul>
+          <li>Every instance serves an HTTP API (and a lightweight web UI),
+          always on when the app runs — the engine other clients talk to.</li>
+          <li>LAN discovery over mDNS: instances see one another automatically,
+          and a light client (phone, another desktop) can join without its own
+          logins.</li>
+          <li>Personal key: set one key across your instances and only matching
+          keys may share credentials — the gate for account sharing on every
+          version.</li>
+          <li>Zero-setup YouTube: one click detects the browser you are already
+          signed in with (native or Flatpak) and connects — no OAuth dance.</li>
+          <li>Minimize to the system tray; a right-click there actually quits.
+          The API server keeps running in the background.</li>
+          <li>A new Android client: discover an instance on your network,
+          connect with your key, search, and play — streaming real hi-res audio
+          from the hub.</li>
+          <li>Fixes: YouTube playlists load reliably again.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.6.1" date="2026-08-30">
       <description>
         <p>Playback and UI polish:</p>
