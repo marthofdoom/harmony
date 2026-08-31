@@ -43,7 +43,7 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
-    <release version="0.8.0a1" date="2026-08-31">
+    <release version="0.7.10" date="2026-08-31">
       <description>
         <p>The Android client is now a full light client — everything the web UI
         does except signing in (accounts stay on the hub):</p>
