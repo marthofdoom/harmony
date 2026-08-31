@@ -67,6 +67,8 @@ class Engine:
         self._providers: dict[Any, Any] | None = None
         self._streams: dict[str, dict[str, Any]] = {}
         self._cast: Any | None = None
+        self._db: Any | None = None
+        self._plans: dict[str, Any] = {}
 
     # -- providers ----------------------------------------------------------
 
@@ -258,6 +260,60 @@ class Engine:
         with self._lock:
             prov.delete_playlist(playlist_id)
         return {"ok": True}
+
+    # -- sync ---------------------------------------------------------------
+
+    _DIRECTIONS = {"a_to_b": "MIRROR_A_TO_B", "b_to_a": "MIRROR_B_TO_A", "two_way": "TWO_WAY"}
+
+    def _sync_engine(self) -> Any:
+        from harmony.config import Settings
+        from harmony.db import Database
+        from harmony.sync import SyncEngine
+
+        if self._db is None:
+            self._db = Database()
+        s = Settings.load()
+        return SyncEngine(
+            self._ensure_providers(), self._db,
+            high_threshold=s.match_high_threshold, low_threshold=s.match_low_threshold,
+            auto_accept_high=s.auto_accept_high,
+        )
+
+    @staticmethod
+    def _plan_counts(plan: Any) -> dict[str, int]:
+        kinds = [a.kind for a in plan.actions]
+        return {"adds": kinds.count("add"), "removes": kinds.count("remove"),
+                "unmatched": kinds.count("unmatched")}
+
+    def sync_plan(self, source: dict[str, str], target: dict[str, str], direction: str) -> dict[str, Any]:
+        from harmony.sync import SyncDirection
+
+        prov_s, prov_t = self._provider(source["service"]), self._provider(target["service"])
+        if prov_s is None:
+            raise KeyError(source["service"])
+        if prov_t is None:
+            raise KeyError(target["service"])
+        d = SyncDirection[self._DIRECTIONS.get(direction, "MIRROR_A_TO_B")]
+        with self._lock:
+            a = prov_s.get_playlist(source["id"])
+            b = prov_t.get_playlist(target["id"])
+            plan = self._sync_engine().plan(a, b, d)
+        token = secrets.token_urlsafe(12)
+        self._plans[token] = plan
+        return {"token": token, "notes": list(plan.notes), **self._plan_counts(plan)}
+
+    def sync_apply(self, token: str) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        plan = self._plans.pop(token, None)
+        if plan is None:
+            raise KeyError("plan token")
+        with self._lock:
+            report = self._sync_engine().apply(
+                plan, snapshot_before_sync=Settings.load().snapshot_before_sync
+            )
+        return {"added": len(report.added), "removed": len(report.removed),
+                "failed": len(report.failed), "messages": list(report.messages)}
 
     # -- streaming ----------------------------------------------------------
 

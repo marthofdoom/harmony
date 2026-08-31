@@ -174,6 +174,14 @@ class _FakeEngine:
     def device_status(self, host):
         return {"state": "playing", "position_s": 5, "duration_s": 200, "volume": 40}
 
+    def sync_plan(self, source, target, direction):
+        self.calls.append(("plan", source["service"], target["service"], direction))
+        return {"token": "pl1", "adds": 3, "removes": 1, "unmatched": 0, "notes": []}
+
+    def sync_apply(self, token):
+        self.calls.append(("apply", token))
+        return {"added": 3, "removed": 1, "failed": 0, "messages": []}
+
     def stream_for(self, token):
         return None  # exercised token path returns 404 in these tests
 
@@ -284,6 +292,30 @@ def test_add_remove_rename_delete_routes(api_url: str) -> None:
     assert ("remove", "qobuz", "p1", ("t1",)) in calls
     assert ("rename", "qobuz", "p1", "New Name") in calls
     assert ("delete", "qobuz", "p1") in calls
+
+
+# -- sync ------------------------------------------------------------------------
+
+
+def test_sync_plan_and_apply(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _, body = _post(api_url + "/api/sync/plan", {
+        "source": {"service": "ytmusic", "id": "s1"},
+        "target": {"service": "qobuz", "id": "t1"}, "direction": "a_to_b"})
+    plan = json.loads(body)
+    assert plan["adds"] == 3 and plan["token"] == "pl1"
+    _, rbody = _post(api_url + "/api/sync/apply", {"token": "pl1"})
+    assert json.loads(rbody)["added"] == 3
+    calls = srv._engine.calls
+    assert ("plan", "ytmusic", "qobuz", "a_to_b") in calls
+    assert ("apply", "pl1") in calls
+
+
+def test_sync_plan_missing_fields_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/sync/plan", {"source": {"service": "ytmusic"}})
+    assert exc.value.code == 400
 
 
 # -- cast to device --------------------------------------------------------------
