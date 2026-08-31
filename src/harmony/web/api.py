@@ -462,6 +462,13 @@ class Engine:
     def audio_stop(self) -> dict[str, Any]:
         return self._router().stop()
 
+    def audio_monitor_argv(self) -> list[str] | None:
+        """ffmpeg command to stream this machine's live output as MP3 (for a
+        light client to pull the hub's audio over HTTP)."""
+        from harmony.audio import monitor_ffmpeg_argv
+
+        return monitor_ffmpeg_argv()
+
     def audio_route(self, direction: str, peer_host: str, peer_port: int,
                     sink: str | None = None, latency_ms: int = 150) -> dict[str, Any]:
         """Set up a full send/receive session with a peer, presenting our key."""

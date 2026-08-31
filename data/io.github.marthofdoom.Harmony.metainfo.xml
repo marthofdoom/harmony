@@ -43,6 +43,17 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.9c" date="2026-08-31">
+      <description>
+        <p>Alpha fix — "play the hub's audio on my phone" now works reliably:</p>
+        <ul>
+          <li>Instead of the hub pushing UDP to the phone (which a phone rarely
+          receives — Wi-Fi isolation, cellular, VPN NAT all block inbound UDP),
+          the hub now serves its live output as an MP3 stream the phone pulls
+          over HTTP and plays with buffering. Works on Wi-Fi, VPN, or cellular.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.9b" date="2026-08-31">
       <description>
         <p>Alpha follow-up — federation fixes, a polished phone client, and the

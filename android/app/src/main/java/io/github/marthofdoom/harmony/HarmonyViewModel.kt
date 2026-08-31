@@ -148,37 +148,23 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Play the connected hub's audio on this phone (RTP receiver → AudioTrack). */
+    /** Play the connected hub's live audio on this phone by *pulling* an MP3
+     *  stream over HTTP (ExoPlayer buffers it; works over Wi-Fi, VPN, or
+     *  cellular — unlike inbound UDP, which a phone rarely receives). */
     fun playHere() {
         val client = api ?: return
-        player.pause() // don't stack in-app streaming on top of the routed audio
-        viewModelScope.launch {
-            val res = withContext(Dispatchers.IO) {
-                runCatching {
-                    val myIp = localIpTowards(hostOf(client.baseUrl))
-                    if (myIp.isEmpty()) error("couldn't determine this phone's IP")
-                    rtp.start()
-                    client.audioSend(myIp, transport = "rtp")
-                }
-            }
-            res.onSuccess {
-                _state.value = _state.value.copy(playingHere = true,
-                    routeStatus = "Playing this hub's audio on your phone.")
-            }.onFailure {
-                rtp.stop()
-                _state.value = _state.value.copy(playingHere = false,
-                    routeStatus = "Couldn't start: ${it.message}")
-            }
-        }
+        player.setMediaItem(MediaItem.fromUri(client.monitorUrl()))
+        player.prepare()
+        player.play()
+        _state.value = _state.value.copy(playingHere = true,
+            playback = Playback(track = null, isPlaying = true),
+            routeStatus = "Playing ${_state.value.instanceName ?: "this hub"}'s audio.")
     }
 
     fun stopPlayHere() {
-        val client = api
-        viewModelScope.launch {
-            withContext(Dispatchers.IO) { runCatching { client?.audioStop() } }
-            rtp.stop()
-            _state.value = _state.value.copy(playingHere = false, routeStatus = "Stopped.")
-        }
+        player.stop()
+        player.clearMediaItems()
+        _state.value = _state.value.copy(playingHere = false, routeStatus = "Stopped.")
     }
 
     /** Route audio between the connected hub and a discovered peer (both hubs). */
@@ -257,9 +243,6 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             _state.value = _state.value.copy(bridgingTo = null, routeStatus = "Bridge stopped.")
         }
     }
-
-    private fun hostOf(baseUrl: String): String =
-        baseUrl.removePrefix("http://").removePrefix("https://").substringBefore(":").substringBefore("/")
 
     private fun localIpTowards(host: String): String = try {
         java.net.DatagramSocket().use { s ->
