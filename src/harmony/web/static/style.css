@@ -63,8 +63,18 @@ body {
 #accounts { margin-top: auto; padding: .75rem 1rem; border-top: 1px solid var(--border);
             font-size: 12.5px; color: var(--muted); }
 #accounts .acct { display:flex; align-items:center; gap:.4rem; }
+#accounts { cursor: pointer; }
+#accounts:hover { color: var(--fg); }
 #accounts .dot { width:.55rem; height:.55rem; border-radius:50%; background: var(--muted); }
 #accounts .dot.ok { background:#2ec27e; }
+
+/* buttons in forms */
+.act { border: 1px solid var(--border); background: var(--accent); color: var(--accent-fg);
+       padding: .4rem .9rem; border-radius: 8px; font: inherit; cursor: pointer; }
+.act:hover { filter: brightness(1.05); }
+.act.ghost { background: transparent; color: var(--fg); }
+.card textarea, .card input[type=text] { background: var(--bg); color: var(--fg);
+       border: 1px solid var(--border); border-radius: 8px; padding: .5rem; }
 
 /* -- content -------------------------------------------------------------- */
 #content { grid-area: content; display: flex; flex-direction: column; min-height: 0; }

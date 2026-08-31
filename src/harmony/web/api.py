@@ -119,6 +119,51 @@ class Engine:
                 out.append({"service": svc.value, "authenticated": authed, "account": name})
         return {"accounts": out}
 
+    # -- credential management (seed the server; clients share these) -------
+
+    def set_qobuz_token(self, token: str) -> dict[str, Any]:
+        from harmony import config
+        from harmony.config import CredentialStore, Settings
+
+        settings = Settings.load()
+        settings.qobuz_auth_kind = "token"
+        settings.qobuz_token_saved = True
+        settings.save()
+        CredentialStore().set(config.QOBUZ_TOKEN, token.strip())
+        self._providers = None  # re-warm with the new credential
+        return self.accounts()
+
+    def set_ytmusic_browser(self, headers_raw: str) -> dict[str, Any]:
+        import ytmusicapi
+
+        from harmony import config
+        from harmony.config import Settings
+
+        settings = Settings.load()
+        path = settings.ytmusic_auth_file or str(config.config_dir() / "browser.json")
+        ytmusicapi.setup(filepath=path, headers_raw=headers_raw)
+        settings.ytmusic_auth_file = path
+        settings.ytmusic_auth_kind = "browser"
+        settings.save()
+        self._providers = None
+        return self.accounts()
+
+    def signout(self, service_value: str) -> dict[str, Any]:
+        from harmony import config
+        from harmony.config import CredentialStore, Settings
+
+        settings = Settings.load()
+        if service_value == "qobuz":
+            settings.qobuz_token_saved = False
+            CredentialStore().delete(config.QOBUZ_TOKEN)
+        elif service_value == "ytmusic":
+            settings.ytmusic_auth_file = ""
+        else:
+            raise KeyError(service_value)
+        settings.save()
+        self._providers = None
+        return self.accounts()
+
     # -- queries ------------------------------------------------------------
 
     def search(self, query: str, kinds: tuple[str, ...], limit: int = 25) -> dict[str, Any]:

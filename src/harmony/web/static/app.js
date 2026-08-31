@@ -26,6 +26,13 @@ async function api(path) {
   return j;
 }
 
+async function apiPost(path, body) {
+  const r = await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body || {}) });
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok || j.error) throw new Error(j.error || `HTTP ${r.status}`);
+  return j;
+}
+
 // -- rendering --------------------------------------------------------------
 
 function renderTracks(tracks) {
@@ -71,6 +78,60 @@ function setView(view) {
   document.querySelectorAll("#nav li").forEach((li) => li.classList.toggle("active", li.dataset.view === view));
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
+  else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
+}
+
+async function renderAccounts() {
+  const list = $("list");
+  list.innerHTML = `<p class="hint">Loading accounts…</p>`;
+  let accounts = [];
+  try { accounts = (await api("/api/accounts")).accounts || []; } catch { /* show forms anyway */ }
+  const status = (svc) => accounts.find((a) => a.service === svc) || { authenticated: false };
+  const q = status("qobuz"), y = status("ytmusic");
+  list.innerHTML = `
+    <div style="max-width:640px">
+      <p class="hint" style="text-align:left;padding:.5rem 0">
+        The server holds these credentials on behalf of every client (this browser
+        and the mobile app) — clients never store them.</p>
+
+      <div class="card">
+        <h2>YouTube Music <span class="badge">${y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out"}</span></h2>
+        <p class="muted">Paste the request headers from a logged-in music.youtube.com tab
+        (DevTools → Network → a request → Copy → Copy request headers).</p>
+        <textarea id="yt-headers" rows="5" style="width:100%;font-family:monospace;font-size:12px" placeholder="Cookie: …\nX-Goog-…"></textarea>
+        <div style="margin-top:.5rem;display:flex;gap:.5rem">
+          <button class="act" id="yt-save">Save</button>
+          ${y.authenticated ? `<button class="act ghost" id="yt-out">Sign out</button>` : ""}
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Qobuz <span class="badge">${q.authenticated ? "signed in" + (q.account ? " · " + esc(q.account) : "") : "signed out"}</span></h2>
+        <p class="muted">Paste your <code>X-User-Auth-Token</code> (DevTools → Application → Local Storage
+        on play.qobuz.com, or a request header).</p>
+        <input id="qb-token" type="text" style="width:100%;font-family:monospace;font-size:12px" placeholder="user auth token" />
+        <div style="margin-top:.5rem;display:flex;gap:.5rem">
+          <button class="act" id="qb-save">Save</button>
+          ${q.authenticated ? `<button class="act ghost" id="qb-out">Sign out</button>` : ""}
+        </div>
+      </div>
+      <p id="acct-msg" class="muted"></p>
+    </div>`;
+
+  const msg = (t, ok) => { const m = $("acct-msg"); m.textContent = t; m.style.color = ok ? "#2ec27e" : "var(--muted)"; };
+  const after = () => { loadAccounts(); renderAccounts(); };
+  $("yt-save").onclick = async () => {
+    const h = $("yt-headers").value.trim(); if (!h) return msg("Paste headers first.");
+    try { await apiPost("/api/accounts/ytmusic/browser", { headers: h }); msg("YouTube Music saved.", true); after(); }
+    catch (e) { msg("Failed: " + e.message); }
+  };
+  $("qb-save").onclick = async () => {
+    const t = $("qb-token").value.trim(); if (!t) return msg("Paste a token first.");
+    try { await apiPost("/api/accounts/qobuz/token", { token: t }); msg("Qobuz saved.", true); after(); }
+    catch (e) { msg("Failed: " + e.message); }
+  };
+  if ($("yt-out")) $("yt-out").onclick = async () => { await apiPost("/api/accounts/ytmusic/signout"); after(); };
+  if ($("qb-out")) $("qb-out").onclick = async () => { await apiPost("/api/accounts/qobuz/signout"); after(); };
 }
 
 async function doSearch(q) {
@@ -151,4 +212,5 @@ $("np-vol").addEventListener("input", () => { audio.volume = $("np-vol").value /
 
 $("search").addEventListener("submit", (e) => { e.preventDefault(); const q = $("search-input").value.trim(); if (q) doSearch(q); });
 document.querySelectorAll("#nav li[data-view]").forEach((li) => li.addEventListener("click", () => setView(li.dataset.view)));
+$("accounts").addEventListener("click", () => setView("accounts"));
 loadAccounts();

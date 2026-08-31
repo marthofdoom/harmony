@@ -37,6 +37,13 @@ def _get(url: str):
         return resp.status, resp.headers.get("Content-Type", ""), resp.read()
 
 
+def _post(url: str, obj: dict):
+    data = json.dumps(obj).encode()
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - loopback test server
+        return resp.status, resp.read()
+
+
 def test_healthz_reports_ok_and_version(base_url: str) -> None:
     status, ctype, body = _get(base_url + "/healthz")
     assert status == 200
@@ -88,8 +95,25 @@ def test_is_public_bind() -> None:
 
 
 class _FakeEngine:
+    def __init__(self):
+        self.calls = []
+
     def accounts(self):
         return {"accounts": [{"service": "qobuz", "authenticated": True, "account": "me"}]}
+
+    def set_qobuz_token(self, token):
+        self.calls.append(("qobuz_token", token))
+        return self.accounts()
+
+    def set_ytmusic_browser(self, headers):
+        self.calls.append(("yt_browser", headers))
+        return self.accounts()
+
+    def signout(self, service):
+        if service not in ("qobuz", "ytmusic"):
+            raise KeyError(service)
+        self.calls.append(("signout", service))
+        return self.accounts()
 
     def search(self, q, kinds, limit=25):
         return {"tracks": [{"id": "t1", "title": f"hit for {q}", "service": "qobuz",
@@ -164,6 +188,46 @@ def test_api_resolve_returns_a_token(api_url: str) -> None:
 def test_stream_unknown_token_is_404(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _get(api_url + "/stream/nope")
+    assert exc.value.code == 404
+
+
+# -- credential management (POST) ------------------------------------------------
+
+
+def test_post_qobuz_token_seeds_and_returns_accounts(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, body = _post(api_url + "/api/accounts/qobuz/token", {"token": "abc123"})
+    assert status == 200
+    assert json.loads(body)["accounts"][0]["service"] == "qobuz"
+    assert ("qobuz_token", "abc123") in srv._engine.calls
+
+
+def test_post_qobuz_token_missing_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/accounts/qobuz/token", {})
+    assert exc.value.code == 400
+
+
+def test_post_ytmusic_browser_seeds(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, _ = _post(api_url + "/api/accounts/ytmusic/browser", {"headers": "Cookie: x"})
+    assert status == 200
+    assert ("yt_browser", "Cookie: x") in srv._engine.calls
+
+
+def test_post_signout_routes_service(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    status, _ = _post(api_url + "/api/accounts/qobuz/signout", {})
+    assert status == 200
+    assert ("signout", "qobuz") in srv._engine.calls
+
+
+def test_post_unknown_service_signout_is_404(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/accounts/spotify/signout", {})
     assert exc.value.code == 404
 
 

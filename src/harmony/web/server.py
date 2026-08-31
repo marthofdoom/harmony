@@ -92,6 +92,43 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         self._serve_static(path)
 
+    def do_POST(self) -> None:  # noqa: N802 - stdlib signature
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/"):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        engine = get_engine()
+        parts = [unquote(p) for p in parsed.path.strip("/").split("/")]
+        try:
+            if parts == ["api", "accounts", "qobuz", "token"]:
+                token = (body.get("token") or "").strip()
+                if not token:
+                    self._send_json({"error": "missing token"}, status=400)
+                    return
+                self._send_json(engine.set_qobuz_token(token))
+            elif parts == ["api", "accounts", "ytmusic", "browser"]:
+                headers_raw = (body.get("headers") or "").strip()
+                if not headers_raw:
+                    self._send_json({"error": "missing headers"}, status=400)
+                    return
+                self._send_json(engine.set_ytmusic_browser(headers_raw))
+            elif len(parts) == 4 and parts[0:2] == ["api", "accounts"] and parts[3] == "signout":
+                self._send_json(engine.signout(parts[2]))
+            else:
+                self._send_json({"error": "not found"}, status=404)
+        except KeyError as exc:
+            self._send_json({"error": f"unknown service {exc}"}, status=404)
+        except Exception as exc:  # noqa: BLE001 - surface as JSON, don't 500-crash
+            log.warning("API POST error on %s: %s", parsed.path, exc)
+            self._send_json({"error": str(exc)}, status=502)
+
     def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:
         engine = get_engine()
         parts = [unquote(p) for p in path.strip("/").split("/")]  # ["api", ...]
