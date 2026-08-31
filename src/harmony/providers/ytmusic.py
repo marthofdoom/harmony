@@ -217,7 +217,9 @@ class YTMusicProvider(MusicProvider):
             return None
         try:
             info = self._call(self._yt.get_account_info)
-        except ProviderError as exc:
+        except Exception as exc:  # noqa: BLE001 - a stale session makes ytmusicapi's
+            # navigator raise a bare KeyError (no account header in a signed-out
+            # response), not just ProviderError; never let that crash a status read.
             log.debug("Could not fetch YTMusic account info: %s", exc)
             return None
         return info.get("accountName")
