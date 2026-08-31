@@ -171,6 +171,25 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {}))
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] in ("pause", "resume", "stop", "volume"):
                 self._send_json(engine.device_control(parts[2], parts[3], body.get("level")))
+            elif parts == ["api", "audio", "receive"]:
+                self._send_json(engine.audio_receive(body.get("sink"), int(body.get("latency_ms") or 150)))
+            elif parts == ["api", "audio", "send"]:
+                to_host = (body.get("to_host") or "").strip()
+                if not to_host:
+                    self._send_json({"error": "missing to_host"}, status=400)
+                    return
+                self._send_json(engine.audio_send(to_host, int(body.get("latency_ms") or 150)))
+            elif parts == ["api", "audio", "stop"]:
+                self._send_json(engine.audio_stop())
+            elif parts == ["api", "audio", "route"]:
+                direction = (body.get("direction") or "").strip()
+                peer_host = (body.get("peer_host") or "").strip()
+                peer_port = body.get("peer_port")
+                if direction not in ("send", "receive") or not peer_host or not peer_port:
+                    self._send_json({"error": "need direction (send|receive), peer_host, peer_port"}, status=400)
+                    return
+                self._send_json(engine.audio_route(direction, peer_host, int(peer_port),
+                                                    body.get("sink"), int(body.get("latency_ms") or 150)))
             elif parts == ["api", "accounts", "qobuz", "token"]:
                 token = (body.get("token") or "").strip()
                 if not token:
@@ -235,6 +254,10 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.devices())
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
                 self._send_json(engine.device_status(parts[2]))
+            elif parts == ["api", "audio", "sinks"]:
+                self._send_json(engine.audio_sinks())
+            elif parts == ["api", "audio", "status"]:
+                self._send_json(engine.audio_status())
             elif parts == ["api", "resolve"]:
                 service = (query.get("service") or [""])[0]
                 track_id = (query.get("id") or [""])[0]

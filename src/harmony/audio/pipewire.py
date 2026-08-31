@@ -54,6 +54,20 @@ def list_sinks() -> list[AudioNode]:
     return _list("sinks")
 
 
+def default_sink() -> str | None:
+    """The system's current default output sink name (for its ``.monitor``)."""
+    try:
+        result = subprocess.run(
+            ["pactl", "get-default-sink"],
+            capture_output=True, text=True, timeout=_TIMEOUT_S, check=True,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.debug("pactl get-default-sink failed: %s", exc)
+        return None
+    name = result.stdout.strip()
+    return name or None
+
+
 def list_sources() -> list[AudioNode]:
     """Input devices (mics, monitors, and network sources once ROC/RTP is up)."""
     return _list("sources")
@@ -301,3 +315,126 @@ def roc_receiver_down(receiver: RocReceiver) -> None:
         receiver.log_file.close()
     except OSError:
         pass
+
+
+# --------------------------------------------------------------------------
+# Senders: broadcast this machine's audio to a peer's receiver
+# --------------------------------------------------------------------------
+#
+# The mirror image of the receivers above, so an instance can *send* its full
+# output (the default sink's monitor) to another instance running a receiver.
+# ROC (``roc-send``) is preferred; RTP (``module-rtp-send`` with a unicast
+# ``destination``) is the fallback. Senders join the same tracked-process /
+# atexit machinery as ROC receivers so nothing outlives the app.
+
+
+def _default_monitor_source(source: str | None) -> str:
+    """Resolve the PulseAudio source to capture: an explicit one, or the default
+    sink's monitor (i.e. everything currently playing on this machine)."""
+    if source:
+        return source
+    sink = default_sink()
+    if not sink:
+        raise ProviderError("No default output sink to capture (is PipeWire/Pulse running?).")
+    return f"{sink}.monitor"
+
+
+@dataclass(frozen=True)
+class RocSender:
+    """Handle to a live ROC sender (a running ``roc-send`` process)."""
+
+    process: subprocess.Popen
+    log_file: object
+    log_path: str
+    host: str
+
+
+def roc_sender_up(
+    host: str,
+    *,
+    source: str | None = None,
+    source_port: int = _ROC_SOURCE_PORT,
+    repair_port: int = _ROC_REPAIR_PORT,
+    control_port: int = _ROC_CONTROL_PORT,
+) -> RocSender:
+    """Broadcast this machine's audio to ``host`` via ``roc-send``.
+
+    Captures ``source`` (default: the current default sink's ``.monitor``, i.e.
+    the full system output) and sends it to the peer's ROC receiver endpoints.
+    Returns a handle to tear it down. Raises ``ProviderError`` if roc-send is
+    missing or dies on startup.
+    """
+    exe = shutil.which("roc-send")
+    if exe is None:
+        raise ProviderError(
+            "roc-send not found -- install roc-toolkit (bundled in the Flatpak) "
+            "to send audio to another instance."
+        )
+    monitor = _default_monitor_source(source)
+    argv = [
+        exe,
+        "-v",
+        "-i", f"pulse://{monitor}",
+        "-s", f"rtp+rs8m://{host}:{source_port}",
+        "-r", f"rs8m://{host}:{repair_port}",
+        "-c", f"rtcp://{host}:{control_port}",
+    ]
+    log_path = _roc_log_path().with_name("roc-send.log")
+    log_file = open(log_path, "wb")
+    try:
+        proc = subprocess.Popen(
+            argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=log_file
+        )
+    except OSError as exc:
+        log_file.close()
+        raise ProviderError(f"couldn't start roc-send: {exc}") from exc
+    time.sleep(0.4)
+    if proc.poll() is not None:
+        log_file.close()
+        err = ""
+        try:
+            err = log_path.read_text(errors="replace").strip().splitlines()[-1]
+        except (OSError, IndexError):
+            pass
+        raise ProviderError(f"roc-send exited immediately: {err or f'code {proc.returncode}'}")
+    _track_roc_proc(proc)
+    return RocSender(process=proc, log_file=log_file, log_path=str(log_path), host=host)
+
+
+def roc_sender_down(sender: RocSender) -> None:
+    """Stop a ROC sender (terminate the roc-send process)."""
+    proc = sender.process
+    _live_roc_procs.discard(proc)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    try:
+        sender.log_file.close()
+    except OSError:
+        pass
+
+
+@dataclass(frozen=True)
+class RtpSender:
+    """Handle to a live RTP sender (a module-rtp-send instance)."""
+
+    module: int
+
+
+def rtp_sender_up(host: str, *, source: str | None = None) -> RtpSender:
+    """Broadcast this machine's audio to ``host`` via ``module-rtp-send`` (unicast).
+
+    The RTP fallback when roc-send isn't present. Loads ``module-rtp-send`` with
+    a unicast ``destination`` so it targets one peer rather than SAP multicast.
+    """
+    monitor = _default_monitor_source(source)
+    module = _load_module("module-rtp-send", f"source={monitor}", f"destination={host}")
+    return RtpSender(module=module)
+
+
+def rtp_sender_down(sender: RtpSender) -> None:
+    """Tear down an RTP sender."""
+    _unload(sender.module)
