@@ -43,6 +43,20 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.11" date="2026-08-31">
+      <description>
+        <p>Federation: full instances copy credentials from a peer.</p>
+        <ul>
+          <li>A full instance (a second desktop, a headless server) with a
+          matching personal key but no accounts of its own now pulls the
+          streaming credentials from a peer — automatically on first boot, or on
+          demand — so a fresh headless server becomes a working credential holder
+          without the browser/OAuth onboarding dance. Light clients (phone, web)
+          still just use the hub's credentials over the API, never copying them.
+          The export is served only to a key-matching caller.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.10" date="2026-08-31">
       <description>
         <p>The Android client is now a full light client — everything the web UI

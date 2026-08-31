@@ -184,6 +184,13 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                                                   transport=body.get("transport")))
             elif parts == ["api", "audio", "stop"]:
                 self._send_json(engine.audio_stop())
+            elif parts == ["api", "credentials", "adopt"]:
+                host = (body.get("host") or "").strip()
+                port = body.get("port")
+                if host and port:
+                    self._send_json(engine.adopt_from_peer(host, int(port)))
+                else:  # no peer given → auto-adopt from any key-matching peer
+                    self._send_json(engine.maybe_adopt_credentials())
             elif parts == ["api", "audio", "route"]:
                 direction = (body.get("direction") or "").strip()
                 peer_host = (body.get("peer_host") or "").strip()
@@ -257,6 +264,16 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.devices())
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
                 self._send_json(engine.device_status(parts[2]))
+            elif parts == ["api", "credentials", "export"]:
+                # Sensitive: only a key-matching caller reaches here (the gate),
+                # and never an open instance — refuse when no key is set.
+                from harmony.config import Settings
+
+                if not Settings.load().personal_key:
+                    self._send_json({"error": "set a personal key to enable credential sharing"},
+                                    status=403)
+                    return
+                self._send_json(engine.export_credentials())
             elif parts == ["api", "audio", "sinks"]:
                 self._send_json(engine.audio_sinks())
             elif parts == ["api", "audio", "status"]:
@@ -368,7 +385,25 @@ def make_server(host: str, port: int) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), HarmonyHTTPRequestHandler)
     httpd.daemon_threads = True
     get_engine().start_mesh(port, bind_host=host)  # best-effort; skips a loopback bind
+    _schedule_credential_adoption()
     return httpd
+
+
+def _schedule_credential_adoption() -> None:
+    """A full instance with a matching key but no accounts of its own pulls
+    credentials from a peer once discovery has found one — so a fresh headless
+    server becomes a working credential holder without manual onboarding."""
+    import threading
+    import time
+
+    def run() -> None:
+        time.sleep(6)  # give mDNS discovery a moment to populate peers
+        try:
+            get_engine().maybe_adopt_credentials()
+        except Exception:  # noqa: BLE001 - best-effort
+            log.debug("startup credential adoption failed", exc_info=True)
+
+    threading.Thread(target=run, daemon=True, name="harmony-adopt").start()
 
 
 def serve(host: str, port: int) -> int:
