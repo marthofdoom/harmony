@@ -1,7 +1,9 @@
 package io.github.marthofdoom.harmony
 
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
@@ -44,6 +46,18 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         }
     }
 
+    private fun post(path: String, json: JSONObject): String {
+        val b = Request.Builder().url(url(path))
+            .post(json.toString().toRequestBody("application/json".toMediaType()))
+        key?.takeIf { it.isNotEmpty() }?.let { b.header("X-Harmony-Key", it) }
+        client.newCall(b.build()).execute().use { resp ->
+            val body = resp.body?.string().orEmpty()
+            if (resp.code == 401) throw ApiError("This instance requires a personal key.", 401)
+            if (!resp.isSuccessful) throw ApiError(errorText(body) ?: "HTTP ${resp.code}", resp.code)
+            return body
+        }
+    }
+
     private fun errorText(body: String): String? =
         runCatching { JSONObject(body).optString("error").ifEmpty { null } }.getOrNull()
 
@@ -76,6 +90,31 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         val keyParam = key?.takeIf { it.isNotEmpty() }?.let { "?key=" + URLEncoder.encode(it, "UTF-8") } ?: ""
         return url("/stream/$token$keyParam")
     }
+
+    /** Other instances this hub sees on the LAN (for routing between them). */
+    fun instances(): List<Instance> {
+        val arr = JSONObject(get("/api/instances")).optJSONArray("instances") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i ->
+            val o = arr.getJSONObject(i)
+            val host = o.optString("host").ifEmpty { return@mapNotNull null }
+            Instance(o.optString("name").ifEmpty { host }, host, o.optInt("port", 8080))
+        }
+    }
+
+    /** Ask this instance to broadcast its audio to [toHost]. A phone passes
+     *  transport="rtp" so it can play the stream without a native ROC library. */
+    fun audioSend(toHost: String, transport: String = "rtp", latencyMs: Int = 150) {
+        post("/api/audio/send", JSONObject().put("to_host", toHost)
+            .put("transport", transport).put("latency_ms", latencyMs))
+    }
+
+    /** Route audio between this instance and a peer (both are Harmony hubs). */
+    fun audioRoute(direction: String, peerHost: String, peerPort: Int, latencyMs: Int = 150) {
+        post("/api/audio/route", JSONObject().put("direction", direction)
+            .put("peer_host", peerHost).put("peer_port", peerPort).put("latency_ms", latencyMs))
+    }
+
+    fun audioStop() { post("/api/audio/stop", JSONObject()) }
 
     private fun parseTracks(arr: org.json.JSONArray?): List<Track> {
         if (arr == null) return emptyList()

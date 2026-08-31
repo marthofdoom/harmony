@@ -178,7 +178,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not to_host:
                     self._send_json({"error": "missing to_host"}, status=400)
                     return
-                self._send_json(engine.audio_send(to_host, int(body.get("latency_ms") or 150)))
+                self._send_json(engine.audio_send(to_host, int(body.get("latency_ms") or 150),
+                                                  transport=body.get("transport")))
             elif parts == ["api", "audio", "stop"]:
                 self._send_json(engine.audio_stop())
             elif parts == ["api", "audio", "route"]:

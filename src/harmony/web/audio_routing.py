@@ -82,20 +82,26 @@ class AudioRouter:
             self._latency_ms = latency_ms
         return {"ok": True, "sink": target, "transport": self._recv_kind, "latency_ms": latency_ms}
 
-    def send(self, to_host: str, latency_ms: int = 150) -> dict[str, Any]:
-        """Start broadcasting this machine's audio to ``to_host``."""
+    def send(self, to_host: str, latency_ms: int = 150, transport: str | None = None) -> dict[str, Any]:
+        """Start broadcasting this machine's audio to ``to_host``.
+
+        ``transport`` forces "roc" or "rtp"; None auto-picks (ROC if available).
+        A phone (which receives plain RTP, no ROC) asks for "rtp" so it can play
+        the stream without a native ROC library.
+        """
         from harmony import audio
 
         if not to_host:
             raise ProviderError("missing to_host")
+        use_rtp = transport == "rtp" or (transport is None and not self._roc())
         with self._lock:
             self._stop_sender_locked()
-            if self._roc():
-                self._sender = audio.roc_sender_up(to_host)
-                self._send_kind = "roc"
-            else:
+            if use_rtp:
                 self._sender = audio.rtp_sender_up(to_host)
                 self._send_kind = "rtp"
+            else:
+                self._sender = audio.roc_sender_up(to_host)
+                self._send_kind = "roc"
             self._peer = to_host
             self._latency_ms = latency_ms
         return {"ok": True, "to_host": to_host, "transport": self._send_kind}

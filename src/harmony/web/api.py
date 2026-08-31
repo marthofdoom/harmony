@@ -426,8 +426,9 @@ class Engine:
     def audio_receive(self, sink: str | None, latency_ms: int = 150) -> dict[str, Any]:
         return self._router().receive(sink=sink, latency_ms=latency_ms)
 
-    def audio_send(self, to_host: str, latency_ms: int = 150) -> dict[str, Any]:
-        return self._router().send(to_host, latency_ms=latency_ms)
+    def audio_send(self, to_host: str, latency_ms: int = 150,
+                   transport: str | None = None) -> dict[str, Any]:
+        return self._router().send(to_host, latency_ms=latency_ms, transport=transport)
 
     def audio_stop(self) -> dict[str, Any]:
         return self._router().stop()
