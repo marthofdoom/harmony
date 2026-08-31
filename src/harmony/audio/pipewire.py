@@ -153,6 +153,11 @@ _ROC_SOURCE_PORT = 10001
 _ROC_REPAIR_PORT = 10002
 _ROC_CONTROL_PORT = 10003
 
+# RTP unicast port for the plain-RTP path (a phone receives here). Must match the
+# Android RtpReceiver's bind port. PipeWire's module-rtp-send defaults to a
+# multicast group on 46000, so we always set destination_ip + this port.
+_RTP_PORT = 5004
+
 # Live roc-recv processes, so a receiver never outlives the app: a subprocess
 # isn't killed when its parent exits, which would leave a stream playing with no
 # in-app way to stop it. We terminate any survivors on interpreter exit.
@@ -424,14 +429,24 @@ class RtpSender:
     module: int
 
 
-def rtp_sender_up(host: str, *, source: str | None = None) -> RtpSender:
+def rtp_sender_up(host: str, *, source: str | None = None, port: int = _RTP_PORT) -> RtpSender:
     """Broadcast this machine's audio to ``host`` via ``module-rtp-send`` (unicast).
 
-    The RTP fallback when roc-send isn't present. Loads ``module-rtp-send`` with
-    a unicast ``destination`` so it targets one peer rather than SAP multicast.
+    The RTP fallback (and the transport a phone uses, since it can't decode ROC).
+    PipeWire's ``module-rtp-send`` defaults to a **multicast** group on port
+    46000, so we pin ``destination_ip`` + ``port`` for a unicast stream the
+    receiver can actually bind, and fix the wire format to 16-bit **big-endian**
+    PCM / 44.1 kHz / stereo so a simple receiver (the Android RtpReceiver) knows
+    exactly what to decode. (Verified against a captured tone: big-endian.)
     """
     monitor = _default_monitor_source(source)
-    module = _load_module("module-rtp-send", f"source={monitor}", f"destination={host}")
+    module = _load_module(
+        "module-rtp-send",
+        f"source={monitor}",
+        f"destination_ip={host}",
+        f"port={port}",
+        "format=s16be", "rate=44100", "channels=2",
+    )
     return RtpSender(module=module)
 
 
