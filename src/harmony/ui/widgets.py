@@ -17,20 +17,21 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gdk, Gio, GLib, GObject, Graphene, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Track  # noqa: E402
 
-# The most recent right-click point, in the toplevel window's coordinate space,
-# as (window_widget, rect). A picker opened from a context-menu action (which
-# runs synchronously right after) anchors here so it appears under the pointer
-# and on-screen, instead of below whatever page-sized widget the caller happened
-# to pass as ``parent`` (which sends tall popovers off the bottom edge). One-shot:
-# consumed by the first picker that opens, and refreshed on every right-click.
-# The timestamp guards against a stale point anchoring a much-later picker (e.g.
-# a toolbar button); only a point set within the last moment counts.
-_last_context_point: tuple[Gtk.Widget, Gdk.Rectangle, float] | None = None
-_CONTEXT_POINT_TTL_S = 1.5
+# The most recent right-clicked widget and the click rect (in that widget's own
+# coordinates), as (widget, rect, when). A picker opened from a context-menu
+# action (which runs synchronously right after) anchors to this widget so it
+# appears under the pointer and on-screen, instead of below whatever page-sized
+# widget the caller happened to pass as ``parent`` (which sends tall popovers off
+# the bottom edge). Parenting to the small clicked widget is what makes GTK's
+# flip/slide placement reliable. One-shot: consumed by the first picker that
+# opens, refreshed on every right-click; the timestamp guards against a stale
+# entry anchoring a much-later picker (e.g. a toolbar button).
+_last_context: tuple[Gtk.Widget, Gdk.Rectangle, float] | None = None
+_CONTEXT_TTL_S = 1.5
 
 log = logging.getLogger(__name__)
 
@@ -130,17 +131,12 @@ def attach_context_menu(
         rect = Gdk.Rectangle()
         rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
         popover.set_pointing_to(rect)
-        # Remember where this menu was invoked, translated into the toplevel
-        # window's coordinates, so a picker opened from one of its actions
-        # (e.g. "Add to Playlist…") anchors under the pointer instead of below a
-        # page-sized container (which pushes it off the bottom of the screen).
-        global _last_context_point
-        root = widget.get_root()
-        ok, point = widget.compute_point(root, Graphene.Point().init(x, y)) if root is not None else (False, None)
-        if ok:
-            win_rect = Gdk.Rectangle()
-            win_rect.x, win_rect.y, win_rect.width, win_rect.height = int(point.x), int(point.y), 1, 1
-            _last_context_point = (root, win_rect, time.monotonic())
+        # Remember the clicked widget + click rect so a picker opened from one of
+        # this menu's actions (e.g. "Add to Playlist…") anchors here -- under the
+        # pointer -- instead of below the page-sized container the caller passes
+        # as ``parent`` (which pushes tall popovers off the bottom of the screen).
+        global _last_context
+        _last_context = (widget, rect, time.monotonic())
         popover.connect("closed", lambda p: p.unparent())
         popover.popup()
 
@@ -174,15 +170,15 @@ def open_list_popover(
       line so a long hostname/IP or playlist title truncates instead of
       wrapping.
     * **Placement**: when opened from a right-click, ``attach_context_menu``
-      records the click in the toplevel window's coordinates; the picker anchors
-      there so it appears under the pointer and is auto-flipped/slid on-screen by
-      GTK, regardless of the (possibly page-sized) ``parent`` the caller passed.
+      records the clicked widget and click rect; the picker parents to that
+      widget (under the pointer) so GTK reliably flips/slides it on-screen,
+      regardless of the (possibly page-sized) ``parent`` the caller passed.
       Otherwise -- e.g. a toolbar button opening the picker -- it anchors to
       ``parent`` itself.
 
     ``popover`` is created by the caller so its row callbacks can ``popdown()``.
     """
-    global _last_context_point
+    global _last_context
     index = 0
     while (row := listbox.get_row_at_index(index)) is not None:
         if isinstance(row, Adw.ActionRow):
@@ -199,11 +195,11 @@ def open_list_popover(
     scroller.set_size_request(width, -1)
     popover.set_child(scroller)
     anchor, rect = parent, None
-    if _last_context_point is not None:
-        point_anchor, point_rect, when = _last_context_point
-        _last_context_point = None  # one-shot
-        if time.monotonic() - when < _CONTEXT_POINT_TTL_S and point_anchor.get_mapped():
-            anchor, rect = point_anchor, point_rect  # under the pointer, in-bounds
+    if _last_context is not None:
+        ctx_widget, ctx_rect, when = _last_context
+        _last_context = None  # one-shot
+        if time.monotonic() - when < _CONTEXT_TTL_S and ctx_widget.get_mapped():
+            anchor, rect = ctx_widget, ctx_rect  # under the pointer, in-bounds
     popover.set_parent(anchor)
     if rect is not None:
         popover.set_pointing_to(rect)
