@@ -26,10 +26,13 @@ depends on whether it's a *light client* or a *full instance*:
 
 The mechanism: `GET /api/credentials/export` serves the secrets + provider
 settings + the YouTube auth file **only** to a caller presenting the matching
-key (and never from an instance with no key set). `POST /api/credentials/adopt`
-pulls from a named peer (or auto-picks a key-matching one); a full instance also
-tries this automatically when its key is set or on startup. Because a *copy*
-crosses the network, keep the mesh on a trusted network/tailnet.
+key (and never from an instance with no key set). The payload is **encrypted
+with a key derived from the personal key** (PBKDF2-HMAC-SHA256 → Fernet), so the
+secrets are confidential on the wire even over plain HTTP — only a holder of the
+matching key can decrypt it. `POST /api/credentials/adopt` pulls from a named
+peer (or auto-picks a key-matching one) and decrypts; a full instance also tries
+this automatically when its key is set or on startup. The personal key thus both
+*authorizes* the request and *encrypts* what crosses.
 
 See [auth](auth.md) and
 [ADR 0004](../decisions/0004-federation-for-credential-custody.md).
