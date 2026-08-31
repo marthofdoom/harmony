@@ -39,6 +39,13 @@ def main() -> int:
         handlers=handlers,
     )
 
+    # ``harmony serve``: run headless under GTK's Broadway backend (browser GUI).
+    # Dispatched before importing gi so the serve path controls GDK_BACKEND.
+    if len(sys.argv) > 1 and sys.argv[1] == "serve":
+        from harmony.server import serve
+
+        return serve(sys.argv[2:])
+
     # Must happen before the first ``from gi.repository import Gtk/Adw`` anywhere
     # in the process, which is why this stays first in the entry point rather
     # than living in a module that might get imported some other way first.
