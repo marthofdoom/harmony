@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Compose owns the real theming; the Activity just needs a no-action-bar
+         base so Compose draws edge to edge. -->
+    <style name="Theme.Harmony" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>
