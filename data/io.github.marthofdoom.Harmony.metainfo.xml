@@ -43,6 +43,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.8.0a1" date="2026-08-31">
+      <description>
+        <p>The Android client is now a full light client — everything the web UI
+        does except signing in (accounts stay on the hub):</p>
+        <ul>
+          <li>Library: browse playlists, open and play them, create / rename /
+          delete, and add or remove tracks.</li>
+          <li>Sync: pick a source and target playlist, preview the plan, apply.</li>
+          <li>Output picker: play a track to a WiiM/UPnP device the hub knows,
+          not just the phone.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.9c" date="2026-08-31">
       <description>
         <p>Alpha fix — "play the hub's audio on my phone" now works reliably:</p>

@@ -40,6 +40,19 @@ data class UiState(
     val renderers: List<UpnpRenderer> = emptyList(),
     val discoveringRenderers: Boolean = false,
     val bridgingTo: String? = null,
+    // library
+    val playlists: List<Playlist> = emptyList(),
+    val openPlaylist: Playlist? = null,
+    val playlistTracks: List<Track> = emptyList(),
+    val libraryLoading: Boolean = false,
+    // cast target: "phone" (this device) or a hub device's host
+    val devices: List<Device> = emptyList(),
+    val target: String = "phone",
+    val devicePaused: Boolean = false,
+    // sync
+    val syncPlan: SyncPlan? = null,
+    val syncBusy: Boolean = false,
+    val syncMsg: String? = null,
 )
 
 class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
@@ -88,7 +101,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 prefs.baseUrl = baseUrl; prefs.key = key
                 val name = _state.value.discovered.firstOrNull { it.baseUrl == baseUrl }?.name ?: baseUrl
                 _state.value = _state.value.copy(conn = ConnState.CONNECTED, instanceName = name)
-                refreshPeers()
+                refreshPeers(); loadLibrary(); loadDevices()
             }.onFailure {
                 _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, message = it.message ?: "Connection failed")
             }
@@ -103,7 +116,9 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
             results = emptyList(), query = "", playback = Playback(),
             peers = emptyList(), playingHere = false, routeStatus = null,
-            renderers = emptyList(), bridgingTo = null)
+            renderers = emptyList(), bridgingTo = null,
+            playlists = emptyList(), openPlaylist = null, playlistTracks = emptyList(),
+            devices = emptyList(), target = "phone", syncPlan = null, syncMsg = null)
     }
 
     fun setQuery(q: String) { _state.value = _state.value.copy(query = q) }
@@ -122,8 +137,16 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun play(track: Track) {
         val client = api ?: return
-        _state.value = _state.value.copy(playback = _state.value.playback.copy(track = track))
+        _state.value = _state.value.copy(playback = _state.value.playback.copy(track = track),
+            playingHere = false)
+        val target = _state.value.target
         viewModelScope.launch {
+            if (target != "phone") {  // cast to a hub device instead of playing here
+                _state.value = _state.value.copy(devicePaused = false)
+                withContext(Dispatchers.IO) { runCatching { client.castPlay(target, track) } }
+                    .onFailure { _state.value = _state.value.copy(message = "Cast failed: ${it.message}") }
+                return@launch
+            }
             val url = withContext(Dispatchers.IO) { runCatching { client.streamUrl(track) } }
             url.onSuccess {
                 player.setMediaItem(MediaItem.fromUri(it))
@@ -132,7 +155,128 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun togglePlayPause() { if (player.isPlaying) player.pause() else player.play() }
+    fun setTarget(target: String) { _state.value = _state.value.copy(target = target) }
+
+    // -- library / playlists ------------------------------------------------
+
+    fun loadLibrary() {
+        val client = api ?: return
+        _state.value = _state.value.copy(libraryLoading = true)
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.playlists() } }
+            res.onSuccess { _state.value = _state.value.copy(playlists = it, libraryLoading = false) }
+                .onFailure { _state.value = _state.value.copy(libraryLoading = false, message = it.message) }
+        }
+    }
+
+    fun openPlaylist(pl: Playlist) {
+        val client = api ?: return
+        _state.value = _state.value.copy(openPlaylist = pl, playlistTracks = emptyList(), libraryLoading = true)
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.playlistTracks(pl.service, pl.id) } }
+            res.onSuccess { _state.value = _state.value.copy(playlistTracks = it, libraryLoading = false) }
+                .onFailure { _state.value = _state.value.copy(libraryLoading = false, message = it.message) }
+        }
+    }
+
+    fun closePlaylist() {
+        _state.value = _state.value.copy(openPlaylist = null, playlistTracks = emptyList())
+    }
+
+    fun createPlaylist(service: String, title: String) = mutate("Playlist created") {
+        it.createPlaylist(service, title)
+    }
+
+    fun renamePlaylist(pl: Playlist, title: String) = mutate("Renamed") {
+        it.renamePlaylist(pl.service, pl.id, title)
+    }
+
+    fun deletePlaylist(pl: Playlist) = viewModelScope.launch {
+        val client = api ?: return@launch
+        withContext(Dispatchers.IO) { runCatching { client.deletePlaylist(pl.service, pl.id) } }
+            .onSuccess { _state.value = _state.value.copy(openPlaylist = null, message = "Deleted"); loadLibrary() }
+            .onFailure { _state.value = _state.value.copy(message = "Delete failed: ${it.message}") }
+    }
+
+    fun addToPlaylist(track: Track, pl: Playlist) = viewModelScope.launch {
+        val client = api ?: return@launch
+        withContext(Dispatchers.IO) { runCatching { client.addTracks(pl.service, pl.id, listOf(track.id)) } }
+            .onSuccess { _state.value = _state.value.copy(message = "Added to ${pl.title}") }
+            .onFailure { _state.value = _state.value.copy(message = "Add failed: ${it.message}") }
+    }
+
+    fun removeFromPlaylist(track: Track) = viewModelScope.launch {
+        val client = api ?: return@launch
+        val pl = _state.value.openPlaylist ?: return@launch
+        withContext(Dispatchers.IO) { runCatching { client.removeTracks(pl.service, pl.id, listOf(track.id)) } }
+            .onSuccess {
+                _state.value = _state.value.copy(
+                    playlistTracks = _state.value.playlistTracks.filterNot { it.id == track.id })
+            }.onFailure { _state.value = _state.value.copy(message = "Remove failed: ${it.message}") }
+    }
+
+    /** Run a mutating call, then refresh the playlist list. */
+    private fun mutate(okMsg: String, block: (HarmonyApi) -> Unit) = viewModelScope.launch {
+        val client = api ?: return@launch
+        withContext(Dispatchers.IO) { runCatching { block(client) } }
+            .onSuccess { _state.value = _state.value.copy(message = okMsg); loadLibrary() }
+            .onFailure { _state.value = _state.value.copy(message = "Failed: ${it.message}") }
+    }
+
+    // -- devices ------------------------------------------------------------
+
+    fun loadDevices() {
+        val client = api ?: return
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { client.devices() } }
+                .onSuccess { _state.value = _state.value.copy(devices = it) }
+        }
+    }
+
+    // -- sync ---------------------------------------------------------------
+
+    fun syncPreview(src: Pair<String, String>, tgt: Pair<String, String>, direction: String) {
+        val client = api ?: return
+        _state.value = _state.value.copy(syncBusy = true, syncPlan = null, syncMsg = "Planning…")
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.syncPlan(src, tgt, direction) } }
+            res.onSuccess {
+                val note = if (it.notes.isEmpty()) "" else " " + it.notes.joinToString(" ")
+                _state.value = _state.value.copy(syncBusy = false, syncPlan = it,
+                    syncMsg = "${it.adds} to add, ${it.removes} to remove, ${it.unmatched} unmatched.$note")
+            }.onFailure { _state.value = _state.value.copy(syncBusy = false, syncMsg = "Plan failed: ${it.message}") }
+        }
+    }
+
+    fun syncApply() {
+        val client = api ?: return
+        val token = _state.value.syncPlan?.token ?: return
+        _state.value = _state.value.copy(syncBusy = true, syncMsg = "Applying…")
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.syncApply(token) } }
+            res.onSuccess {
+                _state.value = _state.value.copy(syncBusy = false, syncPlan = null,
+                    syncMsg = "Added ${it.added}, removed ${it.removed}" +
+                        if (it.failed > 0) ", ${it.failed} failed." else ".")
+            }.onFailure { _state.value = _state.value.copy(syncBusy = false, syncMsg = "Apply failed: ${it.message}") }
+        }
+    }
+
+    fun togglePlayPause() {
+        val target = _state.value.target
+        if (target != "phone") {  // control the cast device
+            val client = api ?: return
+            val paused = _state.value.devicePaused
+            _state.value = _state.value.copy(devicePaused = !paused)
+            viewModelScope.launch {
+                withContext(Dispatchers.IO) {
+                    runCatching { client.deviceControl(target, if (paused) "resume" else "pause") }
+                }
+            }
+            return
+        }
+        if (player.isPlaying) player.pause() else player.play()
+    }
 
     fun seekTo(ms: Long) = player.seekTo(ms)
 

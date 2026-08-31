@@ -22,17 +22,28 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
+import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Sync
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExposedDropdownMenuBox
+import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -170,26 +181,189 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
     Scaffold(
         bottomBar = {
             NavigationBar {
-                NavigationBarItem(
-                    selected = tab == 0, onClick = { tab = 0 },
-                    icon = { Icon(Icons.Filled.Search, null) }, label = { Text("Search") },
-                )
-                NavigationBarItem(
-                    selected = tab == 1, onClick = { tab = 1 },
-                    icon = { Icon(Icons.Filled.Speaker, null) }, label = { Text("Route") },
-                )
-                NavigationBarItem(
-                    selected = tab == 2, onClick = { tab = 2 },
-                    icon = { Icon(Icons.Filled.MusicNote, null) }, label = { Text("Now Playing") },
-                )
+                NavigationBarItem(selected = tab == 0, onClick = { tab = 0 },
+                    icon = { Icon(Icons.Filled.Search, null) }, label = { Text("Search") })
+                NavigationBarItem(selected = tab == 1, onClick = { tab = 1 },
+                    icon = { Icon(Icons.Filled.LibraryMusic, null) }, label = { Text("Library") })
+                NavigationBarItem(selected = tab == 2, onClick = { tab = 2 },
+                    icon = { Icon(Icons.Filled.Sync, null) }, label = { Text("Sync") })
+                NavigationBarItem(selected = tab == 3, onClick = { tab = 3 },
+                    icon = { Icon(Icons.Filled.Speaker, null) }, label = { Text("Route") })
+                NavigationBarItem(selected = tab == 4, onClick = { tab = 4 },
+                    icon = { Icon(Icons.Filled.MusicNote, null) }, label = { Text("Playing") })
             }
         }
     ) { pad ->
         Box(Modifier.padding(pad)) {
             when (tab) {
                 0 -> SearchScreen(vm, state)
-                1 -> RouteScreen(vm, state)
+                1 -> LibraryScreen(vm, state)
+                2 -> SyncScreen(vm, state)
+                3 -> RouteScreen(vm, state)
                 else -> NowPlayingScreen(vm, state)
+            }
+        }
+    }
+}
+
+// ── Library (playlists + editing) ────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
+    val open = state.openPlaylist
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(
+            title = { Text(open?.title ?: "Library", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            navigationIcon = {
+                if (open != null) IconButton(onClick = { vm.closePlaylist() }) {
+                    Icon(Icons.Filled.ArrowBack, "Back")
+                }
+            },
+            actions = {
+                if (open != null) {
+                    TextButton(onClick = { vm.deletePlaylist(open) }) { Text("Delete") }
+                } else {
+                    TextButton(onClick = { vm.loadLibrary() }) { Text("Refresh") }
+                }
+            },
+        )
+        if (state.libraryLoading) {
+            Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
+                CircularProgressIndicator()
+            }
+        }
+        if (open == null) {
+            var showNew by remember { mutableStateOf(false) }
+            if (showNew) NewPlaylistDialog(onDismiss = { showNew = false },
+                onCreate = { svc, title -> vm.createPlaylist(svc, title); showNew = false })
+            Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+                Button(onClick = { showNew = true }) {
+                    Icon(Icons.Filled.Add, null); Spacer(Modifier.width(8.dp)); Text("New playlist")
+                }
+            }
+            LazyColumn(Modifier.fillMaxSize()) {
+                items(state.playlists) { pl ->
+                    Row(Modifier.fillMaxWidth().clickable { vm.openPlaylist(pl) }
+                        .padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        NetworkImage(pl.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(pl.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.bodyLarge)
+                            Text("${pl.service.uppercase().take(3)} · ${pl.trackCount ?: "?"} tracks",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        }
+                    }
+                }
+            }
+        } else {
+            LazyColumn(Modifier.fillMaxSize()) {
+                items(state.playlistTracks) { t ->
+                    TrackRow(t, onPlay = { vm.play(t) },
+                        trailing = {
+                            IconButton(onClick = { vm.removeFromPlaylist(t) }) {
+                                Icon(Icons.Filled.Close, "Remove")
+                            }
+                        })
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun NewPlaylistDialog(onDismiss: () -> Unit, onCreate: (String, String) -> Unit) {
+    var title by remember { mutableStateOf("") }
+    var service by remember { mutableStateOf("qobuz") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New playlist") },
+        text = {
+            Column {
+                OutlinedTextField(value = title, onValueChange = { title = it },
+                    label = { Text("Title") }, singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                Row {
+                    FilterChip(selected = service == "qobuz", onClick = { service = "qobuz" },
+                        label = { Text("Qobuz") })
+                    Spacer(Modifier.width(8.dp))
+                    FilterChip(selected = service == "ytmusic", onClick = { service = "ytmusic" },
+                        label = { Text("YT Music") })
+                }
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = { if (title.isNotBlank()) onCreate(service, title.trim()) }) { Text("Create") }
+        },
+        dismissButton = { TextButton(onClick = onDismiss) { Text("Cancel") } },
+    )
+}
+
+// ── Sync ─────────────────────────────────────────────────────────────────
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun SyncScreen(vm: HarmonyViewModel, state: UiState) {
+    val playlists = state.playlists
+    var src by remember { mutableStateOf<Playlist?>(null) }
+    var tgt by remember { mutableStateOf<Playlist?>(null) }
+    var dir by remember { mutableStateOf("a_to_b") }
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(title = { Text("Sync playlists") })
+        Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
+            Text("Mirror one playlist onto another across services. Preview first — nothing is written until you apply.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+            Spacer(Modifier.height(12.dp))
+            PlaylistDropdown("Source", playlists, src) { src = it }
+            Spacer(Modifier.height(8.dp))
+            PlaylistDropdown("Target", playlists, tgt) { tgt = it }
+            Spacer(Modifier.height(8.dp))
+            Text("Direction", style = MaterialTheme.typography.labelMedium)
+            Row {
+                listOf("a_to_b" to "Source→Target", "b_to_a" to "Target→Source", "two_way" to "Two-way").forEach {
+                    FilterChip(selected = dir == it.first, onClick = { dir = it.first },
+                        label = { Text(it.second) }, modifier = Modifier.padding(end = 6.dp))
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            Row {
+                Button(enabled = src != null && tgt != null && !state.syncBusy,
+                    onClick = { vm.syncPreview(src!!.service to src!!.id, tgt!!.service to tgt!!.id, dir) }) {
+                    Text("Preview")
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(enabled = state.syncPlan?.token != null && !state.syncBusy, onClick = { vm.syncApply() }) {
+                    Text("Apply")
+                }
+            }
+            state.syncMsg?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, style = MaterialTheme.typography.bodyMedium)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PlaylistDropdown(label: String, playlists: List<Playlist>, selected: Playlist?,
+                             onSelect: (Playlist) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = selected?.let { "${it.title} — ${it.service.uppercase().take(3)}" } ?: "",
+            onValueChange = {}, readOnly = true, label = { Text(label) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier.menuAnchor().fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            playlists.forEach { pl ->
+                DropdownMenuItem(text = { Text("${pl.title} — ${pl.service.uppercase().take(3)}") },
+                    onClick = { onSelect(pl); expanded = false })
             }
         }
     }
@@ -331,23 +505,43 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
         }
         LazyColumn(Modifier.fillMaxSize()) {
             items(state.results) { t ->
-                Row(
-                    Modifier.fillMaxWidth().clickable { vm.play(t) }.padding(horizontal = 16.dp, vertical = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                ) {
-                    NetworkImage(t.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodyLarge)
-                        Text(listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · "),
-                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    }
-                    Text(t.service.uppercase().take(3), style = MaterialTheme.typography.labelSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                }
+                TrackRow(t, onPlay = { vm.play(t) },
+                    trailing = { AddToPlaylistButton(vm, state, t) })
+            }
+        }
+    }
+}
+
+/** A track list row: art, title, artist·album, and an optional trailing action. */
+@Composable
+private fun TrackRow(t: Track, onPlay: () -> Unit, trailing: @Composable (() -> Unit)? = null) {
+    Row(Modifier.fillMaxWidth().clickable { onPlay() }.padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        NetworkImage(t.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyLarge)
+            Text(listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · "),
+                maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        trailing?.invoke()
+    }
+}
+
+@Composable
+private fun AddToPlaylistButton(vm: HarmonyViewModel, state: UiState, track: Track) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) { Icon(Icons.Filled.Add, "Add to playlist") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            if (state.playlists.isEmpty()) {
+                DropdownMenuItem(text = { Text("No playlists") }, onClick = { expanded = false })
+            }
+            state.playlists.forEach { pl ->
+                DropdownMenuItem(text = { Text("${pl.title} · ${pl.service.uppercase().take(3)}") },
+                    onClick = { vm.addToPlaylist(track, pl); expanded = false })
             }
         }
     }
@@ -384,13 +578,41 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
             Text(formatMs(dur), style = MaterialTheme.typography.labelSmall)
         }
         Spacer(Modifier.height(16.dp))
+        val onDevice = state.target != "phone"
+        val playing = if (onDevice) !state.devicePaused else pb.isPlaying
         IconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
             modifier = Modifier.size(72.dp)) {
             Icon(
-                if (pb.isPlaying) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                contentDescription = if (pb.isPlaying) "Pause" else "Play",
+                if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                contentDescription = if (playing) "Pause" else "Play",
                 modifier = Modifier.size(48.dp),
             )
+        }
+        Spacer(Modifier.height(16.dp))
+        OutputSelector(vm, state)
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun OutputSelector(vm: HarmonyViewModel, state: UiState) {
+    var expanded by remember { mutableStateOf(false) }
+    val label = if (state.target == "phone") "This phone"
+    else state.devices.firstOrNull { it.host == state.target }?.name ?: state.target
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+        OutlinedTextField(
+            value = label, onValueChange = {}, readOnly = true, label = { Text("Output") },
+            leadingIcon = { Icon(Icons.Filled.Speaker, null) },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded = expanded) },
+            modifier = Modifier.menuAnchor().fillMaxWidth(),
+        )
+        ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(text = { Text("This phone") },
+                onClick = { vm.setTarget("phone"); expanded = false })
+            state.devices.forEach { d ->
+                DropdownMenuItem(text = { Text("${d.name} · ${d.kind}") },
+                    onClick = { vm.setTarget(d.host); expanded = false })
+            }
         }
     }
 }
