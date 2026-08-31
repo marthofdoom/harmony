@@ -119,7 +119,13 @@ class Engine:
                         name = prov.account_name()
                     except Exception:  # noqa: BLE001
                         name = None
-                out.append({"service": svc.value, "authenticated": authed, "account": name})
+                # YouTube's is_authenticated only means "a client was built from
+                # the auth file", not that the cookies are still valid. When the
+                # session has expired the account name can't be fetched -- flag
+                # that as stale so the UI prompts a re-auth instead of lying.
+                stale = authed and name is None and svc.value == "ytmusic"
+                out.append({"service": svc.value, "authenticated": authed,
+                            "account": name, "stale": stale})
         return {"accounts": out}
 
     # -- preferences --------------------------------------------------------

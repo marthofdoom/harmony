@@ -224,7 +224,7 @@ async function renderAccounts() {
       </div>
 
       <div class="card">
-        <h2>YouTube Music <span class="badge">${y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out"}</span></h2>
+        <h2>YouTube Music <span class="badge">${y.stale ? "session expired — re-authenticate" : (y.authenticated ? "signed in" + (y.account ? " · " + esc(y.account) : "") : "signed out")}</span></h2>
         <p class="muted">Paste the request headers from a logged-in music.youtube.com tab
         (DevTools → Network → a request → Copy → Copy request headers).</p>
         <textarea id="yt-headers" rows="5" style="width:100%;font-family:monospace;font-size:12px" placeholder="Cookie: …\nX-Goog-…"></textarea>
@@ -303,11 +303,18 @@ async function newPlaylist() {
   catch (e) { alert("Create failed: " + e.message); }
 }
 
+function acctStatusText(a) {
+  if (a.stale) return "session expired";
+  if (a.account) return esc(a.account);
+  if (a.authenticated) return "signed in";
+  return "signed out";
+}
+
 async function loadAccounts() {
   try {
     const r = await api("/api/accounts");
     $("accounts").innerHTML = (r.accounts || []).map((a) =>
-      `<div class="acct"><span class="dot ${a.authenticated ? "ok" : ""}"></span>${serviceLabel(a.service)}${a.account ? " · " + esc(a.account) : (a.authenticated ? "" : " · signed out")}</div>`).join("");
+      `<div class="acct"><span class="dot ${a.authenticated && !a.stale ? "ok" : ""}"></span>${serviceLabel(a.service)} · ${acctStatusText(a)}</div>`).join("");
   } catch { /* leave blank */ }
 }
 
