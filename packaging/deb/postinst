@@ -20,9 +20,19 @@ if [ "$1" = configure ] || [ -z "$1" ]; then
     if [ ! -x "$VENV/bin/python" ]; then
         python3 -m venv "$VENV"
     fi
-    "$VENV/bin/pip" install --quiet --upgrade pip
-    # Quote the whole spec so the shell doesn't glob the "[server]" extra.
-    "$VENV/bin/pip" install --quiet "${APP}[server]"
+
+    # Install from the bundled wheels first (offline, self-contained). Quote the
+    # whole spec so the shell doesn't glob the "[server]" extra. If the target's
+    # Python/arch isn't among the vendored wheels, fall back to PyPI.
+    WHEELS=/usr/share/harmony/wheels
+    if [ -d "$WHEELS" ] && "$VENV/bin/pip" install --quiet --no-index \
+            --find-links="$WHEELS" "harmony[server]" 2>/dev/null; then
+        echo "Harmony installed from bundled wheels (offline)."
+    else
+        echo "Bundled wheels don't match this platform; installing from PyPI…"
+        "$VENV/bin/pip" install --quiet --upgrade pip
+        "$VENV/bin/pip" install --quiet "${APP}[server]"
+    fi
 
     if command -v systemctl >/dev/null 2>&1; then
         systemctl daemon-reload || true
