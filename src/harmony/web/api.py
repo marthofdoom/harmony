@@ -188,6 +188,9 @@ class Engine:
     def set_ytmusic_browser(self, headers_raw: str) -> dict[str, Any]:
         return self._onboarding().set_ytmusic_browser(headers_raw)
 
+    def ytmusic_autodetect(self, browser: str | None = None) -> dict[str, Any]:
+        return self._onboarding().ytmusic_autodetect(browser)
+
     def set_ytmusic_oauth_client(self, client_id: str, client_secret: str) -> dict[str, Any]:
         return self._onboarding().set_ytmusic_oauth_client(client_id, client_secret)
 

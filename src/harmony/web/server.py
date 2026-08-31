@@ -175,6 +175,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json({"error": "missing headers"}, status=400)
                     return
                 self._send_json(engine.set_ytmusic_browser(headers_raw))
+            elif parts == ["api", "accounts", "ytmusic", "autodetect"]:
+                self._send_json(engine.ytmusic_autodetect(body.get("browser")))
             elif parts == ["api", "accounts", "ytmusic", "oauth", "client"]:
                 cid = (body.get("client_id") or "").strip()
                 secret = (body.get("client_secret") or "").strip()
