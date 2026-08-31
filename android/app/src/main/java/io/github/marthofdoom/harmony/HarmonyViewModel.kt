@@ -32,11 +32,16 @@ data class UiState(
     val searching: Boolean = false,
     val playback: Playback = Playback(),
     val message: String? = null,
+    // audio routing
+    val peers: List<Instance> = emptyList(),
+    val playingHere: Boolean = false,
+    val routeStatus: String? = null,
 )
 
 class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     private val prefs = Prefs(app)
     private val discovery = Discovery(app)
+    private val rtp = RtpReceiver()
     private var api: HarmonyApi? = null
 
     private val _state = MutableStateFlow(UiState())
@@ -77,6 +82,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 prefs.baseUrl = baseUrl; prefs.key = key
                 val name = _state.value.discovered.firstOrNull { it.baseUrl == baseUrl }?.name ?: baseUrl
                 _state.value = _state.value.copy(conn = ConnState.CONNECTED, instanceName = name)
+                refreshPeers()
             }.onFailure {
                 _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, message = it.message ?: "Connection failed")
             }
@@ -84,11 +90,13 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun disconnect() {
+        rtp.stop()
         api = null
         prefs.baseUrl = null
         player.stop(); player.clearMediaItems()
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
-            results = emptyList(), query = "", playback = Playback())
+            results = emptyList(), query = "", playback = Playback(),
+            peers = emptyList(), playingHere = false, routeStatus = null)
     }
 
     fun setQuery(q: String) { _state.value = _state.value.copy(query = q) }
@@ -123,6 +131,74 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun clearMessage() { _state.value = _state.value.copy(message = null) }
 
+    // -- audio routing ------------------------------------------------------
+
+    fun refreshPeers() {
+        val client = api ?: return
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.instances() } }
+            res.onSuccess { _state.value = _state.value.copy(peers = it) }
+        }
+    }
+
+    /** Play the connected hub's audio on this phone (RTP receiver → AudioTrack). */
+    fun playHere() {
+        val client = api ?: return
+        player.pause() // don't stack in-app streaming on top of the routed audio
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val myIp = localIpTowards(hostOf(client.baseUrl))
+                    if (myIp.isEmpty()) error("couldn't determine this phone's IP")
+                    rtp.start()
+                    client.audioSend(myIp, transport = "rtp")
+                }
+            }
+            res.onSuccess {
+                _state.value = _state.value.copy(playingHere = true,
+                    routeStatus = "Playing this hub's audio on your phone.")
+            }.onFailure {
+                rtp.stop()
+                _state.value = _state.value.copy(playingHere = false,
+                    routeStatus = "Couldn't start: ${it.message}")
+            }
+        }
+    }
+
+    fun stopPlayHere() {
+        val client = api
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { client?.audioStop() } }
+            rtp.stop()
+            _state.value = _state.value.copy(playingHere = false, routeStatus = "Stopped.")
+        }
+    }
+
+    /** Route audio between the connected hub and a discovered peer (both hubs). */
+    fun route(direction: String, peer: Instance) {
+        val client = api ?: return
+        _state.value = _state.value.copy(routeStatus = "Setting up…")
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching { client.audioRoute(direction, peer.host, peer.port) }
+            }
+            val verb = if (direction == "send") "Sending this hub → ${peer.name}"
+                       else "Playing ${peer.name} on this hub"
+            res.onSuccess { _state.value = _state.value.copy(routeStatus = "$verb.") }
+                .onFailure { _state.value = _state.value.copy(routeStatus = "Couldn't route: ${it.message}") }
+        }
+    }
+
+    private fun hostOf(baseUrl: String): String =
+        baseUrl.removePrefix("http://").removePrefix("https://").substringBefore(":").substringBefore("/")
+
+    private fun localIpTowards(host: String): String = try {
+        java.net.DatagramSocket().use { s ->
+            s.connect(java.net.InetSocketAddress(host, 9))
+            s.localAddress.hostAddress ?: ""
+        }
+    } catch (e: Exception) { "" }
+
     private fun startProgressTicker() {
         viewModelScope.launch {
             while (true) {
@@ -141,6 +217,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     override fun onCleared() {
+        rtp.stop()
         discovery.stop()
         player.release()
         super.onCleared()

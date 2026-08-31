@@ -24,6 +24,8 @@ import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Speaker
+import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CircularProgressIndicator
@@ -170,6 +172,10 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
                 )
                 NavigationBarItem(
                     selected = tab == 1, onClick = { tab = 1 },
+                    icon = { Icon(Icons.Filled.Speaker, null) }, label = { Text("Route") },
+                )
+                NavigationBarItem(
+                    selected = tab == 2, onClick = { tab = 2 },
                     icon = { Icon(Icons.Filled.MusicNote, null) }, label = { Text("Now Playing") },
                 )
             }
@@ -178,7 +184,75 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
         Box(Modifier.padding(pad)) {
             when (tab) {
                 0 -> SearchScreen(vm, state)
+                1 -> RouteScreen(vm, state)
                 else -> NowPlayingScreen(vm, state)
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RouteScreen(vm: HarmonyViewModel, state: UiState) {
+    Column(Modifier.fillMaxSize()) {
+        TopAppBar(
+            title = { Text("Route audio") },
+            actions = { TextButton(onClick = { vm.refreshPeers() }) { Text("Refresh") } },
+        )
+        Column(Modifier.fillMaxSize().padding(16.dp)) {
+            // Play the connected hub's audio on this phone (RTP → the speaker).
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Play on this phone", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "Stream ${state.instanceName ?: "this hub"}'s audio to your phone and play it here.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    if (state.playingHere) {
+                        Button(onClick = { vm.stopPlayHere() }, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Filled.Stop, null); Spacer(Modifier.width(8.dp)); Text("Stop")
+                        }
+                    } else {
+                        Button(onClick = { vm.playHere() }, modifier = Modifier.fillMaxWidth()) {
+                            Icon(Icons.Filled.Speaker, null); Spacer(Modifier.width(8.dp)); Text("Play here")
+                        }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(16.dp))
+            Text("Route between hubs", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Send this hub's audio to another Harmony instance on your network, or play theirs on it.",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            Spacer(Modifier.height(8.dp))
+            if (state.peers.isEmpty()) {
+                Text("No other instances found.", style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(vertical = 8.dp))
+            } else {
+                LazyColumn(Modifier.weight(1f, fill = false)) {
+                    items(state.peers) { peer ->
+                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Column(Modifier.padding(12.dp)) {
+                                Text(peer.name, style = MaterialTheme.typography.bodyLarge)
+                                Text("${peer.host}:${peer.port}", style = MaterialTheme.typography.bodySmall)
+                                Spacer(Modifier.height(8.dp))
+                                Row {
+                                    TextButton(onClick = { vm.route("send", peer) }) { Text("Send to") }
+                                    Spacer(Modifier.width(8.dp))
+                                    TextButton(onClick = { vm.route("receive", peer) }) { Text("Play theirs") }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            state.routeStatus?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, style = MaterialTheme.typography.bodyMedium)
             }
         }
     }

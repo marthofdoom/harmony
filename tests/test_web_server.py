@@ -221,9 +221,9 @@ class _FakeEngine:
         self.calls.append(("audio_receive", sink, latency_ms))
         return {"ok": True, "sink": sink or "default", "transport": "roc", "latency_ms": latency_ms}
 
-    def audio_send(self, to_host, latency_ms=150):
-        self.calls.append(("audio_send", to_host, latency_ms))
-        return {"ok": True, "to_host": to_host, "transport": "roc"}
+    def audio_send(self, to_host, latency_ms=150, transport=None):
+        self.calls.append(("audio_send", to_host, latency_ms, transport))
+        return {"ok": True, "to_host": to_host, "transport": transport or "roc"}
 
     def audio_stop(self):
         self.calls.append(("audio_stop",))
@@ -480,7 +480,7 @@ def test_audio_route_and_stop(api_url: str) -> None:
     _post(api_url + "/api/audio/stop", {})
     calls = srv._engine.calls
     assert ("audio_route", "receive", "192.168.1.5", 8080, None, 40) in calls
-    assert ("audio_send", "192.168.1.5", 150) in calls
+    assert ("audio_send", "192.168.1.5", 150, None) in calls
     assert ("audio_stop",) in calls
 
 
@@ -494,6 +494,14 @@ def test_audio_send_missing_host_is_400(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _post(api_url + "/api/audio/send", {})
     assert exc.value.code == 400
+
+
+def test_audio_send_forwards_rtp_transport(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    # A phone asks the instance to send plain RTP so it can play without ROC.
+    _post(api_url + "/api/audio/send", {"to_host": "192.168.1.7", "transport": "rtp"})
+    assert ("audio_send", "192.168.1.7", 150, "rtp") in srv._engine.calls
 
 
 # -- credential management (POST) ------------------------------------------------
