@@ -16,15 +16,13 @@ import pytest
 
 SRC = Path(__file__).resolve().parent.parent / "src" / "harmony"
 
-# The only places allowed to touch GTK: the UI package itself and the entry
-# points that construct/run the application. ``server.py`` is the headless
-# ``harmony serve`` entry point -- it launches the same GTK app under GTK's
-# Broadway backend, so it legitimately runs (not imports at module scope) GTK,
-# just like the desktop entry points.
+# The only places allowed to touch GTK: the UI package itself and the desktop
+# entry points that construct the application. The headless server
+# (``server.py`` -> ``harmony serve`` -> ``harmony.web``) is GTK-free like the
+# rest of the engine, so it is NOT exempt -- the fence holds it to the rule.
 GUI_ALLOWED = {
     "app.py",
     "__main__.py",
-    "server.py",
 }
 GUI_ALLOWED_PACKAGES = {"ui"}
 
