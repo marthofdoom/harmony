@@ -211,6 +211,28 @@ class _FakeEngine:
     def device_status(self, host):
         return {"state": "playing", "position_s": 5, "duration_s": 200, "volume": 40}
 
+    def audio_sinks(self):
+        return {"sinks": [{"name": "dac", "description": "USB DAC"}]}
+
+    def audio_status(self):
+        return {"receiving": False, "sending": False, "roc": True}
+
+    def audio_receive(self, sink, latency_ms=150):
+        self.calls.append(("audio_receive", sink, latency_ms))
+        return {"ok": True, "sink": sink or "default", "transport": "roc", "latency_ms": latency_ms}
+
+    def audio_send(self, to_host, latency_ms=150):
+        self.calls.append(("audio_send", to_host, latency_ms))
+        return {"ok": True, "to_host": to_host, "transport": "roc"}
+
+    def audio_stop(self):
+        self.calls.append(("audio_stop",))
+        return {"ok": True}
+
+    def audio_route(self, direction, peer_host, peer_port, sink=None, latency_ms=150):
+        self.calls.append(("audio_route", direction, peer_host, peer_port, sink, latency_ms))
+        return {"ok": True, "direction": direction, "peer": peer_host}
+
     def sync_plan(self, source, target, direction):
         self.calls.append(("plan", source["service"], target["service"], direction))
         return {"token": "pl1", "adds": 3, "removes": 1, "unmatched": 0, "notes": []}
@@ -436,6 +458,41 @@ def test_cast_play_and_transport(api_url: str) -> None:
 def test_cast_play_missing_id_is_400(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _post(api_url + "/api/devices/192.168.1.9/play", {"service": "qobuz"})
+    assert exc.value.code == 400
+
+
+# -- inter-instance audio routing ------------------------------------------------
+
+
+def test_audio_sinks_and_status(api_url: str) -> None:
+    _, _, sinks = _get(api_url + "/api/audio/sinks")
+    assert json.loads(sinks)["sinks"][0]["name"] == "dac"
+    _, _, st = _get(api_url + "/api/audio/status")
+    assert json.loads(st)["roc"] is True
+
+
+def test_audio_route_and_stop(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _post(api_url + "/api/audio/route", {"direction": "receive", "peer_host": "192.168.1.5",
+                                         "peer_port": 8080, "latency_ms": 40})
+    _post(api_url + "/api/audio/send", {"to_host": "192.168.1.5"})
+    _post(api_url + "/api/audio/stop", {})
+    calls = srv._engine.calls
+    assert ("audio_route", "receive", "192.168.1.5", 8080, None, 40) in calls
+    assert ("audio_send", "192.168.1.5", 150) in calls
+    assert ("audio_stop",) in calls
+
+
+def test_audio_route_bad_direction_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/audio/route", {"direction": "sideways", "peer_host": "h", "peer_port": 8080})
+    assert exc.value.code == 400
+
+
+def test_audio_send_missing_host_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/audio/send", {})
     assert exc.value.code == 400
 
 

@@ -71,6 +71,7 @@ class Engine:
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
         self._onboard: Any | None = None
+        self._audio_router: Any | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -406,6 +407,39 @@ class Engine:
 
     def device_status(self, host: str) -> dict[str, Any]:
         return self._caster().status(host)
+
+    # -- inter-instance audio routing --------------------------------------
+
+    def _router(self) -> Any:
+        if self._audio_router is None:
+            from harmony.web.audio_routing import AudioRouter
+
+            self._audio_router = AudioRouter()
+        return self._audio_router
+
+    def audio_sinks(self) -> dict[str, Any]:
+        return self._router().sinks()
+
+    def audio_status(self) -> dict[str, Any]:
+        return self._router().status()
+
+    def audio_receive(self, sink: str | None, latency_ms: int = 150) -> dict[str, Any]:
+        return self._router().receive(sink=sink, latency_ms=latency_ms)
+
+    def audio_send(self, to_host: str, latency_ms: int = 150) -> dict[str, Any]:
+        return self._router().send(to_host, latency_ms=latency_ms)
+
+    def audio_stop(self) -> dict[str, Any]:
+        return self._router().stop()
+
+    def audio_route(self, direction: str, peer_host: str, peer_port: int,
+                    sink: str | None = None, latency_ms: int = 150) -> dict[str, Any]:
+        """Set up a full send/receive session with a peer, presenting our key."""
+        from harmony.config import Settings
+
+        key = Settings.load().personal_key or None
+        return self._router().route(direction, peer_host, int(peer_port),
+                                    key=key, sink=sink, latency_ms=latency_ms)
 
     def stream_for(self, token: str) -> dict[str, Any] | None:
         meta = self._streams.get(token)

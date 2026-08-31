@@ -22,6 +22,7 @@ from gi.repository import Adw, Gtk  # noqa: E402
 
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
+from harmony.ui.widgets import SegmentedToggle  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -61,17 +62,56 @@ class AudioRoutePage(Gtk.Box):
         self.append(heading)
         self.append(Gtk.Label(
             xalign=0.0, wrap=True,
-            label=f"Receive a low-latency network audio stream ({transport}) from another "
-                  "machine on your LAN and play it out a local output device.",
+            label=f"Route audio between machines ({transport}). Play another Harmony "
+                  "instance's audio here, or send this machine's output to one.",
         ))
 
-        group = Adw.PreferencesGroup(title="Receiver")
+        # -- route with another Harmony instance --------------------------------
+        self._peers: list = []
+        mesh = Adw.PreferencesGroup(
+            title="Route with another Harmony instance",
+            description="Discovered on your network. Both instances need the same personal key.",
+        )
+        self.peer_row = Adw.ComboRow(title="Instance")
+        mesh.add(self.peer_row)
+        preset_row = Adw.ActionRow(
+            title="Latency profile",
+            subtitle="Music is rock-solid; Gaming trades a little stability for tightness",
+        )
+        self._preset = SegmentedToggle([("music", "Music"), ("gaming", "Gaming")], active="music")
+        self._preset.set_valign(Gtk.Align.CENTER)
+        self._preset.connect("changed", lambda *_a: self._on_preset_changed())
+        preset_row.add_suffix(self._preset)
+        mesh.add(preset_row)
+        mesh_buttons = Gtk.Box(spacing=6, margin_top=6, margin_bottom=6, margin_start=6, margin_end=6)
+        self.recv_peer_button = Gtk.Button(label="Receive their audio", sensitive=False)
+        self.recv_peer_button.connect("clicked", lambda *_a: self._on_route("receive"))
+        self.send_peer_button = Gtk.Button(label="Send my audio to them",
+                                           css_classes=["suggested-action"], sensitive=False)
+        self.send_peer_button.connect("clicked", lambda *_a: self._on_route("send"))
+        self.stop_route_button = Gtk.Button(label="Stop routing")
+        self.stop_route_button.connect("clicked", lambda *_a: self._on_stop_routing())
+        self.refresh_peers_button = Gtk.Button(label="Refresh")
+        self.refresh_peers_button.connect("clicked", lambda *_a: self._load_peers())
+        for button in (self.recv_peer_button, self.send_peer_button,
+                       self.stop_route_button, self.refresh_peers_button):
+            mesh_buttons.append(button)
+        buttons_row = Adw.ActionRow()
+        buttons_row.set_child(mesh_buttons)
+        mesh.add(buttons_row)
+        self.route_status = Gtk.Label(xalign=0.0, wrap=True, margin_start=6, margin_end=6, margin_bottom=6)
+        status_row = Adw.ActionRow()
+        status_row.set_child(self.route_status)
+        mesh.add(status_row)
+        self.append(mesh)
+
+        group = Adw.PreferencesGroup(title="Receiver (from a non-Harmony sender)")
         self.sink_row = Adw.ComboRow(title="Output device")
         group.add(self.sink_row)
         self.latency_row = Adw.SpinRow.new_with_range(20, 500, 5)
         self.latency_row.set_title("Target latency (ms)")
         self.latency_row.set_subtitle("Higher is more stable over Wi-Fi; lower is tighter")
-        self.latency_row.set_value(100 if self._roc else 40)
+        self.latency_row.set_value(150 if self._roc else 40)  # Music preset default
         group.add(self.latency_row)
         self.append(group)
 
@@ -104,6 +144,81 @@ class AudioRoutePage(Gtk.Box):
         self.append(sender)
 
         self._load_sinks()
+        self._load_peers()
+
+    # -- route with another Harmony instance --------------------------------
+
+    def _on_preset_changed(self) -> None:
+        """Music vs Gaming preset writes a sensible latency into the adjuster."""
+        self.latency_row.set_value(150 if self._preset.get_active_name() == "music" else 40)
+
+    def _load_peers(self) -> None:
+        self.refresh_peers_button.set_sensitive(False)
+
+        def work() -> list:
+            from harmony.web.server import get_engine
+
+            return get_engine().instances().get("instances", [])
+
+        def done(peers: list) -> None:
+            self.refresh_peers_button.set_sensitive(True)
+            self._peers = peers
+            names = [f"{p.get('name')} ({p.get('host')})" for p in peers] or ["No instances found"]
+            self.peer_row.set_model(Gtk.StringList.new(names))
+            self.recv_peer_button.set_sensitive(bool(peers))
+            self.send_peer_button.set_sensitive(bool(peers))
+
+        def error(exc: BaseException) -> None:
+            self.refresh_peers_button.set_sensitive(True)
+            self.state.toast(f"Couldn't list instances: {exc}")
+
+        run_async(work, done, error)
+
+    def _on_route(self, direction: str) -> None:
+        index = self.peer_row.get_selected()
+        if not (0 <= index < len(self._peers)):
+            self.state.toast("Pick an instance first.")
+            return
+        peer = self._peers[index]
+        host, port = peer.get("host"), peer.get("port")
+        if not host or not port:
+            self.state.toast("That instance hasn't resolved an address yet.")
+            return
+        latency = int(self.latency_row.get_value())
+        sink = None
+        if direction == "receive":  # play the incoming stream into the chosen local sink
+            i = self.sink_row.get_selected()
+            if 0 <= i < len(self._sinks):
+                sink = self._sinks[i].name
+        verb = "Receiving from" if direction == "receive" else "Sending to"
+        self.route_status.set_label(f"Setting up… ({verb.lower()} {peer.get('name')})")
+
+        def work() -> object:
+            from harmony.web.server import get_engine
+
+            return get_engine().audio_route(direction, host, int(port), sink=sink, latency_ms=latency)
+
+        def done(_result: object) -> None:
+            self.route_status.set_label(f"{verb} {peer.get('name')}. Stop when you're done.")
+
+        def error(exc: BaseException) -> None:
+            self.route_status.set_label(f"Couldn't route: {exc}")
+
+        run_async(work, done, error)
+
+    def _on_stop_routing(self) -> None:
+        def work() -> object:
+            from harmony.web.server import get_engine
+
+            return get_engine().audio_stop()
+
+        def done(_result: object) -> None:
+            self.route_status.set_label("Routing stopped.")
+
+        def error(exc: BaseException) -> None:
+            self.state.toast(f"Couldn't stop routing: {exc}")
+
+        run_async(work, done, error)
 
     def _sender_command(self, ip: str | None = None) -> str:
         """The command to run on the sender, for the active transport."""
@@ -181,6 +296,13 @@ class AudioRoutePage(Gtk.Box):
         into the host's PipeWire; either would outlive the app otherwise, with
         no in-app way to stop it after reopening.
         """
+        try:  # tear down any inter-instance route owned by the engine
+            from harmony.web.server import get_engine
+
+            get_engine().audio_stop()
+        except Exception:  # noqa: BLE001 - best-effort shutdown cleanup
+            log.debug("route shutdown failed", exc_info=True)
+
         receiver = self._receiver
         if receiver is None:
             return
