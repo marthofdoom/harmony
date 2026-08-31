@@ -152,6 +152,25 @@ rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
 - Container smoke test (`harmony serve` boots, `/healthz` + an unauthenticated
   API call respond) on tag; `PKGBUILD`/`.deb` lint.
 
+## Future: instance mesh (discovery + inter-instance audio routing)
+
+Beyond the client↔server model, instances should form a **mesh on the LAN**:
+
+- **Discovery** — instances advertise and auto-detect each other on the same
+  network (mDNS/zeroconf), so a client (or another instance) finds a home
+  instance without a typed URL.
+- **Inter-instance audio routing** — a **Route Audio** tab lets the user toggle
+  audio routing *to and from another instance's sinks* (full sinks), reusing the
+  existing ROC path (`audio/pipewire.py`, the desktop's route-audio) as a
+  federation primitive: one instance streams its output to another's speakers, or
+  pulls a peer's. This makes the "play to a device" story also "play to another
+  Harmony box's outputs." **Latency default:** music-friendly (higher
+  target-latency = robust, glitch-free) by default, with the existing
+  target-latency adjuster exposed to tune it *down* for low-latency gaming use.
+
+Both are post-slice-3 (they need the API + discovery + the ROC path exposed as
+an API action), but the API/relay boundary is being kept compatible with them.
+
 ## Open questions
 
 - **Client↔server auth model (when enabled)** — accounts (single-user vs multi),
