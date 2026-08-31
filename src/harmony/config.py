@@ -192,6 +192,10 @@ class Settings:
     # discovers instances on the LAN and may use one as its backend (sharing its
     # held credentials) only if the personal keys match. Blank = no key set.
     personal_key: str = ""
+    # Desktop-as-server: run the web/API server + join the LAN mesh from the
+    # desktop app, and keep running (window hidden) when closed. See docs.
+    server_enabled: bool = False
+    server_port: int = 8080
 
     # UI
     window_width: int = 1280

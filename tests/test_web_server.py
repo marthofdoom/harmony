@@ -52,6 +52,19 @@ def test_healthz_reports_ok_and_version(base_url: str) -> None:
     assert payload == {"status": "ok", "service": "harmony", "version": __version__}
 
 
+def test_start_background_serves_and_stops() -> None:
+    from harmony.web.server import start_background
+
+    httpd = start_background("127.0.0.1", 0)  # ephemeral port
+    try:
+        host, port = httpd.server_address
+        status, _, _ = _get(f"http://{host}:{port}/healthz")
+        assert status == 200
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def test_root_serves_the_web_app_shell(base_url: str) -> None:
     status, ctype, body = _get(base_url + "/")
     assert status == 200

@@ -144,6 +144,24 @@ rapidfuzz, yt-dlp, ffmpeg for casting; **no GTK** — the server is headless).
   imports only engine modules.
 - **No frontend build toolchain** — static assets ship in the package.
 
+## Desktop as a server (shipped)
+
+The GTK desktop app is a first-class server + mesh node, so a desktop box people
+leave running *is* a Harmony instance:
+
+- **Preferences → Network → "Run as a server"** (+ port + personal key) starts the
+  same web/API server in a background thread (`web.server.start_background`) and
+  joins the mesh — identical credential powers to the headless server.
+- **Closing the window keeps it running** (hidden, app `hold()`-ed) while sharing
+  is on; re-launching (single-instance) or activating re-shows it, and **Quit
+  (Ctrl+Q)** actually exits. Off = normal close/quit.
+- The Flatpak grants **read-only browser-profile access** so one-click YouTube
+  auto-detect works on the desktop (Firefox directly; Chromium via the login
+  keyring). **`zeroconf` must be vendored into the Flatpak manifest** (a
+  flatpak-pip-generator step) for desktop mDNS discovery to go live; the code
+  degrades to a no-op until then, and native installs (AUR/.deb/pip) already have
+  it.
+
 ## Testing / CI
 
 - API handlers are gi-free and stdlib → unit-testable in the existing offline

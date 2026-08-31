@@ -25,6 +25,7 @@ class HarmonyApplication(Adw.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self.state: AppState | None = None
         self._window: HarmonyWindow | None = None
+        self._httpd: object | None = None  # embedded web server when sharing is on
 
     def do_startup(self) -> None:
         Adw.Application.do_startup(self)
@@ -35,6 +36,39 @@ class HarmonyApplication(Adw.Application):
         apply_theme(self.state.settings.theme)
 
         self._install_actions()
+        if self.state.settings.server_enabled:
+            self.start_server()
+
+    # -- embedded server (desktop-as-server) ---------------------------------
+
+    def server_running(self) -> bool:
+        return self._httpd is not None
+
+    def start_server(self) -> None:
+        """Run the web/API server + join the mesh; hold the app so it keeps
+        running when the window is closed."""
+        if self._httpd is not None:
+            return
+        try:
+            from harmony.web.server import start_background
+
+            port = int(self.state.settings.server_port or 8080)
+            self._httpd = start_background("0.0.0.0", port)  # noqa: S104 - reachable-by-default
+            self.hold()  # stay alive with the window hidden
+        except Exception:
+            log.exception("Failed to start the embedded server")
+            self.state.toast("Couldn't start the server.")
+
+    def stop_server(self) -> None:
+        if self._httpd is None:
+            return
+        try:
+            self._httpd.shutdown()
+            self._httpd.server_close()
+        except Exception:  # noqa: BLE001
+            log.debug("error stopping embedded server", exc_info=True)
+        self._httpd = None
+        self.release()
 
     def do_activate(self) -> None:
         if self._window is None:
@@ -44,6 +78,7 @@ class HarmonyApplication(Adw.Application):
     def do_shutdown(self) -> None:
         from harmony import tasks
 
+        self.stop_server()
         tasks.shutdown(wait=False)
         Adw.Application.do_shutdown(self)
 

@@ -260,4 +260,11 @@ class HarmonyWindow(Adw.ApplicationWindow):
         route_page = self._pages.get("audio_route")
         if route_page is not None and hasattr(route_page, "shutdown"):
             route_page.shutdown()
+        # When acting as a server, closing the window keeps the app running (and
+        # serving) in the background rather than quitting -- hide instead of
+        # destroy. Re-launching (single-instance) or app.activate re-shows it;
+        # "Quit" (Ctrl+Q) actually exits.
+        if self.state.settings.server_enabled:
+            self.set_visible(False)
+            return True
         return False

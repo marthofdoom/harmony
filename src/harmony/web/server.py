@@ -281,11 +281,17 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.close_connection = True
 
 
-def serve(host: str, port: int) -> int:
-    """Run the web server until interrupted."""
+def make_server(host: str, port: int) -> ThreadingHTTPServer:
+    """Create the HTTP server and start the LAN mesh (advertise + discover)."""
     httpd = ThreadingHTTPServer((host, port), HarmonyHTTPRequestHandler)
     httpd.daemon_threads = True
-    get_engine().start_mesh(port)  # advertise on the LAN + discover peers (best-effort)
+    get_engine().start_mesh(port)  # best-effort; no-op without python-zeroconf
+    return httpd
+
+
+def serve(host: str, port: int) -> int:
+    """Run the web server until interrupted (the ``harmony serve`` CLI path)."""
+    httpd = make_server(host, port)
     log.info("Harmony server listening on http://%s:%s/", host, port)
     try:
         httpd.serve_forever()
@@ -294,3 +300,16 @@ def serve(host: str, port: int) -> int:
     finally:
         httpd.server_close()
     return 0
+
+
+def start_background(host: str, port: int) -> ThreadingHTTPServer:
+    """Start the server on a daemon thread and return the httpd (for shutdown).
+
+    Used by the desktop app so a desktop instance is also a server + mesh node.
+    """
+    import threading
+
+    httpd = make_server(host, port)
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="harmony-web").start()
+    log.info("Harmony server (embedded) listening on http://%s:%s/", host, port)
+    return httpd
