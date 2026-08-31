@@ -258,7 +258,7 @@ async function renderAccounts() {
       </div>
 
       <div class="card">
-        <h2>Qobuz <span class="badge">${q.authenticated ? "signed in" + (q.account ? " · " + esc(q.account) : "") : "signed out"}</span></h2>
+        <h2>Qobuz <span class="badge">${q.stale ? "session expired — paste a fresh token" : (q.authenticated ? "signed in" + (q.account ? " · " + esc(q.account) : "") : "signed out")}</span></h2>
         <p class="muted">Paste your <code>X-User-Auth-Token</code> (DevTools → Application → Local Storage
         on play.qobuz.com, or a request header).</p>
         <input id="qb-token" type="text" style="width:100%;font-family:monospace;font-size:12px" placeholder="user auth token" />

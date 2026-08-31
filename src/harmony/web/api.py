@@ -108,6 +108,9 @@ class Engine:
         return None
 
     def accounts(self) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        settings = Settings.load()
         out = []
         with self._lock:
             for svc, prov in self._ensure_providers().items():
@@ -121,11 +124,18 @@ class Engine:
                         name = prov.account_name()
                     except Exception:  # noqa: BLE001
                         name = None
-                # YouTube's is_authenticated only means "a client was built from
-                # the auth file", not that the cookies are still valid. When the
-                # session has expired the account name can't be fetched -- flag
-                # that as stale so the UI prompts a re-auth instead of lying.
-                stale = authed and name is None and svc.value == "ytmusic"
+                # A provider is "stale" when the user configured it but the
+                # session no longer works, so the UI can prompt a reconnect
+                # instead of lying. YouTube's is_authenticated only means "a
+                # client was built", not that the cookies are valid -- an expired
+                # session yields no account name. Qobuz: a token was saved but
+                # authentication failed (revoked/expired token).
+                if svc.value == "ytmusic":
+                    stale = authed and name is None
+                elif svc.value == "qobuz":
+                    stale = not authed and settings.qobuz_token_saved
+                else:
+                    stale = False
                 out.append({"service": svc.value, "authenticated": authed,
                             "account": name, "stale": stale})
         return {"accounts": out}
