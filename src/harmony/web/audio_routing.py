@@ -146,11 +146,17 @@ class AudioRouter:
         if not peer_host or not peer_port:
             raise ProviderError("missing peer host/port")
         if direction == "receive":
+            # Start our receiver, then tell the peer to send in *our* transport —
+            # otherwise the peer picks by its own ROC availability and a ROC-less
+            # receiver paired with a ROC sender just hears silence.
             self.receive(sink=sink, latency_ms=latency_ms)
+            with self._lock:
+                recv_transport = self._recv_kind
             try:
                 my_host = _local_ip_towards(peer_host)
                 self._peer_post(peer_host, peer_port, key, "send",
-                                {"to_host": my_host, "latency_ms": latency_ms})
+                                {"to_host": my_host, "latency_ms": latency_ms,
+                                 "transport": recv_transport})
             except ProviderError:
                 self.stop()  # don't leave an orphan receiver running
                 raise
@@ -158,8 +164,10 @@ class AudioRouter:
                 self._peer = peer_host
             return {"ok": True, "direction": "receive", "peer": peer_host}
         if direction == "send":
-            self._peer_post(peer_host, peer_port, key, "receive", {"latency_ms": latency_ms})
-            self.send(peer_host, latency_ms=latency_ms)
+            # The peer starts its receiver first and tells us which transport it
+            # used, so our sender matches it.
+            resp = self._peer_post(peer_host, peer_port, key, "receive", {"latency_ms": latency_ms})
+            self.send(peer_host, latency_ms=latency_ms, transport=resp.get("transport"))
             return {"ok": True, "direction": "send", "peer": peer_host}
         raise ProviderError(f"unknown direction {direction!r}")
 
