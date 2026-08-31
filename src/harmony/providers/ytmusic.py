@@ -109,19 +109,26 @@ def _largest_thumbnail(raw: Any) -> str | None:
     return best.get("url")
 
 
-def _pick_audio_format(info: dict[str, Any]) -> dict[str, Any]:
+def _pick_audio_format(info: dict[str, Any], *, prefer_highest: bool = False) -> dict[str, Any]:
     """Pick the best audio-only format out of a yt-dlp ``extract_info`` result.
 
-    Preference order: itag 140 (YouTube's standard 128kbps AAC/m4a, present on
-    almost every video and a safe default for LAN playback targets) beats the
-    highest-bitrate audio-only m4a, which beats any other audio-only format.
-    Pure and network-free so it's cheap to unit test against canned ``formats``
-    lists. Raises ``ProviderError`` if nothing audio-only is available.
+    Default preference order: itag 140 (YouTube's standard 128kbps AAC/m4a,
+    present on almost every video and a safe default for LAN playback targets)
+    beats the highest-bitrate audio-only m4a, which beats any other audio-only
+    format. With ``prefer_highest`` (the in-app local player, which can decode
+    anything GStreamer handles) the itag-140 shortcut is skipped and the
+    single highest-bitrate audio-only stream wins outright -- often Opus/WebM,
+    which carries more bits per second than the 128kbps AAC default. Pure and
+    network-free so it's cheap to unit test against canned ``formats`` lists.
+    Raises ``ProviderError`` if nothing audio-only is available.
     """
     candidates: list[dict[str, Any]] = info.get("requested_formats") or info.get("formats") or []
     audio_only = [f for f in candidates if f.get("acodec") not in (None, "none") and f.get("vcodec") == "none"]
     if not audio_only:
         raise ProviderError("No audio-only format found in yt-dlp's extracted info.")
+
+    if prefer_highest:
+        return max(audio_only, key=lambda f: f.get("abr") or 0)
 
     for fmt in audio_only:
         if fmt.get("format_id") == "140":
@@ -130,6 +137,27 @@ def _pick_audio_format(info: dict[str, Any]) -> dict[str, Any]:
     m4a = [f for f in audio_only if f.get("ext") == "m4a"]
     pool = m4a or audio_only
     return max(pool, key=lambda f: f.get("abr") or 0)
+
+
+# yt-dlp ``ext`` -> (mime, container) for the audio-only formats YouTube serves.
+_YT_EXT_MIME = {
+    "m4a": ("audio/mp4", "m4a"),
+    "webm": ("audio/webm", "webm"),
+    "opus": ("audio/ogg", "opus"),
+    "mp3": ("audio/mpeg", "mp3"),
+}
+
+# yt-dlp ``acodec`` prefix -> friendly codec name for the stream quality label.
+_YT_CODEC_NAMES = {"mp4a": "AAC", "opus": "Opus", "vorbis": "Vorbis", "mp3": "MP3", "flac": "FLAC"}
+
+
+def _stream_label(fmt: dict[str, Any]) -> str:
+    """A human quality label for a chosen audio format: codec + bitrate when
+    known (``"AAC 128kbps"``), else codec + itag (``"AAC (itag 140)"``)."""
+    prefix = (fmt.get("acodec") or "").split(".")[0]
+    codec = _YT_CODEC_NAMES.get(prefix, prefix or fmt.get("ext") or "audio")
+    abr = fmt.get("abr")
+    return f"{codec} {round(abr)}kbps" if abr else f"{codec} (itag {fmt.get('format_id')})"
 
 
 class YTMusicProvider(MusicProvider):
@@ -437,7 +465,7 @@ class YTMusicProvider(MusicProvider):
 
     # -- streaming --------------------------------------------------------
 
-    def resolve_stream(self, track_id: str) -> StreamSource:
+    def resolve_stream(self, track_id: str, *, max_quality: bool = False) -> StreamSource:
         """Resolve a playable stream URL for a videoId via yt-dlp.
 
         YouTube Music has no clean, stable stream-URL API of its own, so this
@@ -445,6 +473,10 @@ class YTMusicProvider(MusicProvider):
         YouTube player uses. yt-dlp is an optional runtime dependency (not
         imported at module scope) so importing this module doesn't force it on
         callers who never resolve a stream.
+
+        ``max_quality`` widens yt-dlp's format filter to the best audio-only
+        stream (any codec) instead of pinning the LAN-friendly AAC default --
+        for the in-app player, which decodes whatever GStreamer supports.
         """
         try:
             import yt_dlp  # lazy: optional runtime dependency
@@ -458,7 +490,7 @@ class YTMusicProvider(MusicProvider):
             "quiet": True,
             "no_warnings": True,
             "skip_download": True,
-            "format": "140/bestaudio[ext=m4a]/bestaudio",
+            "format": "bestaudio/best" if max_quality else "140/bestaudio[ext=m4a]/bestaudio",
             "noplaylist": True,
         }
         try:
@@ -467,16 +499,17 @@ class YTMusicProvider(MusicProvider):
         except Exception as exc:  # noqa: BLE001 - yt_dlp raises its own DownloadError et al.
             raise ProviderError(f"Could not resolve a YouTube stream for {track_id}: {exc}") from exc
 
-        fmt = _pick_audio_format(info)
+        fmt = _pick_audio_format(info, prefer_highest=max_quality)
         stream_url = fmt.get("url")
         if not stream_url:
             raise ProviderError(f"YouTube returned no playable audio URL for {track_id}.")
+        mime, container = _YT_EXT_MIME.get(fmt.get("ext") or "", ("audio/mp4", "m4a"))
         return StreamSource(
             url=stream_url,
-            mime_type="audio/mp4",
-            container="m4a",
+            mime_type=mime,
+            container=container,
             headers=dict(fmt.get("http_headers") or {}),
-            label=f"AAC (itag {fmt.get('format_id')})",
+            label=_stream_label(fmt),
         )
 
 

@@ -81,6 +81,11 @@ class AppState(GObject.Object):
     __gsignals__ = {
         "providers-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
         "playlists-changed": (GObject.SignalFlags.RUN_FIRST, None, ()),
+        # A specific playlist's *track contents* changed (a track was added to
+        # it from another page). Carries the mutated Playlist so an open track
+        # view can reload itself — ``playlists-changed`` only refreshes the
+        # playlist *list* (titles/counts), not the tracks pane.
+        "playlist-tracks-changed": (GObject.SignalFlags.RUN_FIRST, None, (object,)),
         # The optional integrations (AI planner, recommender sources) were
         # reconfigured. Pages that render "not configured" placeholders must
         # listen for this, or those placeholders survive the user fixing the
@@ -502,6 +507,17 @@ class AppState(GObject.Object):
             )
         return self._local_player
 
+    def local_audio_label(self) -> str | None:
+        """Negotiated output format of the in-app player while it's the active,
+        playing target (e.g. ``"96 kHz · 24-bit · 2ch"``); None otherwise. Lets
+        the Now Playing bar show what "This computer" is actually outputting."""
+        if self.playback.active_host != LOCAL_HOST or self._local_player is None:
+            return None
+        try:
+            return self._local_player.audio_info()
+        except Exception:  # noqa: BLE001 - a caps read must never break the bar
+            return None
+
     def _on_local_eos(self) -> None:
         """A locally-played track ended: advance the queue or stop (main loop)."""
         host = LOCAL_HOST
@@ -826,20 +842,25 @@ class AppState(GObject.Object):
         if provider is None:
             raise RuntimeError(f"No provider configured for {track.service.label}")
 
-        cached = {"source": provider.resolve_stream(track.id), "at": time.monotonic()}
+        # The in-app player decodes locally, so ask for the highest tier the
+        # track allows; casting keeps the LAN-compatible default so every
+        # renderer can decode what the relay forwards.
+        want_max = device_host == LOCAL_HOST
+        cached = {"source": provider.resolve_stream(track.id, max_quality=want_max), "at": time.monotonic()}
         ttl_s = 600.0
 
         # "This computer": decode + play the resolved stream locally via
         # GStreamer, no relay/device. GStreamer must be driven on the main loop.
         if device_host == LOCAL_HOST:
             source = cached["source"]
+            log.info("Local playback: %s (%s)", getattr(source, "label", "?"), source.mime_type)
             on_main(lambda: self._get_local_player().load_and_play(source.url, dict(source.headers)))
             self._mark_now_playing(device_host, track)
             return
 
         def resolver() -> Any:
             if time.monotonic() - cached["at"] > ttl_s:
-                cached["source"] = provider.resolve_stream(track.id)
+                cached["source"] = provider.resolve_stream(track.id, max_quality=want_max)
                 cached["at"] = time.monotonic()
             return cached["source"]
 

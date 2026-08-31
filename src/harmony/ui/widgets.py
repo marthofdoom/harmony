@@ -130,6 +130,38 @@ def attach_context_menu(
     widget.add_controller(long_press)
 
 
+def open_list_popover(
+    popover: Gtk.Popover,
+    parent: Gtk.Widget,
+    listbox: Gtk.Widget,
+    *,
+    width: int = 300,
+    max_height: int = 360,
+) -> None:
+    """Wrap ``listbox`` in a bounds-capped scroller, parent, and pop up ``popover``.
+
+    Shared by every device/playlist picker. GTK keeps a popover inside the
+    monitor only if its content advertises a bounded size, so this pins the
+    width (min == max, horizontal scrollbar off, so a long hostname/IP or
+    playlist title ellipsizes within the row instead of stretching the popover
+    off-screen) and caps the height with a vertical scrollbar. ``popover`` is
+    created by the caller so its row callbacks can capture it to ``popdown()``.
+    """
+    scroller = Gtk.ScrolledWindow(
+        child=listbox,
+        propagate_natural_height=True,
+        max_content_height=max_height,
+        min_content_width=width,
+        max_content_width=width,
+        hscrollbar_policy=Gtk.PolicyType.NEVER,
+        vscrollbar_policy=Gtk.PolicyType.AUTOMATIC,
+    )
+    popover.set_child(scroller)
+    popover.set_parent(parent)
+    popover.connect("closed", lambda p: p.unparent())
+    popover.popup()
+
+
 class TrackObject(GObject.Object):
     """Wraps a :class:`~harmony.models.Track` for use in a ``Gio.ListStore``.
 

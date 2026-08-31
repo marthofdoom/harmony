@@ -624,21 +624,27 @@ class QobuzProvider(MusicProvider):
 
     # -- streaming --------------------------------------------------------
 
-    def resolve_stream(self, track_id: str) -> StreamSource:
+    def resolve_stream(self, track_id: str, *, max_quality: bool = False) -> StreamSource:
         """Resolve a playable stream URL via Qobuz's signed ``track/getFileUrl``.
 
         Unlike every other endpoint this provider calls, ``getFileUrl`` requires
         a per-request md5 signature (see ``request_sig``) alongside the usual
         ``X-App-Id``/``X-User-Auth-Token`` headers, since it's what actually
         grants access to (rights-limited, format-selected) audio bytes rather
-        than catalog metadata. ``format_id`` 6 is Qobuz's FLAC 16-bit/44.1kHz
-        tier -- lossless but not the hi-res tiers, which keeps bandwidth/decoder
-        requirements broadly compatible with LAN playback targets like the WiiM.
+        than catalog metadata.
+
+        ``format_id`` 6 is Qobuz's FLAC 16-bit/44.1kHz tier -- lossless but not
+        the hi-res tiers, which keeps bandwidth/decoder requirements broadly
+        compatible with LAN playback targets like the WiiM. ``max_quality``
+        requests tier 27 (FLAC up to 24-bit/192kHz); Qobuz transparently hands
+        back the best the track and subscription actually allow (reported in the
+        response's ``bit_depth``/``sampling_rate``), so this is "highest
+        available" rather than a fixed 24/192.
         """
         self._ensure_ready()
         if not self._app_secret:
             raise ProviderError("Qobuz app secret unavailable; cannot sign a stream request.")
-        format_id = 6  # FLAC, 16-bit / 44.1kHz
+        format_id = 27 if max_quality else 6  # 27: FLAC ≤24-bit/192kHz; 6: FLAC 16/44.1
         ts = int(time.time())
         sig_params = {"format_id": format_id, "intent": "stream", "track_id": str(track_id)}
         sig = request_sig("track", "getFileUrl", sig_params, ts, self._app_secret)

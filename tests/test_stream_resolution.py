@@ -146,6 +146,23 @@ class TestQobuzResolveStream:
         assert captured["params"]["format_id"] == 6
         assert captured["params"]["intent"] == "stream"
 
+    def test_max_quality_requests_hires_tier(
+        self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_request(method, path, *, params=None, data=None, **kw):
+            captured["params"] = params
+            return {"url": "https://qobuz.example/hires.flac", "mime_type": "audio/flac",
+                    "bit_depth": 24, "sampling_rate": 96000}
+
+        monkeypatch.setattr(qobuz_provider, "_request", fake_request)
+
+        source = qobuz_provider.resolve_stream("123", max_quality=True)
+
+        assert captured["params"]["format_id"] == 27  # FLAC hi-res tier
+        assert source.label == "FLAC 24/96000"
+
     def test_request_signature_matches_request_sig(
         self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -249,6 +266,16 @@ class TestPickAudioFormat:
         fmt = _pick_audio_format(info)
         assert fmt["format_id"] == "140"
 
+    def test_prefer_highest_skips_itag_140_for_top_bitrate(self) -> None:
+        info = {
+            "formats": [
+                {"format_id": "251", "acodec": "opus", "vcodec": "none", "ext": "webm", "abr": 160},
+                {"format_id": "140", "acodec": "mp4a.40.2", "vcodec": "none", "ext": "m4a", "abr": 128},
+            ]
+        }
+        fmt = _pick_audio_format(info, prefer_highest=True)
+        assert fmt["format_id"] == "251"  # 160kbps opus beats the 128kbps AAC default
+
     def test_no_audio_only_format_raises(self) -> None:
         info = {"formats": [{"format_id": "18", "acodec": "mp4a.40.2", "vcodec": "avc1.42001E", "ext": "mp4"}]}
         with pytest.raises(ProviderError):
@@ -322,8 +349,29 @@ class TestYTMusicResolveStream:
         assert source.mime_type == "audio/mp4"
         assert source.container == "m4a"
         assert source.headers == {"User-Agent": "yt-dlp"}
-        assert source.label == "AAC (itag 140)"
+        assert source.label == "AAC 128kbps"
         assert ydl.extract_info_calls == [("https://music.youtube.com/watch?v=abc123", False)]
+
+    def test_max_quality_prefers_opus_and_maps_mime(
+        self, yt_provider: YTMusicProvider, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        info = {
+            "formats": [
+                {"format_id": "251", "acodec": "opus", "vcodec": "none", "ext": "webm", "abr": 160,
+                 "url": "https://googlevideo.example/251"},
+                {"format_id": "140", "acodec": "mp4a.40.2", "vcodec": "none", "ext": "m4a", "abr": 128,
+                 "url": "https://googlevideo.example/140"},
+            ]
+        }
+        ydl = _FakeYoutubeDL(info=info)
+        _install_fake_yt_dlp(monkeypatch, ydl)
+
+        source = yt_provider.resolve_stream("abc123", max_quality=True)
+
+        assert source.url == "https://googlevideo.example/251"
+        assert source.mime_type == "audio/webm"
+        assert source.container == "webm"
+        assert source.label == "Opus 160kbps"
 
     def test_missing_yt_dlp_raises_not_supported(
         self, yt_provider: YTMusicProvider, monkeypatch: pytest.MonkeyPatch

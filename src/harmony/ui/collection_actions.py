@@ -29,6 +29,7 @@ from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
+from harmony.ui.widgets import open_list_popover  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -42,12 +43,16 @@ def play_collection_on_device(
     *,
     label: str,
     fetch_tracks: Callable[[], list[Track]],
+    collection_key: tuple[Service, str] | None = None,
 ) -> None:
     """Open a device picker; on pick, fetch the collection's tracks and queue them.
 
     ``fetch_tracks`` does provider I/O and ``state.play_tracks_on_device``
     does device I/O, so both run together on the worker thread once a device
     is chosen -- this function itself only ever touches widgets.
+
+    ``collection_key`` is the album/playlist's ``(service, id)``; passing it
+    lets on-screen indicators light up the source collection while it plays.
     """
     devices = state.playback_targets()
     popover = Gtk.Popover()
@@ -63,19 +68,20 @@ def play_collection_on_device(
 
         def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name, pop: Gtk.Popover = popover) -> None:
             pop.popdown()
-            _play_collection(state, label, fetch_tracks, host, name)
+            _play_collection(state, label, fetch_tracks, host, name, collection_key)
 
         row.connect("activated", _pick)
         listbox.append(row)
-    scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320, propagate_natural_height=True, width_request=280)
-    popover.set_child(scroller)
-    popover.set_parent(parent)
-    popover.connect("closed", lambda p: p.unparent())
-    popover.popup()
+    open_list_popover(popover, parent, listbox)
 
 
 def _play_collection(
-    state: AppState, label: str, fetch_tracks: Callable[[], list[Track]], host: str, name: str
+    state: AppState,
+    label: str,
+    fetch_tracks: Callable[[], list[Track]],
+    host: str,
+    name: str,
+    collection_key: tuple[Service, str] | None = None,
 ) -> None:
     state.toast(f"Playing {label} on {name}…")
 
@@ -83,7 +89,7 @@ def _play_collection(
         tracks = list(fetch_tracks())
         if not tracks:
             return 0
-        state.play_tracks_on_device(tracks, host)
+        state.play_tracks_on_device(tracks, host, collection_key)
         return len(tracks)
 
     def done(count: int) -> None:
@@ -134,11 +140,7 @@ def add_collection_to_playlist(
             found = True
     if not found:
         listbox.append(Adw.ActionRow(title="No playlists yet", sensitive=False))
-    scroller = Gtk.ScrolledWindow(child=listbox, max_content_height=320, propagate_natural_height=True, width_request=280)
-    popover.set_child(scroller)
-    popover.set_parent(parent)
-    popover.connect("closed", lambda p: p.unparent())
-    popover.popup()
+    open_list_popover(popover, parent, listbox)
 
 
 def _add_collection(
@@ -162,6 +164,7 @@ def _add_collection(
             return
         state.toast(f"Added {count} track(s) from {label} to {playlist.title}")
         state.all_playlists(refresh=True)
+        state.emit("playlist-tracks-changed", playlist)
 
     run_async(work, done, lambda exc: state.toast(f"Couldn't add tracks: {exc}"))
 
