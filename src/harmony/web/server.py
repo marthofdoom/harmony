@@ -66,6 +66,14 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _authorized(self) -> bool:
+        """True if the request may touch the API/stream (personal-key gate)."""
+        parsed = urlparse(self.path)
+        provided = self.headers.get("X-Harmony-Key")
+        if provided is None:
+            provided = (parse_qs(parsed.query).get("key") or [None])[0]
+        return get_engine().check_key(provided)
+
     def _serve_static(self, path: str) -> None:
         static = _static_dir()
         if path in ("", "/"):
@@ -84,11 +92,14 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json({"status": "ok", "service": "harmony", "version": __version__})
             return
-        if path.startswith("/api/"):
-            self._handle_api(path, parse_qs(parsed.query))
-            return
-        if path.startswith("/stream/"):
-            self._handle_stream(unquote(path[len("/stream/"):]))
+        if path.startswith("/api/") or path.startswith("/stream/"):
+            if not self._authorized():
+                self._send_json({"error": "personal key required"}, status=401)
+                return
+            if path.startswith("/api/"):
+                self._handle_api(path, parse_qs(parsed.query))
+            else:
+                self._handle_stream(unquote(path[len("/stream/"):]))
             return
         self._serve_static(path)
 
@@ -96,6 +107,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         if not parsed.path.startswith("/api/"):
             self._send_json({"error": "not found"}, status=404)
+            return
+        if not self._authorized():
+            self._send_json({"error": "personal key required"}, status=401)
             return
         length = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(length) if length else b""

@@ -97,6 +97,10 @@ def test_is_public_bind() -> None:
 class _FakeEngine:
     def __init__(self):
         self.calls = []
+        self.key = None
+
+    def check_key(self, provided):
+        return not self.key or provided == self.key
 
     def accounts(self):
         return {"accounts": [{"service": "qobuz", "authenticated": True, "account": "me"}]}
@@ -238,6 +242,33 @@ def test_stream_unknown_token_is_404(api_url: str) -> None:
     with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
         _get(api_url + "/stream/nope")
     assert exc.value.code == 404
+
+
+# -- personal-key gate (mesh credential sharing) ---------------------------------
+
+
+def test_personal_key_gate_blocks_and_allows(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    srv._engine.key = "secret"
+    # No key -> 401 on API and stream; static + healthz stay open.
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _get(api_url + "/api/accounts")
+    assert exc.value.code == 401
+    assert _get(api_url + "/healthz")[0] == 200
+    assert _get(api_url + "/")[0] == 200
+
+    # Correct key via header, and via ?key= query, both pass.
+    req = urllib.request.Request(api_url + "/api/accounts", headers={"X-Harmony-Key": "secret"})
+    with urllib.request.urlopen(req, timeout=5) as r:  # noqa: S310
+        assert r.status == 200
+    assert _get(api_url + "/api/accounts?key=secret")[0] == 200
+
+    # Wrong key -> 401.
+    bad = urllib.request.Request(api_url + "/api/accounts", headers={"X-Harmony-Key": "nope"})
+    with pytest.raises(urllib.error.HTTPError) as exc2:  # noqa: PT011
+        urllib.request.urlopen(bad, timeout=5)  # noqa: S310
+    assert exc2.value.code == 401
 
 
 # -- preferences (personal key) --------------------------------------------------

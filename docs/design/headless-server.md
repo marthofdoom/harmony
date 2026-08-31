@@ -167,8 +167,14 @@ Beyond the client↔server model, instances should form a **mesh on the LAN**:
   keys match**. An app with no built-in auth (the default) prompts the user for
   the key they set on their server/desktop instance. This is on **all versions**
   and is the resolution of federation's open "pairing/consent" question: a single
-  user-chosen shared secret, not per-user accounts. (The key field ships now; the
-  discovery + match-enforcement lands with the mesh.)
+  user-chosen shared secret, not per-user accounts.
+  **Enforcement (shipped):** when an instance has a personal key set, every
+  `/api/*` and `/stream/*` request must carry it (`X-Harmony-Key` header or
+  `?key=`), else `401`; static assets and `/healthz` stay open so a client can
+  load and be prompted for the key. Blank key = fully open (the default). The web
+  client stores the key in `localStorage` and prompts on a `401`. **Still to
+  come:** mDNS advertise/discover so a signed-out client finds instances without
+  a typed URL (then it tries its key against each).
 - **Inter-instance audio routing** — a **Route Audio** tab lets the user toggle
   audio routing *to and from another instance's sinks* (full sinks), reusing the
   existing ROC path (`audio/pipewire.py`, the desktop's route-audio) as a
