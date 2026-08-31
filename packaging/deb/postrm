@@ -1,0 +1,14 @@
+#!/bin/sh
+set -e
+# The virtualenv is generated, not shipped, so remove it on uninstall. Keep
+# /var/lib/harmony (accounts, db) unless the admin purges.
+if [ "$1" = remove ] || [ "$1" = purge ]; then
+    rm -rf /opt/harmony/venv
+fi
+if [ "$1" = purge ]; then
+    rm -rf /var/lib/harmony
+fi
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+fi
+exit 0
