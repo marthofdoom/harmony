@@ -183,15 +183,26 @@ class PreferencesDialog(Adw.PreferencesDialog):
             page.add(warn_group)
 
         yt_group = Adw.PreferencesGroup(title="YouTube Music")
+
+        # Primary, zero-setup: detect a signed-in session from a browser on this
+        # machine. No Google Cloud client, no DevTools paste.
+        yt_detect_row = Adw.ActionRow(
+            title="Connect YouTube",
+            subtitle="Detects a signed-in session from a browser on this computer — "
+            "no setup, no pasting.",
+        )
+        yt_detect_button = Gtk.Button(label="Connect", valign=Gtk.Align.CENTER,
+                                      css_classes=["suggested-action"])
+        yt_detect_button.connect("clicked", self._on_ytmusic_autodetect)
+        yt_detect_row.add_suffix(yt_detect_button)
+        yt_group.add(yt_detect_row)
+
         self.yt_kind_row = Adw.ComboRow(
             title="Authentication method", model=Gtk.StringList.new(["Browser headers", "OAuth"])
         )
         self.yt_kind_row.set_selected(_YT_AUTH_KINDS.index(self.settings.ytmusic_auth_kind)
                                        if self.settings.ytmusic_auth_kind in _YT_AUTH_KINDS else 0)
-        self.yt_kind_row.connect(
-            "notify::selected",
-            lambda r, _p: self._set_account_setting("ytmusic_auth_kind", _YT_AUTH_KINDS[r.get_selected()]),
-        )
+        self.yt_kind_row.connect("notify::selected", self._on_ytmusic_auth_kind_changed)
         yt_group.add(self.yt_kind_row)
 
         # OAuth device-flow sign-in: the clean "log in with your real browser"
@@ -221,7 +232,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
 
         # In-app setup guide so the OAuth client isn't a mystery — a one-time
         # Google Cloud setup, with the console linked directly.
-        yt_help_row = Adw.ExpanderRow(
+        self.yt_help_row = yt_help_row = Adw.ExpanderRow(
             title="How to get a Client ID and Secret",
             subtitle="One-time Google Cloud setup — click to expand",
         )
@@ -256,13 +267,12 @@ class PreferencesDialog(Adw.PreferencesDialog):
         yt_help_row.add_suffix(console_button)
         yt_group.add(yt_help_row)
 
-        yt_signin_row = Adw.ActionRow(
+        self.yt_signin_row = yt_signin_row = Adw.ActionRow(
             title="Sign in with Google",
             subtitle="Opens Google in your browser and links this account with a short code — "
             "no devtools needed. Needs the OAuth client above.",
         )
-        yt_signin_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER,
-                                      css_classes=["suggested-action"])
+        yt_signin_button = Gtk.Button(label="Sign in…", valign=Gtk.Align.CENTER)
         yt_signin_button.connect("clicked", self._on_ytmusic_google_signin)
         yt_signin_row.add_suffix(yt_signin_button)
         yt_group.add(yt_signin_row)
@@ -289,6 +299,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         yt_test_button.connect("clicked", lambda *_a: self._test_provider(Service.YTMUSIC, self.yt_status_row))
         self.yt_status_row.add_suffix(yt_test_button)
         yt_group.add(self.yt_status_row)
+        self._update_ytmusic_auth_visibility()
         page.add(yt_group)
 
         qb_group = Adw.PreferencesGroup(title="Qobuz")
@@ -447,6 +458,54 @@ class PreferencesDialog(Adw.PreferencesDialog):
             Gtk.UriLauncher.new(uri).launch(self.get_root(), None, None)
         except Exception:  # noqa: BLE001 - non-fatal; the link is also shown as text
             log.debug("Could not open %s", uri, exc_info=True)
+
+    def _on_ytmusic_auth_kind_changed(self, row: Adw.ComboRow, _param: object) -> None:
+        self._set_account_setting("ytmusic_auth_kind", _YT_AUTH_KINDS[row.get_selected()])
+        self._update_ytmusic_auth_visibility()
+
+    def _update_ytmusic_auth_visibility(self) -> None:
+        """Show the OAuth client rows only when OAuth is the chosen method.
+
+        The primary path is one-click auto-detect (top) or a browser-header
+        paste; the Google Cloud OAuth client is a niche, high-friction option, so
+        hide its fields unless the user deliberately switches to it.
+        """
+        is_oauth = self.settings.ytmusic_auth_kind == "oauth"
+        for row in (self.yt_client_id_row, self.yt_client_secret_row,
+                    self.yt_help_row, self.yt_signin_row):
+            row.set_visible(is_oauth)
+
+    def _on_ytmusic_autodetect(self, _button: Gtk.Button) -> None:
+        self.state.toast("Detecting a signed-in browser…")
+
+        def work() -> str:
+            import ytmusicapi
+
+            from harmony.providers.ytmusic_cookies import autodetect_headers
+
+            headers = autodetect_headers()
+            if not headers:
+                raise RuntimeError(
+                    "No signed-in YouTube session found in a browser on this machine. "
+                    "Sign in to music.youtube.com in a browser here, then retry."
+                )
+            path = self.settings.ytmusic_auth_file or ""
+            if not path or self.settings.ytmusic_auth_kind == "oauth" or path.endswith("oauth.json"):
+                path = str(config.config_dir() / "browser.json")
+            ytmusicapi.setup(filepath=path, headers_raw=headers)
+            return path
+
+        def done(path: str) -> None:
+            self.settings.ytmusic_auth_file = path
+            self.settings.ytmusic_auth_kind = "browser"
+            self.settings.save()
+            self.yt_file_row.set_subtitle(path)
+            if "browser" in _YT_AUTH_KINDS:
+                self.yt_kind_row.set_selected(_YT_AUTH_KINDS.index("browser"))
+            self.state.reload_providers()
+            self.state.toast("Connected to YouTube Music.")
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't connect: {exc}"))
 
     def _on_ytmusic_google_signin(self, _button: Gtk.Button) -> None:
         from harmony.ui import ytmusic_login
