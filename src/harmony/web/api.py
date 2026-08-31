@@ -76,14 +76,18 @@ class Engine:
 
             providers = build_providers(Settings.load(), CredentialStore())
             # build_providers constructs but does not authenticate; load each
-            # provider's stored credentials (e.g. the Qobuz token) so search and
-            # streaming work -- the desktop does the same warm-up at startup.
+            # provider's stored credentials (e.g. the Qobuz token) so search,
+            # is_authenticated, and streaming all reflect reality -- the desktop
+            # does the same warm-up at startup. ``has_credentials`` is a
+            # Qobuz-only *property* (YT lacks it), so read it via getattr with a
+            # True default -- never call it -- and let authenticate() fail-fast
+            # for unconfigured accounts.
             for svc, prov in providers.items():
                 try:
-                    if prov.has_credentials():
+                    if getattr(prov, "has_credentials", True):
                         prov.authenticate()
                 except Exception as exc:  # noqa: BLE001 - one service failing is isolated
-                    log.warning("auth warm-up failed for %s: %s", svc.value, exc)
+                    log.info("provider %s not authenticated: %s", svc.value, exc)
             self._providers = providers
             log.info(
                 "providers ready: %s",
