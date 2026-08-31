@@ -9,7 +9,11 @@ const state = {
   queue: [],      // list of track objects currently loaded (search or playlist)
   index: -1,      // index of the playing track within queue
   playlist: null, // {service, id, title} when viewing an editable playlist, else null
+  target: "browser", // "browser" (this tab's <audio>) or a device host to cast to
+  devicePaused: false,
 };
+
+const onDevice = () => state.target !== "browser";
 
 const fmtTime = (s) => {
   if (!s || s < 0 || !isFinite(s)) return "0:00";
@@ -271,15 +275,34 @@ async function playAt(i) {
   $("nowplaying").classList.remove("empty");
   $("np-art").src = t.artwork_url || "";
   try {
-    const r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`);
-    audio.src = `/stream/${r.token}`;
-    await audio.play();
+    if (onDevice()) {
+      await apiPost(`/api/devices/${encodeURIComponent(state.target)}/play`,
+        { service: t.service, id: t.id, meta: { title: t.title, artist: t.artist, album: t.album, art_url: t.artwork_url, duration_s: t.duration_s } });
+      state.devicePaused = false;
+      $("np-play").textContent = "⏸";
+    } else {
+      const r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`);
+      audio.src = `/stream/${r.token}`;
+      await audio.play();
+    }
   } catch (e) {
     $("np-title").textContent = `Couldn't play: ${e.message}`;
   }
 }
 
-$("np-play").addEventListener("click", () => {
+$("np-device").addEventListener("change", (e) => {
+  const prev = state.target;
+  state.target = e.target.value;
+  if (prev === "browser" && onDevice()) audio.pause();       // handing off to a device
+});
+
+$("np-play").addEventListener("click", async () => {
+  if (onDevice()) {
+    if (state.index < 0) { if (state.queue.length) return playAt(0); return; }
+    try { await apiPost(`/api/devices/${encodeURIComponent(state.target)}/${state.devicePaused ? "resume" : "pause"}`, {});
+      state.devicePaused = !state.devicePaused; $("np-play").textContent = state.devicePaused ? "▶" : "⏸"; } catch { /* ignore */ }
+    return;
+  }
   if (!audio.src) { if (state.queue.length) playAt(0); return; }
   audio.paused ? audio.play() : audio.pause();
 });
@@ -299,7 +322,22 @@ audio.addEventListener("timeupdate", () => {
 let seeking = false;
 $("np-seek").addEventListener("input", () => { seeking = true; $("np-pos").textContent = fmtTime($("np-seek").value); });
 $("np-seek").addEventListener("change", () => { audio.currentTime = Number($("np-seek").value); seeking = false; });
-$("np-vol").addEventListener("input", () => { audio.volume = $("np-vol").value / 100; });
+$("np-vol").addEventListener("input", () => {
+  if (onDevice()) { apiPost(`/api/devices/${encodeURIComponent(state.target)}/volume`, { level: Number($("np-vol").value) }).catch(() => {}); }
+  else { audio.volume = $("np-vol").value / 100; }
+});
+
+async function loadDevices() {
+  try {
+    const devs = (await api("/api/devices")).devices || [];
+    const sel = $("np-device");
+    for (const d of devs) {
+      const o = document.createElement("option");
+      o.value = d.host; o.textContent = d.name;
+      sel.appendChild(o);
+    }
+  } catch { /* no devices */ }
+}
 
 // -- wiring -----------------------------------------------------------------
 
@@ -307,3 +345,4 @@ $("search").addEventListener("submit", (e) => { e.preventDefault(); const q = $(
 document.querySelectorAll("#nav li[data-view]").forEach((li) => li.addEventListener("click", () => setView(li.dataset.view)));
 $("accounts").addEventListener("click", () => setView("accounts"));
 loadAccounts();
+loadDevices();

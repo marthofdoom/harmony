@@ -128,6 +128,15 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.rename_playlist(parts[2], parts[3], title))
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "delete":
                 self._send_json(engine.delete_playlist(parts[2], parts[3]))
+            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "play":
+                service = (body.get("service") or "").strip()
+                track_id = (body.get("id") or "").strip()
+                if not service or not track_id:
+                    self._send_json({"error": "missing service or id"}, status=400)
+                    return
+                self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {}))
+            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] in ("pause", "resume", "stop", "volume"):
+                self._send_json(engine.device_control(parts[2], parts[3], body.get("level")))
             elif parts == ["api", "accounts", "qobuz", "token"]:
                 token = (body.get("token") or "").strip()
                 if not token:
@@ -169,6 +178,10 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.playlists())
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":
                 self._send_json(engine.playlist_tracks(parts[2], parts[3]))
+            elif parts == ["api", "devices"]:
+                self._send_json(engine.devices())
+            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
+                self._send_json(engine.device_status(parts[2]))
             elif parts == ["api", "resolve"]:
                 service = (query.get("service") or [""])[0]
                 track_id = (query.get("id") or [""])[0]

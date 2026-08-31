@@ -160,6 +160,20 @@ class _FakeEngine:
         self.calls.append(("delete", service, pid))
         return {"ok": True}
 
+    def devices(self):
+        return {"devices": [{"host": "192.168.1.9", "name": "Bedroom", "kind": "wiim"}]}
+
+    def cast(self, host, service, track_id, meta=None):
+        self.calls.append(("cast", host, service, track_id))
+        return {"ok": True, "host": host}
+
+    def device_control(self, host, action, level=None):
+        self.calls.append(("control", host, action, level))
+        return {"ok": True}
+
+    def device_status(self, host):
+        return {"state": "playing", "position_s": 5, "duration_s": 200, "volume": 40}
+
     def stream_for(self, token):
         return None  # exercised token path returns 404 in these tests
 
@@ -270,6 +284,34 @@ def test_add_remove_rename_delete_routes(api_url: str) -> None:
     assert ("remove", "qobuz", "p1", ("t1",)) in calls
     assert ("rename", "qobuz", "p1", "New Name") in calls
     assert ("delete", "qobuz", "p1") in calls
+
+
+# -- cast to device --------------------------------------------------------------
+
+
+def test_devices_list_and_status(api_url: str) -> None:
+    _, _, dev = _get(api_url + "/api/devices")
+    assert json.loads(dev)["devices"][0]["name"] == "Bedroom"
+    _, _, st = _get(api_url + "/api/devices/192.168.1.9/status")
+    assert json.loads(st)["state"] == "playing"
+
+
+def test_cast_play_and_transport(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _post(api_url + "/api/devices/192.168.1.9/play", {"service": "qobuz", "id": "t1"})
+    _post(api_url + "/api/devices/192.168.1.9/pause", {})
+    _post(api_url + "/api/devices/192.168.1.9/volume", {"level": 30})
+    calls = srv._engine.calls
+    assert ("cast", "192.168.1.9", "qobuz", "t1") in calls
+    assert ("control", "192.168.1.9", "pause", None) in calls
+    assert ("control", "192.168.1.9", "volume", 30) in calls
+
+
+def test_cast_play_missing_id_is_400(api_url: str) -> None:
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011
+        _post(api_url + "/api/devices/192.168.1.9/play", {"service": "qobuz"})
+    assert exc.value.code == 400
 
 
 # -- credential management (POST) ------------------------------------------------

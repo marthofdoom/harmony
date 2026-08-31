@@ -66,6 +66,7 @@ class Engine:
         self._lock = threading.Lock()
         self._providers: dict[Any, Any] | None = None
         self._streams: dict[str, dict[str, Any]] = {}
+        self._cast: Any | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -276,6 +277,41 @@ class Engine:
         }
         self._prune()
         return {"token": token, "mime": source.mime_type, "label": source.label}
+
+    def _resolve_source(self, service_value: str, track_id: str) -> Any:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            return prov.resolve_stream(track_id, max_quality=True)
+
+    # -- cast to LAN devices ------------------------------------------------
+
+    def _caster(self) -> Any:
+        if self._cast is None:
+            from harmony.web.cast import CastController
+
+            self._cast = CastController(self._resolve_source)
+        return self._cast
+
+    def devices(self) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        out = []
+        for d in Settings.load().known_devices:
+            host = d.get("host")
+            if host:
+                out.append({"host": host, "name": d.get("name") or host, "kind": d.get("kind", "wiim")})
+        return {"devices": out}
+
+    def cast(self, host: str, service_value: str, track_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._caster().cast(host, service_value, track_id, meta)
+
+    def device_control(self, host: str, action: str, level: int | None = None) -> dict[str, Any]:
+        return self._caster().control(host, action, level)
+
+    def device_status(self, host: str) -> dict[str, Any]:
+        return self._caster().status(host)
 
     def stream_for(self, token: str) -> dict[str, Any] | None:
         meta = self._streams.get(token)
