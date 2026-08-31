@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import time
+from pathlib import Path
 
 from harmony.errors import AuthError
 
@@ -25,6 +26,37 @@ _USER_AGENT = (
     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
 )
 _BROWSERS = ("firefox", "chrome", "chromium", "brave", "edge", "vivaldi", "opera")
+
+# Flatpak browsers keep their profiles under ~/.var/app/<id>/, which yt-dlp
+# doesn't check by default; map each to its yt-dlp browser name + the profile /
+# user-data dir under the app. (Harmony's own Flatpak also needs --filesystem
+# access to these -- see the manifest.)
+_FLATPAK_BROWSERS = {
+    "org.mozilla.firefox": ("firefox", ".mozilla/firefox"),
+    "com.google.Chrome": ("chrome", "config/google-chrome"),
+    "org.chromium.Chromium": ("chromium", "config/chromium"),
+    "com.brave.Browser": ("brave", "config/BraveSoftware/Brave-Browser"),
+    "com.microsoft.Edge": ("edge", "config/microsoft-edge"),
+    "com.vivaldi.Vivaldi": ("vivaldi", "config/vivaldi"),
+}
+
+
+def _candidates(browser: str | None) -> list[tuple[str, str | None]]:
+    """(yt-dlp browser name, profile/user-data path or None) pairs to try."""
+    if browser:
+        return [(browser, None)]
+    out: list[tuple[str, str | None]] = [(b, None) for b in _BROWSERS]  # native defaults
+    var_app = Path.home() / ".var" / "app"
+    for app_id, (name, rel) in _FLATPAK_BROWSERS.items():
+        base = var_app / app_id / rel
+        if name == "firefox":
+            try:
+                out += [("firefox", str(ck.parent)) for ck in base.glob("*/cookies.sqlite")]
+            except OSError:
+                pass
+        elif base.exists():
+            out.append((name, str(base)))
+    return out
 
 
 def _sapisid_hash(sapisid: str, origin: str = _YTM_ORIGIN) -> str:
@@ -59,15 +91,16 @@ def autodetect_headers(browser: str | None = None) -> str | None:
         from yt_dlp.cookies import extract_cookies_from_browser
     except ImportError as exc:
         raise AuthError("yt-dlp is required for browser session auto-detect.") from exc
-    for name in ([browser] if browser else _BROWSERS):
+    for name, profile in _candidates(browser):
         try:
-            jar = extract_cookies_from_browser(name)
+            jar = (extract_cookies_from_browser(name, profile=profile) if profile
+                   else extract_cookies_from_browser(name))
         except Exception as exc:  # noqa: BLE001 - browser absent/locked; try the next
-            log.debug("cookie extract from %s failed: %s", name, exc)
+            log.debug("cookie extract from %s (profile=%s) failed: %s", name, profile, exc)
             continue
         cookies = {c.name: c.value for c in jar if c.domain and "youtube.com" in c.domain}
         headers = build_headers_raw(cookies)
         if headers:
-            log.info("YouTube session auto-detected from %s", name)
+            log.info("YouTube session auto-detected from %s%s", name, f" [{profile}]" if profile else "")
             return headers
     return None
