@@ -10,55 +10,24 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import on_main, run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
+    _format_suggestion_subtitle,
+    _humanize_sources,  # noqa: F401 - re-exported for the existing unit tests
+    action_status_page,
     attach_context_menu,
     error_status_page,
-    missing_layer_status_page,
     open_list_popover,
+    open_preferences,
     set_stack_status,
     status_page,
 )
 
 log = logging.getLogger(__name__)
-
-# Recommender source key -> friendly display name. "provider" is deliberately
-# absent: it means the vote came from the *target service's* own similar-
-# tracks endpoint, so it's rendered using that service's own label instead
-# (see `_humanize_sources`) rather than the internal word "provider".
-_SOURCE_LABELS = {"lastfm": "Last.fm", "listenbrainz": "ListenBrainz"}
-
-
-def _humanize_sources(sources: list[str], target_label: str) -> list[str]:
-    """Map recommender source keys to display names, deduped, order preserved.
-
-    Any key this doesn't recognise is passed through unchanged rather than
-    dropped, so a future recommender source never silently vanishes from the
-    subtitle just because this mapping hasn't been updated yet.
-    """
-    labels: list[str] = []
-    for source in sources:
-        label = _SOURCE_LABELS.get(source) or (target_label if source == "provider" else source)
-        if label not in labels:
-            labels.append(label)
-    return labels
-
-
-def _format_suggestion_subtitle(artist: str, sources: list[str], target_label: str) -> str:
-    """Humanized suggestion subtitle: friendly source names, no raw score.
-
-    e.g. ``"Radiohead · via Last.fm, ListenBrainz"`` instead of the old
-    ``"Radiohead · lastfm · listenbrainz · score 2.34"``. Pulled out as a
-    pure function (no widgets) so it's directly unit-testable.
-    """
-    labels = _humanize_sources(sources, target_label)
-    if not labels:
-        return artist
-    return f"{artist} · via {', '.join(labels)}"
 
 
 def _looks_resolved(pick, resolved: list[Track]) -> bool:  # noqa: ANN001 - TrackIdea, kept loosely typed
@@ -163,7 +132,14 @@ class DiscoverPage(Gtk.Box):
         box.append(Gtk.Label(label="Recommendations", xalign=0.0, css_classes=["title-2"]))
 
         if self.state.recommender is None:
-            box.append(missing_layer_status_page("recommender"))
+            box.append(action_status_page(
+                icon_name="starred-symbolic",
+                title="Recommendations aren't set up",
+                description="Connect a music service in Preferences to get recommendations "
+                "based on your playlists.",
+                action_label="Open Preferences",
+                on_action=lambda: open_preferences(self, "accounts"),
+            ))
             return box
 
         controls = Gtk.Box(spacing=8)
@@ -246,16 +222,22 @@ class DiscoverPage(Gtk.Box):
         has_seed = bool(self._playlist_choices)
         if has_service and has_seed:
             self.controls_stack.set_visible_child_name("controls")
-        else:
-            description = (
-                "Add a music service in Preferences to get started."
-                if not has_service
-                else "None of your playlists are available yet. Add one on the Playlists page."
+        elif not has_service:
+            set_stack_status(
+                self.controls_stack, "empty",
+                action_status_page(
+                    icon_name="dialog-information-symbolic", title="Nothing to recommend from yet",
+                    description="Add a music service in Preferences to get started.",
+                    action_label="Open Preferences",
+                    on_action=lambda: open_preferences(self, "accounts"),
+                ),
             )
+        else:
             set_stack_status(
                 self.controls_stack, "empty",
                 status_page(icon_name="dialog-information-symbolic", title="Nothing to recommend from yet",
-                            description=description),
+                            description="None of your playlists are available yet. Add one on the "
+                            "Playlists page."),
             )
         self._update_get_suggestions_sensitivity()
 
@@ -489,8 +471,6 @@ class DiscoverPage(Gtk.Box):
         open_list_popover(popover, parent, listbox)
 
     def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
-        self.state.toast(f"Starting “{track.title}” on {name}…")
-
         def work() -> None:
             self.state.play_track_on_device(track, host)
 
@@ -542,7 +522,11 @@ class DiscoverPage(Gtk.Box):
             return playlist
 
         def done(_playlist: Playlist) -> None:
-            self.state.toast(f"Created “{title}” with {len(ids)} track(s)")
+            count = len(ids)
+            self.state.toast(
+                GLib.dngettext(None, "Created “%s” with %d track", "Created “%s” with %d tracks", count)
+                % (title, count)
+            )
             self.state.all_playlists(refresh=True)
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't create playlist: {exc}"))
@@ -581,7 +565,11 @@ class DiscoverPage(Gtk.Box):
 
         planner = self.state.planner
         if planner is None:
-            box.append(missing_layer_status_page("ai"))
+            box.append(status_page(
+                icon_name="dialog-information-symbolic",
+                title="AI playlist builder unavailable",
+                description="This feature isn't available in your build of Harmony.",
+            ))
             return box
         if not planner.available:
             banner = Adw.Banner(

@@ -325,7 +325,7 @@ class QobuzBrowserAssistDialog(Adw.Window):
         intro = Gtk.Label(
             wrap=True, xalign=0.0,
             label="For accounts signed up with Google or another social login, Qobuz's "
-            "own sign-in refuses to run inside an embedded browser -- it has to happen "
+            "own sign-in refuses to run inside an embedded browser — it has to happen "
             "in your real one. This walks you through grabbing the session token from "
             "there instead.",
         )

@@ -199,7 +199,7 @@ class HarmonyWindow(Adw.ApplicationWindow):
         return Adw.StatusPage(
             icon_name="dialog-error-symbolic",
             title="This page failed to load",
-            description="Check the application log for details.",
+            description="Something went wrong loading this page. Restarting Harmony may help.",
         )
 
     # -- navigation -----------------------------------------------------------
@@ -260,13 +260,46 @@ class HarmonyWindow(Adw.ApplicationWindow):
         route_page = self._pages.get("audio_route")
         if route_page is not None and hasattr(route_page, "shutdown"):
             route_page.shutdown()
-        # The API server is always on (it's the mesh backend), so closing the
-        # window keeps the app running rather than quitting. With a system tray,
-        # hide to the tray (right-click → Quit); without one, minimize so it
-        # stays reachable. "Quit" (Ctrl+Q / the primary menu) always exits.
         app = self.get_application()
+        # "Run in background" (Preferences → Network) lets the user opt out of
+        # keeping the app alive after closing the window. When it's off, close
+        # actually quits. Ctrl+Q / the primary menu always quits regardless.
+        run_in_background = bool(self.state.settings._extra.get("run_in_background", True))
+        if not run_in_background:
+            if app is not None:
+                app.quit()
+            return False
+
+        # Otherwise the API server (the mesh backend) keeps running. With a
+        # system tray, hide to the tray (right-click → Quit); without one,
+        # minimize so it stays reachable.
         if app is not None and getattr(app, "has_tray", False):
             self.set_visible(False)
         else:
             self.minimize()
+        self._notify_running_in_background()
         return True
+
+    def _notify_running_in_background(self) -> None:
+        """Explain, once ever, that closing the window keeps Harmony running.
+
+        A toast is useless here (the window is going away), so this is a real
+        desktop notification via the application.
+        """
+        extra = self.state.settings._extra
+        if extra.get("background_notice_shown"):
+            return
+        extra["background_notice_shown"] = True
+        self.state.settings.save()
+        app = self.get_application()
+        if app is None:
+            return
+        notification = Gio.Notification.new("Harmony is still running")
+        notification.set_body(
+            "It keeps serving your devices in the background. Quit (Ctrl+Q) to exit, "
+            "or turn off “Run in background” in Preferences → Network."
+        )
+        try:
+            app.send_notification("harmony-background", notification)
+        except Exception:  # noqa: BLE001 - a missing notification backend must not block close
+            log.debug("could not send background notification", exc_info=True)

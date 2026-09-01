@@ -23,7 +23,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
@@ -83,8 +83,6 @@ def _play_collection(
     name: str,
     collection_key: tuple[Service, str] | None = None,
 ) -> None:
-    state.toast(f"Playing {label} on {name}…")
-
     def work() -> int:
         tracks = list(fetch_tracks())
         if not tracks:
@@ -162,7 +160,12 @@ def _add_collection(
         if count == 0:
             state.toast(f"{label} has no tracks to add.")
             return
-        state.toast(f"Added {count} track(s) from {label} to {playlist.title}")
+        state.toast(
+            GLib.dngettext(None,
+                "Added %d track from %s to %s", "Added %d tracks from %s to %s", count
+            )
+            % (count, label, playlist.title)
+        )
         state.all_playlists(refresh=True)
         state.emit("playlist-tracks-changed", playlist)
 

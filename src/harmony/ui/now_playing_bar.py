@@ -63,8 +63,14 @@ class NowPlayingBar(Gtk.Box):
         self._artist = Gtk.Label(xalign=0.0, ellipsize=3)
         self._artist.add_css_class("dim-label")
         self._artist.add_css_class("caption")
+        # Live audio-quality readout (bit depth / rate) for local playback, shown
+        # inline rather than hidden in the artwork tooltip.
+        self._quality = Gtk.Label(xalign=0.0, ellipsize=3, visible=False)
+        self._quality.add_css_class("dim-label")
+        self._quality.add_css_class("caption")
         meta.append(self._title)
         meta.append(self._artist)
+        meta.append(self._quality)
         self.append(meta)
 
         # -- transport ------------------------------------------------------
@@ -151,15 +157,21 @@ class NowPlayingBar(Gtk.Box):
     def _reload_devices(self) -> None:
         self._devices = self.state.playback_targets()
         self._syncing = True
+        # No fake "No devices" entry: when there's nothing to target, leave the
+        # dropdown empty and disabled with an explanatory tooltip.
         self._devices_model.splice(0, self._devices_model.get_n_items(),
-                                   [d.name for d in self._devices] or ["No devices"])
+                                   [d.name for d in self._devices])
         active = self.state.playback.active_host
         for i, dev in enumerate(self._devices):
             if dev.host == active:
                 self._device_drop.set_selected(i)
                 break
         self._syncing = False
-        self._device_drop.set_sensitive(bool(self._devices))
+        has_devices = bool(self._devices)
+        self._device_drop.set_sensitive(has_devices)
+        self._device_drop.set_tooltip_text(
+            "Playing to" if has_devices else "Add a device on the Devices page"
+        )
 
     def _on_device_selected(self, drop: Gtk.DropDown, _param: object) -> None:
         if self._syncing:
@@ -253,6 +265,8 @@ class NowPlayingBar(Gtk.Box):
         # a live readout of the highest-quality-stream + bit-perfect work.
         quality = self.state.local_audio_label()
         self._art.set_tooltip_text(f"Output: {quality}" if quality else None)
+        self._quality.set_label(quality or "")
+        self._quality.set_visible(bool(quality))
 
         playing = pb.state == "playing"
         self._play.set_icon_name(

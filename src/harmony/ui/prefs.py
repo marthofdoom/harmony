@@ -43,6 +43,8 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.credentials = state.credentials
         self._debounce: dict[str, tuple[int, Callable[[], None]]] = {}
         self._syncing_thresholds = False
+        # service -> (connection row, spinner, sign-out button)
+        self._status_ui: dict[Service, tuple[Adw.ActionRow, Gtk.Spinner, Gtk.Button]] = {}
 
         self.add(self._build_appearance_page())
         self.add(self._build_accounts_page())
@@ -101,10 +103,8 @@ class PreferencesDialog(Adw.PreferencesDialog):
                                    icon_name="network-server-symbolic")
         group = Adw.PreferencesGroup(
             title="API server",
-            description="Harmony always runs its API server so other devices — a phone, "
-            "another Harmony instance — can discover this one on the LAN and use it as a "
-            "backend. Closing the window keeps it running; Quit (Ctrl+Q) exits. Keep it on "
-            "a trusted network, or set a personal key that clients must present.",
+            description="Harmony runs an API server so other devices can use this one as a "
+            "backend over the LAN.",
         )
         self.server_port_row = Adw.SpinRow.new_with_range(1024, 65535, 1)
         self.server_port_row.set_title("Port")
@@ -115,8 +115,8 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         group.add(self.server_port_row)
 
-        self.personal_key_row = Adw.EntryRow(title="Personal key",
-                                             text=self.settings.personal_key)
+        self.personal_key_row = Adw.PasswordEntryRow(title="Personal key")
+        self.personal_key_row.set_text(self.settings.personal_key)
         self.personal_key_row.connect(
             "notify::text",
             lambda r, _p: self._schedule(
@@ -124,8 +124,23 @@ class PreferencesDialog(Adw.PreferencesDialog):
             ),
         )
         group.add(self.personal_key_row)
+
+        # "Run in background" persists via Settings._extra (an unknown-key
+        # passthrough that survives save/load) so this stays a UI-only change.
+        run_bg_row = Adw.SwitchRow(
+            title="Run in background",
+            subtitle="Keep serving devices after the window is closed. "
+            "Turn off to quit on close — Ctrl+Q always quits.",
+            active=bool(self.settings._extra.get("run_in_background", True)),
+        )
+        run_bg_row.connect("notify::active", lambda r, _p: self._set_run_in_background(r.get_active()))
+        group.add(run_bg_row)
         page.add(group)
         return page
+
+    def _set_run_in_background(self, value: bool) -> None:
+        self.settings._extra["run_in_background"] = bool(value)
+        self.settings.save()
 
     def _build_appearance_page(self) -> Adw.PreferencesPage:
         page = Adw.PreferencesPage(
@@ -133,7 +148,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
 
         group = Adw.PreferencesGroup(
-            title="Theme", description="Pick a color theme for Harmony -- applied immediately."
+            title="Theme", description="Pick a color theme for Harmony — applied immediately."
         )
         self.theme_row = Adw.ComboRow(
             title="Theme", model=Gtk.StringList.new([t.name for t in THEMES])
@@ -277,10 +292,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         paste_row.add_suffix(paste_button)
         yt_group.add(paste_row)
 
-        self.yt_status_row = Adw.ActionRow(title="Connection", subtitle="Unknown")
-        yt_test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
-        yt_test_button.connect("clicked", lambda *_a: self._test_provider(Service.YTMUSIC, self.yt_status_row))
-        self.yt_status_row.add_suffix(yt_test_button)
+        self.yt_status_row = self._build_connection_row(Service.YTMUSIC)
         yt_group.add(self.yt_status_row)
         self._update_ytmusic_auth_visibility()
         page.add(yt_group)
@@ -367,13 +379,82 @@ class PreferencesDialog(Adw.PreferencesDialog):
         )
         qb_group.add(self.qb_app_id_row)
 
-        self.qb_status_row = Adw.ActionRow(title="Connection", subtitle="Unknown")
-        qb_test_button = Gtk.Button(label="Test", valign=Gtk.Align.CENTER)
-        qb_test_button.connect("clicked", lambda *_a: self._test_provider(Service.QOBUZ, self.qb_status_row))
-        self.qb_status_row.add_suffix(qb_test_button)
+        self.qb_status_row = self._build_connection_row(Service.QOBUZ)
         qb_group.add(self.qb_status_row)
         page.add(qb_group)
+        # Probe both services once the dialog is on screen so each shows
+        # "Connected as {name}" / "Not signed in" instead of a stale "Unknown".
+        self._probe_provider(Service.YTMUSIC)
+        self._probe_provider(Service.QOBUZ)
         return page
+
+    def _build_connection_row(self, service: Service) -> Adw.ActionRow:
+        """A "Connection" row with a spinner, a Sign Out button (shown only when
+        connected), and a Check Again button."""
+        row = Adw.ActionRow(title="Connection", subtitle="Checking…")
+        spinner = Gtk.Spinner(valign=Gtk.Align.CENTER, visible=False)
+        signout = Gtk.Button(
+            label="Sign Out", valign=Gtk.Align.CENTER,
+            css_classes=["destructive-action", "flat"], visible=False,
+        )
+        signout.connect("clicked", lambda *_a: self._sign_out(service))
+        check = Gtk.Button(label="Check Again", valign=Gtk.Align.CENTER)
+        check.connect("clicked", lambda *_a: self._probe_provider(service))
+        row.add_suffix(spinner)
+        row.add_suffix(signout)
+        row.add_suffix(check)
+        self._status_ui[service] = (row, spinner, signout)
+        return row
+
+    def _probe_provider(self, service: Service) -> None:
+        """Update a service's Connection row from a live authenticate() probe."""
+        row, spinner, signout = self._status_ui[service]
+        provider = self.state.providers.get(service)
+        if provider is None:
+            row.set_subtitle("Not signed in")
+            signout.set_visible(False)
+            return
+        spinner.set_visible(True)
+        spinner.set_spinning(True)
+
+        def work() -> str | None:
+            provider.authenticate()
+            return provider.account_name()
+
+        def done(name: str | None) -> None:
+            spinner.set_spinning(False)
+            spinner.set_visible(False)
+            row.set_subtitle(f"Connected as {name}" if name else "Connected")
+            signout.set_visible(True)
+
+        def error(_exc: BaseException) -> None:
+            spinner.set_spinning(False)
+            spinner.set_visible(False)
+            row.set_subtitle("Not signed in")
+            signout.set_visible(False)
+
+        run_async(work, done, error)
+
+    def _sign_out(self, service: Service) -> None:
+        """Clear a service's stored credentials and rebuild providers."""
+        if service == Service.YTMUSIC:
+            self.settings.ytmusic_auth_file = ""
+            self.settings.save()
+            self.credentials.delete(config.YTMUSIC_OAUTH_SECRET)
+            self.yt_file_row.set_subtitle("Not set")
+            self.yt_client_secret_row.set_text("")
+        else:
+            self.credentials.delete(config.QOBUZ_TOKEN)
+            self.credentials.delete(config.QOBUZ_PASSWORD)
+            self.settings.qobuz_token_saved = False
+            self.settings.save()
+            self.qb_token_row.set_text("")
+            self.qb_password_row.set_text("")
+        self.state.reload_providers()
+        row, _spinner, signout = self._status_ui[service]
+        row.set_subtitle("Not signed in")
+        signout.set_visible(False)
+        self.state.toast(f"Signed out of {service.label}.")
 
     def _on_qobuz_auth_kind_changed(self, row: Adw.ComboRow, _param: object) -> None:
         kind = _QOBUZ_AUTH_KINDS[row.get_selected()]
@@ -575,25 +656,6 @@ class PreferencesDialog(Adw.PreferencesDialog):
 
         dialog.connect("response", on_response)
         dialog.present(self)
-
-    def _test_provider(self, service: Service, status_row: Adw.ActionRow) -> None:
-        provider = self.state.providers.get(service)
-        if provider is None:
-            status_row.set_subtitle("Not configured")
-            return
-        status_row.set_subtitle("Testing…")
-
-        def work() -> str | None:
-            provider.authenticate()
-            return provider.account_name()
-
-        def done(name: str | None) -> None:
-            status_row.set_subtitle(f"Connected as {name}" if name else "Connected")
-
-        def error(exc: BaseException) -> None:
-            status_row.set_subtitle(f"Failed: {exc}")
-
-        run_async(work, done, error)
 
     # -- integrations ---------------------------------------------------------
 

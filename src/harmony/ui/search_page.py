@@ -23,10 +23,13 @@ from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     SegmentedToggle,
+    action_status_page,
     attach_context_menu,
     build_track_column_view,
     error_status_page,
+    loading_status_page,
     open_list_popover,
+    open_preferences,
     replace_tracks,
     selected_tracks,
     set_stack_status,
@@ -96,6 +99,8 @@ class SearchPage(Gtk.Box):
         other_scroller = Gtk.ScrolledWindow(child=self.other_list, vexpand=True)
         other_box.append(other_scroller)
         self.content_stack.add_named(other_box, "other")
+
+        self.content_stack.add_named(loading_status_page("Searching…"), "loading")
 
         self.content_stack.set_visible_child_name("empty")
         self.append(self.content_stack)
@@ -182,12 +187,16 @@ class SearchPage(Gtk.Box):
             set_stack_status(
                 self.content_stack,
                 "empty",
-                status_page(icon_name="network-offline-symbolic", title="No services configured",
-                            description="Add an account in Preferences to search."),
+                action_status_page(
+                    icon_name="network-offline-symbolic", title="No services connected",
+                    description="Connect YouTube Music or Qobuz in Preferences to search.",
+                    action_label="Open Preferences",
+                    on_action=lambda: open_preferences(self, "accounts"),
+                ),
             )
             return
         kind = _KINDS[self.kind_dropdown.get_selected()]
-        self.content_stack.set_visible_child_name("empty")
+        self.content_stack.set_visible_child_name("loading")
 
         def work() -> SearchResults:
             merged = SearchResults()
@@ -223,8 +232,9 @@ class SearchPage(Gtk.Box):
             self._show_other_kind(kind, results)
 
     def _on_search_error(self, exc: BaseException) -> None:
+        log.exception("Search failed")
         set_stack_status(self.content_stack, "empty", error_status_page(exc, title="Search failed"))
-        self.state.toast(f"Search failed: {exc}")
+        self.state.toast("Something went wrong with your search.")
 
     def _show_other_kind(self, kind: str, results: SearchResults) -> None:
         # A fresh set of search results, not an artist drill-down -- clear
@@ -266,12 +276,19 @@ class SearchPage(Gtk.Box):
             self._show_artist_albums(item)
             return
 
+        self.content_stack.set_visible_child_name("loading")
+
         def work() -> list[Track]:
             if isinstance(item, Album):
                 return provider.get_album_tracks(item.id)
             return provider.get_playlist_tracks(item.id)
 
-        run_async(work, self._on_drill_done, lambda exc: self.state.toast(f"Couldn't load tracks: {exc}"))
+        def on_error(exc: BaseException) -> None:
+            log.exception("Couldn't load tracks")
+            self._restore_search_results()
+            self.state.toast("Couldn't load those tracks — check your connection.")
+
+        run_async(work, self._on_drill_done, on_error)
 
     def _on_drill_done(self, tracks: list[Track]) -> None:
         # Plain album/playlist track drill-down carries no "similar" or
@@ -290,6 +307,8 @@ class SearchPage(Gtk.Box):
         if provider is None:
             self.state.toast(f"No provider configured for {artist.service.label}")
             return
+
+        self.content_stack.set_visible_child_name("loading")
 
         def work() -> list[Album]:
             return provider.get_artist_albums(artist.id)
@@ -317,7 +336,12 @@ class SearchPage(Gtk.Box):
             self._other_back_bar.set_visible(True)
             self.content_stack.set_visible_child_name("other")
 
-        run_async(work, done, lambda exc: self.state.toast(f"Couldn't load albums: {exc}"))
+        def on_error(exc: BaseException) -> None:
+            log.exception("Couldn't load albums")
+            self._restore_search_results()
+            self.state.toast("Couldn't load albums — check your connection.")
+
+        run_async(work, done, on_error)
 
     def _on_show_artist_top_tracks_clicked(self, _button: Gtk.Button) -> None:
         artist = self._showing_artist
@@ -327,6 +351,8 @@ class SearchPage(Gtk.Box):
         if provider is None:
             self.state.toast(f"No provider configured for {artist.service.label}")
             return
+
+        self.content_stack.set_visible_child_name("loading")
 
         def work() -> list[Track]:
             return provider.get_artist_top_tracks(artist.id)
@@ -341,10 +367,12 @@ class SearchPage(Gtk.Box):
             self.content_stack.set_visible_child_name("tracks")
 
         def on_error(exc: BaseException) -> None:
+            self._show_artist_albums(artist)
             if isinstance(exc, NotSupportedError):
                 self.state.toast(f"{artist.service.label} doesn't support this for artists.")
             else:
-                self.state.toast(f"Couldn't load top tracks: {exc}")
+                log.exception("Couldn't load top tracks")
+                self.state.toast("Couldn't load top tracks — check your connection.")
 
         run_async(work, done, on_error)
 
@@ -405,11 +433,15 @@ class SearchPage(Gtk.Box):
             provider.add_tracks(playlist.id, ids)
 
         def done(_result: None) -> None:
-            self.state.toast(f"Added {len(ids)} track(s) to {playlist.title}")
+            count = len(ids)
+            self.state.toast(
+                GLib.dngettext(None, "Added %d track to %s", "Added %d tracks to %s", count)
+                % (count, playlist.title)
+            )
             self.state.all_playlists(refresh=True)
             self.state.emit("playlist-tracks-changed", playlist)
 
-        run_async(work, done, lambda exc: self.state.toast(f"Couldn't add tracks: {exc}"))
+        run_async(work, done, lambda exc: self.state.toast("Couldn't add those tracks — check your connection."))
 
     def _on_play_device_clicked(self, button: Gtk.Button) -> None:
         tracks = selected_tracks(self.track_selection)
@@ -448,8 +480,6 @@ class SearchPage(Gtk.Box):
         open_list_popover(popover, parent, listbox)
 
     def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
-        self.state.toast(f"Starting “{track.title}” on {name}…")
-
         def work() -> None:
             self.state.play_track_on_device(track, host)
 

@@ -181,7 +181,7 @@ def test_play_collection_on_device_picking_a_device_plays_fetched_tracks(no_real
     listbox.get_row_at_index(1).emit("activated")
 
     assert state.play_calls == [(tracks, "10.0.0.5")]
-    assert state.toasts == ["Playing Ziggy Stardust on Living Room…", "Playing Ziggy Stardust on Living Room"]
+    assert state.toasts == ["Playing Ziggy Stardust on Living Room"]
 
 
 def test_play_collection_on_device_empty_tracks_toasts_and_does_not_play(no_real_popup) -> None:
@@ -194,7 +194,7 @@ def test_play_collection_on_device_empty_tracks_toasts_and_does_not_play(no_real
     listbox.get_row_at_index(1).emit("activated")
 
     assert state.play_calls == []
-    assert state.toasts == ["Playing Empty Album on Living Room…", "Empty Album has no tracks to play."]
+    assert state.toasts == ["Empty Album has no tracks to play."]
 
 
 def test_play_collection_on_device_fetch_error_toasts(no_real_popup) -> None:
@@ -259,7 +259,7 @@ def test_add_collection_to_playlist_picking_a_playlist_adds_fetched_track_ids(no
 
     assert [t.id for t in provider.playlists["pl1"]] == ["a", "b"]
     assert state.refreshed is True
-    assert state.toasts == ["Added 2 track(s) from Ziggy Stardust to Faves"]
+    assert state.toasts == ["Added 2 tracks from Ziggy Stardust to Faves"]
 
 
 def test_add_collection_to_playlist_empty_tracks_toasts_and_does_not_add(no_real_popup) -> None:

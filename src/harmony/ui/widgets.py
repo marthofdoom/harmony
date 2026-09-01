@@ -444,6 +444,48 @@ def loading_status_page(title: str = "Loading…") -> Adw.StatusPage:
     return status_page(icon_name="", title=title, child=spinner)
 
 
+def action_status_page(
+    *,
+    icon_name: str = "dialog-information-symbolic",
+    title: str,
+    description: str = "",
+    action_label: str | None = None,
+    on_action: Callable[[], None] | None = None,
+    action_style: str = "suggested-action",
+) -> Adw.StatusPage:
+    """An ``Adw.StatusPage`` with an optional call-to-action ``.pill`` button.
+
+    The shared shape for the app's empty/first-run states: a friendly icon +
+    title + description, plus (when given) a single prominent button that
+    routes the user somewhere useful (usually Preferences).
+    """
+    page = status_page(icon_name=icon_name, title=title, description=description)
+    if action_label and on_action is not None:
+        button = Gtk.Button(
+            label=action_label,
+            halign=Gtk.Align.CENTER,
+            css_classes=["pill", action_style],
+        )
+        button.connect("clicked", lambda *_a: on_action())
+        page.set_child(button)
+    return page
+
+
+def open_preferences(widget: Gtk.Widget, page_name: str = "accounts") -> None:
+    """Open the Preferences dialog from any page, optionally on a given page.
+
+    Routes through the application's ``open_preferences`` when reachable
+    (jumps straight to ``page_name``), falling back to the ``app.preferences``
+    action so an unexpectedly-unrooted widget still does something sane.
+    """
+    root = widget.get_root()
+    app = root.get_application() if root is not None else None
+    if app is not None and hasattr(app, "open_preferences"):
+        app.open_preferences(page_name)
+    elif root is not None:  # pragma: no cover - fallback if the widget is unrooted
+        root.activate_action("app.preferences", None)
+
+
 def error_status_page(exc: BaseException, *, title: str = "Something went wrong") -> Adw.StatusPage:
     return status_page(
         icon_name="dialog-error-symbolic",
@@ -469,18 +511,39 @@ def set_stack_status(stack: Gtk.Stack, name: str, widget: Gtk.Widget) -> None:
     stack.set_visible_child_name(name)
 
 
-def missing_layer_status_page(layer_name: str) -> Adw.StatusPage:
-    """Placeholder shown when a backend module hasn't landed yet.
+# Recommender source key -> friendly display name. "provider" is deliberately
+# absent: it means the vote came from the *target service's* own similar-
+# tracks endpoint, so it's rendered using that service's own label instead
+# (see ``_humanize_sources``) rather than the internal word "provider".
+_SOURCE_LABELS = {"lastfm": "Last.fm", "listenbrainz": "ListenBrainz"}
 
-    Keeps the UI launchable while providers/matching/sync/etc. are written in
-    parallel by other agents.
+
+def _humanize_sources(sources: list[str], target_label: str) -> list[str]:
+    """Map recommender source keys to display names, deduped, order preserved.
+
+    Any key this doesn't recognise is passed through unchanged rather than
+    dropped, so a future recommender source never silently vanishes from the
+    subtitle just because this mapping hasn't been updated yet.
     """
-    return status_page(
-        icon_name="emblem-system-symbolic",
-        title="Not available yet",
-        description=f"The {layer_name} module isn't wired up yet. This page will "
-        "come to life once it lands.",
-    )
+    labels: list[str] = []
+    for source in sources:
+        label = _SOURCE_LABELS.get(source) or (target_label if source == "provider" else source)
+        if label not in labels:
+            labels.append(label)
+    return labels
+
+
+def _format_suggestion_subtitle(artist: str, sources: list[str], target_label: str) -> str:
+    """Humanized suggestion subtitle: friendly source names, no raw score.
+
+    e.g. ``"Radiohead · via Last.fm, ListenBrainz"`` instead of the old
+    ``"Radiohead · lastfm · listenbrainz · score 2.34"``. Pulled out as a
+    pure function (no widgets) so it's directly unit-testable.
+    """
+    labels = _humanize_sources(sources, target_label)
+    if not labels:
+        return artist
+    return f"{artist} · via {', '.join(labels)}"
 
 
 class ProgressDialog(Adw.Window):
