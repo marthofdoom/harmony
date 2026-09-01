@@ -165,13 +165,19 @@ class Engine:
         return not required or provided == required
 
     def set_preferences(self, personal_key: str | None = None) -> dict[str, Any]:
-        from harmony.config import Settings
+        from harmony.config import CredentialStore, Settings
 
         s = Settings.load()
         key_changed = personal_key is not None and personal_key.strip() != s.personal_key
+        # The file store is encrypted with the personal key, so a key change
+        # means re-encrypting it: read under the old key first, rewrite under the
+        # new one (otherwise the store would be unreadable afterwards).
+        old_creds = CredentialStore().all_secrets() if key_changed else None
         if personal_key is not None:
             s.personal_key = personal_key.strip()
         s.save()
+        if key_changed and old_creds:
+            CredentialStore().replace_all(old_creds)
         # A full instance with a fresh matching key and no accounts of its own
         # pulls credentials from a peer — the "full clients copy creds" model.
         if key_changed and s.personal_key:

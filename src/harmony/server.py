@@ -45,14 +45,22 @@ def _is_public_bind(address: str) -> bool:
 
 
 def serve(argv: list[str]) -> int:
+    import os
+
     args = _build_parser().parse_args(argv)
+
+    # A headless server has no unlocked login keyring. If the `keyring` library
+    # half-detects a Secret Service backend it can't actually use (locked, no
+    # session), writes/reads silently drop credentials — so a copied token looks
+    # saved but never authenticates. Default the server to the 0600 file store,
+    # which persists reliably under --data-dir. The desktop GUI (not `serve`)
+    # keeps using the real keyring. An explicit env var still wins.
+    os.environ.setdefault("PYTHON_KEYRING_BACKEND", "keyring.backends.fail.Keyring")
 
     if args.data_dir:
         # Redirect the platform dirs so a container/systemd deployment keeps
         # config, db, and secrets on one mounted volume. Set before anything
         # reads config paths.
-        import os
-
         os.environ.setdefault("XDG_CONFIG_HOME", args.data_dir)
         os.environ.setdefault("XDG_DATA_HOME", args.data_dir)
         os.environ.setdefault("XDG_CACHE_HOME", args.data_dir)
