@@ -506,9 +506,9 @@ def test_cast_play_and_transport(api_url: str) -> None:
     _post(api_url + "/api/devices/192.168.1.9/pause", {})
     _post(api_url + "/api/devices/192.168.1.9/volume", {"level": 30})
     calls = srv._engine.calls
-    assert ("cast", "192.168.1.9", "qobuz", "t1") in calls
-    assert ("control", "192.168.1.9", "pause", None) in calls
-    assert ("control", "192.168.1.9", "volume", 30) in calls
+    assert ("cast", "192.168.1.9", "qobuz", "t1", None) in calls
+    assert ("control", "192.168.1.9", "pause", None, None) in calls
+    assert ("control", "192.168.1.9", "volume", 30, None) in calls
 
 
 def test_cast_play_missing_id_is_400(api_url: str) -> None:
