@@ -21,7 +21,7 @@ trap 'rm -rf "$stage"' EXIT
 
 # Dependencies to vendor (runtime + the [server] extra). pip resolves the
 # transitive set (urllib3, certifi, cryptography, SecretStorage, …).
-DEPS="ytmusicapi requests rapidfuzz platformdirs keyring yt-dlp zeroconf"
+DEPS="ytmusicapi requests rapidfuzz platformdirs keyring yt-dlp zeroconf PyChromecast"
 PYVERS="3.11 3.12 3.13"
 PLATFORMS="manylinux2014_x86_64 manylinux_2_17_x86_64 manylinux_2_28_x86_64"
 
