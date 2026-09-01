@@ -43,6 +43,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.21" date="2026-09-01">
+      <description>
+        <p>Fixes the system tray: the status icon and its right-click Quit menu
+        now register correctly instead of failing silently and flooding the log.</p>
+      </description>
+    </release>
     <release version="0.7.20" date="2026-09-01">
       <description>
         <p>A broad fit-and-finish pass across all three clients. The desktop app
