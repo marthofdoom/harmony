@@ -160,10 +160,18 @@ class Engine:
         (the mesh's credential-sharing gate); this is how a signed-out app uses
         an instance whose key it has been given.
         """
+        import hmac
+
         from harmony.config import Settings
 
         required = Settings.load().personal_key
-        return not required or provided == required
+        if not required:
+            return True
+        if not provided:
+            return False
+        # Constant-time compare so a network attacker can't recover the key one
+        # byte at a time from response timing.
+        return hmac.compare_digest(provided, required)
 
     def set_preferences(self, personal_key: str | None = None) -> dict[str, Any]:
         from harmony.config import CredentialStore, Settings

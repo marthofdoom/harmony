@@ -6,9 +6,11 @@ federation model). No GTK: it drives the display-agnostic engine directly. See
 ``docs/design/headless-server.md``.
 
 Security: the server holds real streaming credentials and controls the user's
-accounts, so it binds ``127.0.0.1`` by default and only warns-and-serves on a
-public bind. Expose it behind an authenticating reverse proxy (Caddy/nginx) or
-over a private network (e.g. Tailscale) — never straight to the internet.
+accounts. It binds ``0.0.0.0`` by default (reachable-by-default is the intended
+UX — the mobile app and other instances need to reach it), gated by the optional
+personal key and warning when it serves on a public interface. Expose it behind
+an authenticating reverse proxy (Caddy/nginx) or over a private network (e.g.
+Tailscale) — never straight to the internet.
 """
 
 from __future__ import annotations

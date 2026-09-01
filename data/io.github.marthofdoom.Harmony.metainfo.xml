@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.18" date="2026-08-31">
+      <description>
+        <p>Instances now reach each other on the most direct address — a
+        shared-subnet LAN hop is preferred over a Tailscale/VPN overlay, so
+        same-network audio routing takes the fast path. The personal-key check is
+        now constant-time.</p>
+      </description>
+    </release>
     <release version="0.7.17" date="2026-08-31">
       <description>
         <p>The web Devices tab now auto-discovers WiiM/UPnP renderers on the
