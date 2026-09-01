@@ -270,9 +270,10 @@ async function renderSync() {
 async function renderAccounts() {
   const list = $("list");
   list.innerHTML = `<p class="hint">Loading accounts…</p>`;
-  let accounts = [], prefs = { personal_key: "" };
+  let accounts = [], prefs = { personal_key: "" }, instances = [];
   try { accounts = (await api("/api/accounts")).accounts || []; } catch { /* show forms anyway */ }
   try { prefs = await api("/api/preferences"); } catch { /* ignore */ }
+  try { instances = (await api("/api/instances")).instances || []; } catch { /* none */ }
   const status = (svc) => accounts.find((a) => a.service === svc) || { authenticated: false };
   const q = status("qobuz"), y = status("ytmusic");
   list.innerHTML = `
@@ -288,6 +289,21 @@ async function renderAccounts() {
         may use one — sharing its credentials — only when the keys match.</p>
         <input id="pk" type="text" style="width:100%;font-family:monospace" placeholder="your personal key" value="${esc(prefs.personal_key || "")}" />
         <div style="margin-top:.5rem"><button class="act" id="pk-save">Save key</button></div>
+      </div>
+
+      <div class="card">
+        <h2>Sync accounts from another instance</h2>
+        <p class="muted">Copy the streaming credentials from another Harmony
+        instance that has the <em>same personal key</em> — handy for a fresh
+        server or a second machine. Set your personal key above first; the copy
+        is encrypted with it.</p>
+        <select id="adopt-peer" style="width:100%">
+          <option value="">— pick a discovered instance —</option>
+          ${instances.map((p) => `<option value="${esc(p.host)}:${esc(p.port)}">${esc(p.name)} (${esc(p.host)}:${esc(p.port)})</option>`).join("")}
+        </select>
+        <input id="adopt-host" type="text" style="width:100%;margin-top:.4rem" placeholder="or host:port — e.g. 192.168.1.10:8080 or a tailnet IP" />
+        <div style="margin-top:.5rem"><button class="act" id="adopt-go">Sync accounts</button></div>
+        <p id="adopt-msg" class="muted"></p>
       </div>
 
       <div class="card">
@@ -328,8 +344,38 @@ async function renderAccounts() {
   const msg = (t, ok) => { const m = $("acct-msg"); m.textContent = t; m.style.color = ok ? "#2ec27e" : "var(--muted)"; };
   const after = () => { loadAccounts(); renderAccounts(); };
   $("pk-save").onclick = async () => {
-    try { await apiPost("/api/preferences", { personal_key: $("pk").value }); msg("Personal key saved.", true); }
-    catch (e) { msg("Failed: " + e.message); }
+    const k = ($("pk").value || "").trim();
+    try {
+      await apiPost("/api/preferences", { personal_key: k });
+      // Keep talking to the server after it starts requiring the key: store the
+      // same key this client sends, so we don't 401 on the next request.
+      harmonyKey = k;
+      try { localStorage.setItem("harmonyKey", harmonyKey); } catch { /* ignore */ }
+      msg("Personal key saved.", true);
+    } catch (e) { msg("Failed: " + e.message); }
+  };
+  $("adopt-go").onclick = async () => {
+    const target = ($("adopt-host").value.trim()) || $("adopt-peer").value;
+    const am = $("adopt-msg");
+    am.style.color = "var(--muted)"; am.textContent = "Syncing…";
+    let body = {};
+    if (target) {
+      const i = target.lastIndexOf(":");
+      const host = (i > 0 ? target.slice(0, i) : target).trim();
+      const port = i > 0 ? Number(target.slice(i + 1)) : 8080;
+      if (!host) { am.textContent = "Enter a host."; return; }
+      body = { host, port: port || 8080 };
+    }
+    try {
+      const r = await apiPost("/api/credentials/adopt", body);
+      if (r.ok) {
+        am.textContent = `Synced ${(r.imported || []).length} credential(s).`;
+        am.style.color = "#2ec27e";
+        loadAccounts(); setTimeout(renderAccounts, 900);
+      } else {
+        am.textContent = r.reason || "Nothing to sync — pick an instance or enter host:port.";
+      }
+    } catch (e) { am.textContent = "Failed: " + e.message; }
   };
   $("yt-save").onclick = async () => {
     const h = $("yt-headers").value.trim(); if (!h) return msg("Paste headers first.");

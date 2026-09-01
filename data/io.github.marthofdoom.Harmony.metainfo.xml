@@ -43,6 +43,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.13" date="2026-08-31">
+      <description>
+        <p>Accounts page gains a "Sync accounts from another instance" button —
+        pick a discovered instance (or type its host:port) and copy its
+        credentials over, encrypted with the personal key, instead of using the
+        API by hand. Saving the personal key now also keeps this browser
+        authenticated, and the web app's cache is bumped so it refreshes.</p>
+      </description>
+    </release>
     <release version="0.7.12" date="2026-08-31">
       <description>
         <p>Credential copies now cross the network encrypted — the copied
