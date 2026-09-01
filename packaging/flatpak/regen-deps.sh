@@ -14,7 +14,8 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 py="${PYTHON:-python3}"
 
 "$py" "$here/flatpak-pip-generator.py" --output "$here/python3-deps" \
-    ytmusicapi requests rapidfuzz platformdirs keyring anthropic yt-dlp
+    ytmusicapi requests rapidfuzz platformdirs keyring anthropic yt-dlp \
+    zeroconf pychromecast
 
 "$py" "$here/swap-sdists-to-wheels.py" "$here/python3-deps.json"
 echo "python3-deps.json regenerated."
