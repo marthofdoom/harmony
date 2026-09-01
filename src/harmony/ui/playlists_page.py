@@ -449,7 +449,7 @@ class PlaylistsPage(Gtk.Box):
 
         def done(_r: None) -> None:
             count = len(ids)
-            self.state.toast(GLib.ngettext("Removed %d track", "Removed %d tracks", count) % count)
+            self.state.toast(GLib.dngettext(None, "Removed %d track", "Removed %d tracks", count) % count)
             self._load_tracks(playlist)
             self.state.all_playlists(refresh=True)
 
@@ -586,17 +586,17 @@ class PlaylistsPage(Gtk.Box):
         def done(outcome: _ImportOutcome) -> None:
             for warning in outcome.warnings:
                 log.warning("Import %s: %s", path.name, warning)
-            message = GLib.ngettext(
+            message = GLib.dngettext(None,
                 "Imported %d of %d track", "Imported %d of %d tracks", outcome.total_rows
             ) % (outcome.added, outcome.total_rows)
             detail = []
             if outcome.rows_skipped:
-                detail.append(GLib.ngettext(
+                detail.append(GLib.dngettext(None,
                     "%d row skipped", "%d rows skipped", outcome.rows_skipped) % outcome.rows_skipped)
             if outcome.unmatched:
                 detail.append(f"{outcome.unmatched} unmatched")
             if outcome.low_confidence:
-                detail.append(GLib.ngettext(
+                detail.append(GLib.dngettext(None,
                     "%d low-confidence match skipped", "%d low-confidence matches skipped",
                     outcome.low_confidence) % outcome.low_confidence)
             if detail:
@@ -637,7 +637,7 @@ class PlaylistsPage(Gtk.Box):
             progress_dialog.close()
             added = len(getattr(report, "added", []))
             self.state.toast(
-                GLib.ngettext("Cloned %d track to %s", "Cloned %d tracks to %s", added)
+                GLib.dngettext(None, "Cloned %d track to %s", "Cloned %d tracks to %s", added)
                 % (added, other.label)
             )
             self.state.all_playlists(refresh=True)

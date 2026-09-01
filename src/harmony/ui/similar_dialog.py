@@ -287,7 +287,7 @@ class _SimilarDialog(Adw.Dialog):
         def done(_playlist: Playlist) -> None:
             count = len(ids)
             self.state.toast(
-                GLib.ngettext("Created “%s” with %d track", "Created “%s” with %d tracks", count)
+                GLib.dngettext(None, "Created “%s” with %d track", "Created “%s” with %d tracks", count)
                 % (title, count)
             )
             self.state.all_playlists(refresh=True)

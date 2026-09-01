@@ -161,7 +161,7 @@ def _add_collection(
             state.toast(f"{label} has no tracks to add.")
             return
         state.toast(
-            GLib.ngettext(
+            GLib.dngettext(None,
                 "Added %d track from %s to %s", "Added %d tracks from %s to %s", count
             )
             % (count, label, playlist.title)

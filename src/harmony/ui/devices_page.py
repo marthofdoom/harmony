@@ -273,7 +273,7 @@ class DevicesPage(Gtk.Box):
         known_hosts = {d.host for d in self.state.known_devices()}
         new_infos = [i for i in infos if i.host not in known_hosts]
         if not new_infos:
-            self.state.toast(GLib.ngettext(
+            self.state.toast(GLib.dngettext(None,
                 "Found %d device — already added.", "Found %d devices — all already added.",
                 len(infos)) % len(infos))
             return

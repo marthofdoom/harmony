@@ -435,7 +435,7 @@ class SearchPage(Gtk.Box):
         def done(_result: None) -> None:
             count = len(ids)
             self.state.toast(
-                GLib.ngettext("Added %d track to %s", "Added %d tracks to %s", count)
+                GLib.dngettext(None, "Added %d track to %s", "Added %d tracks to %s", count)
                 % (count, playlist.title)
             )
             self.state.all_playlists(refresh=True)
