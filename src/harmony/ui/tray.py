@@ -115,7 +115,7 @@ class Tray:
 
     # -- StatusNotifierItem -------------------------------------------------
 
-    def _item_get(self, _conn, _sender, _path, _iface, prop, _err_unused):
+    def _item_get(self, _conn, _sender, _path, _iface, prop):
         return {
             "Category": GLib.Variant("s", "ApplicationStatus"),
             "Id": GLib.Variant("s", "harmony"),
@@ -133,7 +133,7 @@ class Tray:
 
     # -- com.canonical.dbusmenu ---------------------------------------------
 
-    def _menu_get(self, _conn, _sender, _path, _iface, prop, _err_unused):
+    def _menu_get(self, _conn, _sender, _path, _iface, prop):
         if prop == "Version":
             return GLib.Variant("u", 3)
         if prop == "Status":
@@ -142,12 +142,13 @@ class Tray:
 
     def _menu_method(self, _conn, _sender, _path, _iface, method, params, invocation):
         if method == "GetLayout":
+            # The `av` children are variants; the (ia{sv}av) root slots take raw
+            # Python values (a pre-wrapped GLib.Variant here is a nesting error).
             children = [GLib.Variant("v", _menu_item_variant(i, label)) for i, label in _MENU_ITEMS]
-            root = GLib.Variant("(ia{sv}av)", (0, {"children-display": GLib.Variant("s", "submenu")}, children))
+            root = (0, {"children-display": GLib.Variant("s", "submenu")}, children)
             invocation.return_value(GLib.Variant("(u(ia{sv}av))", (1, root)))
         elif method == "GetGroupProperties":
-            rows = [GLib.Variant("(ia{sv})", (i, {"label": GLib.Variant("s", label)}))
-                    for i, label in _MENU_ITEMS]
+            rows = [(i, {"label": GLib.Variant("s", label)}) for i, label in _MENU_ITEMS]
             invocation.return_value(GLib.Variant("(a(ia{sv}))", (rows,)))
         elif method == "Event":
             item_id, event_id = params.get_child_value(0).get_int32(), params.get_child_value(1).get_string()

@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.marthofdoom.harmony"
         minSdk = 26
         targetSdk = 35
-        versionCode = 16
-        versionName = "0.7.20"
+        versionCode = 17
+        versionName = "0.7.21"
     }
 
     buildFeatures { compose = true }
