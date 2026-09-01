@@ -29,7 +29,6 @@ from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     action_status_page,
     confirm_dialog,
-    open_list_popover,
 )
 
 log = logging.getLogger(__name__)
@@ -80,6 +79,17 @@ class DevicesPage(Gtk.Box):
 
         self.state.connect("devices-changed", self._on_devices_changed)
         self._on_devices_changed()
+
+        # Scan the network the first time the page is shown, so devices appear on
+        # their own — no need to press Discover (matches the web Devices tab).
+        self._auto_discovered = False
+        self.connect("map", self._maybe_auto_discover)
+
+    def _maybe_auto_discover(self, *_args: object) -> None:
+        if self._auto_discovered:
+            return
+        self._auto_discovered = True
+        self._on_discover_clicked(self.discover_button)
 
     # -- layout ---------------------------------------------------------------
 
@@ -185,17 +195,28 @@ class DevicesPage(Gtk.Box):
     # -- device list ------------------------------------------------------------
 
     def _build_device_row(self, info: Any) -> Gtk.ListBoxRow:
+        kind = {"cast": "Chromecast", "wiim": "WiiM"}.get(getattr(info, "kind", ""), None)
         row = Adw.ActionRow(title=info.name, subtitle=info.host)
         row.device_host = info.host  # type: ignore[attr-defined]
-        remove_button = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
-                                    tooltip_text="Remove device")
-        remove_button.add_css_class("flat")
-        remove_button.connect("clicked", lambda *_a, h=info.host, n=info.name: self._on_remove_clicked(h, n))
-        row.add_suffix(remove_button)
+        if self.state.is_saved_device(info.host):
+            if kind:
+                row.set_subtitle(f"{info.host} · {kind}")
+            button = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                                tooltip_text="Remove device")
+            button.connect("clicked", lambda *_a, h=info.host, n=info.name: self._on_remove_clicked(h, n))
+        else:
+            # Auto-discovered: usable right away; the button pins it so it sticks.
+            row.set_subtitle(f"{info.host} · {kind or 'discovered'}")
+            button = Gtk.Button(icon_name="view-pin-symbolic", valign=Gtk.Align.CENTER,
+                                tooltip_text="Save this device")
+            button.connect("clicked", lambda *_a, i=info: self.state.add_device(
+                i.host, i.name, kind=getattr(i, "kind", "wiim")))
+        button.add_css_class("flat")
+        row.add_suffix(button)
         return row
 
     def _on_devices_changed(self, *_args: object) -> None:
-        devices = self.state.known_devices()
+        devices = self.state.all_devices()
         self._device_cache = {h: d for h, d in self._device_cache.items() if h in {d2.host for d2 in devices}}
 
         while (row := self.device_list.get_row_at_index(0)) is not None:
@@ -227,7 +248,7 @@ class DevicesPage(Gtk.Box):
         if host is None:
             self.device_title_label.set_label("")
             return
-        info = next((d for d in self.state.known_devices() if d.host == host), None)
+        info = next((d for d in self.state.all_devices() if d.host == host), None)
         self.device_title_label.set_label(info.name if info is not None else host)
         self._refresh_status()
 
@@ -267,41 +288,20 @@ class DevicesPage(Gtk.Box):
     def _on_discover_done(self, infos: list[Any]) -> None:
         self.discover_button.set_sensitive(True)
         self.discover_spinner.set_spinning(False)
+        # Discovered devices drop straight into the list and playback pickers —
+        # no manual add. Pin one (the button on its row) to keep it.
+        self.state.set_discovered_devices(infos)
         if not infos:
             self.state.toast("No devices found on the network.")
             return
-        known_hosts = {d.host for d in self.state.known_devices()}
-        new_infos = [i for i in infos if i.host not in known_hosts]
-        if not new_infos:
-            self.state.toast(GLib.dngettext(None,
-                "Found %d device — already added.", "Found %d devices — all already added.",
-                len(infos)) % len(infos))
-            return
-        self._show_discovery_results(new_infos)
+        self.state.toast(GLib.dngettext(None,
+            "Found %d device.", "Found %d devices.", len(infos)) % len(infos))
 
     def _on_discover_error(self, exc: BaseException) -> None:
         self.discover_button.set_sensitive(True)
         self.discover_spinner.set_spinning(False)
         log.exception("Device discovery failed")
         self.state.toast("Couldn't search for devices — check your connection.")
-
-    def _show_discovery_results(self, infos: list[Any]) -> None:
-        popover = Gtk.Popover()
-        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        listbox.add_css_class("boxed-list")
-        for info in infos:
-            row = Adw.ActionRow(title=info.name, subtitle=info.host)
-            row.set_activatable(True)
-            row.add_suffix(Gtk.Image.new_from_icon_name("list-add-symbolic"))
-
-            def _pick(r: Adw.ActionRow, i: Any = info) -> None:
-                self.state.add_device(i.host, i.name, kind=getattr(i, "kind", "wiim"))
-                r.set_sensitive(False)
-                r.set_subtitle(f"{i.host} · added")
-
-            row.connect("activated", _pick)
-            listbox.append(row)
-        open_list_popover(popover, self.discover_button, listbox)
 
     # -- status / controls ----------------------------------------------------
 

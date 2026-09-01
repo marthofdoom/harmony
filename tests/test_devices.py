@@ -63,6 +63,34 @@ def _signal_recorder(state: AppState, name: str) -> list[None]:
     return calls
 
 
+# -- auto-discovered devices flow into the list + pickers ---------------------
+
+
+def test_discovered_devices_appear_without_saving(state: AppState) -> None:
+    cast = DeviceInfo(id="uuid", name="Living Room", host="10.0.0.5", kind="cast")
+    calls = _signal_recorder(state, "devices-changed")
+    state.set_discovered_devices([cast])
+    # Shows up in the merged list and the playback picker, but isn't persisted.
+    assert [d.host for d in state.all_devices()] == ["10.0.0.5"]
+    assert state.known_devices() == []
+    assert state.is_saved_device("10.0.0.5") is False
+    assert "10.0.0.5" in {d.host for d in state.playback_targets()}
+    assert len(calls) == 1
+
+
+def test_device_for_routes_a_discovered_chromecast(state: AppState) -> None:
+    state.set_discovered_devices([DeviceInfo(id="u", name="TV", host="10.0.0.9", kind="cast")])
+    assert state.device_for("10.0.0.9").__class__.__name__ == "ChromecastDevice"
+
+
+def test_saved_device_wins_over_discovered_duplicate(state: AppState) -> None:
+    state.add_device("10.0.0.5", "Saved", kind="wiim")
+    state.set_discovered_devices([DeviceInfo(id="u", name="Dup", host="10.0.0.5", kind="cast")])
+    hosts = [d.host for d in state.all_devices()]
+    assert hosts == ["10.0.0.5"]  # deduped
+    assert state.is_saved_device("10.0.0.5") is True
+
+
 # -- add_device ---------------------------------------------------------------
 
 
