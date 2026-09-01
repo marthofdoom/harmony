@@ -557,16 +557,24 @@ class AppState(GObject.Object):
             return refilled[0]
         return None
 
-    def add_device(self, host: str, name: str | None = None) -> None:
+    def add_device(self, host: str, name: str | None = None, kind: str = "wiim") -> None:
         """Add a device by host, deduped by host. No-op if already known."""
         host = host.strip()
         if not host:
             return
         if any(entry.get("host") == host for entry in self.settings.known_devices):
             return
-        self.settings.known_devices.append({"host": host, "name": (name or host).strip() or host, "kind": "wiim"})
+        self.settings.known_devices.append(
+            {"host": host, "name": (name or host).strip() or host, "kind": kind or "wiim"}
+        )
         self.settings.save()
         self.emit("devices-changed")
+
+    def _device_entry(self, host: str) -> dict[str, Any]:
+        for entry in self.settings.known_devices:
+            if entry.get("host") == host:
+                return entry
+        return {}
 
     def remove_device(self, host: str) -> None:
         """Forget a device. No-op if it wasn't known."""
@@ -604,6 +612,14 @@ class AppState(GObject.Object):
         no I/O (``WiiMDevice.__init__`` is pure), only the methods called on
         the result do.
         """
+        entry = self._device_entry(host)
+        if entry.get("kind") == "cast":
+            from harmony.playback import ChromecastDevice
+            from harmony.playback.base import DeviceInfo
+
+            info = DeviceInfo(id=host, name=entry.get("name") or host, host=host, kind="cast")
+            return ChromecastDevice(host, info=info)
+
         from harmony.playback import device_from_host
 
         if self._device_session is None:

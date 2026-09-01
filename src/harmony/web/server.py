@@ -170,9 +170,11 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not service or not track_id:
                     self._send_json({"error": "missing service or id"}, status=400)
                     return
-                self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {}))
+                self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {},
+                                            via=body.get("via") or None))
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] in ("pause", "resume", "stop", "volume"):
-                self._send_json(engine.device_control(parts[2], parts[3], body.get("level")))
+                self._send_json(engine.device_control(parts[2], parts[3], body.get("level"),
+                                                       via=body.get("via") or None))
             elif parts == ["api", "audio", "receive"]:
                 self._send_json(engine.audio_receive(body.get("sink"), int(body.get("latency_ms") or 150)))
             elif parts == ["api", "audio", "send"]:
@@ -276,11 +278,15 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.playlist_tracks(parts[2], parts[3]))
             elif parts == ["api", "devices"]:
                 refresh = (query.get("refresh") or ["0"])[0] in ("1", "true", "yes")
-                self._send_json(engine.devices(refresh=refresh))
+                if (query.get("peers") or ["0"])[0] in ("1", "true", "yes"):
+                    self._send_json(engine.federated_devices(refresh=refresh))
+                else:
+                    self._send_json(engine.devices(refresh=refresh))
             elif parts == ["api", "peers"]:
                 self._send_json(engine.instances())
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
-                self._send_json(engine.device_status(parts[2]))
+                via = (query.get("via") or [""])[0] or None
+                self._send_json(engine.device_status(parts[2], via=via))
             elif parts == ["api", "credentials", "export"]:
                 # Sensitive: only a key-matching caller reaches here (the gate),
                 # and never an open instance — refuse when no key is set.

@@ -250,9 +250,11 @@ class DevicesPage(Gtk.Box):
         self.discover_spinner.set_spinning(True)
 
         def work() -> list[Any]:
-            from harmony.playback import discover_wiim
+            from harmony.playback import discover_cast, discover_wiim
 
-            return discover_wiim()
+            # Both scans on the worker thread (per the threading rule); Cast is a
+            # no-op when its optional dependency is absent.
+            return [*discover_wiim(), *discover_cast()]
 
         run_async(work, self._on_discover_done, self._on_discover_error)
 
@@ -284,7 +286,7 @@ class DevicesPage(Gtk.Box):
             row.add_suffix(Gtk.Image.new_from_icon_name("list-add-symbolic"))
 
             def _pick(r: Adw.ActionRow, i: Any = info) -> None:
-                self.state.add_device(i.host, i.name)
+                self.state.add_device(i.host, i.name, kind=getattr(i, "kind", "wiim"))
                 r.set_sensitive(False)
                 r.set_subtitle(f"{i.host} · added")
 

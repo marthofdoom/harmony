@@ -40,7 +40,15 @@ class CastController:
             self._session = requests.Session()
         return self._session
 
-    def _device(self, host: str) -> Any:
+    def _device(self, host: str, kind: str = "wiim", device_info: dict[str, Any] | None = None) -> Any:
+        if kind == "cast":
+            from harmony.playback import ChromecastDevice
+            from harmony.playback.base import DeviceInfo
+
+            raw = {"port": (device_info or {}).get("port"), "uuid": (device_info or {}).get("uuid")}
+            info = DeviceInfo(id=host, name=(device_info or {}).get("name") or host, host=host,
+                              kind="cast", raw={k: v for k, v in raw.items() if v})
+            return ChromecastDevice(host, info=info)
         from harmony.playback import WiiMDevice
 
         return WiiMDevice(host, session=self._http_session())
@@ -61,10 +69,21 @@ class CastController:
         self._upnp_cache[host] = renderer
         return renderer
 
-    def cast(self, host: str, service: str, track_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
+    def cast(self, host: str, service: str, track_id: str, meta: dict[str, Any] | None = None,
+             kind: str = "wiim", device_info: dict[str, Any] | None = None) -> dict[str, Any]:
         meta = meta or {}
         source = self._resolve_source(service, track_id)
         relay = self._relay_server()
+        if kind == "cast":
+            # Chromecast plays the relay's HTTP URL through its default receiver.
+            token = relay.register(lambda: source, title=meta.get("title"),
+                                   artist=meta.get("artist"), allow_icy=False)
+            url = relay.url_for(token, host)
+            self._device(host, kind, device_info).play_url(
+                url, mime=source.mime_type or "audio/mpeg", title=meta.get("title"),
+                artist=meta.get("artist"), art_url=meta.get("art_url"),
+            )
+            return {"ok": True, "host": host}
         renderer = self._upnp_renderer(host)
         if renderer is not None:
             token = relay.register(lambda: source, title=meta.get("title"),
@@ -82,8 +101,9 @@ class CastController:
             self._device(host).play_url(url)
         return {"ok": True, "host": host}
 
-    def control(self, host: str, action: str, level: int | None = None) -> dict[str, Any]:
-        device = self._device(host)
+    def control(self, host: str, action: str, level: int | None = None,
+                kind: str = "wiim", device_info: dict[str, Any] | None = None) -> dict[str, Any]:
+        device = self._device(host, kind, device_info)
         if action == "pause":
             device.pause()
         elif action == "resume":
@@ -96,8 +116,8 @@ class CastController:
             raise ValueError(f"unknown action {action}")
         return {"ok": True}
 
-    def status(self, host: str) -> dict[str, Any]:
-        st = self._device(host).status()
+    def status(self, host: str, kind: str = "wiim", device_info: dict[str, Any] | None = None) -> dict[str, Any]:
+        st = self._device(host, kind, device_info).status()
         return {
             "state": getattr(st, "state", None),
             "position_s": getattr(st, "position_s", None),

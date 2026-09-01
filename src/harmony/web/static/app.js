@@ -10,10 +10,21 @@ const state = {
   index: -1,      // index of the playing track within queue
   playlist: null, // {service, id, title} when viewing an editable playlist, else null
   target: "browser", // "browser" (this tab's <audio>) or a device host to cast to
+  targetVia: null,   // peer "host:port" when the device lives on another instance's LAN
   devicePaused: false,
 };
 
 const onDevice = () => state.target !== "browser";
+// A device target is encoded as "host" (local) or "host::peerhost:port" (federated),
+// so a single <select> value or data-attr carries both.
+const encodeTarget = (host, via) => (via ? `${host}::${via}` : host);
+function setTargetValue(value) {
+  const i = (value || "").indexOf("::");
+  state.target = i >= 0 ? value.slice(0, i) : (value || "browser");
+  state.targetVia = i >= 0 ? value.slice(i + 2) : null;
+}
+// Merge {via} into a device play/control body only when set.
+const withVia = (body) => (state.targetVia ? { ...body, via: state.targetVia } : body);
 
 const fmtTime = (s) => {
   if (!s || s < 0 || !isFinite(s)) return "0:00";
@@ -225,7 +236,7 @@ async function renderDevices(refresh) {
   const list = $("list");
   list.innerHTML = `<p class="hint">${refresh ? "Scanning your network…" : "Loading devices…"}</p>`;
   let devices = [];
-  try { devices = (await api(`/api/devices${refresh ? "?refresh=1" : ""}`)).devices || []; }
+  try { devices = (await api(`/api/devices?peers=1${refresh ? "&refresh=1" : ""}`)).devices || []; }
   catch (e) { list.innerHTML = `<p class="hint">Couldn't load devices: ${esc(e.message)}</p>`; return; }
   const targets = [{ host: "browser", name: "This browser", kind: "" }, ...devices];
   list.innerHTML = `<div style="max-width:640px">
@@ -235,28 +246,30 @@ async function renderDevices(refresh) {
       <button class="act ghost" id="dev-rescan">Rescan</button>
     </div>
     ${targets.map((d) => {
-      const active = state.target === d.host;
+      const value = d.host === "browser" ? "browser" : encodeTarget(d.host, d.via);
+      const active = value === encodeTarget(state.target, state.targetVia);
+      const sub = d.host === "browser" ? "" :
+        `${esc(d.kind === "cast" ? "Chromecast" : (d.kind || "device"))} · ${esc(d.host)}${d.via ? ` · via ${esc(d.via_name || d.via)}` : ""}`;
       return `<div class="card" style="${active ? "border-color:var(--accent)" : ""}">
         <div style="display:flex;align-items:center;gap:.7rem">
-          <span style="font-size:1.4rem">${d.host === "browser" ? "💻" : "📻"}</span>
+          <span style="font-size:1.4rem">${d.host === "browser" ? "💻" : (d.kind === "cast" ? "📺" : "📻")}</span>
           <div style="flex:1;min-width:0">
-            <div style="font-weight:600">${esc(d.name)}${active ? ` <span class="badge">output</span>` : ""}</div>
-            ${d.host !== "browser" ? `<div class="muted" style="font-size:12px">${esc(d.kind || "device")} · ${esc(d.host)}</div>` : ""}
+            <div style="font-weight:600">${esc(d.name)}${active ? ` <span class="badge">output</span>` : ""}${d.via ? ` <span class="badge" style="background:var(--muted)">remote</span>` : ""}</div>
+            ${sub ? `<div class="muted" style="font-size:12px">${sub}</div>` : ""}
           </div>
-          <button class="act ${active ? "" : "ghost"} setout" data-host="${esc(d.host)}">${active ? "Selected" : "Use"}</button>
+          <button class="act ${active ? "" : "ghost"} setout" data-target="${esc(value)}">${active ? "Selected" : "Use"}</button>
         </div>
       </div>`;
     }).join("")}
-    ${devices.length ? "" : `<p class="muted" style="padding:.5rem">No cast devices found yet. WiiM/UPnP renderers on this instance's network are auto-discovered — press Rescan, and note discovery only sees the LAN of the instance you're connected to.</p>`}
+    ${devices.length ? "" : `<p class="muted" style="padding:.5rem">No cast devices found yet. WiiM/UPnP/Chromecast renderers on this instance's network are auto-discovered — press Rescan. Devices on another instance's LAN appear here too, tagged “via …”, and cast through that instance.</p>`}
   </div>`;
   const rescan = $("dev-rescan");
   if (rescan) rescan.onclick = () => renderDevices(true);
   list.querySelectorAll(".setout").forEach((b) => b.onclick = () => {
-    const host = b.dataset.host;
-    const prev = state.target;
-    state.target = host;
-    const sel = $("np-device"); if (sel) sel.value = host;  // keep the Now Playing selector in sync
-    if (prev === "browser" && host !== "browser") audio.pause();  // handing off to a device
+    const prevOnDevice = onDevice();
+    setTargetValue(b.dataset.target);
+    const sel = $("np-device"); if (sel) sel.value = b.dataset.target;  // keep the Now Playing selector in sync
+    if (!prevOnDevice && onDevice()) audio.pause();  // handing off to a device
     renderDevices();
   });
 }
@@ -546,7 +559,7 @@ async function playAt(i) {
   try {
     if (onDevice()) {
       await apiPost(`/api/devices/${encodeURIComponent(state.target)}/play`,
-        { service: t.service, id: t.id, meta: { title: t.title, artist: t.artist, album: t.album, art_url: t.artwork_url, duration_s: t.duration_s } });
+        withVia({ service: t.service, id: t.id, meta: { title: t.title, artist: t.artist, album: t.album, art_url: t.artwork_url, duration_s: t.duration_s } }));
       state.devicePaused = false;
       $("np-play").textContent = "⏸";
     } else {
@@ -561,14 +574,14 @@ async function playAt(i) {
 
 $("np-device").addEventListener("change", (e) => {
   const prev = state.target;
-  state.target = e.target.value;
+  setTargetValue(e.target.value);
   if (prev === "browser" && onDevice()) audio.pause();       // handing off to a device
 });
 
 $("np-play").addEventListener("click", async () => {
   if (onDevice()) {
     if (state.index < 0) { if (state.queue.length) return playAt(0); return; }
-    try { await apiPost(`/api/devices/${encodeURIComponent(state.target)}/${state.devicePaused ? "resume" : "pause"}`, {});
+    try { await apiPost(`/api/devices/${encodeURIComponent(state.target)}/${state.devicePaused ? "resume" : "pause"}`, withVia({}));
       state.devicePaused = !state.devicePaused; $("np-play").textContent = state.devicePaused ? "▶" : "⏸"; } catch { /* ignore */ }
     return;
   }
@@ -592,17 +605,20 @@ let seeking = false;
 $("np-seek").addEventListener("input", () => { seeking = true; $("np-pos").textContent = fmtTime($("np-seek").value); });
 $("np-seek").addEventListener("change", () => { audio.currentTime = Number($("np-seek").value); seeking = false; });
 $("np-vol").addEventListener("input", () => {
-  if (onDevice()) { apiPost(`/api/devices/${encodeURIComponent(state.target)}/volume`, { level: Number($("np-vol").value) }).catch(() => {}); }
+  if (onDevice()) { apiPost(`/api/devices/${encodeURIComponent(state.target)}/volume`, withVia({ level: Number($("np-vol").value) })).catch(() => {}); }
   else { audio.volume = $("np-vol").value / 100; }
 });
 
 async function loadDevices() {
   try {
-    const devs = (await api("/api/devices")).devices || [];
+    const devs = (await api("/api/devices?peers=1")).devices || [];
     const sel = $("np-device");
+    // Rebuild, keeping the first "This browser" option.
+    while (sel.options.length > 1) sel.remove(1);
     for (const d of devs) {
       const o = document.createElement("option");
-      o.value = d.host; o.textContent = d.name;
+      o.value = encodeTarget(d.host, d.via);
+      o.textContent = d.via ? `${d.name} (via ${d.via_name || d.via})` : d.name;
       sel.appendChild(o);
     }
   } catch { /* no devices */ }

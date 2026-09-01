@@ -19,6 +19,28 @@ class Discovery(context: Context) {
     val instances: StateFlow<List<Instance>> = _instances
 
     private var discoveryListener: NsdManager.DiscoveryListener? = null
+    private var registrationListener: NsdManager.RegistrationListener? = null
+
+    /** Advertise this phone as a Harmony instance on [port] so the desktop and
+     *  server see it on the mesh (Route Audio, device lists) — the missing half
+     *  that made the phone invisible. [name] is the advertised service name. */
+    fun advertise(port: Int, name: String) {
+        if (registrationListener != null || port <= 0) return
+        val info = NsdServiceInfo().apply {
+            serviceName = name
+            serviceType = SERVICE_TYPE
+            setPort(port)
+        }
+        val listener = object : NsdManager.RegistrationListener {
+            override fun onServiceRegistered(i: NsdServiceInfo) { Log.i(TAG, "advertising ${i.serviceName}") }
+            override fun onRegistrationFailed(i: NsdServiceInfo, code: Int) { Log.w(TAG, "register failed $code") }
+            override fun onServiceUnregistered(i: NsdServiceInfo) {}
+            override fun onUnregistrationFailed(i: NsdServiceInfo, code: Int) {}
+        }
+        registrationListener = listener
+        runCatching { nsd.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
+            .onFailure { Log.w(TAG, "registerService failed", it) }
+    }
 
     fun start() {
         if (discoveryListener != null) return
@@ -55,6 +77,8 @@ class Discovery(context: Context) {
     fun stop() {
         discoveryListener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
         discoveryListener = null
+        registrationListener?.let { runCatching { nsd.unregisterService(it) } }
+        registrationListener = null
         _instances.value = emptyList()
     }
 }
