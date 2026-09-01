@@ -466,3 +466,40 @@ def test_play_empty_track_list_is_a_noop(state: AppState, monkeypatch) -> None:
     monkeypatch.setattr(state, "_play_one", lambda t, h: (_ for _ in ()).throw(AssertionError("must not play")))
     state.play_tracks_on_device([], "192.168.1.9")
     assert state._queues == {}
+
+
+# -- device handoff: one active stream moves (whole queue) --------------------
+
+
+def test_selecting_a_device_moves_the_whole_queue(state: AppState, monkeypatch) -> None:
+    monkeypatch.setattr("harmony.ui.state.run_async", lambda fn, *a, **k: fn())  # inline
+    monkeypatch.setattr("harmony.ui.state.on_main", lambda fn, *a: None)
+    stopped: list = []
+    played: list = []
+    monkeypatch.setattr(state, "device_for",
+                        lambda h: type("D", (), {"stop": lambda s, hh=h: stopped.append(hh)})())
+    monkeypatch.setattr(state, "_play_one", lambda t, h: played.append((t.id, h)))
+    # A three-track queue is streaming on device A (current track at the front).
+    q = [_track_n(1), _track_n(2), _track_n(3)]
+    state._queues = {"A": q}
+    state._collection_full = {"A": list(q)}
+    state._collection_key = {"A": ("k", "id")}
+    state.playback.active_host = "A"
+    state.playback.track = q[0]
+    state.playback.state = "playing"
+
+    state.playback_set_active_device("B")
+
+    assert "A" in stopped                              # old device stopped
+    assert state.playback.active_host == "B"
+    assert [t.id for t in state._queues["B"]] == ["t1", "t2", "t3"]  # whole queue moved, order kept
+    assert state._collection_key["B"] == ("k", "id")   # collection context carried over
+    assert played == [("t1", "B")]                     # resumes from the current track on B
+
+
+def test_selecting_a_device_with_nothing_playing_just_switches_view(state: AppState) -> None:
+    state._queues = {}
+    state.playback.active_host = "A"
+    state.playback.track = None
+    state.playback_set_active_device("B")
+    assert state.playback.active_host == "B"

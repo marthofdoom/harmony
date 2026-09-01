@@ -43,6 +43,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.25" date="2026-09-01">
+      <description>
+        <p>One active stream per instance, done right. Choosing a different device
+        in the Now Playing bar now moves the whole playing queue to it — stopping
+        the old device — instead of leaving audio behind or starting a second
+        stream. The Devices page also reflects whatever is playing the moment you
+        open it, without having to touch the controls.</p>
+      </description>
+    </release>
     <release version="0.7.24" date="2026-09-01">
       <description>
         <p>Casting to a Chromecast or Google TV now sends the full track details —
