@@ -448,7 +448,8 @@ class AppState(GObject.Object):
             finish()
 
         def error(exc: BaseException) -> None:
-            self.toast(f"Couldn't load playlists: {exc}")
+            log.exception("Couldn't load playlists")
+            self.toast("Couldn't load your playlists — check your connection.")
             finish()
 
         run_async(work, done, error)
@@ -964,6 +965,21 @@ class AppState(GObject.Object):
 
     # -- transport (called from the Now Playing bar, main loop) --------------
 
+    def _toast_playback_error(self, exc: BaseException, fallback: str) -> None:
+        """Toast a short human sentence for a playback failure.
+
+        Reserves the raw exception text for provider-raised errors, which are
+        already written for people; anything else gets ``fallback`` and the
+        detail goes to the log (mirrors devices_page's ``_report_error``).
+        """
+        from harmony.errors import NotSupportedError, ProviderError
+
+        if isinstance(exc, (ProviderError, NotSupportedError)):
+            self.toast(str(exc))
+        else:
+            log.exception("playback error: %s", fallback)
+            self.toast(fallback)
+
     def playback_toggle_pause(self) -> None:
         """Pause if playing, resume if paused/stopped, on the active device."""
         host = self.playback.active_host
@@ -978,7 +994,7 @@ class AppState(GObject.Object):
             return
         device = self.device_for(host)
         action = device.pause if pausing else device.resume
-        run_async(action, None, lambda exc: self.toast(f"Playback control failed: {exc}"))
+        run_async(action, None, lambda exc: self._toast_playback_error(exc, "Couldn't control playback."))
 
     def playback_next(self) -> None:
         """Skip to the next queued track (wraps if repeat is on)."""
@@ -991,7 +1007,7 @@ class AppState(GObject.Object):
             self._end_playback(host)
             return
         run_async(lambda: self._play_one(nxt, host), None,
-                  lambda exc: self.toast(f"Skip failed: {exc}"))
+                  lambda exc: self._toast_playback_error(exc, "Couldn't skip to the next track."))
 
     def playback_previous(self) -> None:
         """Go back to the previously played track (no-op if none)."""
@@ -1003,7 +1019,7 @@ class AppState(GObject.Object):
         self._queues.setdefault(host, []).insert(0, prev)  # prev becomes the current front
         self._queue_armed[host] = False
         run_async(lambda: self._play_one(prev, host), None,
-                  lambda exc: self.toast(f"Previous failed: {exc}"))
+                  lambda exc: self._toast_playback_error(exc, "Couldn't go back to the previous track."))
 
     def playback_seek(self, position_s: int) -> None:
         """Seek the active device to ``position_s`` (UPnP only; toasts otherwise)."""
@@ -1017,7 +1033,7 @@ class AppState(GObject.Object):
         if host == LOCAL_HOST:
             if not self._get_local_player().seek(int(position_s)):
                 self._seek_settle_until = 0.0
-                self.toast("This track can't be seeked.")
+                self.toast("This track doesn't support seeking.")
             return
 
         def work() -> None:
@@ -1026,7 +1042,7 @@ class AppState(GObject.Object):
                 raise RuntimeError("this device doesn't support seeking")
             renderer.seek(int(position_s))
 
-        run_async(work, None, lambda exc: self.toast(f"Seek failed: {exc}"))
+        run_async(work, None, lambda exc: self._toast_playback_error(exc, "Couldn't seek in this track."))
 
     def playback_set_volume(self, level: int) -> None:
         """Set the active device's volume (0..100)."""
@@ -1040,7 +1056,7 @@ class AppState(GObject.Object):
             return
         device = self.device_for(host)
         run_async(lambda: device.set_volume(level), None,
-                  lambda exc: self.toast(f"Volume failed: {exc}"))
+                  lambda exc: self._toast_playback_error(exc, "Couldn't change the volume."))
 
     def playback_set_active_device(self, host: str) -> None:
         """Point the Now Playing bar at ``host`` (the active playback device)."""

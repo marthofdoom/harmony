@@ -25,11 +25,13 @@ from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     ProgressDialog,
+    action_status_page,
     attach_context_menu,
     build_track_column_view,
     confirm_dialog,
     error_status_page,
-    missing_layer_status_page,
+    loading_status_page,
+    open_preferences,
     replace_tracks,
     selected_tracks,
     set_stack_status,
@@ -232,44 +234,76 @@ class PlaylistsPage(Gtk.Box):
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")
+        self.track_stack.add_named(loading_status_page("Loading tracks…"), "loading")
         box.append(self.track_stack)
         return box
 
     def _build_track_toolbar(self) -> Gtk.Widget:
-        bar = Gtk.Box(spacing=6, margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-        self.rename_button = Gtk.Button(label="Rename")
-        self.rename_button.connect("clicked", self._on_rename_clicked)
-        self.delete_button = Gtk.Button(label="Delete")
-        self.delete_button.add_css_class("destructive-action")
-        self.delete_button.connect("clicked", self._on_delete_clicked)
+        bar = Gtk.ActionBar()
+
+        # "Remove Selected" is the one action tied to the track selection, so it
+        # stays out front; the playlist-level actions collapse into an overflow
+        # menu instead of six always-visible buttons.
         self.remove_tracks_button = Gtk.Button(label="Remove Selected")
         self.remove_tracks_button.connect("clicked", self._on_remove_tracks_clicked)
-        self.export_button = Gtk.Button(label="Export")
-        self.export_button.connect("clicked", self._on_export_clicked)
-        self.import_button = Gtk.Button(label="Import")
-        self.import_button.connect("clicked", self._on_import_clicked)
-        self.clone_button = Gtk.Button(label="Clone to Other Service")
-        self.clone_button.connect("clicked", self._on_clone_clicked)
-        for button in (self.rename_button, self.delete_button, self.remove_tracks_button,
-                       self.export_button, self.import_button, self.clone_button):
-            button.set_sensitive(False)
-            bar.append(button)
+        bar.pack_start(self.remove_tracks_button)
+
+        menu = Gio.Menu()
+        menu.append("Rename…", "playlist.rename")
+        menu.append("Export…", "playlist.export")
+        menu.append("Import…", "playlist.import")
+        menu.append("Clone to Other Service", "playlist.clone")
+        menu.append("Delete…", "playlist.delete")
+
+        actions = Gio.SimpleActionGroup()
+        for name, handler in (
+            ("rename", self._on_rename_clicked),
+            ("export", self._on_export_clicked),
+            ("import", self._on_import_clicked),
+            ("clone", self._on_clone_clicked),
+            ("delete", self._on_delete_clicked),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda _a, _p, h=handler: h(None))
+            actions.add_action(action)
+        self._playlist_actions = actions
+        self.insert_action_group("playlist", actions)
+
+        self.playlist_menu_button = Gtk.MenuButton(
+            icon_name="view-more-symbolic", menu_model=menu, tooltip_text="Playlist actions",
+        )
+        bar.pack_end(self.playlist_menu_button)
+
+        self._update_toolbar_sensitivity()
         return bar
 
     def _update_toolbar_sensitivity(self) -> None:
         has_playlist = self._selected_playlist is not None
-        for button in (self.rename_button, self.delete_button, self.export_button,
-                       self.import_button, self.clone_button):
-            button.set_sensitive(has_playlist)
+        # The overflow menu's items are all playlist-level; gate the whole menu.
+        for name in ("rename", "export", "import", "clone", "delete"):
+            action = self._playlist_actions.lookup_action(name)
+            if action is not None:
+                action.set_enabled(has_playlist)
+        self.playlist_menu_button.set_sensitive(has_playlist)
         has_selection = has_playlist and bool(selected_tracks(self.track_selection))
         self.remove_tracks_button.set_sensitive(has_selection)
 
     def _load_tracks(self, playlist: Playlist) -> None:
         provider = self.state.providers.get(playlist.service)
         if provider is None:
-            set_stack_status(self.track_stack, "empty", missing_layer_status_page("providers"))
+            set_stack_status(
+                self.track_stack, "empty",
+                action_status_page(
+                    icon_name="network-offline-symbolic",
+                    title=f"{playlist.service.label} isn't connected",
+                    description=f"Connect {playlist.service.label} in Preferences to see this "
+                    "playlist's tracks.",
+                    action_label="Open Preferences",
+                    on_action=lambda: open_preferences(self, "accounts"),
+                ),
+            )
             return
-        self.track_stack.set_visible_child_name("empty")
+        self.track_stack.set_visible_child_name("loading")
 
         def work() -> list[Track]:
             return provider.get_playlist_tracks(playlist.id)
@@ -414,11 +448,12 @@ class PlaylistsPage(Gtk.Box):
             provider.remove_tracks(playlist.id, ids)
 
         def done(_r: None) -> None:
-            self.state.toast(f"Removed {len(ids)} track(s)")
+            count = len(ids)
+            self.state.toast(GLib.ngettext("Removed %d track", "Removed %d tracks", count) % count)
             self._load_tracks(playlist)
             self.state.all_playlists(refresh=True)
 
-        run_async(work, done, lambda exc: self.state.toast(f"Couldn't remove tracks: {exc}"))
+        run_async(work, done, lambda exc: self.state.toast("Couldn't remove those tracks — check your connection."))
 
     def _on_export_clicked(self, _button: Gtk.Button) -> None:
         playlist = self._selected_playlist
@@ -551,14 +586,19 @@ class PlaylistsPage(Gtk.Box):
         def done(outcome: _ImportOutcome) -> None:
             for warning in outcome.warnings:
                 log.warning("Import %s: %s", path.name, warning)
-            message = f"Imported {outcome.added} of {outcome.total_rows} track(s)"
+            message = GLib.ngettext(
+                "Imported %d of %d track", "Imported %d of %d tracks", outcome.total_rows
+            ) % (outcome.added, outcome.total_rows)
             detail = []
             if outcome.rows_skipped:
-                detail.append(f"{outcome.rows_skipped} row(s) skipped")
+                detail.append(GLib.ngettext(
+                    "%d row skipped", "%d rows skipped", outcome.rows_skipped) % outcome.rows_skipped)
             if outcome.unmatched:
                 detail.append(f"{outcome.unmatched} unmatched")
             if outcome.low_confidence:
-                detail.append(f"{outcome.low_confidence} low-confidence match(es) skipped")
+                detail.append(GLib.ngettext(
+                    "%d low-confidence match skipped", "%d low-confidence matches skipped",
+                    outcome.low_confidence) % outcome.low_confidence)
             if detail:
                 message += " (" + ", ".join(detail) + ")"
             self.state.toast(message)
@@ -596,7 +636,10 @@ class PlaylistsPage(Gtk.Box):
         def done(report: object) -> None:
             progress_dialog.close()
             added = len(getattr(report, "added", []))
-            self.state.toast(f"Cloned {added} track(s) to {other.label}")
+            self.state.toast(
+                GLib.ngettext("Cloned %d track to %s", "Cloned %d tracks to %s", added)
+                % (added, other.label)
+            )
             self.state.all_playlists(refresh=True)
 
         def error(exc: BaseException) -> None:

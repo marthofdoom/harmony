@@ -45,6 +45,8 @@ data class UiState(
     val openPlaylist: Playlist? = null,
     val playlistTracks: List<Track> = emptyList(),
     val libraryLoading: Boolean = false,
+    // the track just removed from the open playlist, offered as an undo
+    val undoableRemove: Track? = null,
     // cast target: "phone" (this device) or a hub device's host
     val devices: List<Device> = emptyList(),
     val target: String = "phone",
@@ -114,7 +116,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(conn = ConnState.CONNECTED, instanceName = name)
                 refreshPeers(); loadLibrary(); loadDevices()
             }.onFailure {
-                _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, message = it.message ?: "Connection failed")
+                _state.value = _state.value.copy(conn = ConnState.DISCONNECTED,
+                    message = friendly(it, "Couldn't connect. Check the address and key, then try again."))
             }
         }
     }
@@ -142,7 +145,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val result = withContext(Dispatchers.IO) { runCatching { client.search(q) } }
             result.onSuccess { _state.value = _state.value.copy(results = it, searching = false) }
-                .onFailure { _state.value = _state.value.copy(searching = false, message = it.message) }
+                .onFailure { _state.value = _state.value.copy(searching = false,
+                    message = friendly(it, "Couldn't search right now. Try again.")) }
         }
     }
 
@@ -155,14 +159,16 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             if (target != "phone") {  // cast to a hub device instead of playing here
                 _state.value = _state.value.copy(devicePaused = false)
                 withContext(Dispatchers.IO) { runCatching { client.castPlay(target, track) } }
-                    .onFailure { _state.value = _state.value.copy(message = "Cast failed: ${it.message}") }
+                    .onFailure { _state.value = _state.value.copy(
+                        message = friendly(it, "Couldn't cast to the device. Try again.")) }
                 return@launch
             }
             val url = withContext(Dispatchers.IO) { runCatching { client.streamUrl(track) } }
             url.onSuccess {
                 player.setMediaItem(MediaItem.fromUri(it))
                 player.prepare(); player.play()
-            }.onFailure { _state.value = _state.value.copy(message = it.message ?: "Could not play track") }
+            }.onFailure { _state.value = _state.value.copy(
+                message = friendly(it, "Couldn't play that track. Try again.")) }
         }
     }
 
@@ -176,7 +182,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val res = withContext(Dispatchers.IO) { runCatching { client.playlists() } }
             res.onSuccess { _state.value = _state.value.copy(playlists = it, libraryLoading = false) }
-                .onFailure { _state.value = _state.value.copy(libraryLoading = false, message = it.message) }
+                .onFailure { _state.value = _state.value.copy(libraryLoading = false,
+                    message = friendly(it, "Couldn't load your library. Try again.")) }
         }
     }
 
@@ -186,7 +193,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val res = withContext(Dispatchers.IO) { runCatching { client.playlistTracks(pl.service, pl.id) } }
             res.onSuccess { _state.value = _state.value.copy(playlistTracks = it, libraryLoading = false) }
-                .onFailure { _state.value = _state.value.copy(libraryLoading = false, message = it.message) }
+                .onFailure { _state.value = _state.value.copy(libraryLoading = false,
+                    message = friendly(it, "Couldn't open that playlist. Try again.")) }
         }
     }
 
@@ -194,26 +202,30 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         _state.value = _state.value.copy(openPlaylist = null, playlistTracks = emptyList())
     }
 
-    fun createPlaylist(service: String, title: String) = mutate("Playlist created") {
-        it.createPlaylist(service, title)
-    }
+    fun createPlaylist(service: String, title: String) =
+        mutate("Playlist created", "Couldn't create the playlist. Try again.") {
+            it.createPlaylist(service, title)
+        }
 
-    fun renamePlaylist(pl: Playlist, title: String) = mutate("Renamed") {
-        it.renamePlaylist(pl.service, pl.id, title)
-    }
+    fun renamePlaylist(pl: Playlist, title: String) =
+        mutate("Playlist renamed", "Couldn't rename the playlist. Try again.") {
+            it.renamePlaylist(pl.service, pl.id, title)
+        }
 
     fun deletePlaylist(pl: Playlist) = viewModelScope.launch {
         val client = api ?: return@launch
         withContext(Dispatchers.IO) { runCatching { client.deletePlaylist(pl.service, pl.id) } }
-            .onSuccess { _state.value = _state.value.copy(openPlaylist = null, message = "Deleted"); loadLibrary() }
-            .onFailure { _state.value = _state.value.copy(message = "Delete failed: ${it.message}") }
+            .onSuccess { _state.value = _state.value.copy(openPlaylist = null, message = "Playlist deleted"); loadLibrary() }
+            .onFailure { _state.value = _state.value.copy(
+                message = friendly(it, "Couldn't delete the playlist. Try again.")) }
     }
 
     fun addToPlaylist(track: Track, pl: Playlist) = viewModelScope.launch {
         val client = api ?: return@launch
         withContext(Dispatchers.IO) { runCatching { client.addTracks(pl.service, pl.id, listOf(track.id)) } }
             .onSuccess { _state.value = _state.value.copy(message = "Added to ${pl.title}") }
-            .onFailure { _state.value = _state.value.copy(message = "Add failed: ${it.message}") }
+            .onFailure { _state.value = _state.value.copy(
+                message = friendly(it, "Couldn't add to ${pl.title}. Try again.")) }
     }
 
     fun removeFromPlaylist(track: Track) = viewModelScope.launch {
@@ -222,16 +234,50 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         withContext(Dispatchers.IO) { runCatching { client.removeTracks(pl.service, pl.id, listOf(track.id)) } }
             .onSuccess {
                 _state.value = _state.value.copy(
-                    playlistTracks = _state.value.playlistTracks.filterNot { it.id == track.id })
-            }.onFailure { _state.value = _state.value.copy(message = "Remove failed: ${it.message}") }
+                    playlistTracks = _state.value.playlistTracks.filterNot { it.id == track.id },
+                    undoableRemove = track)
+            }.onFailure { _state.value = _state.value.copy(
+                message = friendly(it, "Couldn't remove the track. Try again.")) }
     }
 
+    /** Re-add the last track removed from the open playlist (backs an undo Snackbar). */
+    fun undoRemove() {
+        val track = _state.value.undoableRemove ?: return
+        val pl = _state.value.openPlaylist
+        _state.value = _state.value.copy(undoableRemove = null)
+        if (pl == null) return
+        viewModelScope.launch {
+            val client = api ?: return@launch
+            withContext(Dispatchers.IO) { runCatching { client.addTracks(pl.service, pl.id, listOf(track.id)) } }
+                .onSuccess { openPlaylist(pl) }
+                .onFailure { _state.value = _state.value.copy(
+                    message = "Couldn't restore the track. Try adding it again.") }
+        }
+    }
+
+    fun clearUndo() { _state.value = _state.value.copy(undoableRemove = null) }
+
     /** Run a mutating call, then refresh the playlist list. */
-    private fun mutate(okMsg: String, block: (HarmonyApi) -> Unit) = viewModelScope.launch {
+    private fun mutate(okMsg: String, failMsg: String, block: (HarmonyApi) -> Unit) = viewModelScope.launch {
         val client = api ?: return@launch
         withContext(Dispatchers.IO) { runCatching { block(client) } }
             .onSuccess { _state.value = _state.value.copy(message = okMsg); loadLibrary() }
-            .onFailure { _state.value = _state.value.copy(message = "Failed: ${it.message}") }
+            .onFailure { _state.value = _state.value.copy(message = friendly(it, failMsg)) }
+    }
+
+    /** Map common network/auth failures to friendly copy; keep the raw message for logs. */
+    private fun friendly(t: Throwable, fallback: String): String {
+        android.util.Log.w("Harmony", fallback, t)
+        val msg = t.message ?: ""
+        return when {
+            t is java.net.UnknownHostException ->
+                "Couldn't reach the server. Check the address, then try again."
+            t is java.net.ConnectException ->
+                "Couldn't connect. Check the address and key, then try again."
+            "401" in msg || "403" in msg ->
+                "That key wasn't accepted. Check your personal key and try again."
+            else -> fallback
+        }
     }
 
     // -- devices ------------------------------------------------------------

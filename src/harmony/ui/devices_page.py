@@ -26,7 +26,11 @@ from gi.repository import Adw, GLib, Gtk  # noqa: E402
 from harmony.errors import NotSupportedError, ProviderError  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
-from harmony.ui.widgets import confirm_dialog, open_list_popover, status_page  # noqa: E402
+from harmony.ui.widgets import (  # noqa: E402
+    action_status_page,
+    confirm_dialog,
+    open_list_popover,
+)
 
 log = logging.getLogger(__name__)
 
@@ -62,10 +66,12 @@ class DevicesPage(Gtk.Box):
 
         self.content_stack = Gtk.Stack(vexpand=True)
         self.content_stack.add_named(
-            status_page(
+            action_status_page(
                 icon_name="audio-speakers-symbolic",
-                title="No devices",
-                description="Add one by IP or hostname, or discover devices on your network.",
+                title="No devices yet",
+                description="Add one by IP or hostname above, or discover devices on your network.",
+                action_label="Discover Devices",
+                on_action=lambda: self._on_discover_clicked(self.discover_button),
             ),
             "empty",
         )
@@ -267,14 +273,17 @@ class DevicesPage(Gtk.Box):
         known_hosts = {d.host for d in self.state.known_devices()}
         new_infos = [i for i in infos if i.host not in known_hosts]
         if not new_infos:
-            self.state.toast(f"Found {len(infos)} device(s) — all already added.")
+            self.state.toast(GLib.ngettext(
+                "Found %d device — already added.", "Found %d devices — all already added.",
+                len(infos)) % len(infos))
             return
         self._show_discovery_results(new_infos)
 
     def _on_discover_error(self, exc: BaseException) -> None:
         self.discover_button.set_sensitive(True)
         self.discover_spinner.set_spinning(False)
-        self.state.toast(f"Discovery failed: {exc}")
+        log.exception("Device discovery failed")
+        self.state.toast("Couldn't search for devices — check your connection.")
 
     def _show_discovery_results(self, infos: list[Any]) -> None:
         popover = Gtk.Popover()

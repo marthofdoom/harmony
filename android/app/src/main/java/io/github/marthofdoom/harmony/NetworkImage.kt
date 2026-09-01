@@ -2,6 +2,8 @@ package io.github.marthofdoom.harmony
 
 import android.graphics.BitmapFactory
 import android.util.LruCache
+import androidx.compose.animation.Crossfade
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -56,11 +58,15 @@ fun NetworkImage(url: String?, modifier: Modifier = Modifier) {
         if (bitmap == null && !url.isNullOrEmpty()) bitmap = loadBitmap(url)
     }
     Box(modifier.background(MaterialTheme.colorScheme.surfaceVariant), contentAlignment = Alignment.Center) {
-        val bmp = bitmap
-        if (bmp != null) {
-            Image(bmp, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-        } else {
-            Icon(Icons.Filled.MusicNote, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        Crossfade(targetState = bitmap, animationSpec = tween(250), label = "artwork") { bmp ->
+            if (bmp != null) {
+                Image(bmp, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
+            } else {
+                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Icon(Icons.Filled.MusicNote, null, modifier = Modifier.fillMaxSize(0.4f),
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
         }
     }
 }

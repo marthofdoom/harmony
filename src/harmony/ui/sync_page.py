@@ -16,8 +16,9 @@ from harmony.tasks import CancelToken, on_main, run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
     ProgressDialog,
-    SegmentedToggle,
-    missing_layer_status_page,
+    action_status_page,
+    loading_status_page,
+    open_preferences,
     status_page,
 )
 
@@ -67,7 +68,14 @@ class SyncPage(Gtk.Box):
             self.remove(child)
 
         if self.state.sync_engine is None:
-            self.append(missing_layer_status_page("sync"))
+            self.append(action_status_page(
+                icon_name="emblem-synchronizing-symbolic",
+                title="Set up accounts to sync",
+                description="Connect YouTube Music and Qobuz in Preferences to sync "
+                "playlists between them.",
+                action_label="Open Preferences",
+                on_action=lambda: open_preferences(self, "accounts"),
+            ))
             self._content_built = False
             return
 
@@ -79,6 +87,7 @@ class SyncPage(Gtk.Box):
                         description="Pick a source and target playlist, then Preview."),
             "empty",
         )
+        self.plan_stack.add_named(loading_status_page("Building sync plan…"), "loading")
         self.plan_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
                                  margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
         plan_scroller = Gtk.ScrolledWindow(child=self.plan_box, vexpand=True)
@@ -96,27 +105,30 @@ class SyncPage(Gtk.Box):
     # -- controls -------------------------------------------------------------
 
     def _build_controls(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=8,
-                       margin_bottom=8, margin_start=8, margin_end=8)
-        row = Gtk.Box(spacing=8)
-        self.source_dropdown = Gtk.DropDown(hexpand=True)
-        self.target_dropdown = Gtk.DropDown(hexpand=True)
-        row.append(Gtk.Label(label="Source:"))
-        row.append(self.source_dropdown)
-        row.append(Gtk.Label(label="Target:"))
-        row.append(self.target_dropdown)
-        box.append(row)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, margin_top=12,
+                       margin_bottom=8, margin_start=12, margin_end=12)
+        group = Adw.PreferencesGroup()
+        self.source_row = Adw.ComboRow(title="Source")
+        self.target_row = Adw.ComboRow(title="Target")
+        group.add(self.source_row)
+        group.add(self.target_row)
 
-        direction_row = Gtk.Box(spacing=8)
         default_name = _SETTINGS_DIRECTION_TO_ENUM.get(self.state.settings.default_direction, "TWO_WAY")
-        self.direction_toggle = SegmentedToggle(list(_DIRECTIONS), active=default_name)
-        direction_row.append(self.direction_toggle)
-        box.append(direction_row)
+        direction_names = [name for name, _label in _DIRECTIONS]
+        self.direction_row = Adw.ComboRow(
+            title="Direction",
+            model=Gtk.StringList.new([label for _name, label in _DIRECTIONS]),
+        )
+        self.direction_row.set_selected(
+            direction_names.index(default_name) if default_name in direction_names else 2
+        )
+        group.add(self.direction_row)
+        box.append(group)
 
-        action_row = Gtk.Box(spacing=8)
-        self.preview_button = Gtk.Button(label="Preview", css_classes=["suggested-action"])
+        action_row = Gtk.Box(spacing=8, halign=Gtk.Align.END, margin_top=8)
+        self.preview_button = Gtk.Button(label="Preview")
         self.preview_button.connect("clicked", self._on_preview_clicked)
-        self.apply_button = Gtk.Button(label="Apply", sensitive=False)
+        self.apply_button = Gtk.Button(label="Apply", sensitive=False, css_classes=["suggested-action"])
         self.apply_button.connect("clicked", self._on_apply_clicked)
         action_row.append(self.preview_button)
         action_row.append(self.apply_button)
@@ -125,7 +137,7 @@ class SyncPage(Gtk.Box):
 
     def _refresh_playlist_choices(self) -> None:
         if not self._content_built:
-            # The dropdowns below don't exist yet (sync isn't available) —
+            # The rows below don't exist yet (sync isn't available) —
             # ``_render`` calls this itself once they do.
             return
         by_service = self.state.all_playlists()
@@ -134,11 +146,17 @@ class SyncPage(Gtk.Box):
             choices.extend(by_service.get(service, []))
         self._playlist_choices = choices
         labels = [f"{p.title} ({p.service.label})" for p in choices]
-        model = Gtk.StringList.new(labels or ["No playlists available"])
-        self.source_dropdown.set_model(model)
-        self.target_dropdown.set_model(model)
+        model = Gtk.StringList.new(labels)
+        self.source_row.set_model(model)
+        self.target_row.set_model(model)
+        has_choices = bool(choices)
+        # No fake "No playlists available" row: disable the pickers and Preview
+        # when there is genuinely nothing to sync.
+        self.source_row.set_sensitive(has_choices)
+        self.target_row.set_sensitive(has_choices)
+        self.preview_button.set_sensitive(has_choices)
 
-    def _selected_playlist(self, dropdown: Gtk.DropDown) -> Playlist | None:
+    def _selected_playlist(self, dropdown: Adw.ComboRow) -> Playlist | None:
         index = dropdown.get_selected()
         if 0 <= index < len(self._playlist_choices):
             return self._playlist_choices[index]
@@ -147,8 +165,8 @@ class SyncPage(Gtk.Box):
     # -- preview ----------------------------------------------------------------
 
     def _on_preview_clicked(self, _button: Gtk.Button) -> None:
-        source = self._selected_playlist(self.source_dropdown)
-        target = self._selected_playlist(self.target_dropdown)
+        source = self._selected_playlist(self.source_row)
+        target = self._selected_playlist(self.target_row)
         if source is None or target is None:
             self.state.toast("Pick a source and target playlist first.")
             return
@@ -158,8 +176,10 @@ class SyncPage(Gtk.Box):
 
         from harmony.sync import SyncDirection
 
-        direction = getattr(SyncDirection, self.direction_toggle.get_active_name() or "TWO_WAY")
+        direction_name = _DIRECTIONS[self.direction_row.get_selected()][0]
+        direction = getattr(SyncDirection, direction_name)
 
+        self.plan_stack.set_visible_child_name("loading")
         cancel = CancelToken()
         dialog = ProgressDialog(self.get_root(), "Building sync plan", cancel)
 
@@ -176,14 +196,22 @@ class SyncPage(Gtk.Box):
 
         def error(exc: BaseException) -> None:
             dialog.close()
-            self.state.toast(f"Couldn't build sync plan: {exc}")
+            self.plan_stack.set_visible_child_name("empty")
+            log.exception("Sync plan failed")
+            self.state.toast("Couldn't build the sync plan — check your connection.")
+
+        def cancelled() -> None:
+            dialog.close()
+            # A cancelled run fires neither done nor error, so reset the plan
+            # area off "loading" here or it would sit spinning forever.
+            self.plan_stack.set_visible_child_name("empty")
 
         dialog.present()
         # Without on_cancelled the modal, undismissable ProgressDialog would
         # rely on its 5-second grace timer instead of closing the moment the
         # worker actually unwinds -- this is the longest-running dialog in
         # the app, so that grace period is the whole point of Cancel.
-        run_async(work, done, error, on_cancelled=dialog.close)
+        run_async(work, done, error, on_cancelled=cancelled)
 
     def _render_plan(self, plan: object) -> None:
         while child := self.plan_box.get_first_child():
@@ -286,8 +314,9 @@ class SyncPage(Gtk.Box):
         """Resolve an unmatched action in place so Apply picks it up as an add."""
         action.kind = "add"
         action.track = candidate.track
-        expander_row.set_title(f"✓ {candidate.track.title}")
+        expander_row.set_title(candidate.track.title)
         expander_row.set_subtitle(f"Resolved · {candidate.track.artist_name}")
+        expander_row.add_prefix(Gtk.Image.new_from_icon_name("emblem-ok-symbolic"))
         expander_row.set_expanded(False)
         expander_row.set_sensitive(False)
         self.apply_button.set_sensitive(True)
@@ -324,7 +353,8 @@ class SyncPage(Gtk.Box):
 
         def error(exc: BaseException) -> None:
             dialog.close()
-            self.state.toast(f"Sync failed: {exc}")
+            log.exception("Sync apply failed")
+            self.state.toast("Sync didn't finish — check your connection.")
 
         dialog.present()
         run_async(work, done, error, on_cancelled=dialog.close)

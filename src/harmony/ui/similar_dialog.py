@@ -17,12 +17,13 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gtk  # noqa: E402
+from gi.repository import Adw, GLib, Gtk  # noqa: E402
 
 from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
+    _format_suggestion_subtitle,
     attach_context_menu,
     error_status_page,
     loading_status_page,
@@ -120,8 +121,16 @@ class _SimilarDialog(Adw.Dialog):
 
     def _build_row(self, suggestion: object) -> Adw.ActionRow:
         resolved: Track | None = getattr(suggestion, "resolved", None)
-        sources = ", ".join(getattr(suggestion, "sources", None) or [])
-        subtitle = suggestion.artist if not sources else f"{suggestion.artist} · via {sources}"
+        # Humanize source keys ("lastfm" -> "Last.fm"); "provider" renders as the
+        # target service's own label, best-effort from the resolved track or the
+        # first configured service.
+        target_label = (
+            resolved.service.label if resolved is not None
+            else next((s.label for s in Service if s in self.state.providers), "")
+        )
+        subtitle = _format_suggestion_subtitle(
+            suggestion.artist, getattr(suggestion, "sources", None) or [], target_label
+        )
         row = Adw.ActionRow(title=suggestion.title, subtitle=subtitle)
         icon = "emblem-ok-symbolic" if resolved is not None else "dialog-question-symbolic"
         row.add_prefix(Gtk.Image.new_from_icon_name(icon))
@@ -223,8 +232,6 @@ class _SimilarDialog(Adw.Dialog):
         open_list_popover(popover, parent, listbox)
 
     def _play_track_on_device(self, track: Track, host: str, name: str) -> None:
-        self.state.toast(f"Starting “{track.title}” on {name}…")
-
         def work() -> None:
             self.state.play_track_on_device(track, host)
 
@@ -278,7 +285,11 @@ class _SimilarDialog(Adw.Dialog):
             return playlist
 
         def done(_playlist: Playlist) -> None:
-            self.state.toast(f"Created “{title}” with {len(ids)} track(s)")
+            count = len(ids)
+            self.state.toast(
+                GLib.ngettext("Created “%s” with %d track", "Created “%s” with %d tracks", count)
+                % (title, count)
+            )
             self.state.all_playlists(refresh=True)
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't create playlist: {exc}"))
