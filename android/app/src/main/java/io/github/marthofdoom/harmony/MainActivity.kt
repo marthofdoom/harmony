@@ -43,6 +43,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
 import androidx.compose.material3.ExposedDropdownMenuDefaults
+import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -79,7 +80,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         setContent {
-            MaterialTheme {
+            HarmonyTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
                     App()
                 }
@@ -580,13 +581,19 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
         Spacer(Modifier.height(16.dp))
         val onDevice = state.target != "phone"
         val playing = if (onDevice) !state.devicePaused else pb.isPlaying
-        IconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
+        FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
             modifier = Modifier.size(72.dp)) {
             Icon(
                 if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                 contentDescription = if (playing) "Pause" else "Play",
-                modifier = Modifier.size(48.dp),
+                modifier = Modifier.size(40.dp),
             )
+        }
+        if (onDevice) {
+            Spacer(Modifier.height(8.dp))
+            Text("Casting to ${state.devices.firstOrNull { it.host == state.target }?.name ?: "a device"}",
+                style = MaterialTheme.typography.labelMedium,
+                color = MaterialTheme.colorScheme.primary)
         }
         Spacer(Modifier.height(16.dp))
         OutputSelector(vm, state)
