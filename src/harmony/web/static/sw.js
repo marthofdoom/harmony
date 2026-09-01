@@ -3,7 +3,7 @@
 // loads instantly (and offline). API and stream responses are never cached —
 // they must always hit the live instance.
 
-const CACHE = "harmony-shell-v1";
+const CACHE = "harmony-shell-v2";
 const SHELL = [
   "/",
   "/index.html",
