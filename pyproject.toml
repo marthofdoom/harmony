@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harmony"
-version = "0.7.17"
+version = "0.7.18"
 description = "A cross-service music hub for Linux: sync playlists across YouTube Music and Qobuz, search, discover, and control playback devices — standalone but federatable."
 readme = "README.md"
 requires-python = ">=3.11"

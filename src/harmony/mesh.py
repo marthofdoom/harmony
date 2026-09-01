@@ -12,6 +12,7 @@ rest of the app runs unaffected -- so a minimal/offline build still works.
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import socket
 import threading
@@ -22,6 +23,60 @@ from harmony import __version__
 log = logging.getLogger(__name__)
 
 SERVICE_TYPE = "_harmony._tcp.local."
+
+# RFC 6598 shared address space — Tailscale and carrier-grade NAT live here. A
+# peer reachable on both this and a real LAN address should be reached on the LAN
+# (a direct hop), not routed over the overlay.
+_CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def _local_networks() -> list[ipaddress.IPv4Network]:
+    """The IPv4 networks this host is directly attached to (ip/prefix per
+    interface). A peer address inside one of these is on a shared subnet — a
+    direct hop — so we prefer it over a VPN/overlay address for the same peer."""
+    nets: list[ipaddress.IPv4Network] = []
+    try:
+        import ifaddr
+
+        for adapter in ifaddr.get_adapters():
+            for ip in adapter.ips:
+                if isinstance(ip.ip, str) and not ip.ip.startswith("127."):
+                    try:
+                        nets.append(ipaddress.ip_network(f"{ip.ip}/{ip.network_prefix}", strict=False))
+                    except ValueError:
+                        pass
+    except Exception:  # noqa: BLE001
+        pass
+    return nets
+
+
+def _address_rank(addr: str, local_nets: list[ipaddress.IPv4Network]) -> int:
+    """Preference for a peer address — lower is better. Direct (same-subnet LAN)
+    wins; a VPN/CGNAT overlay is the last routable resort."""
+    try:
+        ip = ipaddress.ip_address(addr)
+    except ValueError:
+        return 9
+    if ip.version != 4:
+        return 6  # deprioritise IPv6 for now; the app speaks IPv4 LAN
+    if ip.is_loopback:
+        return 8
+    if ip.is_link_local:  # 169.254/16 — not routable to a peer
+        return 7
+    if any(ip in net for net in local_nets):
+        return 0  # same subnet as one of our interfaces — the direct hop
+    if ip in _CGNAT:
+        return 5  # Tailscale / CGNAT overlay
+    if ip.is_private:
+        return 1  # RFC1918 but not a shared subnet — still a LAN address
+    return 3  # public/other
+
+
+def _best_address(addresses: list[str], local_nets: list[ipaddress.IPv4Network]) -> str | None:
+    """Pick the most-direct address a peer advertises (see _address_rank)."""
+    if not addresses:
+        return None
+    return min(addresses, key=lambda a: (_address_rank(a, local_nets), a))
 
 
 def _primary_ipv4() -> str:
@@ -133,7 +188,9 @@ class Mesh:
             addresses = info.parsed_addresses()
         except Exception:  # noqa: BLE001
             addresses = []
-        host = addresses[0] if addresses else None
+        # A multi-homed peer advertises every address it has (LAN + Tailscale +
+        # …) in arbitrary order. Reach it on the most direct one.
+        host = _best_address(addresses, _local_networks())
         props = {k.decode(): (v.decode() if isinstance(v, bytes) else v)
                  for k, v in (info.properties or {}).items() if k}
         peer = {
