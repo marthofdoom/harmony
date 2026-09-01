@@ -60,15 +60,16 @@ class DiscoverPage(Gtk.Box):
         self._resolved_tracks: list[Track] = []
         self._services_for_ai: list[Service] = []
 
-        scroller = Gtk.ScrolledWindow(vexpand=True)
-        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
-                           margin_top=12, margin_bottom=12, margin_start=12, margin_end=12)
-        content.append(self._build_recommendations_section())
-        content.append(Gtk.Separator())
+        scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        clamp = Adw.Clamp(maximum_size=860, tightening_threshold=576)
+        self._content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24,
+                                    margin_top=24, margin_bottom=24, margin_start=12, margin_end=12)
+        self._reco_section = self._build_recommendations_section()
+        self._content_box.append(self._reco_section)
         self._ai_section = self._build_ai_section()
-        content.append(self._ai_section)
-        self._content_box = content
-        scroller.set_child(content)
+        self._content_box.append(self._ai_section)
+        clamp.set_child(self._content_box)
+        scroller.set_child(clamp)
         self.append(scroller)
 
         # Rebuilt rather than merely re-revealed: the section renders a banner,
@@ -127,42 +128,58 @@ class DiscoverPage(Gtk.Box):
 
     # -- section 1: recommendations ------------------------------------------
 
+    @staticmethod
+    def _compact(page: Adw.StatusPage) -> Adw.StatusPage:
+        """Tag an embedded status page ``.compact`` (its inline, in-page look)."""
+        page.add_css_class("compact")
+        return page
+
     def _build_recommendations_section(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.append(Gtk.Label(label="Recommendations", xalign=0.0, css_classes=["title-2"]))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
 
         if self.state.recommender is None:
-            box.append(action_status_page(
+            box.append(self._compact(action_status_page(
                 icon_name="starred-symbolic",
-                title="Recommendations aren't set up",
+                title="Recommendations Aren't Set Up",
                 description="Connect a music service in Preferences to get recommendations "
                 "based on your playlists.",
                 action_label="Open Preferences",
                 on_action=lambda: open_preferences(self, "accounts"),
-            ))
+            )))
             return box
 
-        controls = Gtk.Box(spacing=8)
-        self.seed_dropdown = Gtk.DropDown(hexpand=True)
-        self.target_service_dropdown = Gtk.DropDown.new_from_strings(
-            [s.label for s in Service if s in self.state.providers]
+        group = Adw.PreferencesGroup(
+            title="Recommendations",
+            description="Find similar tracks based on one of your playlists.",
         )
-        self.get_suggestions_button = Gtk.Button(label="Get Suggestions", css_classes=["suggested-action"])
-        self.get_suggestions_button.connect("clicked", self._on_get_suggestions_clicked)
-        self.regenerate_button = Gtk.Button(
-            icon_name="view-refresh-symbolic", tooltip_text="Regenerate with the same seed", sensitive=False,
+        self.seed_dropdown = Adw.ComboRow(title="Seed playlist")
+        self.target_service_dropdown = Adw.ComboRow(
+            title="Target service",
+            subtitle="Where suggested tracks will be matched and playlists created",
+            model=Gtk.StringList.new([s.label for s in Service if s in self.state.providers]),
         )
-        self.regenerate_button.connect("clicked", self._on_get_suggestions_clicked)
-        controls.append(Gtk.Label(label="Seed playlist:"))
-        controls.append(self.seed_dropdown)
-        controls.append(self.target_service_dropdown)
-        controls.append(self.get_suggestions_button)
-        controls.append(self.regenerate_button)
+        group.add(self.seed_dropdown)
+        group.add(self.target_service_dropdown)
         # Stale results reference a specific (seed, target service) pair --
         # once either changes the old list no longer describes "the current
         # seed", so clear it rather than leave misleading results on screen.
         self.seed_dropdown.connect("notify::selected", self._on_seed_selection_changed)
         self.target_service_dropdown.connect("notify::selected", self._on_seed_selection_changed)
+
+        action_box = Gtk.Box(spacing=8, halign=Gtk.Align.END)
+        self.regenerate_button = Gtk.Button(
+            icon_name="view-refresh-symbolic", tooltip_text="Regenerate with the same seed",
+            sensitive=False, css_classes=["flat"],
+        )
+        self.regenerate_button.connect("clicked", self._on_get_suggestions_clicked)
+        self.get_suggestions_button = Gtk.Button(label="Get Suggestions", css_classes=["suggested-action"])
+        self.get_suggestions_button.connect("clicked", self._on_get_suggestions_clicked)
+        action_box.append(self.regenerate_button)
+        action_box.append(self.get_suggestions_button)
+
+        controls = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        controls.append(group)
+        controls.append(action_box)
 
         # Swaps between the controls above and a status page when there's
         # nothing to recommend from yet (no service, or no playlists on it) --
@@ -171,40 +188,35 @@ class DiscoverPage(Gtk.Box):
         self.controls_stack.add_named(controls, "controls")
         box.append(self.controls_stack)
 
-        legend = Gtk.Box(spacing=16)
-        for icon_name, text in (
-            ("emblem-ok-symbolic", "matched to a playable track"),
-            ("dialog-question-symbolic", "couldn't match — won't be added"),
-        ):
-            item = Gtk.Box(spacing=4)
-            item.append(Gtk.Image.new_from_icon_name(icon_name))
-            item.append(Gtk.Label(label=text, css_classes=["caption", "dim-label"]))
-            legend.append(item)
-        box.append(legend)
-
-        self.suggestions_progress_label = Gtk.Label(xalign=0.0)
-        self.suggestions_progress_bar = Gtk.ProgressBar()
-        progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6,
-                                margin_top=12, margin_bottom=12)
-        progress_box.append(self.suggestions_progress_label)
+        self.suggestions_progress_label = Gtk.Label(css_classes=["dim-label"],
+                                                    justify=Gtk.Justification.CENTER, wrap=True)
+        self.suggestions_progress_bar = Gtk.ProgressBar(width_request=320, halign=Gtk.Align.CENTER)
+        progress_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12, valign=Gtk.Align.CENTER,
+                                margin_top=36, margin_bottom=36)
+        progress_box.append(Gtk.Label(label="Finding Suggestions…", css_classes=["title-4"]))
         progress_box.append(self.suggestions_progress_bar)
+        progress_box.append(self.suggestions_progress_label)
 
-        self.suggestions_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        self.suggestions_list.add_css_class("boxed-list")
+        self.suggestions_group = Adw.PreferencesGroup(title="Suggestions")
+        self.suggestions_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, css_classes=["boxed-list"])
+        self.suggestions_group.add(self.suggestions_list)
+        self.create_from_suggestions_button = Gtk.Button(
+            label="Create Playlist…", valign=Gtk.Align.CENTER,
+            css_classes=["suggested-action"], sensitive=False,
+        )
+        self.create_from_suggestions_button.connect("clicked", self._on_create_from_suggestions)
+        self.suggestions_group.set_header_suffix(self.create_from_suggestions_button)
 
         self.suggestions_stack = Gtk.Stack()
         self.suggestions_stack.add_named(progress_box, "loading")
-        self.suggestions_stack.add_named(self.suggestions_list, "results")
+        self.suggestions_stack.add_named(self.suggestions_group, "results")
         set_stack_status(
             self.suggestions_stack, "idle",
-            status_page(icon_name="edit-find-symbolic", title="No suggestions yet",
-                        description="Pick a seed playlist and press Get Suggestions."),
+            self._compact(status_page(
+                icon_name="edit-find-symbolic", title="No Suggestions Yet",
+                description="Choose a seed playlist and a target service, then select Get Suggestions.")),
         )
         box.append(self.suggestions_stack)
-
-        self.create_from_suggestions_button = Gtk.Button(label="Create Playlist from These", sensitive=False)
-        self.create_from_suggestions_button.connect("clicked", self._on_create_from_suggestions)
-        box.append(self.create_from_suggestions_button)
 
         self._update_recommendations_controls_visibility()
         return box
@@ -225,19 +237,20 @@ class DiscoverPage(Gtk.Box):
         elif not has_service:
             set_stack_status(
                 self.controls_stack, "empty",
-                action_status_page(
-                    icon_name="dialog-information-symbolic", title="Nothing to recommend from yet",
+                self._compact(action_status_page(
+                    icon_name="starred-symbolic", title="Nothing to Recommend From Yet",
                     description="Add a music service in Preferences to get started.",
                     action_label="Open Preferences",
                     on_action=lambda: open_preferences(self, "accounts"),
-                ),
+                )),
             )
         else:
             set_stack_status(
                 self.controls_stack, "empty",
-                status_page(icon_name="dialog-information-symbolic", title="Nothing to recommend from yet",
-                            description="None of your playlists are available yet. Add one on the "
-                            "Playlists page."),
+                self._compact(status_page(
+                    icon_name="starred-symbolic", title="Nothing to Recommend From Yet",
+                    description="None of your playlists are available yet. Add one on the "
+                    "Playlists page.")),
             )
         self._update_get_suggestions_sensitivity()
 
@@ -276,8 +289,9 @@ class DiscoverPage(Gtk.Box):
             self.suggestions_list.remove(row)
         set_stack_status(
             self.suggestions_stack, "idle",
-            status_page(icon_name="edit-find-symbolic", title="No suggestions yet",
-                        description="Pick a seed playlist and press Get Suggestions."),
+            self._compact(status_page(
+                icon_name="edit-find-symbolic", title="No Suggestions Yet",
+                description="Choose a seed playlist and a target service, then select Get Suggestions.")),
         )
 
     def _on_get_suggestions_clicked(self, _button: Gtk.Button) -> None:
@@ -340,14 +354,16 @@ class DiscoverPage(Gtk.Box):
             self.create_from_suggestions_button.set_sensitive(False)
             set_stack_status(
                 self.suggestions_stack, "empty",
-                status_page(icon_name="edit-find-symbolic", title="No suggestions found",
-                            description="Try a different seed playlist, or check that recommendation "
-                            "sources are configured in Preferences."),
+                self._compact(status_page(
+                    icon_name="edit-find-symbolic", title="No Suggestions Found",
+                    description="Try a different seed playlist, or check that recommendation "
+                    "sources are set up in Preferences.")),
             )
             return
         target_label = target_service.label
         for suggestion in suggestions:
             self.suggestions_list.append(self._build_suggestion_row(suggestion, target_label))
+        self.suggestions_group.set_title(f"Suggestions ({len(suggestions)})")
         resolved_any = any(getattr(s, "resolved", None) is not None for s in suggestions)
         self.create_from_suggestions_button.set_sensitive(resolved_any)
         self.suggestions_stack.set_visible_child_name("results")
@@ -357,7 +373,8 @@ class DiscoverPage(Gtk.Box):
         self._update_get_suggestions_sensitivity()
         self.regenerate_button.set_sensitive(bool(self._suggestions))
         self.state.toast(f"Couldn't get suggestions: {exc}")
-        set_stack_status(self.suggestions_stack, "error", error_status_page(exc, title="Couldn't get suggestions"))
+        set_stack_status(self.suggestions_stack, "error",
+                         self._compact(error_status_page(exc, title="Couldn't Get Suggestions")))
 
     # -- suggestion rows: humanized subtitle + per-row actions ----------------
 
@@ -366,21 +383,17 @@ class DiscoverPage(Gtk.Box):
         sources = getattr(suggestion, "sources", None) or []
         subtitle = _format_suggestion_subtitle(suggestion.artist, sources, target_label)
         row = Adw.ActionRow(title=suggestion.title, subtitle=subtitle)
-
-        if resolved is not None:
-            icon_name, tooltip = "emblem-ok-symbolic", "Matched to a playable track"
-        else:
-            icon_name, tooltip = "dialog-question-symbolic", "Couldn't match to a catalog track — won't be added"
-        icon = Gtk.Image.new_from_icon_name(icon_name)
-        icon.set_tooltip_text(tooltip)
-        row.add_prefix(icon)
+        row.set_title_lines(1)
+        row.set_subtitle_lines(1)
 
         if resolved is not None:
             play_button = Gtk.Button(icon_name="media-playback-start-symbolic",
-                                      tooltip_text="Play on Device", valign=Gtk.Align.CENTER)
+                                      tooltip_text="Play on Device…", valign=Gtk.Align.CENTER,
+                                      css_classes=["flat"])
             play_button.connect("clicked", lambda _b, t=resolved: self._open_device_popover(play_button, t))
             add_button = Gtk.Button(icon_name="list-add-symbolic",
-                                     tooltip_text="Add to Playlist…", valign=Gtk.Align.CENTER)
+                                     tooltip_text="Add to Playlist…", valign=Gtk.Align.CENTER,
+                                     css_classes=["flat"])
             add_button.connect("clicked", lambda _b, t=resolved: self._open_playlist_popover(add_button, t))
             row.add_suffix(play_button)
             row.add_suffix(add_button)
@@ -388,10 +401,16 @@ class DiscoverPage(Gtk.Box):
             def build_actions(t: Track = resolved) -> list[tuple[str, Callable[[], None]]]:
                 return [
                     ("Add to Playlist…", lambda: self._open_playlist_popover(row, t)),
-                    ("Play on Device", lambda: self._open_device_popover(row, t)),
+                    ("Play on Device…", lambda: self._open_device_popover(row, t)),
                 ]
 
             attach_context_menu(row, build_actions)
+        else:
+            icon = Gtk.Image.new_from_icon_name("dialog-question-symbolic")
+            icon.add_css_class("dim-label")
+            icon.set_tooltip_text("No playable match found — it won't be added to playlists")
+            row.add_prefix(icon)
+            row.add_css_class("dim-label")
         return row
 
     # -- per-suggestion actions: playlist/device popovers ------------------------
@@ -547,7 +566,7 @@ class DiscoverPage(Gtk.Box):
             return
         # Anything the old section owned is about to be destroyed; drop the
         # references so a stale widget can't be written into later.
-        for attr in ("prompt_view", "ai_target_dropdown", "idea_list", "create_ai_button"):
+        for attr in ("prompt_view", "count_spin", "ai_target_dropdown"):
             if hasattr(self, attr):
                 delattr(self, attr)
         self._idea = None
@@ -560,50 +579,70 @@ class DiscoverPage(Gtk.Box):
         self._refresh_service_choices()
 
     def _build_ai_section(self) -> Gtk.Widget:
-        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        box.append(Gtk.Label(label="AI Playlist Builder", xalign=0.0, css_classes=["title-2"]))
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
 
         planner = self.state.planner
         if planner is None:
-            box.append(status_page(
-                icon_name="dialog-information-symbolic",
-                title="AI playlist builder unavailable",
-                description="This feature isn't available in your build of Harmony.",
+            group = Adw.PreferencesGroup(title="AI Playlist Builder")
+            group.add(Adw.ActionRow(
+                title="Not available",
+                subtitle="This feature isn't included in this build of Harmony.",
+                sensitive=False,
             ))
+            box.append(group)
             return box
         if not planner.available:
-            banner = Adw.Banner(
-                title="Add an Anthropic API key in Preferences → Integrations to enable this.",
-                revealed=True,
+            group = Adw.PreferencesGroup(title="AI Playlist Builder")
+            row = Adw.ActionRow(
+                title="Set up the AI playlist builder",
+                subtitle="Add an Anthropic API key in Preferences to describe a playlist in plain "
+                "words and have it built for you.",
             )
-            banner.set_button_label("Open Preferences")
-            banner.connect("button-clicked", lambda *_a: self._open_integrations_preferences())
-            box.append(banner)
+            button = Gtk.Button(label="Open Preferences", valign=Gtk.Align.CENTER,
+                                css_classes=["suggested-action"])
+            button.connect("clicked", lambda *_a: self._open_integrations_preferences())
+            row.add_suffix(button)
+            group.add(row)
+            box.append(group)
             return box
 
-        frame = Gtk.Frame()
-        self.prompt_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD, top_margin=8, bottom_margin=8,
-                                         left_margin=8, right_margin=8, height_request=90)
-        frame.set_child(self.prompt_view)
-        box.append(frame)
-
-        controls = Gtk.Box(spacing=8)
-        controls.append(Gtk.Label(label="Tracks:"))
-        self.count_spin = Gtk.SpinButton.new_with_range(5, 100, 1)
-        self.count_spin.set_value(25)
-        controls.append(self.count_spin)
-        services = [s for s in Service if s in self.state.providers]
-        self.ai_target_dropdown = Gtk.DropDown.new_from_strings(
-            [s.label for s in services] or ["No services configured"]
+        group = Adw.PreferencesGroup(
+            title="AI Playlist Builder",
+            description="Describe the playlist you want — mood, era, artists — and Harmony will "
+            "plan it and match real tracks.",
         )
-        controls.append(self.ai_target_dropdown)
+
+        # The prompt must read first; ``PreferencesGroup.add`` would push a
+        # non-row child *below* the listbox, so the prompt lives outside the
+        # group, above it, and only the two setting rows go inside.
+        self.prompt_view = Gtk.TextView(wrap_mode=Gtk.WrapMode.WORD, height_request=90,
+                                         top_margin=10, bottom_margin=10, left_margin=12, right_margin=12)
+        prompt_frame = Gtk.Frame(css_classes=["card"], margin_bottom=6)
+        prompt_frame.set_child(self.prompt_view)
+
+        self.count_spin = Adw.SpinRow.new_with_range(5, 100, 1)
+        self.count_spin.set_title("Number of tracks")
+        self.count_spin.set_value(25)
+        services = [s for s in Service if s in self.state.providers]
+        self.ai_target_dropdown = Adw.ComboRow(
+            title="Target service",
+            model=Gtk.StringList.new([s.label for s in services]),
+        )
+        self.ai_target_dropdown.set_sensitive(bool(services))
+        group.add(self.count_spin)
+        group.add(self.ai_target_dropdown)
+
+        action_box = Gtk.Box(spacing=8, halign=Gtk.Align.END)
         generate_button = Gtk.Button(label="Generate", css_classes=["suggested-action"])
         generate_button.connect("clicked", self._on_generate_clicked)
-        controls.append(generate_button)
-        box.append(controls)
+        action_box.append(generate_button)
 
         self._services_for_ai = services
-        self.idea_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        self.idea_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+
+        box.append(prompt_frame)
+        box.append(group)
+        box.append(action_box)
         box.append(self.idea_box)
         return box
 
@@ -623,7 +662,10 @@ class DiscoverPage(Gtk.Box):
 
         while child := self.idea_box.get_first_child():
             self.idea_box.remove(child)
-        self.idea_box.append(Adw.Spinner() if hasattr(Adw, "Spinner") else Gtk.Spinner(spinning=True))
+        spinner = Adw.Spinner() if hasattr(Adw, "Spinner") else Gtk.Spinner(spinning=True)
+        spinner.set_margin_top(24)
+        spinner.set_halign(Gtk.Align.CENTER)
+        self.idea_box.append(spinner)
 
         def work():  # noqa: ANN202 - PlaylistIdea
             idea = planner.plan(prompt, count=count)
@@ -644,24 +686,28 @@ class DiscoverPage(Gtk.Box):
         while child := self.idea_box.get_first_child():
             self.idea_box.remove(child)
 
-        self.idea_box.append(Gtk.Label(label=idea.title or "Untitled playlist", xalign=0.0, css_classes=["heading"]))
-        if getattr(idea, "description", ""):
-            self.idea_box.append(Gtk.Label(label=idea.description, xalign=0.0, wrap=True))
+        group = Adw.PreferencesGroup(
+            title=idea.title or "Untitled Playlist",
+            description=getattr(idea, "description", "") or "",
+        )
+        create_button = Gtk.Button(
+            label=f"Create Playlist ({len(resolved)} matched)", valign=Gtk.Align.CENTER,
+            css_classes=["suggested-action"], sensitive=bool(resolved),
+        )
+        create_button.connect("clicked", self._on_create_ai_playlist)
+        group.set_header_suffix(create_button)
 
-        listbox = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-        listbox.add_css_class("boxed-list")
         for pick in getattr(idea, "tracks", []):
             is_resolved = _looks_resolved(pick, resolved)
-            row = Adw.ActionRow(title=pick.title, subtitle=f"{pick.artist} — {pick.why}")
-            icon = "emblem-ok-symbolic" if is_resolved else "dialog-warning-symbolic"
-            row.add_suffix(Gtk.Image.new_from_icon_name(icon))
-            listbox.append(row)
-        self.idea_box.append(listbox)
-
-        create_button = Gtk.Button(label=f"Create Playlist ({len(resolved)} resolved)")
-        create_button.set_sensitive(bool(resolved))
-        create_button.connect("clicked", self._on_create_ai_playlist)
-        self.idea_box.append(create_button)
+            row = Adw.ActionRow(title=pick.title, subtitle=f"{pick.artist} · {pick.why}")
+            if not is_resolved:
+                row.add_css_class("dim-label")
+                icon = Gtk.Image.new_from_icon_name("dialog-question-symbolic")
+                icon.add_css_class("dim-label")
+                icon.set_tooltip_text("No playable match found — it won't be added to playlists")
+                row.add_suffix(icon)
+            group.add(row)
+        self.idea_box.append(group)
 
     def _on_create_ai_playlist(self, _button: Gtk.Button) -> None:
         if not self._resolved_tracks or self._idea is None:

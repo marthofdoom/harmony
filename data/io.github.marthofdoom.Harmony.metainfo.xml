@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.26" date="2026-09-01">
+      <description>
+        <p>The Discover page has been rebuilt to match the rest of the app —
+        proper preference groups, combo rows, and status pages in a tidy centered
+        column, replacing the old mismatched layout. Recommendations and the AI
+        playlist builder now read consistently, with clearer states and copy.</p>
+      </description>
+    </release>
     <release version="0.7.25" date="2026-09-01">
       <description>
         <p>One active stream per instance, done right. Choosing a different device

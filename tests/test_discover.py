@@ -200,10 +200,10 @@ def test_resolved_suggestion_row_gets_play_and_add_buttons(fake_state: AppState,
 
     row = page._build_suggestion_row(_suggestion("Resolved", "A", resolved=resolved_track), "YouTube Music")
 
-    assert "emblem-ok-symbolic" in _icon_names(row)
+    assert "emblem-ok-symbolic" not in _icon_names(row)
     buttons = [w for w in _children(row) if isinstance(w, Gtk.Button)]
     assert len(buttons) == 2
-    assert {b.get_tooltip_text() for b in buttons} == {"Play on Device", "Add to Playlist…"}
+    assert {b.get_tooltip_text() for b in buttons} == {"Play on Device…", "Add to Playlist…"}
 
 
 def test_unresolved_suggestion_row_has_no_action_buttons(fake_state: AppState) -> None:
