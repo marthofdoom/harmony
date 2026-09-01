@@ -43,6 +43,16 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.17" date="2026-08-31">
+      <description>
+        <p>The web Devices tab now auto-discovers WiiM/UPnP renderers on the
+        instance's network — no manual configuration. Instances reached over a
+        VPN or routed subnet (where mDNS can't reach) can be remembered by
+        address, so they stay in the account-sync and audio-routing lists. And
+        the installable web app now updates itself on reload — no more clearing
+        the service worker after each release.</p>
+      </description>
+    </release>
     <release version="0.7.16" date="2026-08-31">
       <description>
         <p>The web client's Devices tab works now — pick where playback goes

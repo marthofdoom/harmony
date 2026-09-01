@@ -221,16 +221,19 @@ function setView(view) {
   else if (view === "devices") { $("view-title").textContent = "Devices"; renderDevices(); }
 }
 
-async function renderDevices() {
+async function renderDevices(refresh) {
   const list = $("list");
-  list.innerHTML = `<p class="hint">Loading devices…</p>`;
+  list.innerHTML = `<p class="hint">${refresh ? "Scanning your network…" : "Loading devices…"}</p>`;
   let devices = [];
-  try { devices = (await api("/api/devices")).devices || []; }
+  try { devices = (await api(`/api/devices${refresh ? "?refresh=1" : ""}`)).devices || []; }
   catch (e) { list.innerHTML = `<p class="hint">Couldn't load devices: ${esc(e.message)}</p>`; return; }
   const targets = [{ host: "browser", name: "This browser", kind: "" }, ...devices];
   list.innerHTML = `<div style="max-width:640px">
-    <p class="hint" style="text-align:left;padding:.5rem 0">Pick where playback goes. Casting relays the
-    stream on your LAN to the device; the Now Playing bar then controls it.</p>
+    <div style="display:flex;align-items:center;gap:.6rem;padding:.5rem 0">
+      <p class="hint" style="text-align:left;flex:1;margin:0">Pick where playback goes. Casting relays the
+      stream on this instance's LAN to the device; the Now Playing bar then controls it.</p>
+      <button class="act ghost" id="dev-rescan">Rescan</button>
+    </div>
     ${targets.map((d) => {
       const active = state.target === d.host;
       return `<div class="card" style="${active ? "border-color:var(--accent)" : ""}">
@@ -244,8 +247,10 @@ async function renderDevices() {
         </div>
       </div>`;
     }).join("")}
-    ${devices.length ? "" : `<p class="muted" style="padding:.5rem">No cast devices known. WiiM/UPnP renderers on your network appear here once configured.</p>`}
+    ${devices.length ? "" : `<p class="muted" style="padding:.5rem">No cast devices found yet. WiiM/UPnP renderers on this instance's network are auto-discovered — press Rescan, and note discovery only sees the LAN of the instance you're connected to.</p>`}
   </div>`;
+  const rescan = $("dev-rescan");
+  if (rescan) rescan.onclick = () => renderDevices(true);
   list.querySelectorAll(".setout").forEach((b) => b.onclick = () => {
     const host = b.dataset.host;
     const prev = state.target;
@@ -335,10 +340,13 @@ async function renderAccounts() {
         is encrypted with it.</p>
         <select id="adopt-peer" style="width:100%">
           <option value="">— pick a discovered instance —</option>
-          ${instances.map((p) => `<option value="${esc(p.host)}:${esc(p.port)}">${esc(p.name)} (${esc(p.host)}:${esc(p.port)})</option>`).join("")}
+          ${instances.map((p) => `<option value="${esc(p.host)}:${esc(p.port)}">${esc(p.name)} (${esc(p.host)}:${esc(p.port)})${p.source === "manual" ? " · saved" : ""}</option>`).join("")}
         </select>
         <input id="adopt-host" type="text" style="width:100%;margin-top:.4rem" placeholder="or host:port — e.g. 192.168.1.10:8080 or a tailnet IP" />
-        <div style="margin-top:.5rem"><button class="act" id="adopt-go">Sync accounts</button></div>
+        <div style="margin-top:.5rem;display:flex;gap:.5rem">
+          <button class="act" id="adopt-go">Sync accounts</button>
+          <button class="act ghost" id="peer-remember" title="Save this instance so it stays in the list (needed across a tailnet — mDNS won't rediscover it)">Remember instance</button>
+        </div>
         <p id="adopt-msg" class="muted"></p>
       </div>
 
@@ -407,10 +415,28 @@ async function renderAccounts() {
       if (r.ok) {
         am.textContent = `Synced ${(r.imported || []).length} credential(s).`;
         am.style.color = "#2ec27e";
+        // Remember a manually-typed instance so it persists in this dropdown and
+        // the Route tab — mDNS won't rediscover it across a tailnet/routed subnet.
+        if (body.host) { try { await apiPost("/api/peers", body); } catch { /* best-effort */ } }
         loadAccounts(); setTimeout(renderAccounts, 900);
       } else {
         am.textContent = r.reason || "Nothing to sync — pick an instance or enter host:port.";
       }
+    } catch (e) { am.textContent = "Failed: " + e.message; }
+  };
+  const rememberBtn = $("peer-remember");
+  if (rememberBtn) rememberBtn.onclick = async () => {
+    const target = $("adopt-host").value.trim();
+    const am = $("adopt-msg");
+    if (!target) { am.style.color = "var(--muted)"; am.textContent = "Enter host:port to remember."; return; }
+    const i = target.lastIndexOf(":");
+    const host = (i > 0 ? target.slice(0, i) : target).trim();
+    const port = i > 0 ? Number(target.slice(i + 1)) : 8080;
+    am.style.color = "var(--muted)"; am.textContent = "Adding…";
+    try {
+      const r = await apiPost("/api/peers", { host, port: port || 8080 });
+      if (r.ok) { am.textContent = `Remembered ${esc(r.peer.name)}.`; am.style.color = "#2ec27e"; setTimeout(renderAccounts, 700); }
+      else { am.textContent = r.reason || "Couldn't reach that instance."; }
     } catch (e) { am.textContent = "Failed: " + e.message; }
   };
   $("yt-save").onclick = async () => {

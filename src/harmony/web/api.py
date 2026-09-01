@@ -74,6 +74,7 @@ class Engine:
         self._mesh: Any | None = None
         self._onboard: Any | None = None
         self._audio_router: Any | None = None
+        self._devices_cache: tuple[float, list[dict[str, Any]]] | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -534,10 +535,70 @@ class Engine:
         self._mesh.start()
 
     def instances(self) -> dict[str, Any]:
-        """Other Harmony instances discovered on the LAN (empty if mesh is off)."""
-        if self._mesh is None:
-            return {"instances": []}
-        return {"instances": self._mesh.peers()}
+        """Reachable Harmony instances: mDNS-discovered peers plus manually
+        registered ones (Tailscale/routed hosts multicast can't reach)."""
+        from harmony.config import Settings
+
+        by_addr: dict[str, dict[str, Any]] = {}
+        discovered = self._mesh.peers() if self._mesh is not None else []
+        for p in discovered:
+            by_addr[f"{p.get('host')}:{p.get('port')}"] = {**p, "source": "mdns"}
+        for p in Settings.load().known_peers:
+            host, port = p.get("host"), p.get("port")
+            if not host or not port:
+                continue
+            key = f"{host}:{port}"
+            if key in by_addr:
+                by_addr[key]["source"] = "both"
+            else:
+                by_addr[key] = {
+                    "name": p.get("name") or host,
+                    "host": host,
+                    "port": port,
+                    "source": "manual",
+                }
+        return {"instances": list(by_addr.values())}
+
+    def add_peer(self, host: str, port: int, name: str | None = None) -> dict[str, Any]:
+        """Register a peer instance by address, verifying it answers /healthz."""
+        import requests
+
+        from harmony.config import Settings
+
+        host = (host or "").strip()
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid port"}
+        if not host:
+            return {"ok": False, "reason": "no host"}
+        info: dict[str, Any] = {}
+        try:
+            resp = requests.get(f"http://{host}:{port}/healthz", timeout=4)
+            info = resp.json() if resp.ok else {}
+        except Exception as exc:  # noqa: BLE001 - reachability is best-effort
+            return {"ok": False, "reason": f"unreachable: {exc}"}
+        settings = Settings.load()
+        peers = [p for p in settings.known_peers if not (p.get("host") == host and p.get("port") == port)]
+        peers.append({"host": host, "port": port, "name": name or info.get("name") or host})
+        settings.known_peers = peers
+        settings.save()
+        return {"ok": True, "peer": peers[-1], "healthz": info}
+
+    def remove_peer(self, host: str, port: int) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return {"ok": False, "reason": "invalid port"}
+        settings = Settings.load()
+        before = len(settings.known_peers)
+        settings.known_peers = [
+            p for p in settings.known_peers if not (p.get("host") == host and p.get("port") == port)
+        ]
+        settings.save()
+        return {"ok": True, "removed": before - len(settings.known_peers)}
 
     # -- cast to LAN devices ------------------------------------------------
 
@@ -548,15 +609,45 @@ class Engine:
             self._cast = CastController(self._resolve_source)
         return self._cast
 
-    def devices(self) -> dict[str, Any]:
+    def devices(self, refresh: bool = False) -> dict[str, Any]:
+        """Known + auto-discovered playback renderers, deduped by host.
+
+        Manually-configured devices (Settings.known_devices) are always present;
+        SSDP-discovered WiiM/UPnP renderers on the instance's LAN are merged in
+        from a short-lived cache so the page isn't a 3s multicast scan per call.
+        """
         from harmony.config import Settings
 
-        out = []
+        by_host: dict[str, dict[str, Any]] = {}
         for d in Settings.load().known_devices:
             host = d.get("host")
             if host:
-                out.append({"host": host, "name": d.get("name") or host, "kind": d.get("kind", "wiim")})
-        return {"devices": out}
+                by_host[host] = {
+                    "host": host,
+                    "name": d.get("name") or host,
+                    "kind": d.get("kind", "wiim"),
+                    "source": "saved",
+                }
+        for d in self._discovered_devices(refresh=refresh):
+            by_host.setdefault(d["host"], d)
+        return {"devices": list(by_host.values())}
+
+    def _discovered_devices(self, refresh: bool = False) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if not refresh and self._devices_cache and now - self._devices_cache[0] < 60:
+            return self._devices_cache[1]
+        found: list[dict[str, Any]] = []
+        try:
+            from harmony.playback.discovery import discover_wiim
+
+            found = [
+                {"host": d.host, "name": d.name, "kind": d.kind, "source": "discovered"}
+                for d in discover_wiim(timeout=3.0)
+            ]
+        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+            log.debug("device discovery failed: %s", exc)
+        self._devices_cache = (now, found)
+        return found
 
     def cast(self, host: str, service_value: str, track_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
         return self._caster().cast(host, service_value, track_id, meta)
