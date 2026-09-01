@@ -43,6 +43,16 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.19" date="2026-09-01">
+      <description>
+        <p>Cast to more places. Chromecast and Google TV are now output targets
+        alongside WiiM/UPnP, auto-discovered on the network. Devices on another
+        instance's LAN show up too — tagged “via …” — and play through the
+        instance that can reach them, so a remote server can cast to a speaker at
+        home. The phone now announces itself on the mesh, so the desktop and
+        server see it as an instance.</p>
+      </description>
+    </release>
     <release version="0.7.18" date="2026-08-31">
       <description>
         <p>Instances now reach each other on the most direct address — a

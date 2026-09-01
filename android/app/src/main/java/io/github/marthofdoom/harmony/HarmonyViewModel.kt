@@ -62,6 +62,11 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     private val relay = LocalRelay()
     private var api: HarmonyApi? = null
 
+    // Advertise this phone on the mesh so the desktop/server see it as an
+    // instance (e.g. "harmony-<phone>") instead of an invisible client.
+    private val instanceName = "harmony-${android.os.Build.MODEL.replace(' ', '-')}"
+    private val instanceServer = InstanceServer(instanceName, appVersion(app))
+
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
@@ -80,11 +85,17 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             }
         }
         discovery.start()
+        // Stand up the phone's mesh presence, then advertise the port it bound.
+        runCatching { discovery.advertise(instanceServer.start(), instanceName) }
         // Reconnect to the last instance if we have one saved.
         val saved = prefs.baseUrl
         if (saved != null) connect(saved, prefs.key)
         startProgressTicker()
     }
+
+    private fun appVersion(app: Application): String =
+        runCatching { app.packageManager.getPackageInfo(app.packageName, 0).versionName ?: "0" }
+            .getOrDefault("0")
 
     fun startDiscovery() = discovery.start()
 
@@ -415,6 +426,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     override fun onCleared() {
         rtp.stop()
         relay.stop()
+        instanceServer.stop()
         discovery.stop()
         player.release()
         super.onCleared()

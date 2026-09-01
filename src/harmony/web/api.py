@@ -645,26 +645,124 @@ class Engine:
         if not refresh and self._devices_cache and now - self._devices_cache[0] < 60:
             return self._devices_cache[1]
         found: list[dict[str, Any]] = []
-        try:
-            from harmony.playback.discovery import discover_wiim
 
-            found = [
-                {"host": d.host, "name": d.name, "kind": d.kind, "source": "discovered"}
-                for d in discover_wiim(timeout=3.0)
-            ]
-        except Exception as exc:  # noqa: BLE001 - discovery is best-effort
-            log.debug("device discovery failed: %s", exc)
+        def scan_wiim() -> None:
+            try:
+                from harmony.playback.discovery import discover_wiim
+
+                found.extend(
+                    {"host": d.host, "name": d.name, "kind": d.kind, "source": "discovered"}
+                    for d in discover_wiim(timeout=3.0)
+                )
+            except Exception as exc:  # noqa: BLE001 - discovery is best-effort
+                log.debug("WiiM/UPnP discovery failed: %s", exc)
+
+        def scan_cast() -> None:
+            try:
+                from harmony.playback.chromecast import discover_cast
+
+                found.extend(
+                    {"host": d.host, "name": d.name, "kind": d.kind, "source": "discovered",
+                     "port": d.raw.get("port"), "uuid": d.raw.get("uuid")}
+                    for d in discover_cast(timeout=4.0)
+                )
+            except Exception as exc:  # noqa: BLE001 - Cast dep is optional
+                log.debug("Chromecast discovery failed: %s", exc)
+
+        # Run the two multicast scans concurrently so a refresh is ~4s, not ~7s.
+        threads = [threading.Thread(target=fn, daemon=True) for fn in (scan_wiim, scan_cast)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=6)
         self._devices_cache = (now, found)
         return found
 
-    def cast(self, host: str, service_value: str, track_id: str, meta: dict[str, Any] | None = None) -> dict[str, Any]:
-        return self._caster().cast(host, service_value, track_id, meta)
+    def _device_kind(self, host: str) -> tuple[str, dict[str, Any]]:
+        """Resolve a host's backend ('wiim'|'cast'|…) and its extra info, from
+        the saved + discovered device lists. Defaults to WiiM."""
+        from harmony.config import Settings
 
-    def device_control(self, host: str, action: str, level: int | None = None) -> dict[str, Any]:
-        return self._caster().control(host, action, level)
+        for d in Settings.load().known_devices:
+            if d.get("host") == host:
+                return d.get("kind", "wiim"), d
+        for d in self._discovered_devices():
+            if d["host"] == host:
+                return d.get("kind", "wiim"), d
+        return "wiim", {}
 
-    def device_status(self, host: str) -> dict[str, Any]:
-        return self._caster().status(host)
+    # -- federated devices (cast to a peer's LAN device through that peer) ---
+
+    def _split_hostport(self, via: str, default_port: int = 8080) -> tuple[str, int]:
+        via = via.strip()
+        if via.count(":") == 1:
+            host, _, port = via.partition(":")
+            try:
+                return host, int(port)
+            except ValueError:
+                return host, default_port
+        return via, default_port
+
+    def _peer_call(self, via: str, method: str, path: str,
+                   body: dict[str, Any] | None = None, timeout: float = 15.0) -> dict[str, Any]:
+        """Authenticated HTTP call to a peer instance (forwards our personal key)."""
+        import requests
+
+        from harmony.config import Settings
+
+        host, port = self._split_hostport(via)
+        key = Settings.load().personal_key
+        headers = {"X-Harmony-Key": key} if key else {}
+        url = f"http://{host}:{port}{path}"
+        resp = requests.request(method, url, json=body, headers=headers, timeout=timeout)
+        try:
+            return resp.json()
+        except ValueError:
+            return {"ok": resp.ok}
+
+    def federated_devices(self, refresh: bool = False) -> dict[str, Any]:
+        """This instance's devices plus every mesh peer's, so you can cast to a
+        renderer on another LAN through the peer that can reach it. A device we
+        can reach directly wins over the same host offered via a peer."""
+        by_key: dict[str, dict[str, Any]] = {}
+        for d in self.devices(refresh=refresh)["devices"]:
+            by_key[d["host"]] = d
+        for peer in self.instances()["instances"]:
+            via = f"{peer.get('host')}:{peer.get('port')}"
+            try:
+                peer_devs = self._peer_call(via, "GET", "/api/devices", timeout=6).get("devices", [])
+            except Exception as exc:  # noqa: BLE001 - a peer being down mustn't break the list
+                log.debug("peer %s devices unavailable: %s", via, exc)
+                continue
+            for d in peer_devs:
+                host = d.get("host")
+                if not host or host in by_key:  # prefer a directly-reachable device
+                    continue
+                key = f"{via}/{host}"
+                by_key[key] = {**d, "via": via, "via_name": peer.get("name"), "source": "peer"}
+        return {"devices": list(by_key.values())}
+
+    def cast(self, host: str, service_value: str, track_id: str, meta: dict[str, Any] | None = None,
+             via: str | None = None) -> dict[str, Any]:
+        if via:
+            return self._peer_call(via, "POST", f"/api/devices/{host}/play",
+                                   {"service": service_value, "id": track_id, "meta": meta or {}})
+        kind, info = self._device_kind(host)
+        return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
+
+    def device_control(self, host: str, action: str, level: int | None = None,
+                       via: str | None = None) -> dict[str, Any]:
+        if via:
+            return self._peer_call(via, "POST", f"/api/devices/{host}/{action}",
+                                   {"level": level} if level is not None else {})
+        kind, info = self._device_kind(host)
+        return self._caster().control(host, action, level, kind=kind, device_info=info)
+
+    def device_status(self, host: str, via: str | None = None) -> dict[str, Any]:
+        if via:
+            return self._peer_call(via, "GET", f"/api/devices/{host}/status", timeout=6)
+        kind, info = self._device_kind(host)
+        return self._caster().status(host, kind=kind, device_info=info)
 
     # -- inter-instance audio routing --------------------------------------
 

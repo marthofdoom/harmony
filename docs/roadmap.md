@@ -26,6 +26,13 @@ the legend in the [docs index](README.md). Current release: **0.7.17**.
 - **WiiM/UPnP device control + SSDP discovery** — auto-discovered on the Devices
   tab and in the Now Playing picker; add-by-IP and manual peers for hosts mDNS
   can't reach.
+- **Chromecast / Google TV output** — auto-discovered and cast to like any other
+  renderer (optional `pychromecast` dependency). *End-to-end needs a real Cast
+  device to confirm; wiring is unit-tested.*
+- **Federated devices** — a peer's LAN renderers appear in your device list
+  tagged "via …" and play through that peer, so a remote instance can cast to a
+  speaker on another LAN. The phone advertises itself on the mesh, so the desktop
+  and server list it as an instance.
 - **Inter-instance audio routing** — ROC/RTP send+receive between instances with
   music/gaming latency presets.
 - **Play-to-device relay** — resolves a signed stream and byte-forwards with
@@ -41,15 +48,12 @@ the legend in the [docs index](README.md). Current release: **0.7.17**.
 
 ## Federated playback gaps
 
-- **Cross-LAN device reach** — an instance can't cast to a renderer on a *different*
-  LAN; relay through an instance (or the phone) that's on the device's LAN.
-- **Phone-as-a-device on desktop** — the Route Audio tab should list other
-  instances (incl. the phone) as targets.
 - **Multi-room routing** — send to several instances/devices at once.
+- **Phone as a routing sink** — the phone advertises on the mesh now, but
+  receiving pushed audio still needs the deferred Android receiver.
 
 ## Output targets
 
-- **Chromecast / Google TV** (`pychromecast`)
 - **Generic DLNA renderers** — extend the UPnP cast path beyond WiiM
 - **Bluetooth output** — surface BlueZ/PipeWire sinks in the device picker
 - **Android Auto** — `MediaLibraryService` + `MediaSession`

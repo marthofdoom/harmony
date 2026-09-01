@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "harmony"
-version = "0.7.18"
+version = "0.7.19"
 description = "A cross-service music hub for Linux: sync playlists across YouTube Music and Qobuz, search, discover, and control playback devices — standalone but federatable."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -29,8 +29,12 @@ ai = ["anthropic>=0.40"]
 # offline Flatpak build (pip --no-index) doesn't require a vendored wheel; the
 # container/AUR/.deb install it. Pure-Python.
 mesh = ["zeroconf>=0.130"]
+# Chromecast / Google TV output. Optional + soft-imported in
+# harmony.playback.chromecast, so a build without it still runs (Cast just
+# unavailable). Pulls zeroconf transitively.
+cast = ["PyChromecast>=13"]
 # Everything a network server wants (the GHCR/AUR/.deb install target).
-server = ["zeroconf>=0.130"]
+server = ["zeroconf>=0.130", "PyChromecast>=13"]
 dev = ["pytest>=8.0", "ruff>=0.6"]
 
 [project.scripts]

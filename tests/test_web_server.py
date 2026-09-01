@@ -209,15 +209,24 @@ class _FakeEngine:
         self.calls.append(("remove_peer", host, port))
         return {"ok": True, "removed": 1}
 
-    def cast(self, host, service, track_id, meta=None):
-        self.calls.append(("cast", host, service, track_id))
+    def federated_devices(self, refresh=False):
+        self.calls.append(("federated_devices", refresh))
+        return {"devices": [
+            {"host": "192.168.1.9", "name": "Bedroom", "kind": "wiim"},
+            {"host": "10.0.0.5", "name": "Kitchen", "kind": "cast", "via": "peer:8080",
+             "via_name": "harmony-lap01", "source": "peer"},
+        ]}
+
+    def cast(self, host, service, track_id, meta=None, via=None):
+        self.calls.append(("cast", host, service, track_id, via))
         return {"ok": True, "host": host}
 
-    def device_control(self, host, action, level=None):
-        self.calls.append(("control", host, action, level))
+    def device_control(self, host, action, level=None, via=None):
+        self.calls.append(("control", host, action, level, via))
         return {"ok": True}
 
-    def device_status(self, host):
+    def device_status(self, host, via=None):
+        self.calls.append(("status", host, via))
         return {"state": "playing", "position_s": 5, "duration_s": 200, "volume": 40}
 
     def audio_sinks(self):
@@ -333,6 +342,25 @@ def test_api_devices_refresh_flag(api_url: str) -> None:
 
     _get(api_url + "/api/devices?refresh=1")
     assert ("devices", True) in srv._engine.calls
+
+
+def test_api_devices_peers_flag_returns_federated(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _, _, body = _get(api_url + "/api/devices?peers=1")
+    hosts = {d["host"] for d in json.loads(body)["devices"]}
+    assert "10.0.0.5" in hosts  # a peer device is included
+    assert ("federated_devices", False) in srv._engine.calls
+
+
+def test_cast_and_control_forward_via_peer(api_url: str) -> None:
+    import harmony.web.server as srv
+
+    _post(api_url + "/api/devices/10.0.0.5/play",
+          {"service": "qobuz", "id": "t1", "via": "peer:8080"})
+    _post(api_url + "/api/devices/10.0.0.5/pause", {"via": "peer:8080"})
+    assert ("cast", "10.0.0.5", "qobuz", "t1", "peer:8080") in srv._engine.calls
+    assert ("control", "10.0.0.5", "pause", None, "peer:8080") in srv._engine.calls
 
 
 def test_mesh_degrades_without_zeroconf(monkeypatch: pytest.MonkeyPatch) -> None:
