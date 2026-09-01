@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.15" date="2026-08-31">
+      <description>
+        <p>Packaging fix: upgrading the Debian package now actually updates the
+        running server. The install script was missing pip's --upgrade, so an
+        existing virtualenv kept the previous version even though the new one was
+        installed.</p>
+      </description>
+    </release>
     <release version="0.7.14" date="2026-08-31">
       <description>
         <p>Headless-server credential fixes:</p>

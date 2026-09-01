@@ -25,13 +25,16 @@ if [ "$1" = configure ] || [ -z "$1" ]; then
     # whole spec so the shell doesn't glob the "[server]" extra. If the target's
     # Python/arch isn't among the vendored wheels, fall back to PyPI.
     WHEELS=/usr/share/harmony/wheels
-    if [ -d "$WHEELS" ] && "$VENV/bin/pip" install --quiet --no-index \
+    # --upgrade so a package *upgrade* actually reinstalls the new harmony into
+    # an existing venv (without it, pip sees the old version "already satisfied"
+    # and the running server keeps the previous release).
+    if [ -d "$WHEELS" ] && "$VENV/bin/pip" install --quiet --upgrade --no-index \
             --find-links="$WHEELS" "harmony[server]" 2>/dev/null; then
         echo "Harmony installed from bundled wheels (offline)."
     else
         echo "Bundled wheels don't match this platform; installing from PyPI…"
         "$VENV/bin/pip" install --quiet --upgrade pip
-        "$VENV/bin/pip" install --quiet "${APP}[server]"
+        "$VENV/bin/pip" install --quiet --upgrade "${APP}[server]"
     fi
 
     if command -v systemctl >/dev/null 2>&1; then
