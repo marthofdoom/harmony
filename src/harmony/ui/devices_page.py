@@ -86,10 +86,33 @@ class DevicesPage(Gtk.Box):
         self.connect("map", self._maybe_auto_discover)
 
     def _maybe_auto_discover(self, *_args: object) -> None:
+        # Whenever the page is shown, reflect whatever is streaming right now.
+        self._reflect_active_stream()
         if self._auto_discovered:
             return
         self._auto_discovered = True
         self._on_discover_clicked(self.discover_button)
+
+    def _row_for_host(self, host: str) -> Gtk.ListBoxRow | None:
+        index = 0
+        while (row := self.device_list.get_row_at_index(index)) is not None:
+            if getattr(row, "device_host", None) == host:
+                return row
+            index += 1
+        return None
+
+    def _reflect_active_stream(self) -> None:
+        """Select + refresh the device currently streaming, so opening the page
+        shows what's playing without the user pausing it first."""
+        if not self.state.playback.is_active():
+            return
+        row = self._row_for_host(self.state.playback.active_host)
+        if row is None:
+            return
+        if row is not self.device_list.get_selected_row():
+            self.device_list.select_row(row)  # -> _on_row_selected -> _refresh_status
+        else:
+            self._refresh_status()
 
     # -- layout ---------------------------------------------------------------
 
@@ -228,7 +251,10 @@ class DevicesPage(Gtk.Box):
             return
 
         self.content_stack.set_visible_child_name("main")
-        target_host = self._selected_host
+        # Prefer the device currently streaming, so opening the page reflects
+        # what's playing without the user having to poke it.
+        playing = self.state.playback.active_host if self.state.playback.is_active() else None
+        target_host = self._selected_host or playing
         select_row = None
         for info in devices:
             row = self._build_device_row(info)

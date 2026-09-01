@@ -674,6 +674,7 @@ class AppState(GObject.Object):
         play cancels an in-progress album/playlist queue on the same device (the
         queue-teardown is marshalled to the main loop, where its poller lives).
         """
+        self._stop_other_devices(device_host)  # one active stream per instance
         on_main(self._stop_queue, device_host)
         if device_host != LOCAL_HOST:
             on_main(self._stop_local_player)
@@ -700,6 +701,7 @@ class AppState(GObject.Object):
         tracks = list(tracks)
         if not tracks:
             return
+        self._stop_other_devices(device_host)  # one active stream per instance
         if device_host != LOCAL_HOST:
             on_main(self._stop_local_player)
         order = list(tracks)
@@ -884,6 +886,32 @@ class AppState(GObject.Object):
     def _active_device(self) -> Any | None:
         host = self.playback.active_host
         return self.device_for(host) if host else None
+
+    def _teardown_device(self, host: str) -> None:
+        """Stop playback on ``host`` and forget its queue — used when the single
+        active stream moves or is superseded. Runs on a worker thread; queue
+        teardown is marshalled to the main loop where its poller lives."""
+        if not host:
+            return
+        on_main(self._stop_queue, host)
+        self._now_playing.pop(host, None)
+        self._collection_key.pop(host, None)
+        self._collection_full.pop(host, None)
+        self._history.pop(host, None)
+        if host == LOCAL_HOST:
+            on_main(self._stop_local_player)
+        else:
+            try:
+                self.device_for(host).stop()
+            except Exception:  # noqa: BLE001 - best-effort stop; the move continues
+                log.debug("stop on %s during handoff failed", host, exc_info=True)
+
+    def _stop_other_devices(self, keep: str) -> None:
+        """One active stream per instance: stop the previously-active device when
+        a new stream starts elsewhere. Worker thread."""
+        old = self.playback.active_host
+        if old and old != keep:
+            self._teardown_device(old)
 
     def _play_one(self, track: Any, device_host: str) -> None:
         """Resolve ``track``'s stream, register it with the relay, and play it (queue-agnostic).
@@ -1098,16 +1126,50 @@ class AppState(GObject.Object):
                   lambda exc: self._toast_playback_error(exc, "Couldn't change the volume."))
 
     def playback_set_active_device(self, host: str) -> None:
-        """Point the Now Playing bar at ``host`` (the active playback device)."""
-        if not host or self.playback.active_host == host:
+        """Move the single active stream — its whole queue — to ``host``.
+
+        One active stream per instance: choosing a different device in the Now
+        Playing bar hands the current queue off to it (stopping the old device
+        and resuming from the current track, order preserved), rather than
+        starting a second stream. If nothing is playing, just point the bar at
+        ``host``.
+        """
+        old = self.playback.active_host
+        if not host or old == host:
             return
-        self.playback.active_host = host
-        np = self._now_playing.get(host)
-        if np is None:
-            self.playback.track = None
-            self.playback.state = "stopped"
-        self.emit("playback-changed")
-        self._start_queue_poller(host)
+
+        queue = list(self._queues.get(old) or [])
+        if not queue and self.playback.track is not None:
+            queue = [self.playback.track]  # a single track with no queue behind it
+        collection_key = self._collection_key.get(old)
+        collection_full = list(self._collection_full.get(old) or queue)
+
+        if not queue:
+            # Nothing playing: just switch which device the bar reflects.
+            self.playback.active_host = host
+            if self._now_playing.get(host) is None:
+                self.playback.track = None
+                self.playback.state = "stopped"
+            self.emit("playback-changed")
+            self._start_queue_poller(host)
+            return
+
+        def work() -> None:
+            self._teardown_device(old)  # stop the old device (single stream)
+            if host != LOCAL_HOST:
+                on_main(self._stop_local_player)
+            # Preserve the active order (current track first) — no reshuffle.
+            self._collection_full[host] = collection_full
+            self._collection_key[host] = collection_key
+            self._history[host] = []
+            self._queues[host] = queue
+            self._queue_prev_state[host] = ""
+            self.playback.active_host = host
+            self._play_one(queue[0], host)
+            on_main(self._start_queue_poller, host)
+
+        run_async(work, None,
+                  lambda exc: self._toast_playback_error(exc, "Couldn't move playback to that device."))
 
     def playback_set_shuffle(self, on: bool) -> None:
         """Toggle shuffle; reshuffles the remaining queue when turned on."""
