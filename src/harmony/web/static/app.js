@@ -218,6 +218,42 @@ function setView(view) {
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
   else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
   else if (view === "sync") { $("view-title").textContent = "Sync"; renderSync(); }
+  else if (view === "devices") { $("view-title").textContent = "Devices"; renderDevices(); }
+}
+
+async function renderDevices() {
+  const list = $("list");
+  list.innerHTML = `<p class="hint">Loading devices…</p>`;
+  let devices = [];
+  try { devices = (await api("/api/devices")).devices || []; }
+  catch (e) { list.innerHTML = `<p class="hint">Couldn't load devices: ${esc(e.message)}</p>`; return; }
+  const targets = [{ host: "browser", name: "This browser", kind: "" }, ...devices];
+  list.innerHTML = `<div style="max-width:640px">
+    <p class="hint" style="text-align:left;padding:.5rem 0">Pick where playback goes. Casting relays the
+    stream on your LAN to the device; the Now Playing bar then controls it.</p>
+    ${targets.map((d) => {
+      const active = state.target === d.host;
+      return `<div class="card" style="${active ? "border-color:var(--accent)" : ""}">
+        <div style="display:flex;align-items:center;gap:.7rem">
+          <span style="font-size:1.4rem">${d.host === "browser" ? "💻" : "📻"}</span>
+          <div style="flex:1;min-width:0">
+            <div style="font-weight:600">${esc(d.name)}${active ? ` <span class="badge">output</span>` : ""}</div>
+            ${d.host !== "browser" ? `<div class="muted" style="font-size:12px">${esc(d.kind || "device")} · ${esc(d.host)}</div>` : ""}
+          </div>
+          <button class="act ${active ? "" : "ghost"} setout" data-host="${esc(d.host)}">${active ? "Selected" : "Use"}</button>
+        </div>
+      </div>`;
+    }).join("")}
+    ${devices.length ? "" : `<p class="muted" style="padding:.5rem">No cast devices known. WiiM/UPnP renderers on your network appear here once configured.</p>`}
+  </div>`;
+  list.querySelectorAll(".setout").forEach((b) => b.onclick = () => {
+    const host = b.dataset.host;
+    const prev = state.target;
+    state.target = host;
+    const sel = $("np-device"); if (sel) sel.value = host;  // keep the Now Playing selector in sync
+    if (prev === "browser" && host !== "browser") audio.pause();  // handing off to a device
+    renderDevices();
+  });
 }
 
 async function renderSync() {
