@@ -922,6 +922,24 @@ class AppState(GObject.Object):
         relay = self._get_relay()
         source = cached["source"]
 
+        # Chromecast: it isn't a UPnP renderer, so hand the relay URL to its media
+        # receiver directly with the track metadata (its on-screen card shows it).
+        # Passthrough relay (allow_icy=False) — Cast reads metadata from play_media.
+        if self._device_entry(device_host).get("kind") == "cast":
+            token = relay.register(resolver, title=track.title, artist=track.artist_name, allow_icy=False)
+            url = relay.url_for(token, device_host)
+            self.device_for(device_host).play_url(
+                url,
+                title=track.title,
+                artist=track.artist_name,
+                album=getattr(track, "album", None),
+                art_url=getattr(track, "artwork_url", None),
+                duration_s=getattr(track, "duration_s", None),
+                mime=source.mime_type or "audio/mpeg",
+            )
+            self._mark_now_playing(device_host, track)
+            return
+
         # Prefer UPnP AVTransport: DIDL-Lite carries title/artist/album/art +
         # duration (so the device's own screen shows the track and reports a
         # progress/duration), and it plays a plain seekable file — so register

@@ -43,6 +43,13 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.24" date="2026-09-01">
+      <description>
+        <p>Casting to a Chromecast or Google TV now sends the full track details —
+        title, artist, album, and cover art — so the device's on-screen player
+        shows what's playing instead of just streaming audio.</p>
+      </description>
+    </release>
     <release version="0.7.23" date="2026-09-01">
       <description>
         <p>Discovered devices now populate the desktop Devices list and the

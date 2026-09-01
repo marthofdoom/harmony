@@ -159,16 +159,24 @@ class ChromecastDevice(PlaybackDevice):
     def _mc(self) -> Any:
         return self._cast().media_controller
 
-    def play_url(self, url: str, *, mime: str = "audio/mpeg", title: str | None = None,
-                 artist: str | None = None, art_url: str | None = None) -> None:
+    def play_url(self, url: str, *, mime: str | None = "audio/mpeg", title: str | None = None,
+                 artist: str | None = None, album: str | None = None, art_url: str | None = None,
+                 duration_s: int | None = None, **_extra: Any) -> None:
         mc = self._mc()
-        metadata: dict[str, Any] = {"metadataType": 3}  # MusicTrackMediaMetadata
+        # MusicTrackMediaMetadata (type 3) → the device's now-playing card shows
+        # title/artist/album + cover art.
+        metadata: dict[str, Any] = {"metadataType": 3}
         if title:
             metadata["title"] = title
         if artist:
             metadata["artist"] = artist
+        if album:
+            metadata["albumName"] = album
+        if art_url:
+            metadata["images"] = [{"url": art_url}]
         try:
-            mc.play_media(url, content_type=mime, title=title, thumb=art_url, metadata=metadata)
+            mc.play_media(url, content_type=mime or "audio/mpeg", title=title, thumb=art_url,
+                          metadata=metadata)
             mc.block_until_active(timeout=10)
         except Exception as exc:  # noqa: BLE001
             _forget(self._host)
