@@ -317,12 +317,13 @@ def test_api_instances_lists_discovered_peers(api_url: str) -> None:
 
 
 def test_api_peers_add_and_remove(api_url: str) -> None:
-    status, _, body = _post(api_url + "/api/peers", {"host": "100.64.0.5", "port": 8080})
+    status, body = _post(api_url + "/api/peers", {"host": "100.64.0.5", "port": 8080})
     assert status == 200
     assert json.loads(body)["ok"] is True
-    status, _, body = _post(api_url + "/api/peers", {"port": 8080})  # missing host
-    assert status == 400
-    status, _, body = _post(api_url + "/api/peers/remove", {"host": "100.64.0.5", "port": 8080})
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011 - missing host
+        _post(api_url + "/api/peers", {"port": 8080})
+    assert exc.value.code == 400
+    status, body = _post(api_url + "/api/peers/remove", {"host": "100.64.0.5", "port": 8080})
     assert json.loads(body)["removed"] == 1
 
 
