@@ -43,6 +43,20 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.14" date="2026-08-31">
+      <description>
+        <p>Headless-server credential fixes:</p>
+        <ul>
+          <li>Credentials now persist on a server. With no unlocked login
+          keyring, a half-detected Secret Service made copied credentials look
+          saved but never authenticate; the server now always uses the 0600 file
+          store, so adopted credentials work and survive a restart.</li>
+          <li>That file store is now encrypted at rest with a key derived from
+          the personal key — the same key that gates and encrypts credential
+          copies — so on-disk secrets aren't plaintext.</li>
+        </ul>
+      </description>
+    </release>
     <release version="0.7.13" date="2026-08-31">
       <description>
         <p>Accounts page gains a "Sync accounts from another instance" button —

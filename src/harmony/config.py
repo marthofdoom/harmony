@@ -318,43 +318,84 @@ class CredentialStore:
 
     # -- file fallback ----------------------------------------------------
 
+    def _passphrase(self) -> str | None:
+        """The personal key, used to encrypt the file store at rest."""
+        try:
+            return Settings.load().personal_key or None
+        except Exception:  # noqa: BLE001
+            return None
+
     def _file_secrets(self) -> dict[str, str]:
         path = _fallback_secrets_path()
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text("utf-8"))
+            raw = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError):
             return {}
+        # Encrypted-at-rest envelope (see _write_all)? Decrypt with the key.
+        if isinstance(raw, dict) and raw.get("v") and "token" in raw and "salt" in raw:
+            passphrase = self._passphrase()
+            if not passphrase:
+                log.warning("secrets file is encrypted but no personal key is set")
+                return {}
+            try:
+                from harmony.cryptobox import decrypt_json
+
+                data = decrypt_json(raw, passphrase)
+            except Exception:  # noqa: BLE001
+                log.warning("couldn't decrypt the secrets file (personal key changed?)")
+                return {}
+            return data if isinstance(data, dict) else {}
+        return raw if isinstance(raw, dict) else {}  # plaintext (no key / legacy)
+
+    def all_secrets(self) -> dict[str, str]:
+        """Every file-stored secret, decrypted — for re-encrypting on key change."""
+        with self._lock:
+            return dict(self._file_secrets())
+
+    def replace_all(self, data: dict[str, str]) -> None:
+        """Overwrite the whole file store, re-encrypting with the current key."""
+        with self._lock:
+            self._write_all(dict(data))
 
     def _write_file_secret(self, key: str, value: str | None) -> None:
         with self._lock:
-            path = _fallback_secrets_path()
-            path.parent.mkdir(parents=True, exist_ok=True)
             data = self._file_secrets()
             if value is None:
                 data.pop(key, None)
             else:
                 data[key] = value
+            self._write_all(data)
+
+    def _write_all(self, data: dict[str, str]) -> None:
+        path = _fallback_secrets_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        passphrase = self._passphrase()
+        if passphrase:
+            # Encrypt the whole store with a key derived from the personal key,
+            # so on-disk secrets aren't plaintext (matches the transport
+            # encryption). Before a key is set, fall back to plaintext 0600.
+            from harmony.cryptobox import encrypt_json
+
+            payload = json.dumps(encrypt_json(data, passphrase), indent=2).encode("utf-8")
+        else:
             payload = json.dumps(data, indent=2).encode("utf-8")
-            tmp = path.with_suffix(".json.tmp")
-            # Create the temp file already restricted to 0600 (via os.open,
-            # not pathlib's write_text -> builtin open(), which defaults to
-            # 0666 and relies on the process umask to narrow it — leaving a
-            # window where a concurrently-running umask-022 process sees a
-            # world-readable secrets file). O_EXCL after an explicit unlink
-            # also avoids following a pre-existing symlink at that path.
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
-            try:
-                os.write(fd, payload)
-            finally:
-                os.close(fd)
-            tmp.replace(path)
-            os.chmod(path, 0o600)
+        tmp = path.with_suffix(".json.tmp")
+        # Create the temp file already restricted to 0600 (via os.open, not
+        # write_text -> open() at 0666-minus-umask), and O_EXCL after an unlink
+        # so a pre-existing symlink at that path isn't followed.
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        fd = os.open(tmp, os.O_CREAT | os.O_WRONLY | os.O_EXCL, 0o600)
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        tmp.replace(path)
+        os.chmod(path, 0o600)
 
 
 # Well-known credential keys
