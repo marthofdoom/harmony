@@ -81,7 +81,8 @@ class CastController:
             url = relay.url_for(token, host)
             self._device(host, kind, device_info).play_url(
                 url, mime=source.mime_type or "audio/mpeg", title=meta.get("title"),
-                artist=meta.get("artist"), art_url=meta.get("art_url"),
+                artist=meta.get("artist"), album=meta.get("album"),
+                art_url=meta.get("art_url"), duration_s=meta.get("duration_s"),
             )
             return {"ok": True, "host": host}
         renderer = self._upnp_renderer(host)

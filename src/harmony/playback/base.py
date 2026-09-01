@@ -53,8 +53,23 @@ class PlaybackDevice(ABC):
     def status(self) -> PlaybackStatus: ...
 
     @abstractmethod
-    def play_url(self, url: str) -> None:
-        """Start playing a stream URL."""
+    def play_url(
+        self,
+        url: str,
+        *,
+        title: str | None = None,
+        artist: str | None = None,
+        album: str | None = None,
+        art_url: str | None = None,
+        duration_s: int | None = None,
+        mime: str | None = None,
+    ) -> None:
+        """Start playing a stream URL.
+
+        The optional track metadata is for renderers that display it themselves
+        (Chromecast's on-screen card). Backends that read metadata from the
+        stream instead (LinkPlay via ICY) may ignore it.
+        """
 
     @abstractmethod
     def pause(self) -> None: ...

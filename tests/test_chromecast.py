@@ -29,6 +29,7 @@ class _FakeMediaController:
 
     def play_media(self, url, content_type=None, title=None, thumb=None, metadata=None):
         self.calls.append(f"play:{url}:{content_type}")
+        self.last_metadata = metadata
 
     def block_until_active(self, timeout=None):
         pass
@@ -82,6 +83,18 @@ def test_chromecast_device_transport(fake_cast: _FakeCast) -> None:
     assert "play" in fake_cast.media_controller.calls
     assert fake_cast.volume == pytest.approx(0.8)
     assert st.state == "playing" and st.volume == 50
+
+
+def test_chromecast_sends_full_track_metadata(fake_cast: _FakeCast) -> None:
+    dev = ChromecastDevice("192.168.1.50")
+    dev.play_url("http://relay/t.mp3", title="Five Years", artist="Bowie",
+                 album="Ziggy Stardust", art_url="http://art/cover.jpg", duration_s=289)
+    md = fake_cast.media_controller.last_metadata
+    assert md["metadataType"] == 3
+    assert md["title"] == "Five Years"
+    assert md["artist"] == "Bowie"
+    assert md["albumName"] == "Ziggy Stardust"
+    assert md["images"] == [{"url": "http://art/cover.jpg"}]
 
 
 def test_chromecast_has_no_queue_nav(fake_cast: _FakeCast) -> None:

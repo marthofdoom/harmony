@@ -154,7 +154,9 @@ class WiiMDevice(PlaybackDevice):
             raise ProviderError(f"{self.host}: getPlayerStatus returned an unexpected payload")
         return _parse_status(payload)
 
-    def play_url(self, url: str) -> None:
+    def play_url(self, url: str, **_meta: Any) -> None:
+        # LinkPlay reads title/artist from the stream itself (ICY), so the
+        # metadata kwargs are accepted for interface uniformity and ignored.
         self._set(f"play:{quote(url, safe='')}")
 
     def pause(self) -> None:
