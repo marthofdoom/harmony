@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.23" date="2026-09-01">
+      <description>
+        <p>Discovered devices now populate the desktop Devices list and the
+        “play to” picker automatically — the same way the web client works —
+        instead of hiding behind a click-to-add popup. The Devices page also
+        scans on open, and a discovered device can be pinned to keep it.</p>
+      </description>
+    </release>
     <release version="0.7.22" date="2026-09-01">
       <description>
         <p>The Flatpak now bundles the Chromecast library, so the desktop app can

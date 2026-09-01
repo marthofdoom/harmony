@@ -501,7 +501,7 @@ class AppState(GObject.Object):
         except ImportError:
             return self.known_devices()
         local = DeviceInfo(id=LOCAL_HOST, name="This computer", host=LOCAL_HOST, kind="local")
-        return [local, *self.known_devices()]
+        return [local, *self.all_devices()]
 
     def _get_local_player(self) -> Any:
         """Lazily create the GStreamer local player (main loop only)."""
@@ -575,7 +575,28 @@ class AppState(GObject.Object):
         for entry in self.settings.known_devices:
             if entry.get("host") == host:
                 return entry
+        for d in getattr(self, "_discovered", ()):  # discovered-but-unsaved
+            if d.host == host:
+                return {"host": d.host, "name": d.name, "kind": d.kind}
         return {}
+
+    def is_saved_device(self, host: str) -> bool:
+        """True if ``host`` is a persisted device (vs a transient discovery)."""
+        return any(entry.get("host") == host for entry in self.settings.known_devices)
+
+    def set_discovered_devices(self, infos: list[Any]) -> None:
+        """Cache auto-discovered devices so they appear in the device list and
+        playback pickers without a manual add — mirroring the web Devices tab.
+        Not persisted; ``add_device`` is how the user pins one."""
+        self._discovered = list(infos)
+        self.emit("devices-changed")
+
+    def all_devices(self) -> list[Any]:
+        """Saved devices plus the latest auto-discovered ones (deduped by host)."""
+        known = self.known_devices()
+        seen = {d.host for d in known}
+        extra = [d for d in getattr(self, "_discovered", ()) if d.host not in seen]
+        return [*known, *extra]
 
     def remove_device(self, host: str) -> None:
         """Forget a device. No-op if it wasn't known."""
