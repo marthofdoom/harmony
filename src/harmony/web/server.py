@@ -184,6 +184,20 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                                                   transport=body.get("transport")))
             elif parts == ["api", "audio", "stop"]:
                 self._send_json(engine.audio_stop())
+            elif parts == ["api", "peers"]:
+                host = (body.get("host") or "").strip()
+                port = body.get("port")
+                if not host or not port:
+                    self._send_json({"error": "missing host or port"}, status=400)
+                    return
+                self._send_json(engine.add_peer(host, int(port), name=body.get("name")))
+            elif parts == ["api", "peers", "remove"]:
+                host = (body.get("host") or "").strip()
+                port = body.get("port")
+                if not host or not port:
+                    self._send_json({"error": "missing host or port"}, status=400)
+                    return
+                self._send_json(engine.remove_peer(host, int(port)))
             elif parts == ["api", "credentials", "adopt"]:
                 host = (body.get("host") or "").strip()
                 port = body.get("port")
@@ -261,7 +275,10 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":
                 self._send_json(engine.playlist_tracks(parts[2], parts[3]))
             elif parts == ["api", "devices"]:
-                self._send_json(engine.devices())
+                refresh = (query.get("refresh") or ["0"])[0] in ("1", "true", "yes")
+                self._send_json(engine.devices(refresh=refresh))
+            elif parts == ["api", "peers"]:
+                self._send_json(engine.instances())
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
                 self._send_json(engine.device_status(parts[2]))
             elif parts == ["api", "credentials", "export"]:

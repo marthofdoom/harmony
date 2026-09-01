@@ -209,6 +209,12 @@ class Settings:
     # same way harmony.playback.DeviceInfo.kind is).
     known_devices: list[dict[str, Any]] = field(default_factory=list)
 
+    # Manually-registered peer instances (host, port, optional name). Complements
+    # mDNS mesh discovery for peers that don't share a broadcast domain — a hub
+    # reached over Tailscale/WireGuard/a routed subnet, where multicast never
+    # arrives. Non-secret; adoption/routing still gate on the personal key.
+    known_peers: list[dict[str, Any]] = field(default_factory=list)
+
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @classmethod

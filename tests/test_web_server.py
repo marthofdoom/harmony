@@ -197,8 +197,17 @@ class _FakeEngine:
         self.calls.append(("delete", service, pid))
         return {"ok": True}
 
-    def devices(self):
+    def devices(self, refresh=False):
+        self.calls.append(("devices", refresh))
         return {"devices": [{"host": "192.168.1.9", "name": "Bedroom", "kind": "wiim"}]}
+
+    def add_peer(self, host, port, name=None):
+        self.calls.append(("add_peer", host, port, name))
+        return {"ok": True, "peer": {"host": host, "port": port, "name": name or host}}
+
+    def remove_peer(self, host, port):
+        self.calls.append(("remove_peer", host, port))
+        return {"ok": True, "removed": 1}
 
     def cast(self, host, service, track_id, meta=None):
         self.calls.append(("cast", host, service, track_id))
@@ -305,6 +314,25 @@ def test_stream_unknown_token_is_404(api_url: str) -> None:
 def test_api_instances_lists_discovered_peers(api_url: str) -> None:
     _, _, body = _get(api_url + "/api/instances")
     assert json.loads(body)["instances"][0]["name"] == "harmony-desk"
+
+
+def test_api_peers_add_and_remove(api_url: str) -> None:
+    status, body = _post(api_url + "/api/peers", {"host": "100.64.0.5", "port": 8080})
+    assert status == 200
+    assert json.loads(body)["ok"] is True
+    with pytest.raises(urllib.error.HTTPError) as exc:  # noqa: PT011 - missing host
+        _post(api_url + "/api/peers", {"port": 8080})
+    assert exc.value.code == 400
+    status, body = _post(api_url + "/api/peers/remove", {"host": "100.64.0.5", "port": 8080})
+    assert json.loads(body)["removed"] == 1
+
+
+def test_api_devices_refresh_flag(api_url: str) -> None:
+    # ?refresh=1 must reach the engine as refresh=True.
+    import harmony.web.server as srv
+
+    _get(api_url + "/api/devices?refresh=1")
+    assert ("devices", True) in srv._engine.calls
 
 
 def test_mesh_degrades_without_zeroconf(monkeypatch: pytest.MonkeyPatch) -> None:
