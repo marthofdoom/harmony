@@ -43,6 +43,14 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="0.7.27" date="2026-09-01">
+      <description>
+        <p>Hardened credential sharing between instances: a copied YouTube login
+        can no longer leave a peer labelled "signed in" against a dead token. The
+        auth type is now always validated against the real token on both send and
+        receive, and a superseded auth file is cleaned up.</p>
+      </description>
+    </release>
     <release version="0.7.26" date="2026-09-01">
       <description>
         <p>The Discover page has been rebuilt to match the rest of the app —

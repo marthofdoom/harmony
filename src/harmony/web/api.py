@@ -19,6 +19,31 @@ from harmony.errors import ProviderError
 
 log = logging.getLogger(__name__)
 
+
+def _classify_yt_auth(text: str | None) -> str | None:
+    """Infer the YouTube auth kind from an auth-file blob: ``"oauth"`` when it
+    holds an OAuth token, ``"browser"`` when it's request headers, else ``None``.
+
+    Credential sharing keys off this so a copy can never label an instance
+    ``ytmusic_auth_kind=oauth`` without an actual OAuth token behind it — the
+    mismatch that leaves an instance "authenticated" against a dead cookie file.
+    """
+    if not text:
+        return None
+    import json
+
+    try:
+        data = json.loads(text)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    if data.get("refresh_token") or data.get("access_token"):
+        return "oauth"
+    if any(isinstance(k, str) and k.lower() in ("cookie", "authorization") for k in data):
+        return "browser"
+    return None
+
 # Resolved provider stream URLs expire (Qobuz/YouTube sign them for ~minutes),
 # so tokens the browser holds are short-lived and pruned.
 _STREAM_TTL_S = 1800
@@ -223,6 +248,15 @@ class Engine:
             except OSError:
                 pass
         settings = {f: getattr(s, f) for f in self._CRED_SETTINGS if hasattr(s, f)}
+        # Only share a YouTube auth kind that matches the token we're actually
+        # sending — never a phantom "oauth" label without a token behind it.
+        kind = _classify_yt_auth(yt_auth)
+        if kind:
+            settings["ytmusic_auth_kind"] = kind
+        else:
+            settings.pop("ytmusic_auth_kind", None)
+            settings.pop("ytmusic_oauth_client_id", None)
+            yt_auth = None
         return {"secrets": secrets, "settings": settings, "ytmusic_auth": yt_auth}
 
     def export_credentials(self) -> dict[str, Any]:
@@ -240,6 +274,8 @@ class Engine:
 
     def import_credentials(self, data: dict[str, Any]) -> dict[str, Any]:
         """Write credentials pulled from a peer into this instance's own store."""
+        from pathlib import Path
+
         from harmony.config import CredentialStore, Settings, config_dir
 
         cs = CredentialStore()
@@ -247,14 +283,34 @@ class Engine:
             if value:
                 cs.set(key, value)
         s = Settings.load()
-        for field, value in (data.get("settings") or {}).items():
+
+        # Never relabel our YouTube auth 'oauth' without a real token in the
+        # payload — the mismatch that left a peer authed against a dead file.
+        yt_auth = data.get("ytmusic_auth")
+        kind = _classify_yt_auth(yt_auth)
+        incoming = dict(data.get("settings") or {})
+        if not kind:
+            incoming.pop("ytmusic_auth_kind", None)
+            incoming.pop("ytmusic_oauth_client_id", None)
+            yt_auth = None
+        for field, value in incoming.items():
             if hasattr(s, field):
                 setattr(s, field, value)
-        yt_auth = data.get("ytmusic_auth")
-        if yt_auth:
+
+        if yt_auth and kind:
+            old_path = s.ytmusic_auth_file
             path = config_dir() / "ytmusic-auth.json"
             path.write_text(yt_auth, "utf-8")
             s.ytmusic_auth_file = str(path)
+            s.ytmusic_auth_kind = kind  # keep the kind consistent with the token we wrote
+            # Drop a superseded auth file we own, so no stale cookie file lingers.
+            if old_path and old_path != str(path):
+                old = Path(old_path)
+                try:
+                    if old.is_file() and config_dir() in old.parents:
+                        old.unlink()
+                except OSError:
+                    pass
         s.save()
         self._reset_providers()
         return {"ok": True, "imported": sorted((data.get("secrets") or {}).keys())}
