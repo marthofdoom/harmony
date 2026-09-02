@@ -212,6 +212,17 @@ def test_smart_search_group_section_and_incidental(monkeypatch):
     assert all(a["id"] != "A1" for a in res["incidental"]["artists"])
 
 
+def test_search_albums_are_chronological_tracks_keep_order(monkeypatch):
+    prov = _FakeProvider(Service.QOBUZ)
+    prov.search_albums = [_album("b", "B", 2010), _album("a", "A", 2000), _album("c", "C", 2005)]
+    prov.search_tracks = [Track(id="t2", title="Two", service=Service.QOBUZ),
+                          Track(id="t1", title="One", service=Service.QOBUZ)]
+    eng = _engine_with(monkeypatch, prov, mb=False)
+    res = eng.search("x", ("albums", "tracks"))
+    assert [a["title"] for a in res["albums"]] == ["A", "C", "B"]  # chronological
+    assert [t["id"] for t in res["tracks"]] == ["t2", "t1"]        # provider order kept
+
+
 def test_smart_search_no_artist_match(monkeypatch):
     prov = _FakeProvider(Service.QOBUZ)
     prov.search_artists = [Artist(id="A1", name="Totally Different", service=Service.QOBUZ)]

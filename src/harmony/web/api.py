@@ -435,6 +435,9 @@ class Engine:
                 results["albums"] += [album_to_dict(a) for a in r.albums]
                 results["artists"] += [artist_to_dict(a) for a in r.artists]
                 results["playlists"] += [playlist_to_dict(p) for p in r.playlists]
+        # Album results read chronologically; tracks keep the providers'
+        # popularity/relevance order, which is what a track search wants.
+        results["albums"].sort(key=lambda a: (a["year"] is None, a["year"] or 0, (a["title"] or "").lower()))
         return results
 
     # -- entity detail pages + smart search --------------------------------

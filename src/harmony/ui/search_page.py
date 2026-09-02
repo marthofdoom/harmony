@@ -269,7 +269,9 @@ class SearchPage(Gtk.Box):
         while row := self.other_list.get_row_at_index(0):
             self.other_list.remove(row)
         items: list[Album | Artist | Playlist]
-        items = {"albums": results.albums, "artists": results.artists, "playlists": results.playlists}[kind]
+        # Album results read chronologically; artists/playlists keep provider order.
+        items = {"albums": _sorted_by_year(results.albums),
+                 "artists": results.artists, "playlists": results.playlists}[kind]
         for item in items:
             subtitle = item.service.label
             if isinstance(item, Album):
