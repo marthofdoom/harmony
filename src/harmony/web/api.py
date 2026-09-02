@@ -559,6 +559,10 @@ class Engine:
         if overlay:
             from harmony.enrich import entities
             chronology = entities.chronology(overlay)
+            # Make chart album-markers navigable by matching each to a provider
+            # album we already fetched (no extra network) — same year + fuzzy title.
+            if chronology:
+                self._attach_marker_refs(chronology, albums, service_value)
 
         return {
             "artist": {
@@ -578,6 +582,24 @@ class Engine:
             ],
             "chronology": chronology,
         }
+
+    @staticmethod
+    def _attach_marker_refs(chronology: dict[str, Any], provider_albums: list[Any],
+                            service_value: str) -> None:
+        """Add a navigable ``ref`` to each chronology album marker, matched to a
+        provider album by year + fuzzy title (``None`` when nothing matches)."""
+        from rapidfuzz import fuzz
+        for marker in chronology.get("albums", []):
+            ref = None
+            best = 0.0
+            for a in provider_albums:
+                if a.year and marker.get("year") and a.year != marker["year"]:
+                    continue
+                score = fuzz.token_sort_ratio(marker["title"].lower(), a.title.lower())
+                if score > best and score >= 85:
+                    best = score
+                    ref = _album_ref(service_value, a.id, a.title)
+            marker["ref"] = ref
 
     def album_page(self, service_value: str, album_id: str) -> dict[str, Any]:
         prov = self._provider(service_value)

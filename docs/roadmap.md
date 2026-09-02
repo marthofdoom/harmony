@@ -1,9 +1,21 @@
 # Roadmap & status
 
 A snapshot of what exists and what's next. Honest maturity, not aspiration — see
-the legend in the [docs index](README.md). Current release: **0.7.17**.
+the legend in the [docs index](README.md). Current release: **0.8.0**.
 
 ## Done
+
+- **Entity navigation** — every artist, album, and track has its own page,
+  reachable by clicking a name or right-clicking a row on all three surfaces
+  (desktop, web, Android). Artist pages carry a Wikipedia bio, a chronological
+  discography, and — for a band — a Wikipedia-style **member-chronology chart**
+  (member tenures across a year axis with album markers). Album pages list the
+  tracks; track pages show the **performers** (who played on it, not who wrote
+  it) where MusicBrainz has them. **Smart search** shows a searched artist's
+  chronological discography first, or — for a *person* — the albums they actually
+  **performed on** (a band's records only during their tenure), then album-title
+  matches, then incidental results. Powered by a MusicBrainz + Wikipedia metadata
+  layer built once in the engine and shared by every client.
 
 - **Engine** — providers (YT Music, Qobuz), cross-service matching, sync
   (plan/apply with conservative data-loss guarantees), import/export,

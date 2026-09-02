@@ -16,6 +16,22 @@ import kotlinx.coroutines.withContext
 
 enum class ConnState { DISCONNECTED, CONNECTING, CONNECTED }
 
+enum class DetailKind { ARTIST, ALBUM, TRACK }
+
+/** One entry on the entity-navigation back stack. It carries its own loaded
+ *  payload so going back never refetches. `key` disambiguates duplicate routes. */
+data class DetailEntry(
+    val key: Long,
+    val kind: DetailKind,
+    val service: String,
+    val id: String,
+    val loading: Boolean = true,
+    val error: String? = null,
+    val artist: ArtistDetail? = null,
+    val album: AlbumDetail? = null,
+    val track: TrackDetail? = null,
+)
+
 data class Playback(
     val track: Track? = null,
     val isPlaying: Boolean = false,
@@ -30,6 +46,14 @@ data class UiState(
     val query: String = "",
     val results: List<Track> = emptyList(),
     val searching: Boolean = false,
+    // which bottom tab is showing (VM-held so navigation can switch it)
+    val tab: Int = 0,
+    // smart search (spec-ordered sections; fires on submit only)
+    val searchService: String = "both",   // both | ytmusic | qobuz
+    val smart: SmartSearch? = null,
+    val smartSearching: Boolean = false,
+    // entity-navigation back stack (overlays the tabs when non-empty)
+    val detailStack: List<DetailEntry> = emptyList(),
     val playback: Playback = Playback(),
     val message: String? = null,
     // audio routing
@@ -63,6 +87,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     private val rtp = RtpReceiver()
     private val relay = LocalRelay()
     private var api: HarmonyApi? = null
+    private var detailKeySeq = 0L
 
     // Advertise this phone on the mesh so the desktop/server see it as an
     // instance (e.g. "harmony-<phone>") instead of an invisible client.
@@ -129,6 +154,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         player.stop(); player.clearMediaItems()
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
             results = emptyList(), query = "", playback = Playback(),
+            smart = null, detailStack = emptyList(), tab = 0,
             peers = emptyList(), playingHere = false, routeStatus = null,
             renderers = emptyList(), bridgingTo = null,
             playlists = emptyList(), openPlaylist = null, playlistTracks = emptyList(),
@@ -147,6 +173,85 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             result.onSuccess { _state.value = _state.value.copy(results = it, searching = false) }
                 .onFailure { _state.value = _state.value.copy(searching = false,
                     message = friendly(it, "Couldn't search right now. Try again.")) }
+        }
+    }
+
+    // -- smart search + entity navigation -----------------------------------
+
+    fun setTab(i: Int) { _state.value = _state.value.copy(tab = i) }
+
+    fun setSearchService(service: String) {
+        _state.value = _state.value.copy(searchService = service)
+    }
+
+    /** Spec-ordered search; fires on submit only (never per keystroke). */
+    fun smartSearch() {
+        val client = api ?: return
+        val q = _state.value.query.trim()
+        if (q.isEmpty()) return
+        val service = _state.value.searchService
+        _state.value = _state.value.copy(smartSearching = true, message = null)
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.smartSearch(q, service) } }
+            res.onSuccess { _state.value = _state.value.copy(smart = it, smartSearching = false) }
+                .onFailure { _state.value = _state.value.copy(smartSearching = false,
+                    message = friendly(it, "Couldn't search right now. Try again.")) }
+        }
+    }
+
+    /** Tapping a member/band name runs a smart search for it. Clears any open
+     *  detail and returns to the Search tab so the results are visible. */
+    fun searchName(name: String) {
+        _state.value = _state.value.copy(query = name, tab = 0, detailStack = emptyList())
+        smartSearch()
+    }
+
+    fun openArtist(service: String, id: String) = pushDetail(DetailKind.ARTIST, service, id)
+    fun openArtist(ref: ArtistRef) = openArtist(ref.service, ref.id)
+    fun openAlbum(service: String, id: String) = pushDetail(DetailKind.ALBUM, service, id)
+    fun openAlbum(ref: AlbumRef) = openAlbum(ref.service, ref.id)
+    fun openTrack(service: String, id: String) = pushDetail(DetailKind.TRACK, service, id)
+
+    /** Pop one detail screen; backs the system Back button on a detail. */
+    fun popDetail() {
+        val stack = _state.value.detailStack
+        if (stack.isNotEmpty()) _state.value = _state.value.copy(detailStack = stack.dropLast(1))
+    }
+
+    private fun pushDetail(kind: DetailKind, service: String, id: String) {
+        if (api == null) return
+        val entry = DetailEntry(key = detailKeySeq++, kind = kind, service = service, id = id)
+        _state.value = _state.value.copy(detailStack = _state.value.detailStack + entry)
+        loadDetail(entry)
+    }
+
+    private fun loadDetail(entry: DetailEntry) {
+        val client = api ?: return
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    when (entry.kind) {
+                        DetailKind.ARTIST -> client.artist(entry.service, entry.id)
+                        DetailKind.ALBUM -> client.album(entry.service, entry.id)
+                        DetailKind.TRACK -> client.track(entry.service, entry.id)
+                    }
+                }
+            }
+            val updated = res.fold(
+                onSuccess = { data ->
+                    when (data) {
+                        is ArtistDetail -> entry.copy(loading = false, artist = data)
+                        is AlbumDetail -> entry.copy(loading = false, album = data)
+                        is TrackDetail -> entry.copy(loading = false, track = data)
+                        else -> entry.copy(loading = false)
+                    }
+                },
+                onFailure = { entry.copy(loading = false,
+                    error = friendly(it, "Couldn't load that. Try again.")) },
+            )
+            // Replace by key (the stack may have changed while loading).
+            _state.value = _state.value.copy(
+                detailStack = _state.value.detailStack.map { if (it.key == entry.key) updated else it })
         }
     }
 

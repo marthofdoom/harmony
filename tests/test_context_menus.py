@@ -418,6 +418,22 @@ def test_track_row_actions_no_providers_at_all(fake_state: AppState) -> None:
     assert labels == ["Play on Device", "Add to Playlist…"]
 
 
+def test_track_row_actions_add_navigation_when_ids_present(fake_state: AppState) -> None:
+    fake_state.providers = {
+        Service.YTMUSIC: FakeProvider(Service.YTMUSIC),
+        Service.QOBUZ: FakeProvider(Service.QOBUZ),
+    }
+    page = _search_page(fake_state)
+    track = Track(id="1", title="T", service=Service.YTMUSIC, artists=["A"],
+                  artist_ids=["ar1"], album="Al", album_id="al1")
+
+    labels = [label for label, _cb in page._track_row_actions(track)]
+
+    # Existing actions are unchanged and lead; navigation is appended.
+    assert labels[:2] == ["Play on Device", "Add to Playlist…"]
+    assert "Go to Artist" in labels and "Go to Album" in labels
+
+
 def test_artist_row_actions_with_provider(fake_state: AppState) -> None:
     fake_state.providers = {Service.YTMUSIC: FakeProvider(Service.YTMUSIC)}
     page = _search_page(fake_state)

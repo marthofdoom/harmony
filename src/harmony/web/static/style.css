@@ -245,6 +245,96 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 #toast.ok { background: var(--success); color: #06251a; }
 #toast.err { background: var(--danger); color: var(--danger-fg); }
 
+/* -- entity detail pages + smart-search sections -------------------------- */
+/* Icon sizing for icon+label action buttons (e.g. Play track, New playlist). */
+.act .ico { width: 1.1rem; height: 1.1rem; vertical-align: -.18em; }
+.detail { max-width: 900px; }
+.detail-head { margin-bottom: var(--sp-3); }
+.backbtn { display: inline-flex; align-items: center; gap: var(--sp-1); background: none; border: none;
+           color: var(--muted); font: inherit; cursor: pointer; padding: var(--sp-1) var(--sp-2); border-radius: var(--r-md); }
+.backbtn:hover { background: var(--row-hover); color: var(--fg); }
+.backbtn .ico { width: 1rem; height: 1rem; }
+.detail-hero { display: flex; gap: var(--sp-4); align-items: flex-end; margin-bottom: var(--sp-5); }
+.detail-art { width: 148px; height: 148px; flex: none; border-radius: var(--r-lg); overflow: hidden;
+              background: var(--row-hover); display: grid; place-items: center; color: var(--muted); box-shadow: var(--shadow-1); }
+.detail-art .artimg { width: 100%; height: 100%; object-fit: cover; }
+.detail-art .ico { width: 34%; height: 34%; }
+.detail-herometa { min-width: 0; }
+.detail-kind { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .06em; font-weight: 600; }
+.detail-title { margin: var(--sp-1) 0 var(--sp-2); font-size: 1.6rem; line-height: 1.15; }
+.detail-sub { color: var(--muted); }
+
+.detail-sec { margin: var(--sp-5) 0; }
+.detail-sec > h3 { margin: 0 0 var(--sp-3); font-size: 1rem; font-weight: 650; }
+.sec-head { display: flex; align-items: baseline; gap: var(--sp-3); margin-bottom: var(--sp-1); }
+.sec-head h3 { margin: 0; flex: 1; }
+.sec-sub { font-size: 12.5px; margin: 0 0 var(--sp-3); }
+
+.link { color: var(--accent); text-decoration: none; cursor: pointer; }
+.link:hover { text-decoration: underline; }
+.trow a.artist { text-decoration: none; }
+.trow a.artist:hover { color: var(--fg); text-decoration: underline; }
+
+.bio-text { white-space: pre-wrap; margin: 0 0 var(--sp-2); max-width: 68ch; }
+.bio-src { font-size: 12.5px; margin: 0; }
+
+/* album rows (discography / smart search) */
+.albrows { display: flex; flex-direction: column; }
+.albrow { display: grid; grid-template-columns: 3.2rem 2.4rem 1fr auto; gap: var(--sp-3); align-items: center;
+          padding: var(--sp-2); border-radius: var(--r-md); color: inherit; text-decoration: none; cursor: pointer; }
+.albrow:hover { background: var(--row-hover); }
+.albrow.info { cursor: default; color: var(--muted); }
+.albrow.info:hover { background: none; }
+.alb-year { color: var(--muted); font-variant-numeric: tabular-nums; text-align: right; font-size: 13px; }
+.alb-art { width: 2.4rem; height: 2.4rem; border-radius: var(--r-sm); overflow: hidden; flex: none;
+           background: var(--row-hover); display: grid; place-items: center; color: var(--muted); }
+.alb-art .artimg { width: 100%; height: 100%; object-fit: cover; }
+.alb-art .ico { width: 1.1rem; height: 1.1rem; }
+.alb-meta { min-width: 0; }
+.alb-title { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.alb-artist { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* people / artist chips */
+.chips { display: flex; flex-wrap: wrap; gap: var(--sp-2); }
+.chip { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 1px; max-width: 100%;
+        background: var(--card); border: 1px solid var(--border); border-radius: var(--r-lg);
+        padding: .4rem .8rem; font: inherit; color: var(--fg); cursor: pointer; text-decoration: none; text-align: left; }
+.chip:hover { border-color: var(--accent); }
+.chip-name { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 240px; }
+.chip-name .badge { vertical-align: middle; }
+.chip-sub { font-size: 11.5px; }
+
+/* track numbers in album / detail listings (play button on hover) */
+.tlead { position: relative; width: 2rem; height: 2rem; display: grid; place-items: center; }
+.tnum { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.trow.numbered .tlead .play { position: absolute; inset: 0; opacity: 0; }
+.trow.numbered:hover .tlead .play, .trow.numbered:focus-within .tlead .play,
+.trow.numbered.playing .tlead .play { opacity: 1; }
+.trow.numbered:hover .tlead .tnum, .trow.numbered:focus-within .tlead .tnum,
+.trow.numbered.playing .tlead .tnum { opacity: 0; }
+
+/* performers */
+.perf { display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
+.perf-row { display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap; }
+.perf-roles { font-size: 12.5px; }
+.credited { margin: 0 0 var(--sp-2); }
+
+/* member-chronology timeline chart (inline SVG). Its own colours override the
+   global `svg { fill:none; stroke:currentColor }` reset, and every value is a
+   design token so the chart tracks light/dark like the rest of the app. */
+.chrono-wrap { overflow-x: auto; overflow-y: hidden; padding-bottom: var(--sp-2);
+               border: 1px solid var(--border); border-radius: var(--r-lg); background: var(--card); }
+.chrono { display: block; }
+.chrono-stripe { fill: var(--row-hover); stroke: none; }
+.chrono-bar { fill: var(--accent); stroke: none; }
+.chrono-axis { stroke: var(--border); stroke-width: 1.5; }
+.chrono-tick { stroke: var(--border); stroke-width: 1; }
+.chrono-albline { stroke: var(--muted); stroke-width: 1; stroke-dasharray: 3 3; opacity: .5; }
+.chrono-year { fill: var(--muted); stroke: none; font-size: 11px; }
+.chrono-albtitle { fill: var(--muted); stroke: none; font-size: 10.5px; }
+.chrono-name { fill: var(--fg); stroke: none; font-size: 12px; font-weight: 550; }
+.chrono-instr { fill: var(--muted); stroke: none; font-size: 10.5px; }
+
 /* -- mobile bottom nav (hidden on desktop) -------------------------------- */
 #mobilenav { display: none; }
 #mobilenav button {
@@ -287,4 +377,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
   #np-seekwrap { order: 4; flex-basis: 100%; }
   #np-vol { display: none; }              /* phones use hardware volume */
   #toast { bottom: calc(9rem + env(safe-area-inset-bottom, 0px)); }
+
+  /* detail pages: smaller hero, and the album-row art column drops out */
+  .detail-hero { gap: var(--sp-3); }
+  .detail-art { width: 104px; height: 104px; }
+  .detail-title { font-size: 1.3rem; }
+  .albrow { grid-template-columns: 2.6rem 1fr auto; }
+  .albrow .alb-art { display: none; }
 }
