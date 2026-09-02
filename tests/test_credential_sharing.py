@@ -71,3 +71,72 @@ def test_export_is_encrypted_then_adopts(monkeypatch: pytest.MonkeyPatch) -> Non
     assert _FakeCS.store["qobuz.user_auth_token"] == "TOK"
     assert target.qobuz_auth_kind == "token"
     assert "qobuz.user_auth_token" in result["imported"]
+
+
+# -- credential-copy hardening: auth_kind always matches an actual token ------
+
+
+def _use_config_dir(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+
+
+def test_export_labels_yt_kind_by_the_real_token(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    _FakeCS.store = {}
+    # Source *claims* oauth, but its auth file is browser headers (the mismatch).
+    src = _FakeSettings()
+    src.ytmusic_auth_kind = "oauth"
+    authf = tmp_path / "browser.json"
+    authf.write_text('{"cookie": "SID=x", "authorization": "y"}', "utf-8")
+    src.ytmusic_auth_file = str(authf)
+    _use_settings(monkeypatch, src)
+
+    payload = decrypt_json(Engine().export_credentials(), "shared-key")
+    assert payload["settings"]["ytmusic_auth_kind"] == "browser"  # corrected to the file
+
+
+def test_import_ignores_oauth_label_without_a_token(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    monkeypatch.setattr(Engine, "_reset_providers", lambda self: None)
+    _use_config_dir(monkeypatch, tmp_path)
+    _FakeCS.store = {}
+    target = _FakeSettings()
+    target.ytmusic_auth_kind = "browser"
+    target.ytmusic_auth_file = "keep.json"
+    _use_settings(monkeypatch, target)
+
+    Engine().import_credentials(
+        {"secrets": {}, "settings": {"ytmusic_auth_kind": "oauth", "ytmusic_oauth_client_id": "cid"},
+         "ytmusic_auth": None})
+    assert target.ytmusic_auth_kind == "browser"   # not relabeled to a phantom oauth
+    assert target.ytmusic_auth_file == "keep.json"  # left untouched
+
+
+def test_import_oauth_token_writes_file_and_drops_stale(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    monkeypatch.setattr(Engine, "_reset_providers", lambda self: None)
+    _use_config_dir(monkeypatch, tmp_path)
+    _FakeCS.store = {}
+    target = _FakeSettings()
+    stale = tmp_path / "browser.json"
+    stale.write_text("stale cookies", "utf-8")
+    target.ytmusic_auth_file = str(stale)
+    target.ytmusic_auth_kind = "browser"
+    _use_settings(monkeypatch, target)
+
+    token = '{"refresh_token": "RT", "access_token": "AT"}'
+    Engine().import_credentials({"secrets": {}, "settings": {"ytmusic_auth_kind": "oauth"},
+                                 "ytmusic_auth": token})
+    new = tmp_path / "ytmusic-auth.json"
+    assert new.read_text("utf-8") == token
+    assert target.ytmusic_auth_file == str(new)
+    assert target.ytmusic_auth_kind == "oauth"
+    assert not stale.exists()  # superseded auth file removed
