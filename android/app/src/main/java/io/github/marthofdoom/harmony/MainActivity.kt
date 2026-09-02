@@ -78,7 +78,6 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
@@ -147,7 +146,7 @@ private fun App(vm: HarmonyViewModel = viewModel()) {
 
 /** A centered empty/placeholder state: icon, title, supporting line, optional action. */
 @Composable
-private fun EmptyState(
+fun EmptyState(
     icon: ImageVector,
     title: String,
     body: String,
@@ -173,7 +172,7 @@ private fun EmptyState(
 }
 
 /** A human label for a service id: "qobuz" → "Qobuz", "ytmusic" → "YouTube Music". */
-private fun serviceLabel(service: String): String = when (service.lowercase()) {
+fun serviceLabel(service: String): String = when (service.lowercase()) {
     "qobuz" -> "Qobuz"
     "ytmusic", "youtube", "youtubemusic", "yt" -> "YouTube Music"
     "spotify" -> "Spotify"
@@ -182,7 +181,7 @@ private fun serviceLabel(service: String): String = when (service.lowercase()) {
 }
 
 /** Plural-aware track count, or null when unknown (so callers can hide it). */
-private fun trackCountLabel(count: Int?): String? = when {
+fun trackCountLabel(count: Int?): String? = when {
     count == null -> null
     count == 1 -> "1 track"
     else -> "$count tracks"
@@ -285,22 +284,27 @@ private fun normalizeBaseUrl(hostPort: String): String {
 
 @Composable
 private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
-    var tab by rememberSaveable { mutableIntStateOf(0) }
+    // An open entity (artist/album/track) overlays the whole tab shell; Back pops it.
+    if (state.detailStack.isNotEmpty()) {
+        DetailHost(vm, state)
+        return
+    }
+    val tab = state.tab
     Scaffold(
         // The NavigationBar owns the bottom inset; each screen's TopAppBar owns the
         // top inset. This Scaffold adds none of its own, so insets apply once.
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
             NavigationBar {
-                NavigationBarItem(selected = tab == 0, onClick = { tab = 0 },
+                NavigationBarItem(selected = tab == 0, onClick = { vm.setTab(0) },
                     icon = { Icon(Icons.Filled.Search, null) }, label = { Text("Search") })
-                NavigationBarItem(selected = tab == 1, onClick = { tab = 1 },
+                NavigationBarItem(selected = tab == 1, onClick = { vm.setTab(1) },
                     icon = { Icon(Icons.Filled.LibraryMusic, null) }, label = { Text("Library") })
-                NavigationBarItem(selected = tab == 2, onClick = { tab = 2 },
+                NavigationBarItem(selected = tab == 2, onClick = { vm.setTab(2) },
                     icon = { Icon(Icons.Filled.Sync, null) }, label = { Text("Sync") })
-                NavigationBarItem(selected = tab == 3, onClick = { tab = 3 },
+                NavigationBarItem(selected = tab == 3, onClick = { vm.setTab(3) },
                     icon = { Icon(Icons.Filled.Speaker, null) }, label = { Text("Route") })
-                NavigationBarItem(selected = tab == 4, onClick = { tab = 4 },
+                NavigationBarItem(selected = tab == 4, onClick = { vm.setTab(4) },
                     icon = { Icon(Icons.Filled.MusicNote, null) }, label = { Text("Playing") })
             }
         }
@@ -689,6 +693,7 @@ private fun RouteScreen(vm: HarmonyViewModel, state: UiState) {
 @Composable
 private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
     val focus = LocalFocusManager.current
+    val submit = { vm.smartSearch(); focus.clearFocus() }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
             title = { Text(state.instanceName ?: "Harmony", maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -698,9 +703,10 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
             verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = state.query, onValueChange = { vm.setQuery(it) },
-                label = { Text("Search songs") }, singleLine = true, modifier = Modifier.weight(1f),
+                label = { Text("Search artists, albums, songs") },
+                singleLine = true, modifier = Modifier.weight(1f),
                 keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(onSearch = { vm.search(); focus.clearFocus() }),
+                keyboardActions = KeyboardActions(onSearch = { submit() }),
                 trailingIcon = {
                     if (state.query.isNotEmpty()) {
                         IconButton(onClick = { vm.setQuery("") }) { Icon(Icons.Filled.Close, "Clear") }
@@ -708,43 +714,42 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
                 },
             )
             Spacer(Modifier.width(8.dp))
-            IconButton(onClick = { vm.search(); focus.clearFocus() }) { Icon(Icons.Filled.Search, "Search") }
+            IconButton(onClick = { submit() }) { Icon(Icons.Filled.Search, "Search") }
         }
-        if (state.searching) {
+        // Service filter — excluding a provider makes it contribute nothing.
+        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
+            val services = listOf("both" to "All", "ytmusic" to "YouTube Music", "qobuz" to "Qobuz")
+            services.forEach { (value, label) ->
+                FilterChip(
+                    selected = state.searchService == value,
+                    onClick = { vm.setSearchService(value) },
+                    label = { Text(label) },
+                    modifier = Modifier.padding(end = 8.dp),
+                )
+            }
+        }
+        if (state.smartSearching) {
             Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
             }
         }
-        if (state.results.isEmpty() && !state.searching) {
-            if (state.query.isBlank()) {
-                EmptyState(
-                    icon = Icons.Filled.Search,
-                    title = "Search for a song",
-                    body = "Find songs across your connected services.",
-                    modifier = Modifier.fillMaxSize(),
-                )
-            } else {
-                EmptyState(
-                    icon = Icons.Filled.Search,
-                    title = "No results",
-                    body = "Nothing matched “${state.query}”. Try a different search.",
-                    modifier = Modifier.fillMaxSize(),
-                )
-            }
-        }
-        LazyColumn(Modifier.fillMaxSize()) {
-            items(state.results) { t ->
-                TrackRow(t, onPlay = { vm.play(t) },
-                    isPlaying = t.id == state.playback.track?.id,
-                    trailing = { AddToPlaylistButton(vm, state, t) })
-            }
+        val smart = state.smart
+        if (smart == null && !state.smartSearching) {
+            EmptyState(
+                icon = Icons.Filled.Search,
+                title = "Search across your services",
+                body = "Find an artist to see their discography and lineup, an album, or a song.",
+                modifier = Modifier.fillMaxSize(),
+            )
+        } else if (smart != null && !state.smartSearching) {
+            SmartResults(vm, state, smart)
         }
     }
 }
 
 /** A track list row: art, title, artist·album, and an optional trailing action. */
 @Composable
-private fun TrackRow(
+fun TrackRow(
     t: Track,
     onPlay: () -> Unit,
     isPlaying: Boolean = false,
@@ -768,7 +773,7 @@ private fun TrackRow(
 }
 
 @Composable
-private fun AddToPlaylistButton(vm: HarmonyViewModel, state: UiState, track: Track) {
+fun AddToPlaylistButton(vm: HarmonyViewModel, state: UiState, track: Track) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { expanded = true }) { Icon(Icons.Filled.Add, "Add to playlist") }

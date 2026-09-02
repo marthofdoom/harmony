@@ -122,6 +122,14 @@ def _first_str(*values: Any) -> str | None:
     return None
 
 
+def _strip_html(text: str) -> str:
+    """Flatten Qobuz's HTML biography (``<p>…</p><br/>``) to plain paragraphs."""
+    text = re.sub(r"(?i)<\s*br\s*/?>", "\n", text)
+    text = re.sub(r"(?i)</\s*p\s*>", "\n\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
 class QobuzProvider(MusicProvider):
     service = Service.QOBUZ
 
@@ -404,6 +412,8 @@ class QobuzProvider(MusicProvider):
         album = raw.get("album") or album_ctx or {}
         performer = raw.get("performer") or {}
         album_artist = album.get("artist") or {}
+        artist_id = performer.get("id") or album_artist.get("id")
+        album_id = album.get("id")
         # ``artist/page``'s ``top_tracks`` entries come back with
         # ``performer: None`` (verified live against Radiohead, artist_id
         # 43840) -- there's no per-track performer on that endpoint, so fall
@@ -416,7 +426,9 @@ class QobuzProvider(MusicProvider):
             title=raw.get("title") or "",
             service=Service.QOBUZ,
             artists=[artist_name] if artist_name else [],
+            artist_ids=[str(artist_id)] if artist_id else [],
             album=album.get("title"),
+            album_id=str(album_id) if album_id else None,
             duration_s=raw.get("duration"),
             isrc=raw.get("isrc"),
             year=_parse_year(album.get("release_date_original") or album.get("release_date")),
@@ -429,12 +441,15 @@ class QobuzProvider(MusicProvider):
 
     def _album_from_raw(self, raw: dict[str, Any]) -> Album:
         artist = raw.get("artist") or {}
+        date = raw.get("release_date_original") or raw.get("release_date")
         return Album(
             id=str(raw.get("id")),
             title=raw.get("title") or "",
             service=Service.QOBUZ,
             artists=[artist["name"]] if artist.get("name") else [],
-            year=_parse_year(raw.get("release_date_original") or raw.get("release_date")),
+            artist_ids=[str(artist["id"])] if artist.get("id") else [],
+            year=_parse_year(date),
+            date=date or None,
             track_count=raw.get("tracks_count"),
             artwork_url=(raw.get("image") or {}).get("large"),
             raw=raw,
@@ -490,10 +505,29 @@ class QobuzProvider(MusicProvider):
         raw = self._request("GET", "track/get", params={"track_id": track_id})
         return self._track_from_raw(raw)
 
+    def get_album_detail(self, album_id: str) -> Album:
+        album = self._request("GET", "album/get", params={"album_id": album_id})
+        return self._album_from_raw(album)
+
     def get_album_tracks(self, album_id: str) -> list[Track]:
         album = self._request("GET", "album/get", params={"album_id": album_id})
         items = (album.get("tracks") or {}).get("items", [])
         return [self._track_from_raw(t, album_ctx=album) for t in items]
+
+    def get_artist_detail(self, artist_id: str) -> Artist:
+        data = self._request("GET", "artist/get", params={"artist_id": artist_id, "extra": "biography"})
+        image = data.get("image") or {}
+        image_url = image.get("extralarge") or image.get("large") or image.get("medium")
+        bio = data.get("biography") or {}
+        summary = _strip_html(bio.get("content") or bio.get("summary") or "") if isinstance(bio, dict) else ""
+        return Artist(
+            id=str(data.get("id") or artist_id),
+            name=data.get("name") or "",
+            service=Service.QOBUZ,
+            image_url=image_url,
+            bio=summary,
+            raw=data,
+        )
 
     def get_artist_albums(self, artist_id: str, *, limit: int = 100) -> list[Album]:
         data = self._request(

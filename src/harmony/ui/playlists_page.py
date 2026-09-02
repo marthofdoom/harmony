@@ -19,6 +19,7 @@ from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     play_collection_on_device,
+    play_track_on_active_device,
     track_menu_actions,
 )
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
@@ -230,7 +231,8 @@ class PlaylistsPage(Gtk.Box):
             "empty",
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
-            on_row_menu=self._track_row_actions, state=self.state
+            on_row_menu=self._track_row_actions, state=self.state,
+            on_row_activate=lambda t: play_track_on_active_device(self.state, t),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")

@@ -43,6 +43,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.0" date="2026-09-02">
+      <description>
+        <p>Browse the music, not just search it. Every artist, album, and track
+        now has its own page — click a name or right-click a row to open it.
+        Artist pages carry a short bio, a chronological discography, and for a
+        band a Wikipedia-style member-timeline chart with album markers. Track
+        pages show who performed on the recording (where MusicBrainz has it).</p>
+        <p>Search got smarter: searching an artist leads with their albums in
+        release order; searching a person (say a band's former singer) shows the
+        albums they actually performed on — the band's records only during their
+        time in it — not the ones before they joined or after they left.</p>
+      </description>
+    </release>
     <release version="0.7.27" date="2026-09-01">
       <description>
         <p>Hardened credential sharing between instances: a copied YouTube login

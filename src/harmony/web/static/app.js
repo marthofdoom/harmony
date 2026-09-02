@@ -12,6 +12,8 @@ const state = {
   target: "browser", // "browser" (this tab's <audio>) or a device host to cast to
   targetVia: null,   // peer "host:port" when the device lives on another instance's LAN
   devicePaused: false,
+  section: "search", // last non-detail view (restored when a detail page is left)
+  detail: false,     // true while an artist/album/track detail page is showing
 };
 
 const onDevice = () => state.target !== "browser";
@@ -138,7 +140,137 @@ async function apiPost(path, body, _retry) {
   return j;
 }
 
+// -- navigation: hash router + floating context menu ------------------------
+
+// Detail pages are addressable so the browser Back button and deep links work:
+// #/artist/<svc>/<id>, #/album/<svc>/<id>, #/track/<svc>/<id>. Ids are encoded
+// (Qobuz ids are numeric, YT browseIds are opaque) so slashes never split a route.
+const routeHref = (kind, service, id) =>
+  `#/${kind}/${encodeURIComponent(service)}/${encodeURIComponent(id)}`;
+const navigateArtist = (service, id) => { location.hash = routeHref("artist", service, id); };
+const navigateAlbum = (service, id) => { location.hash = routeHref("album", service, id); };
+const navigateTrack = (service, id) => { location.hash = routeHref("track", service, id); };
+
+function parseHash() {
+  const m = (location.hash || "").match(/^#\/(artist|album|track)\/([^/]+)\/(.+)$/);
+  if (!m) return null;
+  return { kind: m[1], service: decodeURIComponent(m[2]), id: decodeURIComponent(m[3]) };
+}
+
+// Swap the placeholder icon in any [data-art] box for its cover once it loads
+// (mirrors the lazy-load used for playlist cards; a broken URL keeps the icon).
+function hydrateArt(scope) {
+  scope.querySelectorAll("[data-art]").forEach((el) => {
+    const url = el.dataset.art;
+    if (!url) return;
+    const img = new Image();
+    img.alt = "";
+    img.className = "artimg";
+    img.onload = () => { el.classList.remove("fallback"); el.replaceChildren(img); };
+    img.src = url;
+  });
+}
+
+// A floating menu that mirrors openAddMenu (outside-click + Escape close,
+// keyboard reachable). `items` is [{label, fn}]; anchored at viewport (x, y).
+function openContextMenu(x, y, items) {
+  document.querySelectorAll(".addmenu").forEach((m) => m.remove());
+  if (!items.length) return;
+  const menu = document.createElement("div");
+  menu.className = "addmenu";
+  menu.setAttribute("role", "menu");
+  menu.innerHTML = items.map((it, i) =>
+    `<div role="menuitem" tabindex="0" data-i="${i}">${esc(it.label)}</div>`).join("");
+  document.body.appendChild(menu);
+  const close = () => menu.remove();
+  menu.querySelectorAll("[data-i]").forEach((el) => {
+    const it = items[Number(el.dataset.i)];
+    el.addEventListener("click", () => { close(); it.fn(); });
+    el.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); close(); it.fn(); }
+    });
+  });
+  menu.style.top = `${Math.min(y, window.innerHeight - menu.offsetHeight - 8)}px`;
+  menu.style.left = `${Math.min(Math.max(8, x), window.innerWidth - menu.offsetWidth - 8)}px`;
+  document.addEventListener("keydown", function onEsc(e) {
+    if (e.key === "Escape") { close(); document.removeEventListener("keydown", onEsc); }
+  });
+  setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
+  const first = menu.querySelector("[data-i]");
+  if (first) first.focus();
+}
+
+function openTrackContextMenu(e, t) {
+  const items = [];
+  if (t.artist_ids && t.artist_ids[0])
+    items.push({ label: "Go to artist", fn: () => navigateArtist(t.service, t.artist_ids[0]) });
+  if (t.album_id)
+    items.push({ label: "Go to album", fn: () => navigateAlbum(t.service, t.album_id) });
+  if (!items.length) return;
+  e.preventDefault();
+  openContextMenu(e.clientX, e.clientY, items);
+}
+
+function openAlbumContextMenu(e, a) {
+  const items = [];
+  if (a.id) items.push({ label: "Go to album", fn: () => navigateAlbum(a.service, a.id) });
+  if (a.artist_ids && a.artist_ids[0])
+    items.push({ label: "Go to artist", fn: () => navigateArtist(a.service, a.artist_ids[0]) });
+  if (!items.length) return;
+  e.preventDefault();
+  openContextMenu(e.clientX, e.clientY, items);
+}
+
+const _truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""));
+function spanLabel(spans) {
+  if (!spans || !spans.length) return "";
+  return spans.map((sp) => `${sp[0] == null ? "?" : sp[0]}–${sp[1] == null ? "present" : sp[1]}`).join(", ");
+}
+
 // -- rendering --------------------------------------------------------------
+
+// The artist name in a track row links to the artist page when the provider
+// gave us an id (`artist_ids` runs parallel to the underlying artist list).
+function trackArtistCell(t) {
+  if (t.artist_ids && t.artist_ids[0])
+    return `<a class="artist" href="${routeHref("artist", t.service, t.artist_ids[0])}">${esc(t.artist)}</a>`;
+  return `<div class="artist">${esc(t.artist)}</div>`;
+}
+
+function trackRowHtml(t, i, opts = {}) {
+  const pl = state.playlist;
+  const num = opts.numbered ? `<span class="tnum">${t.track_number != null ? t.track_number : i + 1}</span>` : "";
+  return `
+    <div class="trow${opts.numbered ? " numbered" : ""}" data-i="${i}">
+      <div class="tlead">${num}<button class="play" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
+      <div class="title"><span class="tt">${esc(t.title)}</span>${opts.hideBadge ? "" : `<span class="badge">${esc(serviceLabel(t.service))}</span>`}</div>
+      ${trackArtistCell(t)}
+      <div class="dur">${fmtTime(t.duration_s)}</div>
+      <div class="rowacts">
+        <button class="mini add" aria-label="Add to playlist">${ICON("add")}</button>
+        ${pl ? `<button class="mini rem" aria-label="Remove from this playlist">${ICON("remove")}</button>` : ""}
+      </div>
+    </div>`;
+}
+
+const tracksHtml = (tracks, opts = {}) =>
+  `<div class="tracks">${tracks.map((t, i) => trackRowHtml(t, i, opts)).join("")}</div>`;
+
+// Wire a rendered set of track rows to shared playback + row menus. The caller
+// owns `state.queue` (so playAt indexes correctly); we only attach handlers.
+function wireTrackRows(scope, tracks) {
+  scope.querySelectorAll(".trow").forEach((row) => {
+    const i = Number(row.dataset.i);
+    row.querySelector(".play").addEventListener("click", () => playAt(i));
+    const add = row.querySelector(".add");
+    if (add) add.addEventListener("click", (e) => { e.preventDefault(); openAddMenu(e.currentTarget, tracks[i]); });
+    const rem = row.querySelector(".rem");
+    if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
+    row.addEventListener("contextmenu", (e) => openTrackContextMenu(e, tracks[i]));
+    // Double-click anywhere on the row (but not on a link/button) plays it.
+    row.addEventListener("dblclick", (e) => { if (!e.target.closest("a, button")) playAt(i); });
+  });
+}
 
 function renderTracks(tracks, opts = {}) {
   const list = $("list");
@@ -157,26 +289,9 @@ function renderTracks(tracks, opts = {}) {
                    opts.query ? "Try a different title or artist." : "Search for a song to get started.");
     list.innerHTML = toolbar + empty; wirePlaylistToolbar(); return;
   }
-  const rows = tracks.map((t, i) => `
-    <div class="trow" data-i="${i}">
-      <button class="play" aria-label="Play ${esc(t.title)}">${ICON("play")}</button>
-      <div class="title"><span class="tt">${esc(t.title)}</span><span class="badge">${esc(serviceLabel(t.service))}</span></div>
-      <div class="artist">${esc(t.artist)}</div>
-      <div class="dur">${fmtTime(t.duration_s)}</div>
-      <div class="rowacts">
-        <button class="mini add" aria-label="Add to playlist">${ICON("add")}</button>
-        ${pl ? `<button class="mini rem" aria-label="Remove from this playlist">${ICON("remove")}</button>` : ""}
-      </div>
-    </div>`).join("");
-  list.innerHTML = toolbar + `<div class="tracks">${rows}</div>`;
+  list.innerHTML = toolbar + tracksHtml(tracks, opts);
   state.queue = tracks;
-  list.querySelectorAll(".trow").forEach((row) => {
-    const i = Number(row.dataset.i);
-    row.querySelector(".play").addEventListener("click", () => playAt(i));
-    row.querySelector(".add").addEventListener("click", (e) => openAddMenu(e.currentTarget, tracks[i]));
-    const rem = row.querySelector(".rem");
-    if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
-  });
+  wireTrackRows(list, tracks);
   wirePlaylistToolbar();
   highlightPlaying();
 }
@@ -287,6 +402,8 @@ function highlightNav(view) {
 }
 
 function setView(view) {
+  state.section = view;
+  state.detail = false;
   highlightNav(view);
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
@@ -574,6 +691,364 @@ async function doSearch(q) {
   } catch (e) { $("list").innerHTML = errorState("Search failed", e.message, "s-retry"); $("s-retry").onclick = () => doSearch(q); }
 }
 
+// -- shared detail-page building blocks -------------------------------------
+
+// A chronological album list. Rows with a provider id navigate to the album
+// page; rows whose id is null (a PERSON's MusicBrainz "performed-on" credits,
+// with no provider match) are informational — shown, but not playable.
+function albumRowsHtml(albums, opts = {}) {
+  return albums.map((a) => {
+    const nav = a.id != null && a.id !== "";
+    const yr = a.year != null ? a.year : (a.date ? String(a.date).slice(0, 4) : "");
+    const aids = (a.artist_ids || []).join(",");
+    const inner = `
+      <div class="alb-year">${esc(yr || "—")}</div>
+      <div class="alb-art" data-art="${esc(a.artwork_url || "")}">${ICON("music")}</div>
+      <div class="alb-meta">
+        <div class="alb-title">${esc(a.title)}</div>
+        ${opts.showArtist && a.artist ? `<div class="alb-artist muted">${esc(a.artist)}</div>` : ""}
+      </div>`;
+    const data = `data-svc="${esc(a.service)}" data-id="${esc(a.id || "")}" data-aids="${esc(aids)}"`;
+    if (nav)
+      return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}</a>`;
+    return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="badge">credit</span></div>`;
+  }).join("");
+}
+
+function wireAlbumRows(scope) {
+  scope.querySelectorAll(".albrow").forEach((row) => {
+    row.addEventListener("contextmenu", (e) => openAlbumContextMenu(e, {
+      service: row.dataset.svc,
+      id: row.dataset.id || null,
+      artist_ids: row.dataset.aids ? row.dataset.aids.split(",").filter(Boolean) : [],
+    }));
+  });
+}
+
+// Members / bands / performers — clicking one runs a smart search for the name
+// (these come from MusicBrainz and carry no provider id of their own).
+function peopleChipsHtml(people, opts = {}) {
+  return `<div class="chips">${people.map((p) => {
+    const sub = opts.instruments && p.instruments && p.instruments.length
+      ? p.instruments.join(", ") : spanLabel(p.spans);
+    return `<button class="chip" data-name="${esc(p.name)}">
+      <span class="chip-name">${esc(p.name)}${opts.current && p.is_current ? ` <span class="badge">current</span>` : ""}</span>
+      ${sub ? `<span class="chip-sub muted">${esc(sub)}</span>` : ""}</button>`;
+  }).join("")}</div>`;
+}
+
+function wireChips(scope) {
+  scope.querySelectorAll(".chip[data-name]").forEach((c) =>
+    c.addEventListener("click", () => { $("search-input").value = c.dataset.name; doSmartSearch(c.dataset.name); }));
+}
+
+function bioHtml(bio) {
+  if (!bio || !bio.text) return "";
+  const label = bio.source === "wikipedia" ? "Wikipedia" : "source";
+  const src = bio.url
+    ? `<p class="muted bio-src">From <a class="link" href="${esc(bio.url)}" target="_blank" rel="noopener">${label}</a></p>`
+    : "";
+  return `<section class="detail-sec"><h3>About</h3><p class="bio-text">${esc(bio.text)}</p>${src}</section>`;
+}
+
+function detailHeader(title, subHtml, artUrl, kind) {
+  return `
+    <div class="detail-head">
+      <button class="backbtn" id="detail-back" aria-label="Go back">${ICON("prev")} Back</button>
+    </div>
+    <div class="detail-hero">
+      <div class="detail-art" data-art="${esc(artUrl || "")}">${ICON("music")}</div>
+      <div class="detail-herometa">
+        ${kind ? `<div class="detail-kind">${esc(kind)}</div>` : ""}
+        <h2 class="detail-title">${esc(title)}</h2>
+        ${subHtml ? `<div class="detail-sub">${subHtml}</div>` : ""}
+      </div>
+    </div>`;
+}
+
+function wireBack() {
+  const b = $("detail-back");
+  if (!b) return;
+  b.onclick = () => {
+    if (history.length > 1) history.back();
+    else { history.replaceState(null, "", location.pathname + location.search); showSection("search"); }
+  };
+}
+
+// -- detail views -----------------------------------------------------------
+
+async function renderArtistView(service, id) {
+  const list = $("list");
+  state.detail = true;
+  state.playlist = null;
+  highlightNav("");
+  $("view-title").textContent = "Artist";
+  list.innerHTML = loadingState("Loading artist…");
+  let d;
+  try { d = await api(`/api/artist/${encodeURIComponent(service)}/${encodeURIComponent(id)}`); }
+  catch (e) { list.innerHTML = errorState("Couldn’t load this artist", e.message, "ar-retry"); $("ar-retry").onclick = () => renderArtistView(service, id); return; }
+
+  const a = d.artist || {};
+  $("view-title").textContent = a.name || "Artist";
+  const kindLabel = d.kind === "group" ? "Group" : "Artist";
+  const isPerson = d.kind === "person";
+
+  const albums = d.albums || [];
+  const albumsSec = albums.length ? `
+    <section class="detail-sec">
+      <h3>${isPerson ? "Appears on" : "Discography"}</h3>
+      <div class="albrows">${albumRowsHtml(albums, { showArtist: isPerson })}</div>
+    </section>` : "";
+
+  const chartSec = d.chronology ? `
+    <section class="detail-sec">
+      <h3>Timeline</h3>
+      <div class="chrono-wrap">${buildChronologySvg(d.chronology)}</div>
+    </section>` : "";
+
+  const top = d.top_tracks || [];
+  const topSec = top.length ? `<section class="detail-sec"><h3>Top tracks</h3>${tracksHtml(top)}</section>` : "";
+
+  const members = d.members || [];
+  const bands = d.member_of || [];
+  let peopleSec = "";
+  if (members.length) peopleSec += `<section class="detail-sec"><h3>Members</h3>${peopleChipsHtml(members, { instruments: true, current: true })}</section>`;
+  if (bands.length) peopleSec += `<section class="detail-sec"><h3>Member of</h3>${peopleChipsHtml(bands, {})}</section>`;
+
+  list.innerHTML = `<div class="detail">
+    ${detailHeader(a.name || "Unknown artist", "", a.image_url, kindLabel)}
+    ${bioHtml(a.bio)}
+    ${chartSec}
+    ${albumsSec}
+    ${topSec}
+    ${peopleSec}
+  </div>`;
+  wireBack();
+  hydrateArt(list);
+  wireAlbumRows(list);
+  wireChips(list);
+  if (top.length) { state.queue = top; wireTrackRows(list, top); highlightPlaying(); }
+}
+
+async function renderAlbumView(service, id) {
+  const list = $("list");
+  state.detail = true;
+  state.playlist = null;
+  highlightNav("");
+  $("view-title").textContent = "Album";
+  list.innerHTML = loadingState("Loading album…");
+  let d;
+  try { d = await api(`/api/album/${encodeURIComponent(service)}/${encodeURIComponent(id)}`); }
+  catch (e) { list.innerHTML = errorState("Couldn’t load this album", e.message, "al-retry"); $("al-retry").onclick = () => renderAlbumView(service, id); return; }
+
+  const al = d.album || {};
+  const ref = d.artist_ref;
+  $("view-title").textContent = al.title || "Album";
+  const yr = al.year != null ? al.year : (al.date ? String(al.date).slice(0, 4) : "");
+  const artistHtml = ref
+    ? `<a class="link" href="${routeHref("artist", ref.service, ref.id)}">${esc(ref.name)}</a>`
+    : esc(al.artist || "");
+  const bits = [artistHtml, yr ? esc(String(yr)) : "", al.track_count != null ? esc(nTracks(al.track_count)) : ""]
+    .filter(Boolean).join(" · ");
+  const tracks = d.tracks || [];
+  const tracksSec = tracks.length
+    ? tracksHtml(tracks, { numbered: true, hideBadge: true })
+    : emptyState("music", "No tracks", "This album has no playable tracks right now.");
+
+  list.innerHTML = `<div class="detail">
+    ${detailHeader(al.title || "Album", bits, al.artwork_url, "Album")}
+    ${bioHtml(d.bio)}
+    <section class="detail-sec">${tracksSec}</section>
+  </div>`;
+  wireBack();
+  hydrateArt(list);
+  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
+}
+
+async function renderTrackView(service, id) {
+  const list = $("list");
+  state.detail = true;
+  state.playlist = null;
+  highlightNav("");
+  $("view-title").textContent = "Track";
+  list.innerHTML = loadingState("Loading track…");
+  let d;
+  try { d = await api(`/api/track/${encodeURIComponent(service)}/${encodeURIComponent(id)}`); }
+  catch (e) { list.innerHTML = errorState("Couldn’t load this track", e.message, "tk-retry"); $("tk-retry").onclick = () => renderTrackView(service, id); return; }
+
+  const t = d.track || {};
+  $("view-title").textContent = t.title || "Track";
+  const refs = d.artist_refs || [];
+  const artistsHtml = (list2) => list2.map((r) =>
+    `<a class="link" href="${routeHref("artist", r.service, r.id)}">${esc(r.name)}</a>`).join(", ");
+  const artistHtml = refs.length ? artistsHtml(refs) : esc(t.artist || "");
+  const albumHtml = d.album_ref
+    ? `<a class="link" href="${routeHref("album", d.album_ref.service, d.album_ref.id)}">${esc(d.album_ref.title)}</a>`
+    : esc(t.album || "");
+  const meta = [artistHtml, albumHtml, t.year ? esc(String(t.year)) : "", t.duration_s ? fmtTime(t.duration_s) : ""]
+    .filter(Boolean).join(" · ");
+
+  const perf = d.performers || [];
+  let perfSec;
+  if (perf.length) {
+    perfSec = `<section class="detail-sec"><h3>Performers</h3>
+      <div class="perf">${perf.map((p) => `
+        <div class="perf-row">
+          <button class="chip" data-name="${esc(p.name)}"><span class="chip-name">${esc(p.name)}</span></button>
+          <span class="perf-roles muted">${esc((p.roles || []).join(", "))}</span>
+        </div>`).join("")}</div></section>`;
+  } else {
+    const credited = refs.length ? artistsHtml(refs) : esc(t.artist || "");
+    perfSec = `<section class="detail-sec"><h3>Performers</h3>
+      ${credited ? `<p class="credited">${credited}</p>` : ""}
+      <p class="muted">Detailed performer credits aren’t in MusicBrainz for this recording.</p></section>`;
+  }
+
+  list.innerHTML = `<div class="detail">
+    ${detailHeader(t.title || "Track", meta, t.artwork_url, "Track")}
+    <section class="detail-sec">
+      <button class="act" id="tk-play">${ICON("play")} Play track</button>
+    </section>
+    ${perfSec}
+  </div>`;
+  wireBack();
+  hydrateArt(list);
+  wireChips(list);
+  $("tk-play").onclick = () => { state.queue = [t]; playAt(0); };
+}
+
+// -- member-chronology timeline chart (inline SVG, theme-aware, scrollable) --
+
+function buildChronologySvg(c) {
+  const start = c.start_year;
+  const end = Math.max(c.end_year, start + 1);
+  const span = end - start;
+  const members = c.members || [];
+  const albums = (c.albums || []).filter((a) => a.year != null);
+
+  const labelW = 150, rightPad = 26;
+  const plotW = Math.max(span * 42, 360);       // long timelines overflow → scroll
+  const yearW = plotW / span;
+  const X = (y) => labelW + (Math.max(start, Math.min(end, y)) - start) * yearW;
+
+  const topLabels = albums.length ? 84 : 10;    // room for rotated album titles
+  const axisH = 26, rowH = 38, barH = 18;
+  const axisY = topLabels;
+  const lanesTop = topLabels + axisH;
+  const height = lanesTop + members.length * rowH + 14;
+  const width = labelW + plotW + rightPad;
+
+  const maxTicks = Math.max(2, Math.floor(plotW / 52));
+  const step = [1, 2, 5, 10, 20, 25, 50, 100].find((s) => span / s <= maxTicks) || 100;
+  const ticks = [];
+  for (let y = Math.ceil(start / step) * step; y <= end; y += step) ticks.push(y);
+  if (!ticks.length || ticks[0] !== start) ticks.unshift(start);
+
+  let svg = "";
+  members.forEach((m, k) => {
+    if (k % 2 === 1)
+      svg += `<rect class="chrono-stripe" x="${labelW}" y="${(lanesTop + k * rowH).toFixed(1)}" width="${plotW.toFixed(1)}" height="${rowH}"/>`;
+  });
+  albums.forEach((a) => {
+    const x = X(a.year), ty = axisY - 8;
+    svg += `<line class="chrono-albline" x1="${x.toFixed(1)}" y1="${axisY}" x2="${x.toFixed(1)}" y2="${height - 8}"/>`;
+    svg += `<text class="chrono-albtitle" x="${x.toFixed(1)}" y="${ty}" transform="rotate(-40 ${x.toFixed(1)} ${ty})">${esc(_truncate(a.title, 22))} · ${esc(String(a.year))}</text>`;
+  });
+  svg += `<line class="chrono-axis" x1="${labelW}" y1="${axisY}" x2="${(width - rightPad).toFixed(1)}" y2="${axisY}"/>`;
+  ticks.forEach((y) => {
+    const x = X(y);
+    svg += `<line class="chrono-tick" x1="${x.toFixed(1)}" y1="${axisY}" x2="${x.toFixed(1)}" y2="${axisY + 5}"/>`;
+    svg += `<text class="chrono-year" x="${x.toFixed(1)}" y="${axisY + 18}" text-anchor="middle">${y}</text>`;
+  });
+  members.forEach((m, k) => {
+    const cy = lanesTop + k * rowH + rowH / 2;
+    const barY = cy - barH / 2;
+    (m.spans || []).forEach((sp) => {
+      const x1 = X(sp[0] == null ? start : sp[0]);
+      const x2 = X(sp[1] == null ? end : sp[1]);
+      svg += `<rect class="chrono-bar" x="${x1.toFixed(1)}" y="${barY.toFixed(1)}" width="${Math.max(6, x2 - x1).toFixed(1)}" height="${barH}" rx="4"><title>${esc(m.name)}: ${sp[0] == null ? "?" : sp[0]}–${sp[1] == null ? "present" : sp[1]}</title></rect>`;
+    });
+    const instr = (m.instruments && m.instruments.length) ? m.instruments[0] : "";
+    const nameY = instr ? cy - 5 : cy;
+    svg += `<text class="chrono-name" x="${labelW - 12}" y="${nameY.toFixed(1)}" text-anchor="end" dominant-baseline="middle">${esc(_truncate(m.name, 20))}</text>`;
+    if (instr)
+      svg += `<text class="chrono-instr" x="${labelW - 12}" y="${(cy + 9).toFixed(1)}" text-anchor="end" dominant-baseline="middle">${esc(_truncate(instr, 18))}</text>`;
+  });
+
+  return `<svg class="chrono" width="${width.toFixed(0)}" height="${height}" viewBox="0 0 ${width.toFixed(0)} ${height}" role="img" aria-label="Member timeline, ${start} to ${end}">${svg}</svg>`;
+}
+
+// -- smart search -----------------------------------------------------------
+
+async function doSmartSearch(q) {
+  state.playlist = null;
+  state.detail = false;
+  state.section = "search";
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  highlightNav("search");
+  $("view-title").textContent = "Search";
+  if ($("search-input").value !== q) $("search-input").value = q;
+  $("list").innerHTML = loadingState(`Searching for “${q}”…`);
+  let r;
+  try { r = await api(`/api/search/smart?q=${encodeURIComponent(q)}`); }
+  catch (e) { $("list").innerHTML = errorState("Search failed", e.message, "s-retry"); $("s-retry").onclick = () => doSmartSearch(q); return; }
+  renderSmartResults(r, q);
+}
+
+// Sections render top-to-bottom in the spec order: artist discography (if a
+// confident name match), then album-title matches, then incidental hits.
+function renderSmartResults(r, q) {
+  const list = $("list");
+  const inc = r.incidental || {};
+  let html = "";
+
+  if (r.artist) {
+    const a = r.artist;
+    html += `<section class="detail-sec">
+      <div class="sec-head">
+        <h3>${esc(a.ref.name)}</h3>
+        <a class="link" href="${routeHref("artist", a.ref.service, a.ref.id)}">View artist →</a>
+      </div>
+      <div class="muted sec-sub">${a.kind === "person" ? "Appears on" : "Discography"}</div>
+      ${a.albums && a.albums.length
+        ? `<div class="albrows">${albumRowsHtml(a.albums, { showArtist: a.kind === "person" })}</div>`
+        : `<p class="muted">No albums found.</p>`}
+    </section>`;
+  }
+  if (r.albums && r.albums.length) {
+    html += `<section class="detail-sec"><h3>Albums</h3>
+      <div class="albrows">${albumRowsHtml(r.albums, { showArtist: true })}</div></section>`;
+  }
+  const tracks = inc.tracks || [];
+  if (tracks.length) html += `<section class="detail-sec"><h3>Tracks</h3>${tracksHtml(tracks)}</section>`;
+  if (inc.artists && inc.artists.length) {
+    html += `<section class="detail-sec"><h3>Artists</h3><div class="chips">${inc.artists.map((ar) =>
+      `<a class="chip" href="${routeHref("artist", ar.service, ar.id)}"><span class="chip-name">${esc(ar.name)}</span><span class="chip-sub muted">${esc(serviceLabel(ar.service))}</span></a>`).join("")}</div></section>`;
+  }
+  if (inc.playlists && inc.playlists.length) {
+    html += `<section class="detail-sec"><h3>Playlists</h3><div class="plgrid">${inc.playlists.map((p) =>
+      `<div class="plcard" data-service="${esc(p.service)}" data-id="${esc(p.id)}" data-art="${esc(p.artwork_url || "")}">
+        <div class="art">${ICON("music")}</div>
+        <div class="t">${esc(p.title)}</div>
+        <div class="s">${esc(serviceLabel(p.service))}${p.track_count != null ? " · " + nTracks(p.track_count) : ""}</div>
+      </div>`).join("")}</div></section>`;
+  }
+
+  if (!html) {
+    list.innerHTML = emptyState("search", `No results for “${q}”`, "Try a different title or artist.");
+    return;
+  }
+  list.innerHTML = html;
+  hydrateArt(list);
+  wireAlbumRows(list);
+  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
+  list.querySelectorAll(".plcard").forEach((card) => {
+    const url = card.dataset.art;
+    if (url) { const img = new Image(); img.className = "art"; img.alt = ""; img.onload = () => { const slot = card.querySelector(".art"); if (slot) slot.replaceWith(img); }; img.src = url; }
+    card.addEventListener("click", () => openPlaylist(card.dataset.service, card.dataset.id, card.querySelector(".t").textContent));
+  });
+}
+
 async function loadPlaylists() {
   state.playlist = null;
   $("list").innerHTML = loadingState("Loading playlists…");
@@ -779,15 +1254,41 @@ async function loadDevices() {
 
 // -- wiring -----------------------------------------------------------------
 
-$("search").addEventListener("submit", (e) => { e.preventDefault(); const q = $("search-input").value.trim(); if (q) doSearch(q); });
+// Switch to a section view, leaving any detail page. Detail pages live in the
+// URL hash; clearing it (replaceState — no extra history entry) returns here.
+function showSection(view) {
+  const leavingDetail = state.detail || !!$("list").querySelector(".detail");
+  state.detail = false;
+  // setView("search") intentionally leaves #list untouched (search keeps its
+  // results), so coming from a detail page we reset it to the hint first.
+  if (view === "search" && leavingDetail)
+    $("list").innerHTML = `<p class="hint">Search for a song, or open your playlists.</p>`;
+  setView(view);
+}
+function goView(view) {
+  if (location.hash) history.replaceState(null, "", location.pathname + location.search);
+  showSection(view);
+}
+
+function renderRoute() {
+  const r = parseHash();
+  if (!r) { if (state.detail) showSection(state.section || "search"); return; }
+  if (r.kind === "artist") renderArtistView(r.service, r.id);
+  else if (r.kind === "album") renderAlbumView(r.service, r.id);
+  else if (r.kind === "track") renderTrackView(r.service, r.id);
+}
+
+$("search").addEventListener("submit", (e) => { e.preventDefault(); const q = $("search-input").value.trim(); if (q) doSmartSearch(q); });
 document.querySelectorAll("#nav li[data-view]").forEach((el) => {
-  el.addEventListener("click", () => setView(el.dataset.view));
-  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); setView(el.dataset.view); } });
+  el.addEventListener("click", () => goView(el.dataset.view));
+  el.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); goView(el.dataset.view); } });
 });
-document.querySelectorAll("#mobilenav button").forEach((el) => el.addEventListener("click", () => setView(el.dataset.view)));
-$("accounts").addEventListener("click", () => setView("accounts"));
+document.querySelectorAll("#mobilenav button").forEach((el) => el.addEventListener("click", () => goView(el.dataset.view)));
+$("accounts").addEventListener("click", () => goView("accounts"));
+window.addEventListener("hashchange", renderRoute);
 loadAccounts();
 loadDevices();
+if (parseHash()) renderRoute();   // deep link → render the detail page on load
 
 // Progressive web app: install + offline shell.
 if ("serviceWorker" in navigator) {

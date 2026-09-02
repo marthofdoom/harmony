@@ -60,8 +60,13 @@ def track_to_dict(t: Any) -> dict[str, Any]:
         "title": t.title,
         "service": t.service.value,
         "artist": t.artist_name,
+        "artist_ids": list(getattr(t, "artist_ids", []) or []),
         "album": t.album,
+        "album_id": getattr(t, "album_id", None),
         "duration_s": t.duration_s,
+        "track_number": getattr(t, "track_number", None),
+        "year": getattr(t, "year", None),
+        "isrc": getattr(t, "isrc", None),
         "artwork_url": t.artwork_url,
     }
 
@@ -79,11 +84,27 @@ def playlist_to_dict(p: Any) -> dict[str, Any]:
 
 def album_to_dict(a: Any) -> dict[str, Any]:
     return {"id": a.id, "title": a.title, "service": a.service.value,
-            "artist": _artists(a), "year": a.year, "artwork_url": a.artwork_url}
+            "artist": _artists(a), "artist_ids": list(getattr(a, "artist_ids", []) or []),
+            "year": a.year, "date": getattr(a, "date", None),
+            "track_count": getattr(a, "track_count", None), "artwork_url": a.artwork_url}
 
 
 def artist_to_dict(a: Any) -> dict[str, Any]:
-    return {"id": a.id, "name": a.name, "service": a.service.value}
+    return {"id": a.id, "name": a.name, "service": a.service.value,
+            "image_url": getattr(a, "image_url", None), "bio": getattr(a, "bio", "")}
+
+
+def _artist_ref(service_value: str, artist_id: str, name: str) -> dict[str, Any]:
+    return {"service": service_value, "id": artist_id, "name": name}
+
+
+def _album_ref(service_value: str, album_id: str, title: str) -> dict[str, Any]:
+    return {"service": service_value, "id": album_id, "title": title}
+
+
+def _sort_albums_chrono(albums: list[Any]) -> list[Any]:
+    """Chronological ascending; undated albums sink to the end, then by title."""
+    return sorted(albums, key=lambda a: (a.year is None, a.year or 0, a.title.lower()))
 
 
 class Engine:
@@ -414,7 +435,315 @@ class Engine:
                 results["albums"] += [album_to_dict(a) for a in r.albums]
                 results["artists"] += [artist_to_dict(a) for a in r.artists]
                 results["playlists"] += [playlist_to_dict(p) for p in r.playlists]
+        # Album results read chronologically; tracks keep the providers'
+        # popularity/relevance order, which is what a track search wants.
+        results["albums"].sort(key=lambda a: (a["year"] is None, a["year"] or 0, (a["title"] or "").lower()))
         return results
+
+    # -- entity detail pages + smart search --------------------------------
+    #
+    # Provider data (playable albums/tracks, native ids, artwork) is merged with
+    # a MusicBrainz overlay (is this a band or a person, who was in it and when,
+    # what did a person perform on, who played on this recording) and a Wikipedia
+    # bio. MB is best-effort: every path returns provider data even when MB is
+    # off or unreachable, and MB failures never raise past here.
+
+    def _entity_db(self) -> Any:
+        if self._db is None:
+            from harmony.db import Database
+            self._db = Database()
+        return self._db
+
+    def _mb_enabled(self) -> bool:
+        from harmony.config import Settings
+        try:
+            return bool(Settings.load().musicbrainz_enabled)
+        except Exception:  # noqa: BLE001 - a settings read must never break a page
+            return False
+
+    def _overlay(self, name: str, *, prefer_type: str | None = None) -> dict[str, Any] | None:
+        if not name or not self._mb_enabled():
+            return None
+        try:
+            from harmony.enrich import entities
+            return entities.artist_overlay(name, db=self._entity_db(), prefer_type=prefer_type)
+        except Exception as exc:  # noqa: BLE001 - MB is an optional overlay
+            log.info("MusicBrainz overlay failed for %r: %s", name, exc)
+            return None
+
+    @staticmethod
+    def _bio_dict(overlay: dict[str, Any] | None, provider_bio: str) -> dict[str, Any] | None:
+        if overlay and overlay.get("bio"):
+            return overlay["bio"]
+        if provider_bio:
+            return {"text": provider_bio, "url": "", "source": "provider"}
+        return None
+
+    def _search_album_match(self, prov: Any, service_value: str, title: str,
+                            band: str, year: int | None) -> dict[str, Any] | None:
+        """Best provider album for an MB (title, band, year), cached a week.
+
+        Maps a MusicBrainz "performed-on" album onto a playable provider album so
+        a person's discography rows are navigable. Returns ``{}`` (cached) when no
+        confident match exists, so a miss isn't retried on every page load.
+        """
+        from rapidfuzz import fuzz
+        db = self._entity_db()
+        key = f"albmap:{service_value}:{title.lower()}|{band.lower()}"
+        if db is not None:
+            cached = db.cache_get(key, max_age_s=7 * 24 * 3600)
+            if cached is not None:
+                return cached or None
+        match: dict[str, Any] = {}
+        try:
+            res = prov.search(f"{title} {band}".strip(), kinds=("albums",), limit=6)
+        except Exception as exc:  # noqa: BLE001
+            log.info("album mapping search failed (%s): %s", service_value, exc)
+            return None  # transient — don't poison the cache
+        best_score = 0.0
+        for a in res.albums:
+            score = fuzz.token_sort_ratio(title.lower(), a.title.lower())
+            if year and a.year == year:
+                score += 12
+            if score > best_score and score >= 80:
+                best_score = score
+                match = {"id": a.id, "artwork_url": a.artwork_url,
+                         "track_count": a.track_count, "year": a.year}
+        if db is not None:
+            db.cache_put(key, match)
+        return match or None
+
+    def _map_performed_albums(self, prov: Any, service_value: str,
+                              mb_albums: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        for mba in mb_albums:
+            match = self._search_album_match(
+                prov, service_value, mba["title"], mba.get("band", ""), mba.get("year"))
+            out.append({
+                "id": (match or {}).get("id"),
+                "title": mba["title"],
+                "service": service_value,
+                "artist": mba.get("band", ""),
+                "artist_ids": [],
+                "year": mba.get("year"),
+                "date": None,
+                "track_count": (match or {}).get("track_count"),
+                "artwork_url": (match or {}).get("artwork_url"),
+                "mbid": mba.get("mbid"),
+            })
+        return out
+
+    def artist_page(self, service_value: str, artist_id: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            detail = self._try(prov.get_artist_detail, artist_id)
+            albums = self._try(prov.get_artist_albums, artist_id) or []
+            top = self._try(lambda: prov.get_artist_top_tracks(artist_id, limit=10)) or []
+
+        name = (detail.name if detail else "") or (albums[0].artist_name if albums else "")
+        image = detail.image_url if detail else None
+        overlay = self._overlay(name)
+        kind = overlay["kind"] if overlay else "unknown"
+
+        if kind == "person":
+            from harmony.enrich import entities
+            pd = entities.performed_discography(name, db=self._entity_db())
+            with self._lock:
+                albums_out = self._map_performed_albums(
+                    prov, service_value, pd["albums"] if pd else [])
+            singles_out: list[dict[str, Any]] = []
+        else:
+            albums_out = [album_to_dict(a) for a in _sort_albums_chrono(albums)]
+            singles_out = []
+
+        chronology = None
+        if overlay:
+            from harmony.enrich import entities
+            chronology = entities.chronology(overlay)
+            # Make chart album-markers navigable by matching each to a provider
+            # album we already fetched (no extra network) — same year + fuzzy title.
+            if chronology:
+                self._attach_marker_refs(chronology, albums, service_value)
+
+        return {
+            "artist": {
+                "id": artist_id, "name": name, "service": service_value,
+                "image_url": image,
+                "bio": self._bio_dict(overlay, detail.bio if detail else ""),
+            },
+            "kind": kind,
+            "mbid": overlay["mbid"] if overlay else None,
+            "albums": albums_out,
+            "singles": singles_out,
+            "top_tracks": [track_to_dict(t) for t in top],
+            "members": overlay["members"] if overlay else [],
+            "member_of": [
+                {"name": b["name"], "mbid": b.get("mbid"), "spans": b.get("spans", []), "ref": None}
+                for b in (overlay["member_of"] if overlay else [])
+            ],
+            "chronology": chronology,
+        }
+
+    @staticmethod
+    def _attach_marker_refs(chronology: dict[str, Any], provider_albums: list[Any],
+                            service_value: str) -> None:
+        """Add a navigable ``ref`` to each chronology album marker, matched to a
+        provider album by year + fuzzy title (``None`` when nothing matches)."""
+        from rapidfuzz import fuzz
+        for marker in chronology.get("albums", []):
+            ref = None
+            best = 0.0
+            for a in provider_albums:
+                if a.year and marker.get("year") and a.year != marker["year"]:
+                    continue
+                score = fuzz.token_sort_ratio(marker["title"].lower(), a.title.lower())
+                if score > best and score >= 85:
+                    best = score
+                    ref = _album_ref(service_value, a.id, a.title)
+            marker["ref"] = ref
+
+    def album_page(self, service_value: str, album_id: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            header = self._try(prov.get_album_detail, album_id)
+            tracks = self._try(prov.get_album_tracks, album_id) or []
+
+        album_dict = album_to_dict(header) if header else {
+            "id": album_id, "title": tracks[0].album if tracks else "",
+            "service": service_value, "artist": "", "artist_ids": [], "year": None,
+            "date": None, "track_count": None, "artwork_url": None}
+        if not album_dict.get("track_count"):
+            album_dict["track_count"] = len(tracks)
+        if not album_dict.get("artwork_url") and tracks:
+            album_dict["artwork_url"] = tracks[0].artwork_url
+
+        artist_ref = None
+        if header and header.artist_ids and header.artists:
+            artist_ref = _artist_ref(service_value, header.artist_ids[0], header.artists[0])
+        elif tracks and tracks[0].artist_ids and tracks[0].artists:
+            artist_ref = _artist_ref(service_value, tracks[0].artist_ids[0], tracks[0].artists[0])
+
+        return {
+            "album": album_dict,
+            "artist_ref": artist_ref,
+            "bio": None,
+            "tracks": [track_to_dict(t) for t in tracks],
+        }
+
+    def track_page(self, service_value: str, track_id: str) -> dict[str, Any]:
+        prov = self._provider(service_value)
+        if prov is None:
+            raise KeyError(service_value)
+        with self._lock:
+            track = self._try(prov.get_track, track_id)
+        if track is None:
+            raise KeyError(track_id)
+
+        performers: list[dict[str, Any]] = []
+        if self._mb_enabled():
+            try:
+                from harmony.enrich import entities
+                performers = entities.performers(
+                    isrc=track.isrc, artist=track.artist_name, title=track.title,
+                    db=self._entity_db())
+            except Exception as exc:  # noqa: BLE001
+                log.info("performer lookup failed for %r: %s", track.title, exc)
+
+        album_ref = None
+        if track.album_id and track.album:
+            album_ref = _album_ref(service_value, track.album_id, track.album)
+        artist_refs = [
+            _artist_ref(service_value, aid, nm)
+            for aid, nm in zip(track.artist_ids, track.artists, strict=False)
+        ]
+        return {
+            "track": track_to_dict(track),
+            "album_ref": album_ref,
+            "artist_refs": artist_refs,
+            "performers": performers,
+            "mbid": None,
+        }
+
+    def search_smart(self, query: str, service: str = "both") -> dict[str, Any]:
+        provs = [
+            (svc, prov) for svc, prov in self._ensure_providers().items()
+            if service in ("both", svc.value)
+        ]
+        artists: list[Any] = []
+        albums: list[Any] = []
+        tracks: list[Any] = []
+        playlists: list[Any] = []
+        with self._lock:
+            for svc, prov in provs:
+                try:
+                    r = prov.search(query, kinds=("artists", "albums", "tracks", "playlists"), limit=8)
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("smart search failed for %s: %s", svc.value, exc)
+                    continue
+                artists += r.artists
+                albums += r.albums
+                tracks += r.tracks
+                playlists += r.playlists
+
+        from rapidfuzz import fuzz
+        q = query.lower()
+        best_artist = None
+        best_score = 0.0
+        for a in artists:
+            score = fuzz.token_sort_ratio(q, a.name.lower())
+            if score > best_score and score >= 80:
+                best_score, best_artist = score, a
+
+        artist_section = None
+        if best_artist is not None:
+            svc_value = best_artist.service.value
+            overlay = self._overlay(best_artist.name)
+            kind = overlay["kind"] if overlay else "unknown"
+            prov = self._provider(svc_value)
+            if kind == "person":
+                from harmony.enrich import entities
+                pd = entities.performed_discography(best_artist.name, db=self._entity_db())
+                with self._lock:
+                    section_albums = self._map_performed_albums(
+                        prov, svc_value, pd["albums"] if pd else [])
+            else:
+                with self._lock:
+                    a_albums = self._try(prov.get_artist_albums, best_artist.id) or []
+                section_albums = [album_to_dict(a) for a in _sort_albums_chrono(a_albums)]
+            artist_section = {
+                "ref": _artist_ref(svc_value, best_artist.id, best_artist.name),
+                "kind": kind,
+                "mbid": overlay["mbid"] if overlay else None,
+                "albums": section_albums,
+            }
+
+        chosen_id = best_artist.id if best_artist is not None else None
+        return {
+            "query": query,
+            "artist": artist_section,
+            "albums": [album_to_dict(a) for a in _sort_albums_chrono(albums)],
+            "incidental": {
+                "tracks": [track_to_dict(t) for t in tracks],
+                "artists": [
+                    _artist_ref(a.service.value, a.id, a.name)
+                    for a in artists if a.id != chosen_id
+                ],
+                "playlists": [playlist_to_dict(p) for p in playlists],
+            },
+        }
+
+    @staticmethod
+    def _try(fn: Any, *args: Any) -> Any:
+        """Call a provider method, swallowing failures to keep a page best-effort."""
+        try:
+            return fn(*args)
+        except Exception as exc:  # noqa: BLE001
+            log.info("provider call %s failed: %s", getattr(fn, "__name__", fn), exc)
+            return None
 
     def playlists(self) -> dict[str, Any]:
         out = []

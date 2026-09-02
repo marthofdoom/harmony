@@ -18,7 +18,9 @@ from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     play_collection_on_device,
+    play_track_on_active_device,
 )
+from harmony.ui.detail_widgets import album_group, tracks_widget  # noqa: E402
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
@@ -41,6 +43,19 @@ log = logging.getLogger(__name__)
 _KINDS = ["tracks", "albums", "artists", "playlists"]
 _KIND_LABELS = ["Tracks", "Albums", "Artists", "Playlists"]
 _SEARCH_DEBOUNCE_MS = 400
+
+
+def _year_label(year: int) -> Gtk.Label:
+    """A dim, fixed-width release-year prefix, matching the detail pages' album rows."""
+    label = Gtk.Label(label=str(year), valign=Gtk.Align.CENTER)
+    label.add_css_class("dim-label")
+    label.add_css_class("numeric")
+    return label
+
+
+def _sorted_by_year(albums: list[Album]) -> list[Album]:
+    """Chronological ascending; undated albums sink to the end, then by title."""
+    return sorted(albums, key=lambda a: (a.year is None, a.year or 0, a.title.lower()))
 
 
 class SearchPage(Gtk.Box):
@@ -67,7 +82,8 @@ class SearchPage(Gtk.Box):
             "empty",
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
-            on_row_menu=self._track_row_actions, state=self.state
+            on_row_menu=self._track_row_actions, state=self.state,
+            on_row_activate=lambda t: play_track_on_active_device(self.state, t),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_action_sensitivity())
         tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -100,6 +116,13 @@ class SearchPage(Gtk.Box):
         other_box.append(other_scroller)
         self.content_stack.add_named(other_box, "other")
 
+        # Smart search (Enter) renders sections — artist discography, then album
+        # matches, then incidental — into its own scrolled group container.
+        self.smart_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18,
+                                 margin_top=12, margin_bottom=18, margin_start=8, margin_end=8)
+        smart_clamp = Adw.Clamp(child=self.smart_box, maximum_size=920)
+        self.content_stack.add_named(Gtk.ScrolledWindow(child=smart_clamp, vexpand=True), "smart")
+
         self.content_stack.add_named(loading_status_page("Searching…"), "loading")
 
         self.content_stack.set_visible_child_name("empty")
@@ -112,7 +135,7 @@ class SearchPage(Gtk.Box):
                        margin_bottom=8, margin_start=8, margin_end=8)
         self.search_entry = Gtk.SearchEntry(hexpand=True, placeholder_text="Search…")
         self.search_entry.connect("search-changed", self._on_search_changed)
-        self.search_entry.connect("activate", lambda *_a: self._run_search(immediate=True))
+        self.search_entry.connect("activate", lambda *_a: self._run_smart_search())
         box.append(self.search_entry)
 
         self.kind_dropdown = Gtk.DropDown.new_from_strings(_KIND_LABELS)
@@ -246,18 +269,39 @@ class SearchPage(Gtk.Box):
         while row := self.other_list.get_row_at_index(0):
             self.other_list.remove(row)
         items: list[Album | Artist | Playlist]
-        items = {"albums": results.albums, "artists": results.artists, "playlists": results.playlists}[kind]
+        # Album results read chronologically; artists/playlists keep provider order.
+        items = {"albums": _sorted_by_year(results.albums),
+                 "artists": results.artists, "playlists": results.playlists}[kind]
         for item in items:
             subtitle = item.service.label
             if isinstance(item, Album):
                 subtitle = f"{item.artist_name} · {item.service.label}"
             row = Adw.ActionRow(title=item.title if hasattr(item, "title") else item.name, subtitle=subtitle)
+            if isinstance(item, Album) and item.year:
+                row.add_prefix(_year_label(item.year))
             row.set_activatable(True)
             row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-            row.connect("activated", lambda _r, it=item: self._drill_into(it))
+            row.connect("activated", lambda _r, it=item: self._open_item(it))
             attach_context_menu(row, lambda it=item, r=row: self._other_row_actions(it, r))
             self.other_list.append(row)
         self.content_stack.set_visible_child_name("other")
+
+    # -- navigation to detail pages -----------------------------------------
+
+    def _navigator(self) -> object | None:
+        return getattr(self.state, "navigator", None)
+
+    def _open_item(self, item: Album | Artist | Playlist) -> None:
+        """Row-activate / "Open": artists and albums go to their detail pages;
+        playlists (which have no detail page) still drill in-place."""
+        nav = self._navigator()
+        if nav is not None and isinstance(item, Artist) and item.id:
+            nav.go_to_artist(item.service, item.id)
+            return
+        if nav is not None and isinstance(item, Album) and item.id:
+            nav.go_to_album(item.service, item.id)
+            return
+        self._drill_into(item)
 
     def _drill_into(self, item: Album | Artist | Playlist) -> None:
         """Row-activate on a non-track result.
@@ -318,12 +362,14 @@ class SearchPage(Gtk.Box):
             while row := self.other_list.get_row_at_index(0):
                 self.other_list.remove(row)
             if albums:
-                for album in albums:
+                for album in _sorted_by_year(albums):
                     subtitle = f"{album.artist_name} · {album.service.label}" if album.artist_name else album.service.label
                     row = Adw.ActionRow(title=album.title, subtitle=subtitle)
+                    if album.year:
+                        row.add_prefix(_year_label(album.year))
                     row.set_activatable(True)
                     row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
-                    row.connect("activated", lambda _r, a=album: self._drill_into(a))
+                    row.connect("activated", lambda _r, a=album: self._open_item(a))
                     attach_context_menu(row, lambda a=album, r=row: self._other_row_actions(a, r))
                     self.other_list.append(row)
             else:
@@ -583,6 +629,13 @@ class SearchPage(Gtk.Box):
         other = Service.QOBUZ if track.service == Service.YTMUSIC else Service.YTMUSIC
         if other in self.state.providers:
             actions.append(("Find on Other Service", lambda: self._find_other_for_track(track)))
+        # Navigate to the detail pages (only when we have provider ids to target).
+        if track.artist_ids:
+            actions.append(("Go to Artist", lambda: self._open_item(
+                Artist(id=track.artist_ids[0], name=track.artist_name, service=track.service))))
+        if track.album_id:
+            actions.append(("Go to Album", lambda: self._open_item(
+                Album(id=track.album_id, title=track.album or "", service=track.service))))
         return actions
 
     def _other_row_actions(
@@ -649,7 +702,7 @@ class SearchPage(Gtk.Box):
                         ),
                     ),
                 ))
-        actions.append(("Open", lambda: self._drill_into(item)))
+        actions.append(("Open", lambda: self._open_item(item)))
         return actions
 
     def _on_back_to_results(self, _button: Gtk.Button) -> None:
@@ -676,3 +729,84 @@ class SearchPage(Gtk.Box):
             self.content_stack.set_visible_child_name("tracks")
         else:
             self._show_other_kind(kind, self._last_results)
+
+    # -- smart search (Enter): sectioned results -----------------------------
+    #
+    # Ordering encodes the spec: an artist's chronological discography first
+    # (for a person, the albums they *performed on*), then album-title matches,
+    # then incidental artists/tracks. Runs against the engine's search_smart so
+    # the MusicBrainz-aware person case works. Only fires on submit, never on
+    # every keystroke (the incremental provider search still handles typing).
+
+    def _run_smart_search(self) -> None:
+        query = self.search_entry.get_text().strip()
+        if not query:
+            self.content_stack.set_visible_child_name("empty")
+            return
+        nav = self._navigator()
+        if nav is None:  # no navigation host (e.g. a bare test harness) — plain search
+            self._run_search(immediate=True)
+            return
+        service = self.service_toggle.get_active_name() or "both"
+        self.content_stack.set_visible_child_name("loading")
+
+        def work() -> dict:
+            from harmony.web.server import get_engine
+
+            return get_engine().search_smart(query, service=service)
+
+        run_async(work, self._on_smart_done, self._on_search_error)
+
+    def _on_smart_done(self, result: dict) -> None:
+        nav = self._navigator()
+        child = self.smart_box.get_first_child()
+        while child is not None:
+            nxt = child.get_next_sibling()
+            self.smart_box.remove(child)
+            child = nxt
+
+        artist = result.get("artist")
+        albums = result.get("albums") or []
+        incidental = result.get("incidental") or {}
+        inc_tracks = incidental.get("tracks") or []
+        inc_artists = incidental.get("artists") or []
+        if not (artist or albums or inc_tracks or inc_artists):
+            set_stack_status(self.content_stack, "empty",
+                             status_page(icon_name="edit-find-symbolic", title="No results",
+                                         description="Try a different search."))
+            return
+
+        if artist:
+            name = artist.get("ref", {}).get("name", "")
+            heading = f"{name} — {'appears on' if artist.get('kind') == 'person' else 'discography'}"
+            self.smart_box.append(album_group(heading, artist.get("albums", []), nav,
+                                              self._smart_album_menu, empty_text="No albums found."))
+        if albums:
+            self.smart_box.append(album_group("Albums", albums, nav, self._smart_album_menu))
+        if inc_artists:
+            self.smart_box.append(self._artist_refs_group("Artists", inc_artists, nav))
+        if inc_tracks:
+            self.smart_box.append(tracks_widget(inc_tracks, self.state, nav, title="Tracks"))
+        self.content_stack.set_visible_child_name("smart")
+
+    def _smart_album_menu(self, album: dict) -> list[tuple[str, Callable[[], None]]]:
+        nav = self._navigator()
+        actions: list[tuple[str, Callable[[], None]]] = [
+            ("Open Album", lambda: nav and nav.go_to_album(album["service"], album["id"])),
+        ]
+        artist_ids = album.get("artist_ids") or []
+        if artist_ids:
+            actions.append(("Go to Artist", lambda: nav and nav.go_to_artist(album["service"], artist_ids[0])))
+        return actions
+
+    def _artist_refs_group(self, title: str, refs: list[dict], nav: object) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(title=title)
+        for ref in refs:
+            row = Adw.ActionRow(title=ref.get("name", ""), subtitle=Service(ref["service"]).label
+                                if ref.get("service") else "")
+            if ref.get("id") and nav is not None:
+                row.set_activatable(True)
+                row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                row.connect("activated", lambda _r, r=ref: nav.go_to_artist(r["service"], r["id"]))
+            group.add(row)
+        return group

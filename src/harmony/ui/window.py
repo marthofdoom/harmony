@@ -135,6 +135,17 @@ class HarmonyWindow(Adw.ApplicationWindow):
             self.activate_action("app.preferences", None)
 
     def _build_content(self) -> Adw.NavigationPage:
+        # An Adw.NavigationView hosts the top-level view stack as its root page
+        # and lets any page push artist/album/track detail pages on top of it
+        # (with the standard back button/gesture). The Navigator is the handle
+        # pages use to push; it lives on the shared state so every page, row,
+        # and context menu can reach it without threading it through ctors.
+        self.nav_view = Adw.NavigationView()
+        from harmony.ui.entity_nav import Navigator
+
+        self.navigator = Navigator(self.nav_view, self.state)
+        self.state.navigator = self.navigator  # type: ignore[attr-defined]
+
         toolbar = Adw.ToolbarView()
         header = Adw.HeaderBar()
         self._window_title = Adw.WindowTitle(title="Search")
@@ -159,7 +170,11 @@ class HarmonyWindow(Adw.ApplicationWindow):
             self.stack.add_titled(widget, name, title)
         toolbar.set_content(self.stack)
 
-        self._content_page = Adw.NavigationPage(title="Search", child=toolbar)
+        # The first page added to an empty navigation view becomes its root.
+        self._root_page = Adw.NavigationPage(title="Search", child=toolbar)
+        self.nav_view.add(self._root_page)
+
+        self._content_page = Adw.NavigationPage(title="Harmony", child=self.nav_view)
         return self._content_page
 
     def _build_page(self, name: str) -> Gtk.Widget:
@@ -212,9 +227,13 @@ class HarmonyWindow(Adw.ApplicationWindow):
     def _activate_page(self, name: str) -> None:
         if name not in _TITLES:
             return
+        # If the user is deep in a detail page, switching top-level sections
+        # returns to the root view first so the back stack never spans sections.
+        if getattr(self, "nav_view", None) is not None and self.nav_view.get_visible_page() is not self._root_page:
+            self.nav_view.pop_to_page(self._root_page)
         self.stack.set_visible_child_name(name)
         self._window_title.set_title(_TITLES[name])
-        self._content_page.set_title(_TITLES[name])
+        self._root_page.set_title(_TITLES[name])
         row = self._nav_rows.get(name)
         if row is not None:
             self._nav_list.select_row(row)
