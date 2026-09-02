@@ -272,6 +272,19 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     return
                 kinds = tuple((query.get("kinds") or ["tracks"])[0].split(","))
                 self._send_json(engine.search(q, kinds))
+            elif parts == ["api", "search", "smart"]:
+                q = (query.get("q") or [""])[0].strip()
+                if not q:
+                    self._send_json({"error": "missing q"}, status=400)
+                    return
+                svc = (query.get("service") or ["both"])[0]
+                self._send_json(engine.search_smart(q, service=svc))
+            elif len(parts) == 4 and parts[0:2] == ["api", "artist"]:
+                self._send_json(engine.artist_page(parts[2], parts[3]))
+            elif len(parts) == 4 and parts[0:2] == ["api", "album"]:
+                self._send_json(engine.album_page(parts[2], parts[3]))
+            elif len(parts) == 4 and parts[0:2] == ["api", "track"]:
+                self._send_json(engine.track_page(parts[2], parts[3]))
             elif parts == ["api", "playlists"]:
                 self._send_json(engine.playlists())
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":

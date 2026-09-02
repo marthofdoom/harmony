@@ -16,7 +16,7 @@ from collections.abc import Callable, Iterator, Sequence
 from typing import Any, TypeVar
 
 from ..errors import NotSupportedError, RateLimitedError
-from ..models import Album, Playlist, SearchResults, Service, StreamSource, Track
+from ..models import Album, Artist, Playlist, SearchResults, Service, StreamSource, Track
 
 log = logging.getLogger(__name__)
 
@@ -99,8 +99,25 @@ class MusicProvider(ABC):
     @abstractmethod
     def get_track(self, track_id: str) -> Track: ...
 
+    def get_album_detail(self, album_id: str) -> Album:
+        """Album header (title, artist, year, artwork) by id.
+
+        Concrete default returns a bare :class:`Album`; providers override it to
+        fill the header shown above the album's track listing.
+        """
+        return Album(id=album_id, title="", service=self.service)
+
     @abstractmethod
     def get_album_tracks(self, album_id: str) -> list[Track]: ...
+
+    def get_artist_detail(self, artist_id: str) -> Artist:
+        """Name, image, and any provider blurb for an artist by id.
+
+        Concrete (not abstract) so a provider that can't cheaply resolve an
+        artist header still satisfies the contract — the default returns a
+        bare :class:`Artist` and the caller fills the name from context.
+        """
+        return Artist(id=artist_id, name="", service=self.service)
 
     @abstractmethod
     def get_artist_albums(self, artist_id: str, *, limit: int = 100) -> list[Album]: ...

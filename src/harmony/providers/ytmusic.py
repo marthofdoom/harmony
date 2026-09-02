@@ -89,11 +89,31 @@ def _artist_names(raw: Any) -> list[str]:
     return names
 
 
+def _artist_ids(raw: Any) -> list[str]:
+    """Browse ids parallel to :func:`_artist_names`, for "go to artist" nav."""
+    if not raw:
+        return []
+    ids = []
+    for item in raw:
+        if isinstance(item, dict):
+            bid = item.get("id") or item.get("browseId") or item.get("channelId")
+            if bid:
+                ids.append(str(bid))
+    return ids
+
+
 def _album_title(raw: Any) -> str | None:
     if isinstance(raw, dict):
         return raw.get("name") or raw.get("title")
     if isinstance(raw, str):
         return raw
+    return None
+
+
+def _album_id(raw: Any) -> str | None:
+    if isinstance(raw, dict):
+        bid = raw.get("id") or raw.get("browseId")
+        return str(bid) if bid else None
     return None
 
 
@@ -264,7 +284,9 @@ class YTMusicProvider(MusicProvider):
             title=raw.get("title") or "",
             service=Service.YTMUSIC,
             artists=artists,
+            artist_ids=_artist_ids(raw.get("artists")),
             album=_album_title(raw.get("album")),
+            album_id=_album_id(raw.get("album")),
             duration_s=duration_s,
             isrc=None,
             year=_safe_int(raw.get("year")),
@@ -309,6 +331,7 @@ class YTMusicProvider(MusicProvider):
             title=raw.get("title") or "",
             service=Service.YTMUSIC,
             artists=artists,
+            artist_ids=_artist_ids(raw.get("artists")),
             year=_safe_int(raw.get("year")),
             track_count=_safe_int(raw.get("trackCount")),
             artwork_url=_largest_thumbnail(raw.get("thumbnails")),
@@ -378,10 +401,24 @@ class YTMusicProvider(MusicProvider):
                 return self._track_from_raw(raw)
         raise ProviderError(f"YouTube Music track {track_id!r} could not be resolved")
 
+    def get_album_detail(self, album_id: str) -> Album:
+        album = self._call(self._yt.get_album, album_id)
+        return Album(
+            id=album_id,
+            title=album.get("title") or "",
+            service=Service.YTMUSIC,
+            artists=_artist_names(album.get("artists")),
+            artist_ids=_artist_ids(album.get("artists")),
+            year=_safe_int(album.get("year")),
+            track_count=_safe_int(album.get("trackCount")),
+            artwork_url=_largest_thumbnail(album.get("thumbnails")),
+            raw=album,
+        )
+
     def get_album_tracks(self, album_id: str) -> list[Track]:
         album = self._call(self._yt.get_album, album_id)
         tracks = []
-        for raw in album.get("tracks", []):
+        for position, raw in enumerate(album.get("tracks", []), start=1):
             if not (raw.get("videoId") or raw.get("id")):
                 continue  # unavailable album track — can't play or match it
             track = self._track_from_raw(raw, fallback_artist=_album_artist_name(album))
@@ -389,8 +426,22 @@ class YTMusicProvider(MusicProvider):
                 track.artwork_url = _largest_thumbnail(album.get("thumbnails"))
             if not track.album:
                 track.album = album.get("title")
+            track.album_id = album_id
+            if track.track_number is None:
+                track.track_number = position
             tracks.append(track)
         return tracks
+
+    def get_artist_detail(self, artist_id: str) -> Artist:
+        artist = self._call(self._yt.get_artist, artist_id)
+        return Artist(
+            id=artist_id,
+            name=artist.get("name") or "",
+            service=Service.YTMUSIC,
+            image_url=_largest_thumbnail(artist.get("thumbnails")),
+            bio=artist.get("description") or "",
+            raw=artist,
+        )
 
     def get_artist_albums(self, artist_id: str, *, limit: int = 100) -> list[Album]:
         artist = self._call(self._yt.get_artist, artist_id)

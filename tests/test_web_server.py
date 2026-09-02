@@ -672,7 +672,10 @@ def test_track_to_dict_shape() -> None:
     from harmony.web.api import track_to_dict
 
     t = SimpleNamespace(id="x", title="T", service=Service.QOBUZ, artist_name="A",
-                        album="Al", duration_s=123, artwork_url="u")
+                        artist_ids=["a1"], album="Al", album_id="al1", duration_s=123,
+                        track_number=3, year=2001, isrc="US1", artwork_url="u")
     d = track_to_dict(t)
     assert d == {"id": "x", "title": "T", "service": "qobuz", "artist": "A",
-                 "album": "Al", "duration_s": 123, "artwork_url": "u"}
+                 "artist_ids": ["a1"], "album": "Al", "album_id": "al1",
+                 "duration_s": 123, "track_number": 3, "year": 2001, "isrc": "US1",
+                 "artwork_url": "u"}

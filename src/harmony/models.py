@@ -25,6 +25,10 @@ class Artist:
     id: str
     name: str
     service: Service
+    image_url: str | None = None
+    #: A provider-supplied blurb, used only as a fallback when MusicBrainz has no
+    #: Wikipedia link for the artist (the detail pages prefer the Wikipedia bio).
+    bio: str = ""
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
 
@@ -34,7 +38,14 @@ class Album:
     title: str
     service: Service
     artists: list[str] = field(default_factory=list)
+    #: Provider-native artist ids parallel to ``artists`` (best-effort; may be
+    #: shorter/empty when the payload omits them). Powers "go to artist" nav.
+    artist_ids: list[str] = field(default_factory=list)
     year: int | None = None
+    #: Full ISO release date (``YYYY-MM-DD`` or a truncation) when the provider
+    #: exposes it (Qobuz does; YouTube Music gives only ``year``). Kept alongside
+    #: ``year`` so the album page can show the exact date without digging in ``raw``.
+    date: str | None = None
     track_count: int | None = None
     artwork_url: str | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
@@ -56,7 +67,12 @@ class Track:
     title: str
     service: Service
     artists: list[str] = field(default_factory=list)
+    #: Provider-native artist ids parallel to ``artists`` (best-effort). Lets a
+    #: track row navigate to the performing artist's page without a name search.
+    artist_ids: list[str] = field(default_factory=list)
     album: str | None = None
+    #: Provider-native id of the album this track belongs to, when known.
+    album_id: str | None = None
     duration_s: int | None = None
     isrc: str | None = None
     year: int | None = None
