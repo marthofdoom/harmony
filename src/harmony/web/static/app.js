@@ -267,6 +267,8 @@ function wireTrackRows(scope, tracks) {
     const rem = row.querySelector(".rem");
     if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
     row.addEventListener("contextmenu", (e) => openTrackContextMenu(e, tracks[i]));
+    // Double-click anywhere on the row (but not on a link/button) plays it.
+    row.addEventListener("dblclick", (e) => { if (!e.target.closest("a, button")) playAt(i); });
   });
 }
 

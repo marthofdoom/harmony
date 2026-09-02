@@ -18,6 +18,7 @@ from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     play_collection_on_device,
+    play_track_on_active_device,
 )
 from harmony.ui.detail_widgets import album_group, tracks_widget  # noqa: E402
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
@@ -44,6 +45,19 @@ _KIND_LABELS = ["Tracks", "Albums", "Artists", "Playlists"]
 _SEARCH_DEBOUNCE_MS = 400
 
 
+def _year_label(year: int) -> Gtk.Label:
+    """A dim, fixed-width release-year prefix, matching the detail pages' album rows."""
+    label = Gtk.Label(label=str(year), valign=Gtk.Align.CENTER)
+    label.add_css_class("dim-label")
+    label.add_css_class("numeric")
+    return label
+
+
+def _sorted_by_year(albums: list[Album]) -> list[Album]:
+    """Chronological ascending; undated albums sink to the end, then by title."""
+    return sorted(albums, key=lambda a: (a.year is None, a.year or 0, a.title.lower()))
+
+
 class SearchPage(Gtk.Box):
     """Search entry + service/kind filters + results, with per-track actions."""
 
@@ -68,7 +82,8 @@ class SearchPage(Gtk.Box):
             "empty",
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
-            on_row_menu=self._track_row_actions, state=self.state
+            on_row_menu=self._track_row_actions, state=self.state,
+            on_row_activate=lambda t: play_track_on_active_device(self.state, t),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_action_sensitivity())
         tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -260,6 +275,8 @@ class SearchPage(Gtk.Box):
             if isinstance(item, Album):
                 subtitle = f"{item.artist_name} · {item.service.label}"
             row = Adw.ActionRow(title=item.title if hasattr(item, "title") else item.name, subtitle=subtitle)
+            if isinstance(item, Album) and item.year:
+                row.add_prefix(_year_label(item.year))
             row.set_activatable(True)
             row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
             row.connect("activated", lambda _r, it=item: self._open_item(it))
@@ -343,9 +360,11 @@ class SearchPage(Gtk.Box):
             while row := self.other_list.get_row_at_index(0):
                 self.other_list.remove(row)
             if albums:
-                for album in albums:
+                for album in _sorted_by_year(albums):
                     subtitle = f"{album.artist_name} · {album.service.label}" if album.artist_name else album.service.label
                     row = Adw.ActionRow(title=album.title, subtitle=subtitle)
+                    if album.year:
+                        row.add_prefix(_year_label(album.year))
                     row.set_activatable(True)
                     row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
                     row.connect("activated", lambda _r, a=album: self._open_item(a))

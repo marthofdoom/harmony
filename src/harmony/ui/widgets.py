@@ -338,6 +338,7 @@ def _indicator_factory() -> Gtk.SignalListItemFactory:
 def build_track_column_view(
     on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None = None,
     state: object | None = None,
+    on_row_activate: Callable[[Track], None] | None = None,
 ) -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
     """Build a multi-select ``Gtk.ColumnView`` for track lists.
 
@@ -357,12 +358,22 @@ def build_track_column_view(
     matches the currently-playing track lights up. The view subscribes to
     ``playback-changed`` and to its own store's changes, so newly-loaded results
     also reflect what's playing.
+
+    ``on_row_activate``, if given, is called with a row's ``Track`` when the row
+    is activated (double-click or Enter) -- wired to play the track on the
+    active device.
     """
     store = Gio.ListStore(item_type=TrackObject)
     selection = Gtk.MultiSelection(model=store)
     column_view = Gtk.ColumnView(model=selection)
     column_view.add_css_class("data-table")
     column_view.set_show_row_separators(True)
+    if on_row_activate is not None:
+        def _on_activate(_cv: Gtk.ColumnView, position: int) -> None:
+            item = store.get_item(position)
+            if isinstance(item, TrackObject):
+                on_row_activate(item.track)
+        column_view.connect("activate", _on_activate)
     if state is not None:
         indicator = Gtk.ColumnViewColumn(title="", factory=_indicator_factory())
         indicator.set_fixed_width(28)
