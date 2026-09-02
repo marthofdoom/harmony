@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 # (internal name, display title, symbolic icon)
 _PAGES: list[tuple[str, str, str]] = [
     ("search", "Search", "system-search-symbolic"),
+    ("now_playing", "Now Playing", "emblem-music-symbolic"),
     ("playlists", "Playlists", "view-list-symbolic"),
     ("sync", "Sync", "emblem-synchronizing-symbolic"),
     ("discover", "Discover", "starred-symbolic"),
@@ -189,6 +190,10 @@ class HarmonyWindow(Adw.ApplicationWindow):
                 from harmony.ui.search_page import SearchPage
 
                 return SearchPage(self.state)
+            if name == "now_playing":
+                from harmony.ui.now_playing_page import NowPlayingPage
+
+                return NowPlayingPage(self.state, self.navigator)
             if name == "playlists":
                 from harmony.ui.playlists_page import PlaylistsPage
 

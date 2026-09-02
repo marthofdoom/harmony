@@ -21,7 +21,7 @@ from gi.repository import Adw, Gtk  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     play_collection_on_device,
-    play_track_on_active_device,
+    play_track_here,
 )
 from harmony.ui.entity_nav import Navigator, load_artwork_into, track_from_dict  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
@@ -165,7 +165,7 @@ def tracks_widget(track_dicts: list[dict[str, Any]], state: Any, navigator: Navi
     holder: dict[str, Gtk.Widget] = {}
     column_view, store, _sel = build_track_column_view(
         on_row_menu=track_menu_builder(state, navigator, lambda: holder["cv"]), state=state,
-        on_row_activate=lambda t: play_track_on_active_device(state, t))
+        on_row_activate=lambda t: play_track_here(state, t))
     holder["cv"] = column_view
     replace_tracks(store, [track_from_dict(d) for d in track_dicts])
     scroller = Gtk.ScrolledWindow(child=column_view)

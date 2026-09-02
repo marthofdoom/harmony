@@ -46,6 +46,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.1" date="2026-09-02">
+      <description>
+        <p>Playback polish. A new Now Playing view shows the whole playing
+        playlist or album beside large cover art. The Now Playing bar gains a
+        stop button, and double-clicking a track plays it here. Skipping a track
+        no longer occasionally jumps two. Casting to a Chromecast now shows a
+        moving progress bar and a working volume slider.</p>
+      </description>
+    </release>
     <release version="1.0.0" date="2026-09-02">
       <description>
         <p>Browse the music, not just search it. Every artist, album, and track

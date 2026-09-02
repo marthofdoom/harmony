@@ -71,6 +71,12 @@ _QUEUE_POLL_S = 3
 # count the track as finished. A couple of seconds absorbs the poll interval and
 # the device rounding/settling its final position.
 _END_EPSILON_S = 3
+# After a track starts, ignore end-detection for this long. A device reports a
+# transient "stopped"/idle status while it swaps tracks; without this window the
+# state-edge fallback (no-duration devices) reads that transition as the *new*
+# track already ending and advances again — the "skip skips two" bug. One track
+# start opens exactly one window; real playback re-arms end-detection after it.
+_ADVANCE_SETTLE_S = 6
 
 log = logging.getLogger(__name__)
 
@@ -146,6 +152,9 @@ class AppState(GObject.Object):
         # single near-end reading advances exactly once (not every poll near the
         # end). Re-armed when the next track is seen mid-play.
         self._queue_armed: dict[str, bool] = {}
+        # Per-host monotonic deadline until which end-detection is suppressed
+        # after a track starts (see _ADVANCE_SETTLE_S).
+        self._advance_settle: dict[str, float] = {}
         # Per-host play context for the media-player UI: the full track order a
         # queue was built from (for repeat + shuffle), which collection it came
         # from, and the tracks already played (so "previous" can go back).
@@ -725,6 +734,7 @@ class AppState(GObject.Object):
         self._queues.pop(host, None)
         self._queue_prev_state.pop(host, None)
         self._queue_armed.pop(host, None)
+        self._advance_settle.pop(host, None)
         source_id = self._queue_poll_ids.pop(host, None)
         if source_id is not None:
             GLib.source_remove(source_id)
@@ -745,6 +755,11 @@ class AppState(GObject.Object):
         self._queue_prev_state[host] = state or ""
         queue = self._queues.get(host)
         if not queue:
+            return None
+
+        # A track just started: ride out the device's swap-transition status so a
+        # transient stop/idle isn't misread as the new track already ending.
+        if time.monotonic() < self._advance_settle.get(host, 0.0):
             return None
 
         has_duration = bool(duration and duration > 0 and position is not None)
@@ -925,6 +940,11 @@ class AppState(GObject.Object):
         if provider is None:
             raise RuntimeError(f"No provider configured for {track.service.label}")
 
+        # Open the settle window before touching the device: from now until the
+        # new track is genuinely under way, the poller must not read the swap's
+        # transient idle/stopped status as this track ending (the skip-two bug).
+        self._advance_settle[device_host] = time.monotonic() + _ADVANCE_SETTLE_S
+
         # The in-app player decodes locally, so ask for the highest tier the
         # track allows; casting keeps the LAN-compatible default so every
         # renderer can decode what the relay forwards.
@@ -1062,6 +1082,46 @@ class AppState(GObject.Object):
         device = self.device_for(host)
         action = device.pause if pausing else device.resume
         run_async(action, None, lambda exc: self._toast_playback_error(exc, "Couldn't control playback."))
+
+    def playback_stop(self) -> None:
+        """Stop the active stream entirely (not pause): halt the device and clear its queue."""
+        host = self.playback.active_host
+        if not host:
+            return
+        device = self.device_for(host) if host != LOCAL_HOST else None
+
+        def work() -> None:
+            if device is not None:
+                device.stop()
+
+        run_async(work, lambda _r: self._end_playback(host),
+                  lambda exc: self._toast_playback_error(exc, "Couldn't stop playback."))
+
+    def current_queue(self) -> list[Any]:
+        """The full track list backing the active stream (the playing playlist/album),
+        for the Now Playing view — the whole collection, not just what's left to play."""
+        host = self.playback.active_host
+        if not host:
+            return []
+        full = self._collection_full.get(host)
+        return list(full) if full else list(self._queues.get(host, []))
+
+    def playback_play_from(self, track: Any) -> None:
+        """From the Now Playing list: (re)start the active collection at ``track``.
+
+        Plays ``track`` and everything after it in the current collection, on the
+        active device, keeping the collection context so indicators still light up.
+        """
+        host = self.playback.active_host or LOCAL_HOST
+        full = self.current_queue() or [track]
+        try:
+            idx = next(i for i, t in enumerate(full) if t.key() == track.key())
+        except (StopIteration, AttributeError):
+            idx = 0
+        ordered = list(full[idx:])
+        key = self._collection_key.get(host)
+        run_async(lambda: self.play_tracks_on_device(ordered, host, key), None,
+                  lambda exc: self._toast_playback_error(exc, "Couldn't play that track."))
 
     def playback_next(self) -> None:
         """Skip to the next queued track (wraps if repeat is on)."""

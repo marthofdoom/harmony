@@ -50,6 +50,7 @@ def state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     obj._queues = {}
     obj._queue_prev_state = {}
     obj._queue_armed = {}
+    obj._advance_settle = {}
     obj._queue_poll_ids = {}
     obj._collection_full = {}
     obj._collection_key = {}
@@ -437,6 +438,24 @@ def test_queue_falls_back_to_stopped_without_duration(state: AppState) -> None:
     _seed_queue(state, [_track_n(1), _track_n(2)])
     state._queue_prev_state = {"h": "playing"}
     nxt = state._next_after_status("h", "stopped", None, None)  # no duration -> state edge
+    assert nxt is not None and nxt.id == "t2"
+
+
+def test_advance_settle_suppresses_transition_advance(state: AppState) -> None:
+    # A track that just started opens a settle window: the device's transient
+    # "stopped" during the swap must NOT be read as the new track ending (the
+    # skip-skips-two bug), even on the no-duration state-edge path.
+    import time as _time
+
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state._queue_prev_state = {"h": "playing"}
+    state._advance_settle = {"h": _time.monotonic() + 30}
+    assert state._next_after_status("h", "stopped", None, None) is None  # suppressed
+    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]            # nothing popped
+    # Once the window lapses, the same edge advances exactly once.
+    state._advance_settle = {"h": 0.0}
+    state._queue_prev_state = {"h": "playing"}
+    nxt = state._next_after_status("h", "stopped", None, None)
     assert nxt is not None and nxt.id == "t2"
 
 
