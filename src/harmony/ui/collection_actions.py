@@ -99,22 +99,19 @@ def _play_collection(
     run_async(work, done, lambda exc: state.toast(f"Couldn't play {label} on {name}: {exc}"))
 
 
-def play_track_on_active_device(state: AppState, track: Track) -> None:
-    """Play one track on the app's currently-active device — double-click / Enter.
+def play_track_here(state: AppState, track: Track) -> None:
+    """Play one track on *this device* (in-app local playback) — double-click / Enter.
 
-    Targets the device the Now Playing bar controls (``playback.active_host``),
-    defaulting to in-app local playback when nothing else is active, so a
-    double-click "just plays" without a device prompt. Blocking play runs on a
-    worker; the outcome toasts.
+    Always targets the local player rather than whatever remote device is active,
+    so a double-click is a predictable "play it here now" without a device prompt.
+    Blocking play runs on a worker; the outcome toasts.
     """
     from harmony.ui.state import LOCAL_HOST
 
-    host = getattr(state.playback, "active_host", None) or LOCAL_HOST
-    name = next((i.name for i in state.playback_targets() if i.host == host), "this app")
     run_async(
-        lambda: state.play_track_on_device(track, host),
-        lambda _r: state.toast(f"Playing “{track.title}” on {name}"),
-        lambda exc: state.toast(f"Couldn't play on {name}: {exc}"),
+        lambda: state.play_track_on_device(track, LOCAL_HOST),
+        lambda _r: state.toast(f"Playing “{track.title}” on this device"),
+        lambda exc: state.toast(f"Couldn't play “{track.title}”: {exc}"),
     )
 
 

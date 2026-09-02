@@ -185,6 +185,15 @@ class ChromecastDevice(PlaybackDevice):
     def status(self) -> PlaybackStatus:
         try:
             cast = self._cast()
+            # pychromecast only refreshes media_controller.status (and its
+            # current_time) when asked; without this the reported position stays
+            # frozen at the last event, so the Now Playing progress bar never
+            # advances while casting. Best-effort — a poll that can't refresh
+            # just reads the previous values.
+            try:
+                cast.media_controller.update_status()
+            except Exception:  # noqa: BLE001 - a stale read is fine; don't fail the poll
+                pass
             mc = cast.media_controller.status
             cs = cast.status
             state_map = {"PLAYING": "playing", "PAUSED": "paused", "IDLE": "stopped",

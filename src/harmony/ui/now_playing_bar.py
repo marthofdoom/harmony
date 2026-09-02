@@ -85,7 +85,11 @@ class NowPlayingBar(Gtk.Box):
         self._next.add_css_class("flat")
         self._next.set_tooltip_text("Next")
         self._next.connect("clicked", lambda *_a: self.state.playback_next())
-        for button in (self._prev, self._play, self._next):
+        self._stop = Gtk.Button.new_from_icon_name("media-playback-stop-symbolic")
+        self._stop.add_css_class("flat")
+        self._stop.set_tooltip_text("Stop")
+        self._stop.connect("clicked", lambda *_a: self.state.playback_stop())
+        for button in (self._prev, self._play, self._next, self._stop):
             self.append(button)
 
         # -- seek bar -------------------------------------------------------
@@ -275,6 +279,7 @@ class NowPlayingBar(Gtk.Box):
         self._play.set_tooltip_text("Pause" if playing else "Play")
         self._prev.set_sensitive(pb.has_prev)
         self._next.set_sensitive(pb.has_next)
+        self._stop.set_sensitive(pb.state in ("playing", "paused"))
 
         # seek bar (don't fight the user mid-drag). Reconcile the local
         # interpolation baseline to the freshly-polled position so drift from
