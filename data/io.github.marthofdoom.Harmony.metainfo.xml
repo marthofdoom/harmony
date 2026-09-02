@@ -4,7 +4,10 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>Harmony</name>
-  <summary>Create and sync playlists across YouTube Music and Qobuz</summary>
+  <summary>Browse, search, and sync music across YouTube Music and Qobuz</summary>
+
+  <url type="homepage">https://github.com/marthofdoom/harmony</url>
+  <url type="bugtracker">https://github.com/marthofdoom/harmony/issues</url>
 
   <description>
     <p>

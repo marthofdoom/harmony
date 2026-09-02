@@ -1,0 +1,85 @@
+# Flathub manifest for Harmony — the submission variant of the in-repo dev
+# manifest (../io.github.marthofdoom.Harmony.yml). Two differences, both required
+# by Flathub's build rules:
+#
+#   1. NO roc-toolkit module. The dev build compiles roc-toolkit with build-time
+#      network access (scons + roc fetching libuv/openfec/ragel/gengetopt), which
+#      Flathub forbids (offline builds, no --share=network in build-args). So the
+#      Flathub build ships WITHOUT roc-recv: the Route Audio page falls back to
+#      plain RTP (module-rtp-recv, provided by the runtime). Full offline-vendored
+#      ROC is a planned fast-follow. Everything else is identical.
+#   2. The harmony module is pinned to a release commit, not branch: main.
+#
+# python3-deps.json (the pinned, checksummed dependency wheels) is copied in
+# alongside this manifest — those are declared `sources`, which Flathub downloads
+# normally, so no build-time network is needed.
+app-id: io.github.marthofdoom.Harmony
+runtime: org.gnome.Platform
+runtime-version: '49'
+sdk: org.gnome.Sdk
+command: harmony
+
+finish-args:
+  # The whole point of the app: talk to the YouTube Music and Qobuz APIs.
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  # Network audio routing (Route Audio page): pactl talks to PipeWire's pulse
+  # socket. The runtime ships pactl + module-rtp-recv, so RTP receive works.
+  - --socket=pulseaudio
+  # Local player ("This computer"): GStreamer's pipewiresink outputs to PipeWire.
+  - --filesystem=xdg-run/pipewire-0
+  # Credentials go to the Secret Service via the keyring package.
+  - --talk-name=org.freedesktop.secrets
+  # System-tray icon (StatusNotifierItem).
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # One-click "Connect YouTube" reads the user's OWN browser cookies (read-only)
+  # to auto-detect a signed-in session, avoiding a manual DevTools header paste.
+  # Only the user's own profiles on their own machine are read; nothing is
+  # written. Chromium-family cookies are additionally encrypted with a key from
+  # the login keyring (reached via the secrets portal above).
+  - --filesystem=~/.mozilla/firefox:ro
+  - --filesystem=~/.config/google-chrome:ro
+  - --filesystem=~/.config/chromium:ro
+  - --filesystem=~/.config/BraveSoftware:ro
+  - --filesystem=~/.config/microsoft-edge:ro
+  - --filesystem=~/.var/app/org.mozilla.firefox/.mozilla/firefox:ro
+  - --filesystem=~/.var/app/com.google.Chrome/config:ro
+  - --filesystem=~/.var/app/org.chromium.Chromium/config:ro
+  - --filesystem=~/.var/app/com.brave.Browser/config:ro
+  - --filesystem=~/.var/app/com.microsoft.Edge/config:ro
+  - --filesystem=~/.var/app/com.vivaldi.Vivaldi/config:ro
+
+cleanup:
+  - '/include'
+  - '/lib/pkgconfig'
+  - '/share/man'
+  - '*.a'
+  - '*.la'
+  - '__pycache__'
+
+modules:
+  # Pinned Python dependency wheels (generated with flatpak-pip-generator, then
+  # every sdist swapped for its manylinux/abi3 wheel so the build needs no
+  # compiler, Rust, or network). Declared sources -> Flathub-friendly.
+  - python3-deps.json
+
+  - name: harmony
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-index --no-build-isolation --prefix=${FLATPAK_DEST} .
+      - install -Dm644 data/io.github.marthofdoom.Harmony.desktop
+          ${FLATPAK_DEST}/share/applications/io.github.marthofdoom.Harmony.desktop
+      - install -Dm644 data/io.github.marthofdoom.Harmony.metainfo.xml
+          ${FLATPAK_DEST}/share/metainfo/io.github.marthofdoom.Harmony.metainfo.xml
+      - install -Dm644 data/icons/io.github.marthofdoom.Harmony.svg
+          ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.marthofdoom.Harmony.svg
+    sources:
+      - type: git
+        url: https://github.com/marthofdoom/harmony.git
+        # Pinned to a release commit (Flathub requires a fixed ref, not a branch).
+        # Update to the commit whose metainfo carries the required <screenshots>.
+        tag: v1.0.0
+        commit: a3d72b23960fa0c2209b953db473d3ec3ef4612a
