@@ -187,6 +187,15 @@ class Settings:
     ai_enabled: bool = False
     ai_model: str = "claude-opus-5"
     contact_email: str = ""              # used in the MusicBrainz User-Agent
+
+    # Lidarr acquisition ("Get with Lidarr"). URL of the Lidarr instance; the API
+    # key is a secret (LIDARR_API_KEY in the keyring). Root folder + profile ids
+    # are optional — blank means "use Lidarr's first configured value".
+    lidarr_enabled: bool = False
+    lidarr_url: str = ""                  # e.g. http://192.168.1.10:8686
+    lidarr_root_folder: str = ""
+    lidarr_quality_profile_id: int = 0    # 0 => first configured
+    lidarr_metadata_profile_id: int = 0   # 0 => first configured
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its
@@ -410,6 +419,7 @@ QOBUZ_TOKEN = "qobuz.user_auth_token"
 QOBUZ_APP_SECRET = "qobuz.app_secret"
 YTMUSIC_OAUTH_SECRET = "ytmusic.oauth_client_secret"
 LASTFM_API_KEY = "lastfm.api_key"
+LIDARR_API_KEY = "lidarr.api_key"
 ANTHROPIC_API_KEY = "anthropic.api_key"
 
 

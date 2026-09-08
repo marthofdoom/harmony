@@ -104,6 +104,10 @@ you run across your whole home. What that unlocks:
 - **Natural-language playlist building** (optional) — describe a playlist and
   have Claude plan it; every suggestion is resolved against the real catalog, so
   nothing invented reaches your library.
+- **Lidarr acquisition** (optional) — right-click any album or artist and *Get
+  with Lidarr*: Harmony hands your Lidarr instance the request (add, monitor,
+  search), matched by MusicBrainz id when known. Harmony discovers and plays;
+  Lidarr fetches. Needs only a Lidarr URL + API key.
 
 ## Requirements
 

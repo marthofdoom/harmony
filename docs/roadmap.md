@@ -5,6 +5,10 @@ the legend in the [docs index](README.md). Current release: **1.0.2** (pre-1.0 p
 
 ## Done
 
+- **Lidarr acquisition** — "Get with Lidarr" on any album or artist (right-click
+  a result) hands the request to a configured Lidarr instance (add + monitor +
+  search), matched exactly by MusicBrainz id when Harmony knows it. Harmony
+  discovers and serves; Lidarr acquires. Auth-free — no streaming-service creds.
 - **Entity navigation** — every artist, album, and track has its own page,
   reachable by clicking a name or right-clicking a row on all three surfaces
   (desktop, web, Android). Artist pages carry a Wikipedia bio, a chronological

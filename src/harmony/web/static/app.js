@@ -14,6 +14,7 @@ const state = {
   devicePaused: false,
   section: "search", // last non-detail view (restored when a detail page is left)
   detail: false,     // true while an artist/album/track detail page is showing
+  lidarr: null,      // cached GET /api/lidarr status ({enabled, configured, …}) or null
 };
 
 const onDevice = () => state.target !== "browser";
@@ -140,6 +141,53 @@ async function apiPost(path, body, _retry) {
   return j;
 }
 
+// -- Lidarr ("Get with Lidarr") ---------------------------------------------
+// A right-click item that hands an album/artist to this instance's Lidarr to
+// acquire. Status is fetched once and cached on state so the menu can decide
+// synchronously whether to show the item; renderAccounts re-fetches on save.
+
+async function loadLidarrStatus() {
+  try { state.lidarr = await api("/api/lidarr"); }
+  catch { state.lidarr = null; }
+  return state.lidarr;
+}
+const lidarrEnabled = () => !!(state.lidarr && state.lidarr.enabled);
+
+async function sendToLidarr(body, label) {
+  try {
+    const r = await apiPost("/api/lidarr/request", body);
+    toast(`Sent “${r.title || label}” to Lidarr.`, "ok");
+  } catch (e) { toastErr("Lidarr couldn’t take that: " + e.message); }
+}
+
+// Build the (0-or-1) "Get with Lidarr" menu items for an album/artist target.
+// `mbid` (when the entity data carries one) is passed through for an exact match.
+function lidarrMenuItems(o) {
+  if (!lidarrEnabled()) return [];
+  const body = { kind: o.kind };
+  if (o.title) body.title = o.title;
+  if (o.artist) body.artist = o.artist;
+  if (o.mbid) body.mbid = o.mbid;
+  const label = o.title || o.artist || "item";
+  return [{ label: "Get with Lidarr", fn: () => sendToLidarr(body, label) }];
+}
+
+// Attach a "Get with Lidarr" (artist) right-click menu to any element carrying
+// data-lidarr-artist (optional data-lidarr-mbid). Used for artist/people chips
+// and the artist detail hero.
+function wireLidarrArtistTargets(scope) {
+  scope.querySelectorAll("[data-lidarr-artist]").forEach((el) => {
+    el.addEventListener("contextmenu", (e) => {
+      const items = lidarrMenuItems({
+        kind: "artist", artist: el.dataset.lidarrArtist, mbid: el.dataset.lidarrMbid || "",
+      });
+      if (!items.length) return;
+      e.preventDefault();
+      openContextMenu(e.clientX, e.clientY, items);
+    });
+  });
+}
+
 // -- navigation: hash router + floating context menu ------------------------
 
 // Detail pages are addressable so the browser Back button and deep links work:
@@ -216,6 +264,7 @@ function openAlbumContextMenu(e, a) {
   if (a.id) items.push({ label: "Go to album", fn: () => navigateAlbum(a.service, a.id) });
   if (a.artist_ids && a.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(a.service, a.artist_ids[0]) });
+  items.push(...lidarrMenuItems({ kind: "album", title: a.title, artist: a.artist, mbid: a.mbid }));
   if (!items.length) return;
   e.preventDefault();
   openContextMenu(e.clientX, e.clientY, items);
@@ -562,13 +611,40 @@ async function renderSync() {
 async function renderAccounts() {
   const list = $("list");
   list.innerHTML = loadingState("Loading accounts…");
-  let accounts = [], prefs = { personal_key: "" }, instances = [];
+  let accounts = [], prefs = { personal_key: "" }, instances = [], lidarr = {};
   try { accounts = (await api("/api/accounts")).accounts || []; } catch { /* show forms anyway */ }
   try { prefs = await api("/api/preferences"); } catch { /* ignore */ }
   try { instances = (await api("/api/instances")).instances || []; } catch { /* none */ }
+  try { lidarr = await api("/api/lidarr"); state.lidarr = lidarr; } catch { /* show form anyway */ }
+  // Options (root folders / profiles) only exist once Lidarr is reachable.
+  let lopts = null;
+  if (lidarr.configured) { try { lopts = await api("/api/lidarr/options"); } catch { /* degrade */ } }
   const status = (svc) => accounts.find((a) => a.service === svc) || { authenticated: false };
   const q = status("qobuz"), y = status("ytmusic");
   const badge = (a) => a.stale ? "session expired" : a.authenticated ? "signed in" + (a.account ? " · " + esc(a.account) : "") : "signed out";
+
+  // Lidarr integration block: URL + API key + enable, plus root/profile
+  // dropdowns once the instance is reachable. Degrades to just the form when
+  // Lidarr is unconfigured or unreachable.
+  const liBadge = lidarr.configured
+    ? (lidarr.ok ? (lidarr.version ? "v" + esc(lidarr.version) : "connected") : "unreachable")
+    : "not configured";
+  const liStatusText = lidarr.configured
+    ? (lidarr.ok ? `Connected to Lidarr${lidarr.version ? " v" + esc(lidarr.version) : ""}.`
+                 : `Lidarr is unreachable: ${esc(lidarr.error || "unknown error")}`)
+    : "";
+  const liStatusCls = lidarr.configured ? (lidarr.ok ? " ok" : " err") : "";
+  const liSelect = (id, label, options) => `<label class="muted field">${esc(label)}</label>
+        <select id="${id}" class="field" style="width:100%">
+          <option value="">Use Lidarr’s default</option>${options}</select>`;
+  const liOpts = lopts
+    ? liSelect("li-root", "Root folder", (lopts.root_folders || []).map((p) =>
+        `<option value="${esc(p)}">${esc(p)}</option>`).join(""))
+      + liSelect("li-qual", "Quality profile", (lopts.quality_profiles || []).map((p) =>
+        `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join(""))
+      + liSelect("li-meta", "Metadata profile", (lopts.metadata_profiles || []).map((p) =>
+        `<option value="${esc(p.id)}">${esc(p.name)}</option>`).join(""))
+    : "";
   list.innerHTML = `
     <div class="page-narrow">
       <p class="muted field">The server holds these credentials for every client (this browser and the
@@ -634,6 +710,22 @@ async function renderAccounts() {
           <button class="act" id="qb-save">Save</button>
           ${q.authenticated ? `<button class="act ghost" id="qb-out">Sign out</button>` : ""}
         </div>
+      </div>
+
+      <div class="card">
+        <h2>Lidarr <span class="badge">${liBadge}</span></h2>
+        <p class="muted">Hand an album or artist to your Lidarr instance to acquire it. Once enabled,
+        right-click an album or artist anywhere and choose “Get with Lidarr”.</p>
+        <label class="muted field">Server URL</label>
+        <input id="li-url" type="text" class="field" placeholder="http://192.168.1.10:8686" value="${esc(lidarr.url || "")}" autocomplete="off" />
+        <label class="muted field">API key</label>
+        <input id="li-key" type="password" class="field" placeholder="${lidarr.configured ? "•••••••• (leave blank to keep)" : "Lidarr API key"}" autocomplete="off" />
+        ${liOpts}
+        <label class="field" style="display:flex;gap:.5rem;align-items:center">
+          <input id="li-enabled" type="checkbox"${lidarr.enabled ? " checked" : ""} /> <span>Enable “Get with Lidarr”</span>
+        </label>
+        <div class="field-acts"><button class="act" id="li-save">Save</button></div>
+        <p id="li-msg" class="muted msg${liStatusCls}">${liStatusText}</p>
       </div>
       <p id="acct-msg" class="muted msg"></p>
     </div>`;
@@ -722,6 +814,19 @@ async function renderAccounts() {
   };
   if ($("yt-out")) $("yt-out").onclick = async () => { await apiPost("/api/accounts/ytmusic/signout"); after(); };
   if ($("qb-out")) $("qb-out").onclick = async () => { await apiPost("/api/accounts/qobuz/signout"); after(); };
+  if ($("li-save")) $("li-save").onclick = async () => {
+    const lm = $("li-msg"); lm.textContent = "Saving…"; lm.className = "muted msg";
+    const body = { url: $("li-url").value.trim(), enabled: $("li-enabled").checked };
+    const key = $("li-key").value.trim();
+    if (key) body.api_key = key;   // only overwrites the stored key when non-empty
+    if ($("li-root")) body.root_folder = $("li-root").value;
+    if ($("li-qual")) body.quality_profile_id = Number($("li-qual").value || 0);
+    if ($("li-meta")) body.metadata_profile_id = Number($("li-meta").value || 0);
+    try {
+      state.lidarr = await apiPost("/api/lidarr/config", body);
+      renderAccounts();   // re-render to reflect status + load option dropdowns
+    } catch (e) { lm.textContent = "Couldn’t save: " + e.message; lm.className = "muted msg err"; }
+  };
 }
 
 async function doSearch(q) {
@@ -754,7 +859,7 @@ function albumRowsHtml(albums, opts = {}) {
         <div class="alb-title">${esc(a.title)}</div>
         ${opts.showArtist && a.artist ? `<div class="alb-artist muted">${esc(a.artist)}</div>` : ""}
       </div>`;
-    const data = `data-svc="${esc(a.service)}" data-id="${esc(a.id || "")}" data-aids="${esc(aids)}"`;
+    const data = `data-svc="${esc(a.service)}" data-id="${esc(a.id || "")}" data-aids="${esc(aids)}" data-title="${esc(a.title || "")}" data-artist="${esc(a.artist || "")}" data-mbid="${esc(a.mbid || "")}"`;
     if (nav)
       return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}</a>`;
     return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="badge">credit</span></div>`;
@@ -767,6 +872,9 @@ function wireAlbumRows(scope) {
       service: row.dataset.svc,
       id: row.dataset.id || null,
       artist_ids: row.dataset.aids ? row.dataset.aids.split(",").filter(Boolean) : [],
+      title: row.dataset.title || "",
+      artist: row.dataset.artist || "",
+      mbid: row.dataset.mbid || "",
     }));
   });
 }
@@ -777,7 +885,7 @@ function peopleChipsHtml(people, opts = {}) {
   return `<div class="chips">${people.map((p) => {
     const sub = opts.instruments && p.instruments && p.instruments.length
       ? p.instruments.join(", ") : spanLabel(p.spans);
-    return `<button class="chip" data-name="${esc(p.name)}">
+    return `<button class="chip" data-name="${esc(p.name)}" data-lidarr-artist="${esc(p.name)}"${p.mbid ? ` data-lidarr-mbid="${esc(p.mbid)}"` : ""}>
       <span class="chip-name">${esc(p.name)}${opts.current && p.is_current ? ` <span class="badge">current</span>` : ""}</span>
       ${sub ? `<span class="chip-sub muted">${esc(sub)}</span>` : ""}</button>`;
   }).join("")}</div>`;
@@ -873,6 +981,10 @@ async function renderArtistView(service, id) {
   hydrateArt(list);
   wireAlbumRows(list);
   wireChips(list);
+  // Right-click the artist hero → "Get with Lidarr" (this artist).
+  const hero = list.querySelector(".detail-hero");
+  if (hero && a.name) { hero.dataset.lidarrArtist = a.name; if (d.mbid) hero.dataset.lidarrMbid = d.mbid; }
+  wireLidarrArtistTargets(list);
   if (top.length) { state.queue = top; wireTrackRows(list, top); highlightPlaying(); }
 }
 
@@ -940,7 +1052,7 @@ async function renderTrackView(service, id) {
     perfSec = `<section class="detail-sec"><h3>Performers</h3>
       <div class="perf">${perf.map((p) => `
         <div class="perf-row">
-          <button class="chip" data-name="${esc(p.name)}"><span class="chip-name">${esc(p.name)}</span></button>
+          <button class="chip" data-name="${esc(p.name)}" data-lidarr-artist="${esc(p.name)}"><span class="chip-name">${esc(p.name)}</span></button>
           <span class="perf-roles muted">${esc((p.roles || []).join(", "))}</span>
         </div>`).join("")}</div></section>`;
   } else {
@@ -960,6 +1072,7 @@ async function renderTrackView(service, id) {
   wireBack();
   hydrateArt(list);
   wireChips(list);
+  wireLidarrArtistTargets(list);
   $("tk-play").onclick = () => { state.queue = [t]; playAt(0); };
 }
 
@@ -1069,7 +1182,7 @@ function renderSmartResults(r, q) {
   if (tracks.length) html += `<section class="detail-sec"><h3>Tracks</h3>${tracksHtml(tracks)}</section>`;
   if (inc.artists && inc.artists.length) {
     html += `<section class="detail-sec"><h3>Artists</h3><div class="chips">${inc.artists.map((ar) =>
-      `<a class="chip" href="${routeHref("artist", ar.service, ar.id)}"><span class="chip-name">${esc(ar.name)}</span><span class="chip-sub muted">${esc(serviceLabel(ar.service))}</span></a>`).join("")}</div></section>`;
+      `<a class="chip" href="${routeHref("artist", ar.service, ar.id)}" data-lidarr-artist="${esc(ar.name)}"><span class="chip-name">${esc(ar.name)}</span><span class="chip-sub muted">${esc(serviceLabel(ar.service))}</span></a>`).join("")}</div></section>`;
   }
   if (inc.playlists && inc.playlists.length) {
     html += `<section class="detail-sec"><h3>Playlists</h3><div class="plgrid">${inc.playlists.map((p) =>
@@ -1087,6 +1200,7 @@ function renderSmartResults(r, q) {
   list.innerHTML = html;
   hydrateArt(list);
   wireAlbumRows(list);
+  wireLidarrArtistTargets(list);
   if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
   list.querySelectorAll(".plcard").forEach((card) => {
     const url = card.dataset.art;
@@ -1409,6 +1523,7 @@ $("accounts").addEventListener("click", () => goView("accounts"));
 window.addEventListener("hashchange", renderRoute);
 loadAccounts();
 loadDevices();
+loadLidarrStatus();
 if (parseHash()) renderRoute();   // deep link → render the detail page on load
 
 // Progressive web app: install + offline shell.
