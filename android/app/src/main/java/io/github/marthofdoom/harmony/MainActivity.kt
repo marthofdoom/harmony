@@ -418,7 +418,7 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
         } else {
             LazyColumn(Modifier.fillMaxSize()) {
                 items(state.playlistTracks) { t ->
-                    TrackRow(t, onPlay = { vm.play(t) },
+                    TrackRow(t, onPlay = { vm.play(t, state.playlistTracks) },
                         isPlaying = t.id == state.playback.track?.id,
                         trailing = {
                             IconButton(onClick = { vm.removeFromPlaylist(t) }) {
@@ -815,71 +815,98 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
     // When playingHere with no track, we're streaming the hub's live audio.
     val title = pb.track?.title ?: "Hub audio"
     val subtitle = pb.track?.artist?.ifBlank { null } ?: state.instanceName ?: ""
+    // The whole collection this playback started from (album/playlist/search list),
+    // mirroring the desktop's Now Playing. Shown only when there's more than the
+    // single track, with the current one highlighted and tappable to jump.
+    val queue = state.queue
 
-    Column(
-        Modifier.fillMaxSize().padding(24.dp),
+    // Big art + transport live in a header above the queue; the whole thing scrolls
+    // together so a long queue can be browsed without the controls stealing space.
+    LazyColumn(
+        Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
     ) {
-        Surface(
-            shape = RoundedCornerShape(14.dp),
-            shadowElevation = 8.dp,
-            modifier = Modifier.padding(bottom = 24.dp),
-        ) {
-            NetworkImage(pb.track?.artworkUrl, Modifier.size(240.dp).clip(RoundedCornerShape(14.dp)))
-        }
-        Text(title, style = MaterialTheme.typography.titleLarge,
-            maxLines = 1, overflow = TextOverflow.Ellipsis)
-        Text(subtitle, style = MaterialTheme.typography.bodyMedium,
-            maxLines = 1, overflow = TextOverflow.Ellipsis,
-            color = MaterialTheme.colorScheme.onSurfaceVariant)
-        Spacer(Modifier.height(24.dp))
+        item {
+            Column(
+                Modifier.fillMaxWidth().padding(24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally,
+            ) {
+                Surface(
+                    shape = RoundedCornerShape(14.dp),
+                    shadowElevation = 8.dp,
+                    modifier = Modifier.padding(bottom = 24.dp),
+                ) {
+                    NetworkImage(pb.track?.artworkUrl, Modifier.size(280.dp).clip(RoundedCornerShape(14.dp)))
+                }
+                Text(title, style = MaterialTheme.typography.titleLarge,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(subtitle, style = MaterialTheme.typography.bodyMedium,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Spacer(Modifier.height(24.dp))
 
-        val dur = pb.durationMs.coerceAtLeast(0)
-        val pos = pb.positionMs.coerceIn(0, if (dur > 0) dur else pb.positionMs)
-        // While dragging, show the drag position; only commit on release so the
-        // slider doesn't fight the 500ms progress ticker.
-        var dragPos by remember { mutableStateOf<Float?>(null) }
-        if (onDevice) {
-            // The local slider only reflects this phone's player; when casting, the
-            // device owns transport.
-            Text("Playback controls are on the device.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
-        } else if (pb.track != null && dur > 0) {
-            val livePos = pos.toFloat() / dur
-            Slider(
-                value = dragPos ?: livePos,
-                onValueChange = { dragPos = it },
-                onValueChangeFinished = {
-                    dragPos?.let { vm.seekTo((it * dur).toLong()) }
-                    dragPos = null
-                },
-            )
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                Text(formatMs((dragPos?.let { (it * dur).toLong() }) ?: pos),
-                    style = MaterialTheme.typography.labelSmall)
-                Text(formatMs(dur), style = MaterialTheme.typography.labelSmall)
+                val dur = pb.durationMs.coerceAtLeast(0)
+                val pos = pb.positionMs.coerceIn(0, if (dur > 0) dur else pb.positionMs)
+                // While dragging, show the drag position; only commit on release so the
+                // slider doesn't fight the 500ms progress ticker.
+                var dragPos by remember { mutableStateOf<Float?>(null) }
+                if (onDevice) {
+                    // The local slider only reflects this phone's player; when casting, the
+                    // device owns transport.
+                    Text("Playback controls are on the device.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else if (pb.track != null && dur > 0) {
+                    val livePos = pos.toFloat() / dur
+                    Slider(
+                        value = dragPos ?: livePos,
+                        onValueChange = { dragPos = it },
+                        onValueChangeFinished = {
+                            dragPos?.let { vm.seekTo((it * dur).toLong()) }
+                            dragPos = null
+                        },
+                    )
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text(formatMs((dragPos?.let { (it * dur).toLong() }) ?: pos),
+                            style = MaterialTheme.typography.labelSmall)
+                        Text(formatMs(dur), style = MaterialTheme.typography.labelSmall)
+                    }
+                }
+                Spacer(Modifier.height(16.dp))
+                val playing = if (onDevice) !state.devicePaused else pb.isPlaying
+                FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
+                    modifier = Modifier.size(72.dp)) {
+                    Icon(
+                        if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        contentDescription = if (playing) "Pause" else "Play",
+                        modifier = Modifier.size(40.dp),
+                    )
+                }
+                if (onDevice) {
+                    Spacer(Modifier.height(8.dp))
+                    Text("Casting to ${state.devices.firstOrNull { it.host == state.target }?.name ?: "a device"}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary)
+                }
+                Spacer(Modifier.height(16.dp))
+                OutputSelector(vm, state)
             }
         }
-        Spacer(Modifier.height(16.dp))
-        val playing = if (onDevice) !state.devicePaused else pb.isPlaying
-        FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
-            modifier = Modifier.size(72.dp)) {
-            Icon(
-                if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                contentDescription = if (playing) "Pause" else "Play",
-                modifier = Modifier.size(40.dp),
-            )
+
+        // The playing collection: tap any row to jump to it, keeping the same queue.
+        if (queue.size > 1) {
+            item {
+                Text("Playing from this list", style = MaterialTheme.typography.titleSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.fillMaxWidth()
+                        .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp))
+            }
+            items(queue) { t ->
+                TrackRow(t, onPlay = { vm.play(t, queue) },
+                    isPlaying = t.id == pb.track?.id)
+            }
+            item { Spacer(Modifier.height(24.dp)) }
         }
-        if (onDevice) {
-            Spacer(Modifier.height(8.dp))
-            Text("Casting to ${state.devices.firstOrNull { it.host == state.target }?.name ?: "a device"}",
-                style = MaterialTheme.typography.labelMedium,
-                color = MaterialTheme.colorScheme.primary)
-        }
-        Spacer(Modifier.height(16.dp))
-        OutputSelector(vm, state)
     }
 }
 

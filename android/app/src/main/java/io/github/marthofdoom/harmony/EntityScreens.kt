@@ -186,7 +186,7 @@ private fun ArtistScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntr
                 if (d.topTracks.isNotEmpty()) {
                     item { SectionHeader("Top tracks") }
                     items(d.topTracks) { t ->
-                        TrackRow(t, onPlay = { vm.play(t) },
+                        TrackRow(t, onPlay = { vm.play(t, d.topTracks) },
                             isPlaying = t.id == state.playback.track?.id,
                             trailing = { AddToPlaylistButton(vm, state, t) })
                     }
@@ -305,7 +305,7 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
                         t,
                         isPlaying = t.id == state.playback.track?.id,
                         onOpen = { vm.openTrack(t.service, t.id) },
-                        onPlay = { vm.play(t) },
+                        onPlay = { vm.play(t, d.tracks) },
                     )
                 }
                 item { Spacer(Modifier.height(24.dp)) }
@@ -525,7 +525,7 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
         if (inc.tracks.isNotEmpty()) {
             item { SectionHeader("Songs") }
             items(inc.tracks) { t ->
-                TrackRow(t, onPlay = { vm.play(t) },
+                TrackRow(t, onPlay = { vm.play(t, inc.tracks) },
                     isPlaying = t.id == state.playback.track?.id,
                     trailing = { AddToPlaylistButton(vm, state, t) })
             }

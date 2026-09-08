@@ -55,6 +55,9 @@ data class UiState(
     // entity-navigation back stack (overlays the tabs when non-empty)
     val detailStack: List<DetailEntry> = emptyList(),
     val playback: Playback = Playback(),
+    // the full track list playback was started from (album/playlist/search list),
+    // shown on Now Playing with the current track highlighted and tappable
+    val queue: List<Track> = emptyList(),
     val message: String? = null,
     // audio routing
     val peers: List<Instance> = emptyList(),
@@ -153,7 +156,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         prefs.baseUrl = null
         player.stop(); player.clearMediaItems()
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
-            results = emptyList(), query = "", playback = Playback(),
+            results = emptyList(), query = "", playback = Playback(), queue = emptyList(),
             smart = null, detailStack = emptyList(), tab = 0,
             peers = emptyList(), playingHere = false, routeStatus = null,
             renderers = emptyList(), bridgingTo = null,
@@ -255,10 +258,14 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun play(track: Track) {
+    /** Play [track]. [queue] is the full collection it was started from (an album,
+     *  a playlist, a search list) — retained so Now Playing can show the whole list
+     *  with this track highlighted; tapping another row replays it in the same queue.
+     *  Defaults to just this track when there's no surrounding list. */
+    fun play(track: Track, queue: List<Track> = listOf(track)) {
         val client = api ?: return
         _state.value = _state.value.copy(playback = _state.value.playback.copy(track = track),
-            playingHere = false)
+            queue = queue, playingHere = false)
         val target = _state.value.target
         viewModelScope.launch {
             if (target != "phone") {  // cast to a hub device instead of playing here
@@ -463,7 +470,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         player.prepare()
         player.play()
         _state.value = _state.value.copy(playingHere = true,
-            playback = Playback(track = null, isPlaying = true),
+            playback = Playback(track = null, isPlaying = true), queue = emptyList(),
             routeStatus = "Playing ${_state.value.instanceName ?: "this hub"}'s audio.")
     }
 
