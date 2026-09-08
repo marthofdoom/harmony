@@ -247,6 +247,20 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.ytmusic_oauth_poll(token))
             elif len(parts) == 4 and parts[0:2] == ["api", "accounts"] and parts[3] == "signout":
                 self._send_json(engine.signout(parts[2]))
+            elif parts == ["api", "lidarr", "config"]:
+                self._send_json(engine.lidarr_save_config(
+                    url=body.get("url"), api_key=body.get("api_key"),
+                    enabled=body.get("enabled"), root_folder=body.get("root_folder"),
+                    quality_profile_id=body.get("quality_profile_id"),
+                    metadata_profile_id=body.get("metadata_profile_id")))
+            elif parts == ["api", "lidarr", "request"]:
+                kind = (body.get("kind") or "").strip()
+                if kind not in ("album", "artist"):
+                    self._send_json({"error": "kind must be 'album' or 'artist'"}, status=400)
+                    return
+                self._send_json(engine.lidarr_request(
+                    kind, title=body.get("title", ""), artist=body.get("artist", ""),
+                    mbid=body.get("mbid")))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except KeyError as exc:
@@ -285,6 +299,10 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.album_page(parts[2], parts[3]))
             elif len(parts) == 4 and parts[0:2] == ["api", "track"]:
                 self._send_json(engine.track_page(parts[2], parts[3]))
+            elif parts == ["api", "lidarr"]:
+                self._send_json(engine.lidarr_status())
+            elif parts == ["api", "lidarr", "options"]:
+                self._send_json(engine.lidarr_options())
             elif parts == ["api", "playlists"]:
                 self._send_json(engine.playlists())
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":

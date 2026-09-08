@@ -745,6 +745,77 @@ class Engine:
             log.info("provider call %s failed: %s", getattr(fn, "__name__", fn), exc)
             return None
 
+    # -- Lidarr acquisition ("Get with Lidarr") -----------------------------
+
+    def _lidarr_client(self) -> Any:
+        from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
+        from harmony.lidarr import LidarrClient
+        s = Settings.load()
+        return LidarrClient(s.lidarr_url, CredentialStore().get(LIDARR_API_KEY) or ""), s
+
+    def lidarr_status(self) -> dict[str, Any]:
+        from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
+        s = Settings.load()
+        configured = bool(s.lidarr_url and CredentialStore().get(LIDARR_API_KEY))
+        out: dict[str, Any] = {"enabled": bool(s.lidarr_enabled), "configured": configured,
+                               "url": s.lidarr_url}
+        if configured:
+            try:
+                out["version"] = self._lidarr_client()[0].status().get("version")
+                out["ok"] = True
+            except Exception as exc:  # noqa: BLE001 - surface as status, don't raise
+                out["ok"] = False
+                out["error"] = str(exc)
+        return out
+
+    def lidarr_options(self) -> dict[str, Any]:
+        """Root folders + profiles, to populate the Lidarr settings form."""
+        client, _ = self._lidarr_client()
+        return {
+            "root_folders": [f.get("path") for f in client.root_folders()],
+            "quality_profiles": [{"id": p.get("id"), "name": p.get("name")}
+                                 for p in client.quality_profiles()],
+            "metadata_profiles": [{"id": p.get("id"), "name": p.get("name")}
+                                  for p in client.metadata_profiles()],
+        }
+
+    def lidarr_save_config(self, *, url: str | None = None, api_key: str | None = None,
+                           enabled: bool | None = None, root_folder: str | None = None,
+                           quality_profile_id: int | None = None,
+                           metadata_profile_id: int | None = None) -> dict[str, Any]:
+        from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
+        s = Settings.load()
+        if url is not None:
+            s.lidarr_url = url.strip()
+        if enabled is not None:
+            s.lidarr_enabled = bool(enabled)
+        if root_folder is not None:
+            s.lidarr_root_folder = root_folder
+        if quality_profile_id is not None:
+            s.lidarr_quality_profile_id = int(quality_profile_id or 0)
+        if metadata_profile_id is not None:
+            s.lidarr_metadata_profile_id = int(metadata_profile_id or 0)
+        s.save()
+        if api_key:  # only replace the stored key when a fresh one is provided
+            CredentialStore().set(LIDARR_API_KEY, api_key.strip())
+        return self.lidarr_status()
+
+    def lidarr_request(self, kind: str, *, title: str = "", artist: str = "",
+                       mbid: str | None = None) -> dict[str, Any]:
+        """Ask Lidarr to acquire an album or artist. ``mbid`` (a MusicBrainz
+        release-group/artist id, from the entity layer) makes the match exact."""
+        client, s = self._lidarr_client()
+        common = {"root_folder": s.lidarr_root_folder,
+                  "quality_profile_id": s.lidarr_quality_profile_id or None,
+                  "metadata_profile_id": s.lidarr_metadata_profile_id or None}
+        if kind == "album":
+            added = client.add_album(title, artist, mbid=mbid, **common)
+            return {"ok": True, "kind": "album", "title": added.get("title", title)}
+        if kind == "artist":
+            added = client.add_artist(artist or title, mbid=mbid, **common)
+            return {"ok": True, "kind": "artist", "title": added.get("artistName", artist or title)}
+        raise KeyError(kind)
+
     def playlists(self) -> dict[str, Any]:
         out = []
         with self._lock:
