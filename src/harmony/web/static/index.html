@@ -27,6 +27,7 @@
       <symbol id="i-next" viewBox="0 0 24 24"><path d="M5 5v14l10-7zM18 5v14" fill="currentColor" stroke="none"/></symbol>
       <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 5v14l12-7z" fill="currentColor" stroke="none"/></symbol>
       <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="5" width="4" height="14" rx="1" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1.5" fill="currentColor" stroke="none"/></symbol>
       <symbol id="i-add" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
       <symbol id="i-remove" viewBox="0 0 24 24"><path d="M5 12h14"/></symbol>
       <symbol id="i-cast" viewBox="0 0 24 24"><path d="M2 8V6a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-6"/><path d="M2 12a6 6 0 0 1 6 6M2 16a2 2 0 0 1 2 2"/><path d="M2 20h.01"/></symbol>
@@ -42,6 +43,7 @@
     <div class="brand"><svg class="logo"><use href="#i-music"></use></svg> Harmony</div>
     <ul id="nav" role="tablist">
       <li data-view="search" class="active" tabindex="0" role="tab"><svg class="ico"><use href="#i-search"></use></svg> Search</li>
+      <li data-view="nowplaying" tabindex="0" role="tab"><svg class="ico"><use href="#i-play"></use></svg> Now Playing</li>
       <li data-view="playlists" tabindex="0" role="tab"><svg class="ico"><use href="#i-playlists"></use></svg> Playlists</li>
       <li data-view="sync" tabindex="0" role="tab"><svg class="ico"><use href="#i-sync"></use></svg> Sync</li>
       <li data-view="devices" tabindex="0" role="tab"><svg class="ico"><use href="#i-devices"></use></svg> Devices</li>
@@ -71,6 +73,7 @@
       <button id="np-prev" aria-label="Previous track"><svg class="ico"><use href="#i-prev"></use></svg></button>
       <button id="np-play" class="play" aria-label="Play"><svg class="ico"><use href="#i-play"></use></svg></button>
       <button id="np-next" aria-label="Next track"><svg class="ico"><use href="#i-next"></use></svg></button>
+      <button id="np-stop" aria-label="Stop"><svg class="ico"><use href="#i-stop"></use></svg></button>
     </div>
     <div id="np-seekwrap">
       <span class="time" id="np-pos">0:00</span>
@@ -84,6 +87,7 @@
 
   <nav id="mobilenav" aria-label="Primary">
     <button data-view="search"><svg class="ico"><use href="#i-search"></use></svg><span class="l">Search</span></button>
+    <button data-view="nowplaying"><svg class="ico"><use href="#i-play"></use></svg><span class="l">Playing</span></button>
     <button data-view="playlists"><svg class="ico"><use href="#i-playlists"></use></svg><span class="l">Playlists</span></button>
     <button data-view="sync"><svg class="ico"><use href="#i-sync"></use></svg><span class="l">Sync</span></button>
     <button data-view="devices"><svg class="ico"><use href="#i-devices"></use></svg><span class="l">Devices</span></button>

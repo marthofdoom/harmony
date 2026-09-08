@@ -46,6 +46,16 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.2" date="2026-09-02">
+      <description>
+        <p>The Now Playing view now works the same on the web and phone apps as
+        on the desktop: large cover art beside the whole playing playlist or
+        album, the current track highlighted, tap or click any track to jump to
+        it. The web player gains a stop button to match. Casting to a Chromecast
+        now shows a moving progress bar (the desktop and web players advance it
+        from the track length while the device streams).</p>
+      </description>
+    </release>
     <release version="1.0.1" date="2026-09-02">
       <description>
         <p>Playback polish. A new Now Playing view shows the whole playing

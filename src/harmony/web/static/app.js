@@ -391,6 +391,51 @@ function highlightPlaying() {
   });
 }
 
+// -- Now Playing view: big cover art + the whole current queue -------------
+// Mirrors the desktop's Now Playing page. Reuses the track-row machinery so the
+// current row lights up (highlightPlaying) and clicking one plays that index.
+
+function renderNowPlaying() {
+  const list = $("list");
+  const t = state.index >= 0 ? state.queue[state.index] : null;
+  if (!t) {
+    list.innerHTML = emptyState("music", "Nothing playing",
+      "Play a track, album, or playlist and it shows up here.");
+    return;
+  }
+  list.innerHTML = `<div class="detail npview">
+    <div class="detail-hero">
+      <div class="detail-art" id="np-view-art" data-art="${esc(t.artwork_url || "")}">${ICON("music")}</div>
+      <div class="detail-herometa">
+        <div class="detail-kind">Now Playing</div>
+        <h2 class="detail-title" id="np-view-title">${esc(t.title || "")}</h2>
+        <div class="detail-sub" id="np-view-artist">${esc(t.artist || "")}</div>
+      </div>
+    </div>
+    <section class="detail-sec">
+      <h3>Queue</h3>
+      ${tracksHtml(state.queue)}
+    </section>
+  </div>`;
+  hydrateArt(list);
+  wireTrackRows(list, state.queue);
+  highlightPlaying();
+}
+
+// Keep an open Now Playing view in step with a track change without rebuilding
+// the whole list (so the queue's scroll position survives a next/prev).
+function updateNowPlayingView() {
+  const wrap = $("list").querySelector(".npview");
+  if (!wrap) return;
+  const t = state.index >= 0 ? state.queue[state.index] : null;
+  if (!t) { renderNowPlaying(); return; }
+  const titleEl = $("np-view-title"), artistEl = $("np-view-artist"), artEl = $("np-view-art");
+  if (titleEl) titleEl.textContent = t.title || "";
+  if (artistEl) artistEl.textContent = t.artist || "";
+  if (artEl) { artEl.classList.add("fallback"); artEl.innerHTML = ICON("music"); artEl.dataset.art = t.artwork_url || ""; hydrateArt(wrap); }
+  highlightPlaying();
+}
+
 // -- views ------------------------------------------------------------------
 
 function highlightNav(view) {
@@ -406,6 +451,7 @@ function setView(view) {
   state.detail = false;
   highlightNav(view);
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
+  else if (view === "nowplaying") { $("view-title").textContent = "Now Playing"; renderNowPlaying(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
   else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
   else if (view === "sync") { $("view-title").textContent = "Sync"; renderSync(); }
@@ -1135,19 +1181,66 @@ function updateCastChip() {
   } else { via.classList.remove("show"); np.classList.remove("casting"); }
 }
 
+// Cast progress is driven by a LOCAL clock: while casting to a device we count
+// elapsed seconds ourselves and advance the bar every second, then only *snap*
+// to the device's reported position when that position actually moved between
+// polls (a real seek, or a well-behaved WiiM/UPnP renderer). Chromecast relays
+// report a FROZEN position for a relayed stream, so trusting it verbatim leaves
+// the bar stuck; a frozen/zero reading is ignored and the local clock carries on.
 let devicePoll = null;
+let castPos = 0;              // locally-interpolated position (seconds)
+let castDur = 0;             // known track duration (seconds)
+let castLastReported = null; // last device-reported position, to detect movement
+let _castTick = 0;           // 1s ticks, so we reconcile against the device ~every 2s
+
 function stopDevicePoll() { if (devicePoll) { clearInterval(devicePoll); devicePoll = null; } }
+
+// A fresh cast track: reset the local clock (and the bar) to 0.
+function resetCastProgress(dur) {
+  castPos = 0;
+  castLastReported = null;
+  _castTick = 0;
+  castDur = dur || 0;
+  if (castDur) { $("np-seek").max = castDur; $("np-dur").textContent = fmtTime(castDur); }
+  $("np-seek").value = 0;
+  $("np-pos").textContent = fmtTime(0);
+}
+
+function paintCastProgress() {
+  $("np-seek").value = Math.floor(castPos);
+  $("np-pos").textContent = fmtTime(castPos);
+}
+
+async function pollCastStatus() {
+  try {
+    const q = state.targetVia ? `?via=${encodeURIComponent(state.targetVia)}` : "";
+    const s = await api(`/api/devices/${encodeURIComponent(state.target)}/status${q}`);
+    if (s.duration_s) { castDur = s.duration_s; $("np-seek").max = s.duration_s; $("np-dur").textContent = fmtTime(s.duration_s); }
+    if (s.position_s != null) {
+      const rep = Number(s.position_s);
+      const moved = castLastReported == null || Math.abs(rep - castLastReported) >= 1;
+      // Never let a frozen/zeroed reading yank an already-advancing bar back to 0.
+      const zeroMidTrack = rep <= 0 && castPos > 2;
+      if (moved && !zeroMidTrack) {
+        castPos = castDur ? Math.min(Math.max(0, rep), castDur) : Math.max(0, rep);
+        paintCastProgress();
+      }
+      castLastReported = rep;
+    }
+  } catch { /* device may be mid-buffer; ignore */ }
+}
+
 function startDevicePoll() {
   stopDevicePoll();
-  devicePoll = setInterval(async () => {
+  devicePoll = setInterval(() => {
     if (!onDevice()) return stopDevicePoll();
-    try {
-      const q = state.targetVia ? `?via=${encodeURIComponent(state.targetVia)}` : "";
-      const s = await api(`/api/devices/${encodeURIComponent(state.target)}/status${q}`);
-      if (s.duration_s) { $("np-seek").max = s.duration_s; $("np-dur").textContent = fmtTime(s.duration_s); }
-      if (s.position_s != null) { $("np-seek").value = s.position_s; $("np-pos").textContent = fmtTime(s.position_s); }
-    } catch { /* device may be mid-buffer; ignore */ }
-  }, 1500);
+    _castTick++;
+    if (!state.devicePaused) {
+      castPos = castDur ? Math.min(castPos + 1, castDur) : castPos + 1;
+      paintCastProgress();
+    }
+    if (_castTick % 2 === 0) pollCastStatus();   // reconcile with the device ~every 2s
+  }, 1000);
 }
 
 function updateMediaSession(t) {
@@ -1165,6 +1258,7 @@ async function playAt(i) {
   const t = state.queue[i];
   state.index = i;
   highlightPlaying();
+  updateNowPlayingView();
   $("np-title").textContent = t.title;
   $("np-artist").textContent = t.artist;
   $("nowplaying").classList.remove("empty");
@@ -1173,6 +1267,7 @@ async function playAt(i) {
   updateCastChip();
   try {
     if (onDevice()) {
+      resetCastProgress(t.duration_s);
       await apiPost(`/api/devices/${encodeURIComponent(state.target)}/play`,
         withVia({ service: t.service, id: t.id, meta: { title: t.title, artist: t.artist, album: t.album, art_url: t.artwork_url, duration_s: t.duration_s } }));
       state.devicePaused = false;
@@ -1188,6 +1283,32 @@ async function playAt(i) {
     toastErr(`Couldn’t play “${t.title}”: ${e.message}`);
   }
 }
+
+// Stop: halt playback and reset the bar to its "nothing playing" state. For a
+// cast target this tears the cast down via the same device-control stop path the
+// cast flow uses; for the browser it pauses and rewinds the <audio> element.
+function stopPlayback() {
+  if (onDevice()) {
+    apiPost(`/api/devices/${encodeURIComponent(state.target)}/stop`, withVia({})).catch(() => { /* best-effort */ });
+  }
+  stopDevicePoll();
+  try { audio.pause(); } catch { /* ignore */ }
+  try { audio.currentTime = 0; } catch { /* ignore */ }
+  audio.removeAttribute("src");
+  try { audio.load(); } catch { /* ignore */ }
+  state.index = -1;
+  state.devicePaused = false;
+  castPos = 0; castDur = 0; castLastReported = null;
+  setPlayIcon(false);
+  $("np-seek").value = 0; $("np-seek").max = 1;
+  $("np-pos").textContent = "0:00"; $("np-dur").textContent = "0:00";
+  $("np-title").textContent = "Nothing playing";
+  $("np-artist").textContent = "";
+  $("nowplaying").classList.add("empty");
+  highlightPlaying();
+  updateNowPlayingView();
+}
+$("np-stop").addEventListener("click", stopPlayback);
 
 $("np-device").addEventListener("change", (e) => {
   const prev = state.target;

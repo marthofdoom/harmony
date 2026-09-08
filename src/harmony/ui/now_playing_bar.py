@@ -48,6 +48,12 @@ class NowPlayingBar(Gtk.Box):
         # Locally-interpolated position so the seek bar advances every second
         # instead of jumping on the ~3s device poll (reconciled on each poll).
         self._interp_pos: float | None = None
+        # The last device-reported position we saw. A Chromecast playing a
+        # relayed stream reports a *frozen* position, so we only snap the bar to
+        # the device when its own clock actually moves (a real poll or a seek);
+        # otherwise the local ticker carries the progress. Keeps WiiM/UPnP — which
+        # do advance their clock — accurate, and lets casting show progress at all.
+        self._last_poll_pos: float | None = None
         self._devices: list = []
         self._art_cache: dict[str, object] = {}
 
@@ -287,13 +293,20 @@ class NowPlayingBar(Gtk.Box):
         if not self._seeking:
             duration = pb.duration_s or 0
             position = pb.position_s or 0
-            self._interp_pos = float(position)
+            # Snap to the device only when its reported clock genuinely moved (a
+            # fresh poll or a seek); if it's frozen (a cast relaying a stream),
+            # keep the locally-ticked position so the bar still advances.
+            moved = self._last_poll_pos is None or abs(position - self._last_poll_pos) > 1
+            self._last_poll_pos = float(position)
+            if moved or self._interp_pos is None:
+                self._interp_pos = float(position)
+            shown = int(self._interp_pos)
             self._syncing = True
             self._seek.set_range(0, max(1, duration))
-            self._seek.set_value(min(position, duration or position))
+            self._seek.set_value(min(shown, duration or shown))
             self._syncing = False
             self._seek.set_sensitive(duration > 0)
-            self._pos.set_label(_fmt(position))
+            self._pos.set_label(_fmt(shown))
             self._dur.set_label(_fmt(pb.duration_s))
 
         # shuffle + repeat
