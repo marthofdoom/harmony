@@ -7,6 +7,7 @@ import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
 import androidx.media3.exoplayer.ExoPlayer
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -17,6 +18,9 @@ import kotlinx.coroutines.withContext
 enum class ConnState { DISCONNECTED, CONNECTING, CONNECTED }
 
 enum class DetailKind { ARTIST, ALBUM, TRACK }
+
+/** Active-queue repeat mode: no repeat, loop the whole queue, or repeat one track. */
+enum class RepeatMode { OFF, ALL, ONE }
 
 /** One entry on the entity-navigation back stack. It carries its own loaded
  *  payload so going back never refetches. `key` disambiguates duplicate routes. */
@@ -55,9 +59,15 @@ data class UiState(
     // entity-navigation back stack (overlays the tabs when non-empty)
     val detailStack: List<DetailEntry> = emptyList(),
     val playback: Playback = Playback(),
-    // the full track list playback was started from (album/playlist/search list),
-    // shown on Now Playing with the current track highlighted and tappable
+    // The ephemeral ACTIVE PLAY QUEUE (ordered tracks) the player advances through,
+    // separate from any browsed list. Shown on Now Playing with the current track
+    // highlighted/tappable; mutated only by play / enqueue / play-next / reorder /
+    // auto-advance — never as a side effect of navigation.
     val queue: List<Track> = emptyList(),
+    // Index of the currently-playing track within [queue] (-1 when nothing is queued).
+    val activeIndex: Int = -1,
+    val shuffle: Boolean = false,
+    val repeatMode: RepeatMode = RepeatMode.OFF,
     val message: String? = null,
     // audio routing
     val peers: List<Instance> = emptyList(),
@@ -100,10 +110,22 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state.asStateFlow()
 
+    // The job resolving/starting the current track; cancelled when we jump elsewhere
+    // so a slow stream-URL resolve can't stomp a newer selection.
+    private var advanceJob: Job? = null
+    // Snapshot of the pre-shuffle order, so toggling shuffle off restores it.
+    private var preShuffleOrder: List<Track>? = null
+
     val player: ExoPlayer = ExoPlayer.Builder(app).build().apply {
         addListener(object : Player.Listener {
             override fun onIsPlayingChanged(isPlaying: Boolean) {
                 _state.value = _state.value.copy(playback = _state.value.playback.copy(isPlaying = isPlaying))
+            }
+            // Auto-advance: when the current track finishes, move through the active
+            // queue (respecting repeat/shuffle). Only for local "play here" playback —
+            // hub-audio streaming and casting are handled elsewhere.
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_ENDED) onTrackEnded()
             }
         })
     }
@@ -155,8 +177,10 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         api = null
         prefs.baseUrl = null
         player.stop(); player.clearMediaItems()
+        advanceJob?.cancel(); preShuffleOrder = null
         _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, instanceName = null,
-            results = emptyList(), query = "", playback = Playback(), queue = emptyList(),
+            results = emptyList(), query = "", playback = Playback(),
+            queue = emptyList(), activeIndex = -1,
             smart = null, detailStack = emptyList(), tab = 0,
             peers = emptyList(), playingHere = false, routeStatus = null,
             renderers = emptyList(), bridgingTo = null,
@@ -258,16 +282,41 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** Play [track]. [queue] is the full collection it was started from (an album,
-     *  a playlist, a search list) — retained so Now Playing can show the whole list
-     *  with this track highlighted; tapping another row replays it in the same queue.
-     *  Defaults to just this track when there's no surrounding list. */
+    /** Play [track], loading [queue] as the ACTIVE PLAY QUEUE (a copy of the album,
+     *  playlist or search list it came from). This REPLACES the active queue and jumps
+     *  to [track]; the player then auto-advances through it. Defaults to a 1-item queue
+     *  when there's no surrounding list. Honours the current shuffle state. */
     fun play(track: Track, queue: List<Track> = listOf(track)) {
+        if (api == null) return
+        val idx = queue.indexOfFirst { it.id == track.id && it.service == track.service }
+            .coerceAtLeast(0)
+        preShuffleOrder = null
+        if (_state.value.shuffle && queue.size > 1) {
+            val cur = queue[idx]
+            preShuffleOrder = queue
+            val shuffled = listOf(cur) + queue.filterIndexed { i, _ -> i != idx }.shuffled()
+            _state.value = _state.value.copy(queue = shuffled)
+            playIndex(0)
+        } else {
+            _state.value = _state.value.copy(queue = queue)
+            playIndex(idx)
+        }
+    }
+
+    /** Start the track at [index] in the active queue — the single funnel for
+     *  play / jump / prev / next / auto-advance. Resolves the per-track stream URL
+     *  off the main thread (the same resolve the old play() used), or casts it when a
+     *  hub device is the target. */
+    private fun playIndex(index: Int) {
+        val q = _state.value.queue
+        if (index !in q.indices) return
         val client = api ?: return
-        _state.value = _state.value.copy(playback = _state.value.playback.copy(track = track),
-            queue = queue, playingHere = false)
+        val track = q[index]
+        _state.value = _state.value.copy(activeIndex = index, playingHere = false,
+            playback = _state.value.playback.copy(track = track))
         val target = _state.value.target
-        viewModelScope.launch {
+        advanceJob?.cancel()
+        advanceJob = viewModelScope.launch {
             if (target != "phone") {  // cast to a hub device instead of playing here
                 _state.value = _state.value.copy(devicePaused = false)
                 withContext(Dispatchers.IO) { runCatching { client.castPlay(target, track) } }
@@ -282,6 +331,140 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             }.onFailure { _state.value = _state.value.copy(
                 message = friendly(it, "Couldn't play that track. Try again.")) }
         }
+    }
+
+    /** A track finished on the local player: advance through the active queue. */
+    private fun onTrackEnded() {
+        if (_state.value.playingHere || _state.value.target != "phone") return
+        val q = _state.value.queue
+        if (q.isEmpty()) return
+        val i = _state.value.activeIndex
+        when (_state.value.repeatMode) {
+            RepeatMode.ONE -> playIndex(i)
+            else -> {
+                val next = i + 1
+                when {
+                    next < q.size -> playIndex(next)
+                    _state.value.repeatMode == RepeatMode.ALL -> playIndex(0)
+                    else -> { /* end of queue: stop, keep the last track shown */ }
+                }
+            }
+        }
+    }
+
+    /** Skip to the next track in the active queue (wraps only when repeat=all). */
+    fun next() {
+        val q = _state.value.queue
+        if (q.isEmpty()) return
+        val i = _state.value.activeIndex
+        val target = when {
+            i + 1 < q.size -> i + 1
+            _state.value.repeatMode == RepeatMode.ALL -> 0
+            else -> return
+        }
+        playIndex(target)
+    }
+
+    /** Go to the previous track; restarts the current one if we're already past 3s. */
+    fun prev() {
+        val q = _state.value.queue
+        if (q.isEmpty()) return
+        if (_state.value.target == "phone" && player.currentPosition > 3000) {
+            player.seekTo(0); return
+        }
+        val i = _state.value.activeIndex
+        val target = when {
+            i - 1 >= 0 -> i - 1
+            _state.value.repeatMode == RepeatMode.ALL -> q.size - 1
+            else -> { if (_state.value.target == "phone") player.seekTo(0); return }
+        }
+        playIndex(target)
+    }
+
+    /** Tap a queue row to jump straight to it. */
+    fun jumpTo(index: Int) = playIndex(index)
+
+    /** Append [tracks] to the end of the active queue (does not interrupt playback).
+     *  If nothing is queued yet, starts playing from the first added track. */
+    fun addToQueue(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
+        val wasEmpty = _state.value.queue.isEmpty()
+        _state.value = _state.value.copy(queue = _state.value.queue + tracks,
+            message = if (tracks.size == 1) "Added to queue" else "${tracks.size} tracks added to queue")
+        preShuffleOrder = preShuffleOrder?.plus(tracks)
+        if (wasEmpty) playIndex(0)
+    }
+
+    fun addToQueue(track: Track) = addToQueue(listOf(track))
+
+    /** Insert [tracks] immediately after the current track in the active queue. */
+    fun playNext(tracks: List<Track>) {
+        if (tracks.isEmpty()) return
+        val q = _state.value.queue
+        if (q.isEmpty()) { addToQueue(tracks); return }
+        val at = (_state.value.activeIndex + 1).coerceIn(0, q.size)
+        val newQ = q.toMutableList().apply { addAll(at, tracks) }
+        _state.value = _state.value.copy(queue = newQ, message = "Playing next")
+        preShuffleOrder = preShuffleOrder?.plus(tracks)
+    }
+
+    fun playNext(track: Track) = playNext(listOf(track))
+
+    /** Move an active-queue item, keeping the currently-playing track current. */
+    fun moveQueueItem(from: Int, to: Int) {
+        val q = _state.value.queue
+        if (from !in q.indices || to !in q.indices || from == to) return
+        val cur = q.getOrNull(_state.value.activeIndex)
+        val m = q.toMutableList()
+        m.add(to, m.removeAt(from))
+        val ni = if (cur != null) m.indexOfFirst { it === cur }.coerceAtLeast(0)
+                 else _state.value.activeIndex
+        _state.value = _state.value.copy(queue = m, activeIndex = ni)
+    }
+
+    /** Remove an upcoming track from the active queue (the current track is kept). */
+    fun removeFromQueue(index: Int) {
+        val q = _state.value.queue
+        val cur = q.getOrNull(_state.value.activeIndex) ?: return
+        if (index !in q.indices || index == _state.value.activeIndex) return
+        val m = q.toMutableList().apply { removeAt(index) }
+        _state.value = _state.value.copy(queue = m,
+            activeIndex = m.indexOfFirst { it === cur }.coerceAtLeast(0))
+    }
+
+    /** Toggle shuffle. On: keep the current track first, shuffle the rest. Off:
+     *  restore the pre-shuffle order, staying on the current track. Does not restart
+     *  playback — only the upcoming order changes. */
+    fun toggleShuffle() {
+        val on = !_state.value.shuffle
+        val q = _state.value.queue
+        val i = _state.value.activeIndex
+        if (q.isEmpty() || i !in q.indices) {
+            _state.value = _state.value.copy(shuffle = on); return
+        }
+        val cur = q[i]
+        if (on) {
+            preShuffleOrder = q
+            val shuffled = listOf(cur) + q.filterIndexed { idx, _ -> idx != i }.shuffled()
+            _state.value = _state.value.copy(shuffle = true, queue = shuffled, activeIndex = 0)
+        } else {
+            val restore = preShuffleOrder ?: q
+            val ni = restore.indexOfFirst { it === cur }
+                .let { if (it < 0) restore.indexOfFirst { t -> t.id == cur.id && t.service == cur.service } else it }
+                .coerceAtLeast(0)
+            preShuffleOrder = null
+            _state.value = _state.value.copy(shuffle = false, queue = restore, activeIndex = ni)
+        }
+    }
+
+    /** Cycle repeat: off → all → one → off. */
+    fun cycleRepeat() {
+        val next = when (_state.value.repeatMode) {
+            RepeatMode.OFF -> RepeatMode.ALL
+            RepeatMode.ALL -> RepeatMode.ONE
+            RepeatMode.ONE -> RepeatMode.OFF
+        }
+        _state.value = _state.value.copy(repeatMode = next)
     }
 
     fun setTarget(target: String) { _state.value = _state.value.copy(target = target) }
@@ -466,11 +649,13 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
      *  cellular — unlike inbound UDP, which a phone rarely receives). */
     fun playHere() {
         val client = api ?: return
+        advanceJob?.cancel(); preShuffleOrder = null
         player.setMediaItem(MediaItem.fromUri(client.monitorUrl()))
         player.prepare()
         player.play()
         _state.value = _state.value.copy(playingHere = true,
-            playback = Playback(track = null, isPlaying = true), queue = emptyList(),
+            playback = Playback(track = null, isPlaying = true),
+            queue = emptyList(), activeIndex = -1,
             routeStatus = "Playing ${_state.value.instanceName ?: "this hub"}'s audio.")
     }
 

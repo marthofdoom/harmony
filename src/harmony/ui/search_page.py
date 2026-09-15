@@ -17,6 +17,7 @@ from harmony.models import Album, Artist, Playlist, SearchResults, Service, Trac
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
+    enqueue_collection,
     play_collection_on_device,
     play_track_here,
 )
@@ -615,6 +616,8 @@ class SearchPage(Gtk.Box):
     def _track_row_actions(self, track: Track) -> list[tuple[str, Callable[[], None]]]:
         actions: list[tuple[str, Callable[[], None]]] = [
             ("Play on Device", lambda: self._open_device_popover(self.column_view, track)),
+            ("Add to Queue", lambda: self.state.playback_enqueue([track])),
+            ("Play Next", lambda: self.state.playback_play_next([track])),
             ("Add to Playlist…", lambda: self._open_playlist_popover(self.column_view, [track])),
         ]
         provider = self._similar_target_provider(track.service)
@@ -662,6 +665,14 @@ class SearchPage(Gtk.Box):
             actions.append((
                 "Play on Device",
                 lambda: play_collection_on_device(anchor, self.state, label=label, fetch_tracks=fetch_tracks),
+            ))
+            actions.append((
+                "Add to Queue",
+                lambda: enqueue_collection(self.state, label=label, fetch_tracks=fetch_tracks),
+            ))
+            actions.append((
+                "Play Next",
+                lambda: enqueue_collection(self.state, label=label, fetch_tracks=fetch_tracks, play_next=True),
             ))
             actions.append((
                 "Add to Playlist…",

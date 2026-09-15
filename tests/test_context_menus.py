@@ -395,7 +395,7 @@ def test_track_row_actions_full_providers(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._track_row_actions(track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Find on Other Service"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Find on Other Service"]
 
 
 def test_track_row_actions_no_other_service_configured(fake_state: AppState) -> None:
@@ -405,7 +405,7 @@ def test_track_row_actions_no_other_service_configured(fake_state: AppState) -> 
 
     labels = [label for label, _cb in page._track_row_actions(track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar"]
 
 
 def test_track_row_actions_no_providers_at_all(fake_state: AppState) -> None:
@@ -415,7 +415,7 @@ def test_track_row_actions_no_providers_at_all(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._track_row_actions(track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…"]
 
 
 def test_track_row_actions_add_navigation_when_ids_present(fake_state: AppState) -> None:
@@ -430,7 +430,7 @@ def test_track_row_actions_add_navigation_when_ids_present(fake_state: AppState)
     labels = [label for label, _cb in page._track_row_actions(track)]
 
     # Existing actions are unchanged and lead; navigation is appended.
-    assert labels[:2] == ["Play on Device", "Add to Playlist…"]
+    assert labels[:4] == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…"]
     assert "Go to Artist" in labels and "Go to Album" in labels
 
 
@@ -441,7 +441,7 @@ def test_artist_row_actions_with_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._other_row_actions(artist)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_artist_row_actions_falls_back_to_other_provider(fake_state: AppState) -> None:
@@ -473,7 +473,7 @@ def test_album_row_actions_with_native_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._other_row_actions(album)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_album_row_actions_without_native_provider_omits_show_similar(fake_state: AppState) -> None:
@@ -495,7 +495,7 @@ def test_playlist_row_actions_with_native_provider(fake_state: AppState) -> None
 
     labels = [label for label, _cb in page._other_row_actions(playlist)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_playlist_row_actions_without_native_provider_omits_show_similar(fake_state: AppState) -> None:
@@ -519,7 +519,7 @@ def test_playlists_page_row_actions_with_provider(fake_state: AppState) -> None:
 
     labels = [label for label, _cb in page._playlist_row_actions(playlist, wrapper)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_playlists_page_row_actions_without_provider(fake_state: AppState) -> None:

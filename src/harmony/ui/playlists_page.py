@@ -18,6 +18,7 @@ from harmony.models import Playlist, Service, Track  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
+    enqueue_collection,
     play_collection_on_device,
     play_track_here,
     track_menu_actions,
@@ -173,6 +174,15 @@ class PlaylistsPage(Gtk.Box):
                     anchor, self.state, label=playlist.title, fetch_tracks=fetch_tracks,
                     collection_key=(playlist.service, playlist.id),
                 ),
+            ))
+            actions.append((
+                "Add to Queue",
+                lambda: enqueue_collection(self.state, label=playlist.title, fetch_tracks=fetch_tracks),
+            ))
+            actions.append((
+                "Play Next",
+                lambda: enqueue_collection(self.state, label=playlist.title,
+                                           fetch_tracks=fetch_tracks, play_next=True),
             ))
             actions.append((
                 "Add to Playlist…",

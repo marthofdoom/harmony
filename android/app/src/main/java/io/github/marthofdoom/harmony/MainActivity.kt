@@ -22,6 +22,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardActions
@@ -29,15 +30,26 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
+import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LibraryMusic
+import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.MusicNote
 import androidx.compose.material.icons.filled.Pause
 import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.material.icons.filled.Repeat
+import androidx.compose.material.icons.filled.RepeatOne
 import androidx.compose.material.icons.filled.Search
+import androidx.compose.material.icons.filled.Shuffle
+import androidx.compose.material.icons.filled.SkipNext
+import androidx.compose.material.icons.filled.SkipPrevious
 import androidx.compose.material.icons.filled.Speaker
 import androidx.compose.material.icons.filled.Stop
 import androidx.compose.material.icons.filled.Sync
@@ -56,6 +68,7 @@ import androidx.compose.material3.ExposedDropdownMenuDefaults
 import androidx.compose.material3.FilledIconButton
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -772,6 +785,34 @@ fun TrackRow(
     }
 }
 
+/** Row overflow menu: queue actions (Play next / Add to queue) plus the existing
+ *  "add to playlist" targets. Used as the trailing action on track rows. */
+@Composable
+fun TrackRowMenu(vm: HarmonyViewModel, state: UiState, track: Track) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) { Icon(Icons.Filled.MoreVert, "More actions") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(
+                text = { Text("Play next") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistPlay, null) },
+                onClick = { vm.playNext(track); expanded = false })
+            DropdownMenuItem(
+                text = { Text("Add to queue") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) },
+                onClick = { vm.addToQueue(track); expanded = false })
+            if (state.playlists.isNotEmpty()) {
+                HorizontalDivider()
+                state.playlists.forEach { pl ->
+                    DropdownMenuItem(
+                        text = { Text("Add to ${pl.title}") },
+                        onClick = { vm.addToPlaylist(track, pl); expanded = false })
+                }
+            }
+        }
+    }
+}
+
 @Composable
 fun AddToPlaylistButton(vm: HarmonyViewModel, state: UiState, track: Track) {
     var expanded by remember { mutableStateOf(false) }
@@ -874,13 +915,39 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                 }
                 Spacer(Modifier.height(16.dp))
                 val playing = if (onDevice) !state.devicePaused else pb.isPlaying
-                FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
-                    modifier = Modifier.size(72.dp)) {
-                    Icon(
-                        if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
-                        contentDescription = if (playing) "Pause" else "Play",
-                        modifier = Modifier.size(40.dp),
-                    )
+                val hasQueue = state.queue.isNotEmpty()
+                Row(verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    // Shuffle: tinted when on.
+                    IconButton(onClick = { vm.toggleShuffle() }) {
+                        Icon(Icons.Filled.Shuffle, "Shuffle",
+                            tint = if (state.shuffle) MaterialTheme.colorScheme.primary
+                                   else MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                    IconButton(onClick = { vm.prev() }, enabled = hasQueue) {
+                        Icon(Icons.Filled.SkipPrevious, "Previous", Modifier.size(32.dp))
+                    }
+                    FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
+                        modifier = Modifier.size(72.dp)) {
+                        Icon(
+                            if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                            contentDescription = if (playing) "Pause" else "Play",
+                            modifier = Modifier.size(40.dp),
+                        )
+                    }
+                    IconButton(onClick = { vm.next() }, enabled = hasQueue) {
+                        Icon(Icons.Filled.SkipNext, "Next", Modifier.size(32.dp))
+                    }
+                    // Repeat: off → all → one; tinted when not off, filled-one icon for "one".
+                    IconButton(onClick = { vm.cycleRepeat() }) {
+                        Icon(
+                            if (state.repeatMode == RepeatMode.ONE) Icons.Filled.RepeatOne
+                            else Icons.Filled.Repeat,
+                            contentDescription = "Repeat: ${state.repeatMode.name.lowercase()}",
+                            tint = if (state.repeatMode == RepeatMode.OFF)
+                                       MaterialTheme.colorScheme.onSurfaceVariant
+                                   else MaterialTheme.colorScheme.primary)
+                    }
                 }
                 if (onDevice) {
                     Spacer(Modifier.height(8.dp))
@@ -893,19 +960,71 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
             }
         }
 
-        // The playing collection: tap any row to jump to it, keeping the same queue.
+        // The active play queue: tap a row to jump to it; reorder upcoming tracks with
+        // the up/down affordances (drag is heavy in Compose without an extra library).
         if (queue.size > 1) {
             item {
-                Text("Playing from this list", style = MaterialTheme.typography.titleSmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.fillMaxWidth()
-                        .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp))
+                Row(Modifier.fillMaxWidth()
+                    .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically) {
+                    Icon(Icons.AutoMirrored.Filled.QueueMusic, null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Queue", style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
-            items(queue) { t ->
-                TrackRow(t, onPlay = { vm.play(t, queue) },
-                    isPlaying = t.id == pb.track?.id)
+            itemsIndexed(queue, key = { i, t -> "$i-${t.service}-${t.id}" }) { i, t ->
+                QueueRow(
+                    track = t,
+                    isCurrent = i == state.activeIndex,
+                    canMoveUp = i > 0,
+                    canMoveDown = i < queue.size - 1,
+                    onTap = { vm.jumpTo(i) },
+                    onMoveUp = { vm.moveQueueItem(i, i - 1) },
+                    onMoveDown = { vm.moveQueueItem(i, i + 1) },
+                )
             }
             item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+/** One row in the active-queue list: art, title/artist, current highlight, and
+ *  up/down reorder controls. Tapping the row jumps playback to it. */
+@Composable
+private fun QueueRow(
+    track: Track,
+    isCurrent: Boolean,
+    canMoveUp: Boolean,
+    canMoveDown: Boolean,
+    onTap: () -> Unit,
+    onMoveUp: () -> Unit,
+    onMoveDown: () -> Unit,
+) {
+    Row(Modifier.fillMaxWidth().clickable { onTap() }.padding(horizontal = 16.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        NetworkImage(track.artworkUrl, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)))
+        Spacer(Modifier.width(12.dp))
+        Column(Modifier.weight(1f)) {
+            Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodyLarge,
+                color = if (isCurrent) MaterialTheme.colorScheme.primary
+                        else MaterialTheme.colorScheme.onSurface)
+            Text(listOfNotNull(track.artist.ifBlank { null }, track.album).joinToString(" · "),
+                maxLines = 1, overflow = TextOverflow.Ellipsis,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        IconButton(onClick = onMoveUp, enabled = canMoveUp) {
+            Icon(Icons.Filled.ArrowUpward, "Move up",
+                tint = if (canMoveUp) MaterialTheme.colorScheme.onSurfaceVariant
+                       else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f))
+        }
+        IconButton(onClick = onMoveDown, enabled = canMoveDown) {
+            Icon(Icons.Filled.ArrowDownward, "Move down",
+                tint = if (canMoveDown) MaterialTheme.colorScheme.onSurfaceVariant
+                       else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f))
         }
     }
 }

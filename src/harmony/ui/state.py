@@ -1123,6 +1123,80 @@ class AppState(GObject.Object):
         run_async(lambda: self.play_tracks_on_device(ordered, host, key), None,
                   lambda exc: self._toast_playback_error(exc, "Couldn't play that track."))
 
+    # -- queue management (enqueue / play-next / reorder) -------------------
+    #
+    # These mutate the live active queue (``_queues[host]``, current track at
+    # index 0) on the main loop — the same loop the queue poller runs on, so no
+    # locking is needed. They never touch a device directly; auto-advance picks
+    # up the changed queue on its next step.
+
+    def active_queue(self) -> list[Any]:
+        """The live active queue on the active device (current track first, then
+        what's actually up next) — for the Now Playing view + reordering."""
+        host = self.playback.active_host
+        return list(self._queues.get(host, [])) if host else []
+
+    def playback_enqueue(self, tracks: list[Any]) -> None:
+        """Append ``tracks`` to the end of the active queue (start playing if idle)."""
+        tracks = [t for t in tracks if t]
+        if not tracks:
+            return
+        host = self.playback.active_host or LOCAL_HOST
+        queue = self._queues.get(host)
+        if not queue:
+            key = getattr(tracks[0], "collection_key", None)
+            run_async(lambda: self.play_tracks_on_device(tracks, host, key), None,
+                      lambda exc: self._toast_playback_error(exc, "Couldn't queue those tracks."))
+            return
+        queue.extend(tracks)
+        if host in self._collection_full:
+            self._collection_full[host].extend(tracks)
+        self.playback.has_next = True
+        self.emit("playback-changed")
+        self.toast(f"Added {len(tracks)} to the queue" if len(tracks) > 1 else "Added to the queue")
+
+    def playback_play_next(self, tracks: list[Any]) -> None:
+        """Insert ``tracks`` right after the current track in the active queue."""
+        tracks = [t for t in tracks if t]
+        if not tracks:
+            return
+        host = self.playback.active_host or LOCAL_HOST
+        queue = self._queues.get(host)
+        if not queue:
+            self.playback_enqueue(tracks)
+            return
+        for offset, track in enumerate(tracks, start=1):
+            queue.insert(offset, track)  # after the current track (index 0)
+        self.playback.has_next = True
+        self.emit("playback-changed")
+        self.toast("Playing next")
+
+    def playback_reorder(self, from_index: int, to_index: int) -> None:
+        """Move an *upcoming* queue item (indices >= 1; the current track stays put)."""
+        host = self.playback.active_host
+        queue = self._queues.get(host) if host else None
+        if not queue:
+            return
+        n = len(queue)
+        if from_index < 1 or to_index < 1 or from_index >= n or to_index >= n or from_index == to_index:
+            return
+        queue.insert(to_index, queue.pop(from_index))
+        self.emit("playback-changed")
+
+    def playback_remove(self, track: Any) -> None:
+        """Remove an upcoming track from the active queue (never the current one)."""
+        host = self.playback.active_host
+        queue = self._queues.get(host) if host else None
+        if not queue:
+            return
+        key = track.key()
+        for i in range(1, len(queue)):  # skip index 0 (currently playing)
+            if queue[i].key() == key:
+                queue.pop(i)
+                self.playback.has_next = bool(len(queue) > 1) or self.playback.repeat != "off"
+                self.emit("playback-changed")
+                return
+
     def playback_next(self) -> None:
         """Skip to the next queued track (wraps if repeat is on)."""
         host = self.playback.active_host

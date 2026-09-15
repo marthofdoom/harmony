@@ -6,8 +6,18 @@ const $ = (id) => document.getElementById(id);
 const audio = $("audio");
 
 const state = {
-  queue: [],      // list of track objects currently loaded (search or playlist)
-  index: -1,      // index of the playing track within queue
+  // The currently DISPLAYED list (search results / album / playlist). Used only
+  // for rendering + highlighting — NEVER for playback. Reassigned freely as the
+  // user browses.
+  queue: [],
+  // The persistent ACTIVE play queue: what auto-advance, prev/next and the Media
+  // Session act on. It survives navigation and changes ONLY through play / enqueue
+  // / play-next / reorder / auto-advance — never as a side effect of rendering.
+  activeQueue: [],
+  activeIndex: -1,   // index of the playing track within activeQueue
+  sourceOrder: null, // pre-shuffle snapshot of activeQueue, to restore on shuffle-off
+  shuffle: false,    // play the active queue shuffled (upcoming tracks)
+  repeat: "off",     // "off" | "all" | "one"
   playlist: null, // {service, id, title} when viewing an editable playlist, else null
   target: "browser", // "browser" (this tab's <audio>) or a device host to cast to
   targetVia: null,   // peer "host:port" when the device lives on another instance's LAN
@@ -16,6 +26,19 @@ const state = {
   detail: false,     // true while an artist/album/track detail page is showing
   lidarr: null,      // cached GET /api/lidarr status ({enabled, configured, …}) or null
 };
+
+// Shuffle/repeat are user prefs — persisted alongside the personal key.
+try {
+  const _p = JSON.parse(localStorage.getItem("harmonyPrefs") || "{}");
+  if (_p && typeof _p === "object") {
+    state.shuffle = !!_p.shuffle;
+    if (["off", "all", "one"].includes(_p.repeat)) state.repeat = _p.repeat;
+  }
+} catch (_e) { /* defaults */ }
+function persistPrefs() {
+  try { localStorage.setItem("harmonyPrefs", JSON.stringify({ shuffle: state.shuffle, repeat: state.repeat })); }
+  catch (_e) { /* ignore */ }
+}
 
 const onDevice = () => state.target !== "browser";
 // A device target is encoded as "host" (local) or "host::peerhost:port" (federated),
@@ -249,19 +272,25 @@ function openContextMenu(x, y, items) {
 }
 
 function openTrackContextMenu(e, t) {
-  const items = [];
+  const items = [
+    { label: "Play next", fn: () => playNextTracks([t], t.title) },
+    { label: "Add to queue", fn: () => enqueueTracks([t], t.title) },
+  ];
   if (t.artist_ids && t.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(t.service, t.artist_ids[0]) });
   if (t.album_id)
     items.push({ label: "Go to album", fn: () => navigateAlbum(t.service, t.album_id) });
-  if (!items.length) return;
   e.preventDefault();
   openContextMenu(e.clientX, e.clientY, items);
 }
 
 function openAlbumContextMenu(e, a) {
   const items = [];
-  if (a.id) items.push({ label: "Go to album", fn: () => navigateAlbum(a.service, a.id) });
+  if (a.id) {
+    items.push({ label: "Play next", fn: () => albumToQueue(a, "next") });
+    items.push({ label: "Add to queue", fn: () => albumToQueue(a, "end") });
+    items.push({ label: "Go to album", fn: () => navigateAlbum(a.service, a.id) });
+  }
   if (a.artist_ids && a.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(a.service, a.artist_ids[0]) });
   items.push(...lidarrMenuItems({ kind: "album", title: a.title, artist: a.artist, mbid: a.mbid }));
@@ -289,13 +318,15 @@ function trackArtistCell(t) {
 function trackRowHtml(t, i, opts = {}) {
   const pl = state.playlist;
   const num = opts.numbered ? `<span class="tnum">${t.track_number != null ? t.track_number : i + 1}</span>` : "";
+  const grip = opts.reorder ? `<button class="mini grip" aria-label="Drag to reorder" tabindex="-1">${ICON("drag")}</button>` : "";
   return `
-    <div class="trow${opts.numbered ? " numbered" : ""}" data-i="${i}">
+    <div class="trow${opts.numbered ? " numbered" : ""}${opts.reorder ? " reorder" : ""}" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
       <div class="tlead">${num}<button class="play" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
       <div class="title"><span class="tt">${esc(t.title)}</span>${opts.hideBadge ? "" : `<span class="badge">${esc(serviceLabel(t.service))}</span>`}</div>
       ${trackArtistCell(t)}
       <div class="dur">${fmtTime(t.duration_s)}</div>
       <div class="rowacts">
+        ${grip}
         <button class="mini add" aria-label="Add to playlist">${ICON("add")}</button>
         ${pl ? `<button class="mini rem" aria-label="Remove from this playlist">${ICON("remove")}</button>` : ""}
       </div>
@@ -305,19 +336,27 @@ function trackRowHtml(t, i, opts = {}) {
 const tracksHtml = (tracks, opts = {}) =>
   `<div class="tracks">${tracks.map((t, i) => trackRowHtml(t, i, opts)).join("")}</div>`;
 
-// Wire a rendered set of track rows to shared playback + row menus. The caller
-// owns `state.queue` (so playAt indexes correctly); we only attach handlers.
-function wireTrackRows(scope, tracks) {
+// Wire a rendered set of track rows to shared playback + row menus. Clicking a
+// row's play button loads THIS list into the active queue (playFrom) and plays
+// at the clicked index — so browsing never leaks into the active queue, and the
+// active queue is set only by an explicit play. `opts.onPlay(i)` overrides that
+// (the Now Playing queue passes playActive to jump within the active queue);
+// `opts.clickToPlay` makes a single row click play (used by the NP queue).
+function wireTrackRows(scope, tracks, opts = {}) {
   scope.querySelectorAll(".trow").forEach((row) => {
     const i = Number(row.dataset.i);
-    row.querySelector(".play").addEventListener("click", () => playAt(i));
+    const play = opts.onPlay ? () => opts.onPlay(i) : () => playFrom(tracks, i);
+    const pbtn = row.querySelector(".play");
+    if (pbtn) pbtn.addEventListener("click", play);
     const add = row.querySelector(".add");
     if (add) add.addEventListener("click", (e) => { e.preventDefault(); openAddMenu(e.currentTarget, tracks[i]); });
     const rem = row.querySelector(".rem");
     if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
     row.addEventListener("contextmenu", (e) => openTrackContextMenu(e, tracks[i]));
-    // Double-click anywhere on the row (but not on a link/button) plays it.
-    row.addEventListener("dblclick", (e) => { if (!e.target.closest("a, button")) playAt(i); });
+    if (opts.clickToPlay)
+      row.addEventListener("click", (e) => { if (!e.target.closest("a, button")) play(); });
+    else
+      row.addEventListener("dblclick", (e) => { if (!e.target.closest("a, button")) play(); });
   });
 }
 
@@ -431,9 +470,17 @@ function renderPlaylists(playlists) {
   });
 }
 
+// Two track objects refer to the same track. Highlighting matches on this
+// (service + id), never on index, since the displayed list is now decoupled
+// from the active queue — the playing track may sit at a different index (or
+// not appear at all) in whatever list is on screen.
+const sameTrack = (a, b) => !!(a && b && a.service === b.service && String(a.id) === String(b.id));
+const activeTrack = () => (state.activeIndex >= 0 ? state.activeQueue[state.activeIndex] : null);
+
 function highlightPlaying() {
+  const cur = activeTrack();
   document.querySelectorAll(".trow").forEach((row) => {
-    const active = Number(row.dataset.i) === state.index;
+    const active = !!cur && row.dataset.svc === String(cur.service) && row.dataset.tid === String(cur.id);
     row.classList.toggle("playing", active);
     const btn = row.querySelector(".play");
     if (btn) btn.innerHTML = active ? `<span class="eq"><span></span><span></span><span></span></span>` : ICON("play");
@@ -446,12 +493,13 @@ function highlightPlaying() {
 
 function renderNowPlaying() {
   const list = $("list");
-  const t = state.index >= 0 ? state.queue[state.index] : null;
+  const t = activeTrack();
   if (!t) {
     list.innerHTML = emptyState("music", "Nothing playing",
       "Play a track, album, or playlist and it shows up here.");
     return;
   }
+  const repIco = state.repeat === "one" ? "repeat-one" : "repeat";
   list.innerHTML = `<div class="detail npview">
     <div class="detail-hero">
       <div class="detail-art" id="np-view-art" data-art="${esc(t.artwork_url || "")}">${ICON("music")}</div>
@@ -462,12 +510,21 @@ function renderNowPlaying() {
       </div>
     </div>
     <section class="detail-sec">
-      <h3>Queue</h3>
-      ${tracksHtml(state.queue)}
+      <div class="qhead">
+        <h3>Queue</h3>
+        <div class="qctrls">
+          <button class="qbtn${state.shuffle ? " on" : ""}" id="np-shuffle" aria-pressed="${state.shuffle}" aria-label="Shuffle" title="Shuffle">${ICON("shuffle")}</button>
+          <button class="qbtn${state.repeat !== "off" ? " on" : ""}" id="np-repeat" aria-label="Repeat: ${state.repeat}" title="Repeat: ${state.repeat}">${ICON(repIco)}</button>
+        </div>
+      </div>
+      ${tracksHtml(state.activeQueue, { reorder: true })}
     </section>
   </div>`;
   hydrateArt(list);
-  wireTrackRows(list, state.queue);
+  wireTrackRows(list, state.activeQueue, { onPlay: playActive, clickToPlay: true });
+  wireQueueReorder(list);
+  $("np-shuffle").onclick = toggleShuffle;
+  $("np-repeat").onclick = cycleRepeat;
   highlightPlaying();
 }
 
@@ -476,13 +533,58 @@ function renderNowPlaying() {
 function updateNowPlayingView() {
   const wrap = $("list").querySelector(".npview");
   if (!wrap) return;
-  const t = state.index >= 0 ? state.queue[state.index] : null;
+  const t = activeTrack();
   if (!t) { renderNowPlaying(); return; }
   const titleEl = $("np-view-title"), artistEl = $("np-view-artist"), artEl = $("np-view-art");
   if (titleEl) titleEl.textContent = t.title || "";
   if (artistEl) artistEl.textContent = t.artist || "";
   if (artEl) { artEl.classList.add("fallback"); artEl.innerHTML = ICON("music"); artEl.dataset.art = t.artwork_url || ""; hydrateArt(wrap); }
   highlightPlaying();
+}
+
+// Pointer-based drag-to-reorder for the Now Playing queue. Pointer events (not
+// HTML5 drag) so it works with touch; the grip carries touch-action:none so a
+// drag never scrolls the page. On drop we rebuild the active queue from the new
+// DOM order and re-anchor activeIndex on the still-playing track (by identity).
+function wireQueueReorder(scope) {
+  const container = scope.querySelector(".tracks");
+  if (!container) return;
+  container.querySelectorAll(".trow.reorder .grip").forEach((grip) => {
+    grip.addEventListener("pointerdown", (e) => {
+      e.preventDefault();
+      const row = grip.closest(".trow");
+      if (!row) return;
+      row.classList.add("dragging");
+      try { grip.setPointerCapture(e.pointerId); } catch (_e) { /* ignore */ }
+      const move = (ev) => {
+        const others = [...container.querySelectorAll(".trow")].filter((r) => r !== row);
+        const after = others.find((r) => ev.clientY < r.getBoundingClientRect().top + r.offsetHeight / 2);
+        if (after) container.insertBefore(row, after);
+        else container.appendChild(row);
+      };
+      const up = () => {
+        grip.removeEventListener("pointermove", move);
+        grip.removeEventListener("pointerup", up);
+        grip.removeEventListener("pointercancel", up);
+        row.classList.remove("dragging");
+        commitQueueOrder(container);
+      };
+      grip.addEventListener("pointermove", move);
+      grip.addEventListener("pointerup", up);
+      grip.addEventListener("pointercancel", up);
+    });
+  });
+}
+
+function commitQueueOrder(container) {
+  const cur = activeTrack();
+  const order = [...container.querySelectorAll(".trow")].map((r) => Number(r.dataset.i));
+  if (!order.length) return;
+  const next = order.map((i) => state.activeQueue[i]).filter(Boolean);
+  if (next.length !== state.activeQueue.length) { renderNowPlaying(); return; }
+  state.activeQueue = next;
+  if (cur) { const i = next.findIndex((tr) => sameTrack(tr, cur)); if (i >= 0) state.activeIndex = i; }
+  renderNowPlaying();   // rebuild with fresh indices + handlers
 }
 
 // -- views ------------------------------------------------------------------
@@ -1073,7 +1175,7 @@ async function renderTrackView(service, id) {
   hydrateArt(list);
   wireChips(list);
   wireLidarrArtistTargets(list);
-  $("tk-play").onclick = () => { state.queue = [t]; playAt(0); };
+  $("tk-play").onclick = () => playFrom([t], 0);
 }
 
 // -- member-chronology timeline chart (inline SVG, theme-aware, scrollable) --
@@ -1367,10 +1469,119 @@ function updateMediaSession(t) {
   } catch { /* ignore */ }
 }
 
-async function playAt(i) {
-  if (i < 0 || i >= state.queue.length) return;
-  const t = state.queue[i];
-  state.index = i;
+// -- active queue: load / enqueue / shuffle / repeat / advance --------------
+
+// Replace the active queue with a copy of `list` and play at `index`. This is
+// the ONLY way (besides enqueue / play-next / reorder / auto-advance) the active
+// queue changes — navigation never calls it. With shuffle on, the chosen track
+// stays put and the upcoming tracks are shuffled around it.
+function setActiveQueue(list, index) {
+  state.activeQueue = (list || []).slice();
+  state.activeIndex = index;
+  state.sourceOrder = state.shuffle ? state.activeQueue.slice() : null;
+  if (state.shuffle) shuffleUpcoming();
+}
+
+// Fisher–Yates over the tracks AFTER the current one (current track unmoved).
+function shuffleUpcoming() {
+  const q = state.activeQueue, lo = state.activeIndex + 1;
+  for (let i = q.length - 1; i > lo; i--) {
+    const j = lo + Math.floor(Math.random() * (i - lo + 1));
+    [q[i], q[j]] = [q[j], q[i]];
+  }
+}
+
+function toggleShuffle() {
+  state.shuffle = !state.shuffle;
+  if (state.shuffle) { state.sourceOrder = state.activeQueue.slice(); shuffleUpcoming(); }
+  else if (state.sourceOrder) {
+    // Restore the pre-shuffle order, re-anchoring on the still-playing track.
+    const cur = activeTrack();
+    state.activeQueue = state.sourceOrder.slice();
+    const i = cur ? state.activeQueue.findIndex((t) => sameTrack(t, cur)) : -1;
+    if (i >= 0) state.activeIndex = i;
+    state.sourceOrder = null;
+  }
+  persistPrefs();
+  refreshQueueUi();
+}
+
+function cycleRepeat() {
+  state.repeat = state.repeat === "off" ? "all" : state.repeat === "all" ? "one" : "off";
+  persistPrefs();
+  refreshQueueUi();
+}
+
+// Re-render the Now Playing queue when it is the open view (queue changed).
+function refreshQueueUi() { if ($("list").querySelector(".npview")) renderNowPlaying(); }
+
+// Load a displayed list as the active queue and start playing at `index`.
+function playFrom(list, index) {
+  setActiveQueue(list, index);
+  playActive(state.activeIndex);
+}
+
+// Append tracks to the END of the active queue (does not interrupt playback;
+// when nothing is playing it just starts at the first appended track).
+function enqueueTracks(tracks, label) {
+  const add = (tracks || []).filter(Boolean);
+  if (!add.length) return;
+  const idle = state.activeIndex < 0 || !state.activeQueue.length;
+  const startAt = state.activeQueue.length;
+  state.activeQueue.push(...add);
+  if (state.sourceOrder) state.sourceOrder.push(...add);
+  if (idle) { playActive(startAt); return; }
+  refreshQueueUi();
+  toast(label ? `Added “${label}” to the queue.` : `Added ${nTracks(add.length)} to the queue.`, "ok");
+}
+
+// Insert tracks immediately AFTER the current track.
+function playNextTracks(tracks, label) {
+  const add = (tracks || []).filter(Boolean);
+  if (!add.length) return;
+  if (state.activeIndex < 0 || !state.activeQueue.length) return enqueueTracks(add, label);
+  const cur = activeTrack();
+  state.activeQueue.splice(state.activeIndex + 1, 0, ...add);
+  if (state.sourceOrder) {
+    const si = cur ? state.sourceOrder.findIndex((t) => sameTrack(t, cur)) : -1;
+    state.sourceOrder.splice(si >= 0 ? si + 1 : state.sourceOrder.length, 0, ...add);
+  }
+  refreshQueueUi();
+  toast(label ? `“${label}” plays next.` : `${nTracks(add.length)} play next.`, "ok");
+}
+
+// Enqueue / play-next an album: its tracks aren't on the row, so fetch them.
+async function albumToQueue(a, where) {
+  try {
+    const d = await api(`/api/album/${encodeURIComponent(a.service)}/${encodeURIComponent(a.id)}`);
+    const tracks = d.tracks || [];
+    if (!tracks.length) { toastErr("That album has no playable tracks."); return; }
+    (where === "next" ? playNextTracks : enqueueTracks)(tracks, a.title || "album");
+  } catch (e) { toastErr("Couldn’t load that album: " + e.message); }
+}
+
+// Auto-advance / Next: honour repeat (one → replay; all → wrap; off → stop at end).
+function playNextInQueue(auto) {
+  if (!state.activeQueue.length) return;
+  if (auto && state.repeat === "one") return playActive(state.activeIndex);
+  let i = state.activeIndex + 1;
+  if (i >= state.activeQueue.length) {
+    if (state.repeat === "all") i = 0; else return;
+  }
+  playActive(i);
+}
+
+function playPrevInQueue() {
+  if (!state.activeQueue.length) return;
+  let i = state.activeIndex - 1;
+  if (i < 0) i = state.repeat === "all" ? state.activeQueue.length - 1 : 0;
+  playActive(i);
+}
+
+async function playActive(i) {
+  if (i < 0 || i >= state.activeQueue.length) return;
+  const t = state.activeQueue[i];
+  state.activeIndex = i;
   highlightPlaying();
   updateNowPlayingView();
   $("np-title").textContent = t.title;
@@ -1410,7 +1621,7 @@ function stopPlayback() {
   try { audio.currentTime = 0; } catch { /* ignore */ }
   audio.removeAttribute("src");
   try { audio.load(); } catch { /* ignore */ }
-  state.index = -1;
+  state.activeIndex = -1;
   state.devicePaused = false;
   castPos = 0; castDur = 0; castLastReported = null;
   setPlayIcon(false);
@@ -1434,17 +1645,17 @@ $("np-device").addEventListener("change", (e) => {
 
 $("np-play").addEventListener("click", async () => {
   if (onDevice()) {
-    if (state.index < 0) { if (state.queue.length) return playAt(0); return; }
+    if (state.activeIndex < 0) { if (state.activeQueue.length) return playActive(0); return; }
     try { await apiPost(`/api/devices/${encodeURIComponent(state.target)}/${state.devicePaused ? "resume" : "pause"}`, withVia({}));
       state.devicePaused = !state.devicePaused; setPlayIcon(!state.devicePaused); } catch { /* ignore */ }
     return;
   }
-  if (!audio.src) { if (state.queue.length) playAt(0); return; }
+  if (!audio.src) { if (state.activeQueue.length) playActive(state.activeIndex >= 0 ? state.activeIndex : 0); return; }
   audio.paused ? audio.play() : audio.pause();
 });
-$("np-prev").addEventListener("click", () => playAt(state.index - 1));
-$("np-next").addEventListener("click", () => playAt(state.index + 1));
-audio.addEventListener("ended", () => playAt(state.index + 1));
+$("np-prev").addEventListener("click", () => playPrevInQueue());
+$("np-next").addEventListener("click", () => playNextInQueue(false));
+audio.addEventListener("ended", () => playNextInQueue(true));
 audio.addEventListener("play", () => setPlayIcon(true));
 audio.addEventListener("pause", () => setPlayIcon(false));
 audio.addEventListener("loadedmetadata", () => {
@@ -1467,8 +1678,8 @@ if ("mediaSession" in navigator) {
   const ms = navigator.mediaSession;
   ms.setActionHandler("play", () => $("np-play").click());
   ms.setActionHandler("pause", () => $("np-play").click());
-  ms.setActionHandler("previoustrack", () => playAt(state.index - 1));
-  ms.setActionHandler("nexttrack", () => playAt(state.index + 1));
+  ms.setActionHandler("previoustrack", () => playPrevInQueue());
+  ms.setActionHandler("nexttrack", () => playNextInQueue(false));
 }
 
 async function loadDevices() {
