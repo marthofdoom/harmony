@@ -14,7 +14,7 @@ dependencies = [
     "ytmusicapi>=1.10",
     "requests>=2.31",
     "rapidfuzz>=3.0",
-    "platformdirs>=4.0",
+    "platformdirs>=4.11.5",
     "keyring>=24.0",
     # Resolves a playable YouTube audio stream URL for play-to-device (the
     # relay). Imported lazily in the YT provider so a minimal install still
