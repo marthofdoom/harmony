@@ -1,7 +1,7 @@
 # Roadmap & status
 
 A snapshot of what exists and what's next. Honest maturity, not aspiration — see
-the legend in the [docs index](README.md). Current release: **1.0.3** (pre-1.0 polish; not yet billed stable).
+the legend in the [docs index](README.md). Current release: **1.0.4** (pre-1.0 polish; not yet billed stable).
 
 ## Done
 

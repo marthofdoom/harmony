@@ -46,6 +46,15 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.4" date="2026-09-15">
+      <description>
+        <p>Sync your streaming logins between your devices. The desktop and phone
+        apps can now pull the accounts held by another Harmony instance — like
+        your always-on server — so you sign in once and everything follows.
+        Syncing only copies connections that actually work, and never overwrites
+        a login that's already working on the device you're syncing to.</p>
+      </description>
+    </release>
     <release version="1.0.3" date="2026-09-15">
       <description>
         <p>Playback now has a proper play queue. Playing an album or playlist
