@@ -46,6 +46,16 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.3" date="2026-09-15">
+      <description>
+        <p>Playback now has a proper play queue. Playing an album or playlist
+        loads it as the active queue and keeps playing while you browse elsewhere
+        — the next song no longer comes from whatever page you're looking at, and
+        the phone app now plays consecutive songs. Add tracks or albums to the
+        queue or play them next, and shuffle, repeat, and reorder the queue from
+        the Now Playing screen.</p>
+      </description>
+    </release>
     <release version="1.0.2" date="2026-09-02">
       <description>
         <p>The Now Playing view now works the same on the web and phone apps as
