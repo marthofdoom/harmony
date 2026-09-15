@@ -482,6 +482,7 @@ private fun SyncScreen(vm: HarmonyViewModel, state: UiState) {
     var src by remember { mutableStateOf<Playlist?>(null) }
     var tgt by remember { mutableStateOf<Playlist?>(null) }
     var dir by remember { mutableStateOf("a_to_b") }
+    var peerAddr by remember { mutableStateOf("") }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(title = { Text("Sync playlists") })
         Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp)) {
@@ -554,8 +555,70 @@ private fun SyncScreen(vm: HarmonyViewModel, state: UiState) {
                 Text(it, style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+
+            // Pull the streaming logins held by another Harmony instance (e.g. the
+            // always-on server), decrypted with the shared personal key — the phone's
+            // equivalent of the web/desktop "Sync accounts".
+            Spacer(Modifier.height(24.dp))
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Sync accounts from a server", style = MaterialTheme.typography.titleMedium)
+                    Text("Copy the streaming logins from another Harmony instance that has them. " +
+                        "Both instances must share the same personal key.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Spacer(Modifier.height(12.dp))
+                    OutlinedTextField(
+                        value = peerAddr,
+                        onValueChange = { peerAddr = it },
+                        label = { Text("Server address") },
+                        placeholder = { Text("host or host:port — e.g. 192.168.1.10:8080") },
+                        singleLine = true,
+                        enabled = !state.accountSyncBusy,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Spacer(Modifier.height(12.dp))
+                    Button(
+                        enabled = peerAddr.isNotBlank() && !state.accountSyncBusy,
+                        onClick = {
+                            val (host, port) = parseHostPort(peerAddr)
+                            vm.syncAccounts(host, port)
+                        },
+                    ) {
+                        if (state.accountSyncBusy) {
+                            CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
+                            Spacer(Modifier.width(8.dp)); Text("Syncing…")
+                        } else Text("Sync accounts")
+                    }
+                    state.accountSyncMsg?.let {
+                        Spacer(Modifier.height(12.dp))
+                        Text(it, style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
+                }
+            }
         }
     }
+}
+
+/** Split "host" or "host:port" (defaulting to 8080). Uses the last colon for the
+ *  common IPv4/hostname case, brackets an IPv6 literal ([::1]:8080), and treats a
+ *  bare multi-colon IPv6 as a host with the default port. */
+private fun parseHostPort(text: String): Pair<String, Int> {
+    val t = text.trim()
+    if (t.startsWith("[")) {                       // [IPv6] or [IPv6]:port
+        val end = t.indexOf(']')
+        if (end > 0) {
+            val host = t.substring(1, end)
+            val port = t.substring(end + 1).removePrefix(":").toIntOrNull() ?: 8080
+            return host to port
+        }
+    }
+    val i = t.lastIndexOf(':')
+    if (i > 0 && t.indexOf(':') == i) {            // exactly one colon → host:port
+        t.substring(i + 1).toIntOrNull()?.let { return t.substring(0, i) to it }
+    }
+    return t to 8080
 }
 
 @OptIn(ExperimentalMaterial3Api::class)

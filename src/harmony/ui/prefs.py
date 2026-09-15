@@ -382,11 +382,71 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self.qb_status_row = self._build_connection_row(Service.QOBUZ)
         qb_group.add(self.qb_status_row)
         page.add(qb_group)
+
+        # Pull streaming logins from another Harmony instance (e.g. the always-on
+        # server hub), decrypted with the shared personal key — the desktop
+        # equivalent of the web client's "Sync accounts".
+        adopt_group = Adw.PreferencesGroup(
+            title="Sync from another instance",
+            description="Pull the streaming logins held by a Harmony instance that has them "
+            "— e.g. your server. Both instances must share the same personal key (set it on "
+            "the Network page).",
+        )
+        self.adopt_host_row = Adw.EntryRow(title="Server address (host or host:port)")
+        adopt_group.add(self.adopt_host_row)
+        adopt_row = Adw.ActionRow(
+            title="Sync accounts now",
+            subtitle="e.g. 192.168.1.10:8080 or a tailnet address (port defaults to 8080)",
+        )
+        adopt_button = Gtk.Button(label="Sync", valign=Gtk.Align.CENTER,
+                                  css_classes=["suggested-action"])
+        adopt_button.connect("clicked", lambda *_a: self._on_adopt_from_peer())
+        adopt_row.add_suffix(adopt_button)
+        adopt_group.add(adopt_row)
+        page.add(adopt_group)
         # Probe both services once the dialog is on screen so each shows
         # "Connected as {name}" / "Not signed in" instead of a stale "Unknown".
         self._probe_provider(Service.YTMUSIC)
         self._probe_provider(Service.QOBUZ)
         return page
+
+    def _on_adopt_from_peer(self) -> None:
+        """Pull credentials from another instance, then rebuild this app's providers."""
+        text = self.adopt_host_row.get_text().strip()
+        host, _, port_s = text.partition(":")
+        host = host.strip()
+        if not host:
+            self.state.toast("Enter the server's address first.")
+            return
+        try:
+            port = int(port_s) if port_s.strip() else 8080
+        except ValueError:
+            self.state.toast("Port must be a number (use host or host:port).")
+            return
+
+        def work() -> dict:
+            from harmony.web.server import get_engine
+            return get_engine().adopt_from_peer(host, port)
+
+        def done(result: dict) -> None:
+            # The pull wrote settings + keyring and reset the engine's providers;
+            # rebuild THIS app's provider set too, and re-probe the rows once it's
+            # done (providers-changed fires when the rebuild lands).
+            handler: list[int] = []
+
+            def on_changed(*_a: object) -> None:
+                if handler:
+                    self.state.disconnect(handler[0])
+                self._probe_provider(Service.YTMUSIC)
+                self._probe_provider(Service.QOBUZ)
+
+            handler.append(self.state.connect("providers-changed", on_changed))
+            self.state.reload_providers()
+            count = len(result.get("imported", []))
+            self.state.toast(f"Synced accounts from {host}"
+                             + (f" — {count} credential{'s' if count != 1 else ''}" if count else ""))
+
+        run_async(work, done, lambda exc: self.state.toast(f"Couldn't sync accounts: {exc}"))
 
     def _build_connection_row(self, service: Service) -> Adw.ActionRow:
         """A "Connection" row with a spinner, a Sign Out button (shown only when

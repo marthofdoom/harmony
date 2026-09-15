@@ -1,5 +1,6 @@
 """Full instances copy credentials from a key-matching peer, encrypted by the
-personal key (no real secrets touched)."""
+personal key — adopting only *working* connections and never clobbering a
+working local one (no real secrets touched)."""
 
 from __future__ import annotations
 
@@ -38,6 +39,13 @@ def _use_settings(monkeypatch: pytest.MonkeyPatch, s: _FakeSettings) -> None:
     monkeypatch.setattr(config, "Settings", type("S", (), {"load": staticmethod(lambda: s)}))
 
 
+def _engine(working: dict[str, bool] | None = None) -> Engine:
+    """An Engine with its service-working probe stubbed (no real providers)."""
+    e = Engine()
+    e._service_working = lambda: dict(working or {})  # type: ignore[method-assign]
+    return e
+
+
 def test_cryptobox_roundtrip_and_wrong_key() -> None:
     env = encrypt_json({"secrets": {"a": "b"}}, "shared-key")
     assert "token" in env and "secrets" not in env  # payload is opaque
@@ -51,26 +59,72 @@ def test_export_is_encrypted_then_adopts(monkeypatch: pytest.MonkeyPatch) -> Non
 
     monkeypatch.setattr(config, "CredentialStore", _FakeCS)
 
-    # Source holds credentials; export them (encrypted envelope, not plaintext).
+    # Source holds a WORKING Qobuz connection; export it (encrypted, not plaintext).
     _FakeCS.store = {"qobuz.user_auth_token": "TOK", "qobuz.app_secret": "SEC"}
     _use_settings(monkeypatch, _FakeSettings())
-    envelope = Engine().export_credentials()
+    envelope = _engine({"qobuz": True}).export_credentials()
     assert "token" in envelope and "secrets" not in envelope
 
-    # Only the matching key decrypts it back to the real payload.
     payload = decrypt_json(envelope, "shared-key")
     assert set(payload["secrets"]) == {"qobuz.user_auth_token", "qobuz.app_secret"}
-    assert payload["settings"]["qobuz_auth_kind"] == "token"
+    assert payload["working"] == {"qobuz": True}  # advertises what works
 
-    # Target imports the decrypted payload and becomes an independent holder.
+    # Target has NO working Qobuz -> adopts it and becomes an independent holder.
     _FakeCS.store = {}
     target = _FakeSettings()
     target.qobuz_token_saved = False
     _use_settings(monkeypatch, target)
-    result = Engine().import_credentials(payload)
+    result = _engine({}).import_credentials(payload)
     assert _FakeCS.store["qobuz.user_auth_token"] == "TOK"
     assert target.qobuz_auth_kind == "token"
     assert "qobuz.user_auth_token" in result["imported"]
+    assert result["synced"] == ["qobuz"]
+
+
+# -- only sync working connections; never clobber a working local one ---------
+
+
+def test_import_skips_a_service_not_working_on_the_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    _FakeCS.store = {"qobuz.user_auth_token": "OLD"}  # local, untouched
+    _use_settings(monkeypatch, _FakeSettings())
+    payload = {"secrets": {"qobuz.user_auth_token": "FROM_PEER"},
+               "settings": {}, "ytmusic_auth": None,
+               "working": {"qobuz": False}}  # source says Qobuz is NOT working
+    result = _engine({}).import_credentials(payload)
+    assert _FakeCS.store["qobuz.user_auth_token"] == "OLD"   # a broken source cred isn't pulled
+    assert result["synced"] == []
+    assert "qobuz.user_auth_token" not in result["imported"]
+
+
+def test_import_keeps_a_working_local_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    _FakeCS.store = {"qobuz.user_auth_token": "MINE"}  # my working token
+    _use_settings(monkeypatch, _FakeSettings())
+    payload = {"secrets": {"qobuz.user_auth_token": "PEERS"},
+               "settings": {}, "ytmusic_auth": None,
+               "working": {"qobuz": True}}  # source also works — but don't clobber mine
+    result = _engine({"qobuz": True}).import_credentials(payload)  # local Qobuz works
+    assert _FakeCS.store["qobuz.user_auth_token"] == "MINE"  # not clobbered
+    assert result["synced"] == [] and result["kept"] == ["qobuz"]
+
+
+def test_import_adopts_a_working_source_when_local_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    _FakeCS.store = {}
+    _use_settings(monkeypatch, _FakeSettings())
+    payload = {"secrets": {"qobuz.user_auth_token": "GOOD"},
+               "settings": {"qobuz_auth_kind": "token"}, "ytmusic_auth": None,
+               "working": {"qobuz": True}}
+    result = _engine({}).import_credentials(payload)  # nothing working locally
+    assert _FakeCS.store["qobuz.user_auth_token"] == "GOOD"
+    assert result["synced"] == ["qobuz"]
 
 
 # -- credential-copy hardening: auth_kind always matches an actual token ------
@@ -87,15 +141,14 @@ def test_export_labels_yt_kind_by_the_real_token(monkeypatch: pytest.MonkeyPatch
 
     monkeypatch.setattr(config, "CredentialStore", _FakeCS)
     _FakeCS.store = {}
-    # Source *claims* oauth, but its auth file is browser headers (the mismatch).
     src = _FakeSettings()
-    src.ytmusic_auth_kind = "oauth"
+    src.ytmusic_auth_kind = "oauth"  # claims oauth, but the file is browser headers
     authf = tmp_path / "browser.json"
     authf.write_text('{"cookie": "SID=x", "authorization": "y"}', "utf-8")
     src.ytmusic_auth_file = str(authf)
     _use_settings(monkeypatch, src)
 
-    payload = decrypt_json(Engine().export_credentials(), "shared-key")
+    payload = decrypt_json(_engine({"ytmusic": True}).export_credentials(), "shared-key")
     assert payload["settings"]["ytmusic_auth_kind"] == "browser"  # corrected to the file
 
 
@@ -103,7 +156,6 @@ def test_import_ignores_oauth_label_without_a_token(monkeypatch: pytest.MonkeyPa
     import harmony.config as config
 
     monkeypatch.setattr(config, "CredentialStore", _FakeCS)
-    monkeypatch.setattr(Engine, "_reset_providers", lambda self: None)
     _use_config_dir(monkeypatch, tmp_path)
     _FakeCS.store = {}
     target = _FakeSettings()
@@ -111,7 +163,7 @@ def test_import_ignores_oauth_label_without_a_token(monkeypatch: pytest.MonkeyPa
     target.ytmusic_auth_file = "keep.json"
     _use_settings(monkeypatch, target)
 
-    Engine().import_credentials(
+    _engine({}).import_credentials(
         {"secrets": {}, "settings": {"ytmusic_auth_kind": "oauth", "ytmusic_oauth_client_id": "cid"},
          "ytmusic_auth": None})
     assert target.ytmusic_auth_kind == "browser"   # not relabeled to a phantom oauth
@@ -122,7 +174,6 @@ def test_import_oauth_token_writes_file_and_drops_stale(monkeypatch: pytest.Monk
     import harmony.config as config
 
     monkeypatch.setattr(config, "CredentialStore", _FakeCS)
-    monkeypatch.setattr(Engine, "_reset_providers", lambda self: None)
     _use_config_dir(monkeypatch, tmp_path)
     _FakeCS.store = {}
     target = _FakeSettings()
@@ -133,8 +184,8 @@ def test_import_oauth_token_writes_file_and_drops_stale(monkeypatch: pytest.Monk
     _use_settings(monkeypatch, target)
 
     token = '{"refresh_token": "RT", "access_token": "AT"}'
-    Engine().import_credentials({"secrets": {}, "settings": {"ytmusic_auth_kind": "oauth"},
-                                 "ytmusic_auth": token})
+    _engine({}).import_credentials({"secrets": {}, "settings": {"ytmusic_auth_kind": "oauth"},
+                                    "ytmusic_auth": token})
     new = tmp_path / "ytmusic-auth.json"
     assert new.read_text("utf-8") == token
     assert target.ytmusic_auth_file == str(new)

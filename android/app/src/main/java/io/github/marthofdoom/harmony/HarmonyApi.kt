@@ -375,6 +375,19 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         return SyncResult(o.optInt("added"), o.optInt("removed"), o.optInt("failed"))
     }
 
+    // -- credentials (adopt / "sync accounts") ------------------------------
+
+    /** Ask the connected instance to pull [peerHost]:[peerPort]'s encrypted
+     *  streaming credentials and decrypt them with the shared personal key. Both
+     *  instances must carry the same key. Returns the imported secret keys;
+     *  throws ApiError (the peer/decrypt failure surfaces as a 502 with `error`). */
+    fun adoptCredentials(peerHost: String, peerPort: Int): List<String> {
+        val o = JSONObject(post("/api/credentials/adopt",
+            JSONObject().put("host", peerHost).put("port", peerPort)))
+        val arr = o.optJSONArray("imported") ?: return emptyList()
+        return (0 until arr.length()).mapNotNull { i -> arr.optString(i).ifEmpty { null } }
+    }
+
     // -- cast to a hub device ----------------------------------------------
 
     fun devices(): List<Device> {

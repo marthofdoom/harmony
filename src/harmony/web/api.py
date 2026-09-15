@@ -251,6 +251,32 @@ class Engine:
         "qobuz_auth_kind", "qobuz_token_saved",
         "ytmusic_auth_kind", "ytmusic_oauth_client_id",
     )
+    # Per-streaming-service credential groups, so a sync can adopt one service
+    # without touching another (only working connections; never clobber working
+    # ones). Non-connection utility keys (lastfm/anthropic) aren't gated.
+    _SERVICE_SECRETS = {
+        "qobuz": ("qobuz.user_auth_token", "qobuz.app_secret", "qobuz.password"),
+        "ytmusic": ("ytmusic.oauth_client_secret",),
+    }
+    _SERVICE_SETTINGS = {
+        "qobuz": ("qobuz_auth_kind", "qobuz_token_saved"),
+        "ytmusic": ("ytmusic_oauth_client_id",),  # ytmusic_auth_kind is set from the token
+    }
+    _UTILITY_SECRETS = ("lastfm.api_key", "anthropic.api_key")
+
+    def _service_working(self) -> dict[str, bool]:
+        """Which streaming services are currently authenticated on THIS instance.
+
+        Best-effort — used to decide sync direction (adopt only a working source
+        connection; keep a working local one). Never raises.
+        """
+        out: dict[str, bool] = {}
+        try:
+            for svc, prov in self._ensure_providers().items():
+                out[svc.value] = bool(getattr(prov, "is_authenticated", False))
+        except Exception:  # noqa: BLE001 - status is advisory, never fatal
+            pass
+        return out
 
     def _collect_credentials(self) -> dict[str, Any]:
         """Everything a full instance needs to become an independent credential
@@ -278,7 +304,10 @@ class Engine:
             settings.pop("ytmusic_auth_kind", None)
             settings.pop("ytmusic_oauth_client_id", None)
             yt_auth = None
-        return {"secrets": secrets, "settings": settings, "ytmusic_auth": yt_auth}
+        # Advertise which services actually work here, so the importer only
+        # adopts working connections (and can leave its own working ones alone).
+        return {"secrets": secrets, "settings": settings, "ytmusic_auth": yt_auth,
+                "working": self._service_working()}
 
     def export_credentials(self) -> dict[str, Any]:
         """Encrypted envelope of the credentials, keyed by the personal key — so
@@ -294,47 +323,82 @@ class Engine:
         return encrypt_json(self._collect_credentials(), key)
 
     def import_credentials(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Write credentials pulled from a peer into this instance's own store."""
+        """Adopt a peer's credentials — but only working connections, and never
+        clobber a working local one.
+
+        Per streaming service (qobuz, ytmusic): skip it if this instance already
+        has it working (don't clobber), otherwise adopt it only if the source
+        advertised it as working. A payload with no ``working`` map (an older
+        peer) falls back to the previous behaviour — adopt what's present — while
+        still protecting a working local connection.
+        """
         from pathlib import Path
 
         from harmony.config import CredentialStore, Settings, config_dir
 
         cs = CredentialStore()
-        for key, value in (data.get("secrets") or {}).items():
-            if value:
-                cs.set(key, value)
         s = Settings.load()
-
-        # Never relabel our YouTube auth 'oauth' without a real token in the
-        # payload — the mismatch that left a peer authed against a dead file.
-        yt_auth = data.get("ytmusic_auth")
-        kind = _classify_yt_auth(yt_auth)
+        secrets = data.get("secrets") or {}
         incoming = dict(data.get("settings") or {})
-        if not kind:
-            incoming.pop("ytmusic_auth_kind", None)
-            incoming.pop("ytmusic_oauth_client_id", None)
-            yt_auth = None
-        for field, value in incoming.items():
-            if hasattr(s, field):
-                setattr(s, field, value)
 
-        if yt_auth and kind:
-            old_path = s.ytmusic_auth_file
-            path = config_dir() / "ytmusic-auth.json"
-            path.write_text(yt_auth, "utf-8")
-            s.ytmusic_auth_file = str(path)
-            s.ytmusic_auth_kind = kind  # keep the kind consistent with the token we wrote
-            # Drop a superseded auth file we own, so no stale cookie file lingers.
-            if old_path and old_path != str(path):
-                old = Path(old_path)
-                try:
-                    if old.is_file() and config_dir() in old.parents:
-                        old.unlink()
-                except OSError:
-                    pass
+        local_working = self._service_working()     # checked BEFORE we reset providers
+        source_working = data.get("working")        # None for older peers
+
+        def adopt(service: str) -> bool:
+            if local_working.get(service):
+                return False                        # keep the working local login
+            if source_working is None:
+                return True                         # old peer: no status -> prior behaviour
+            return bool(source_working.get(service))
+
+        imported: list[str] = []
+        synced: list[str] = []
+        kept: list[str] = []
+
+        # -- Qobuz + YouTube, gated per service --------------------------------
+        for service in ("qobuz", "ytmusic"):
+            if not adopt(service):
+                if local_working.get(service):
+                    kept.append(service)
+                continue
+            synced.append(service)
+            for key in self._SERVICE_SECRETS[service]:
+                if secrets.get(key):
+                    cs.set(key, secrets[key])
+                    imported.append(key)
+            for field in self._SERVICE_SETTINGS[service]:
+                if field in incoming and hasattr(s, field):
+                    setattr(s, field, incoming[field])
+
+        # -- YouTube auth file (only if YT is being adopted) -------------------
+        if "ytmusic" in synced:
+            yt_auth = data.get("ytmusic_auth")
+            # Never relabel our YT auth 'oauth' without a real token behind it.
+            kind = _classify_yt_auth(yt_auth)
+            if yt_auth and kind:
+                old_path = s.ytmusic_auth_file
+                path = config_dir() / "ytmusic-auth.json"
+                path.write_text(yt_auth, "utf-8")
+                s.ytmusic_auth_file = str(path)
+                s.ytmusic_auth_kind = kind
+                if old_path and old_path != str(path):
+                    old = Path(old_path)
+                    try:
+                        if old.is_file() and config_dir() in old.parents:
+                            old.unlink()
+                    except OSError:
+                        pass
+
+        # -- Non-connection utility keys (not gated) ---------------------------
+        for key in self._UTILITY_SECRETS:
+            if secrets.get(key):
+                cs.set(key, secrets[key])
+                imported.append(key)
+
         s.save()
         self._reset_providers()
-        return {"ok": True, "imported": sorted((data.get("secrets") or {}).keys())}
+        return {"ok": True, "imported": sorted(imported),
+                "synced": synced, "kept": kept}
 
     def adopt_from_peer(self, host: str, port: int) -> dict[str, Any]:
         """Pull a peer's (encrypted) credentials, decrypt with our personal key,

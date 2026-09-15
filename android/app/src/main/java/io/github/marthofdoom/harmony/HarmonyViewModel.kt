@@ -92,6 +92,9 @@ data class UiState(
     val syncPlan: SyncPlan? = null,
     val syncBusy: Boolean = false,
     val syncMsg: String? = null,
+    // account credential adopt ("Sync accounts" — pull logins from a peer)
+    val accountSyncBusy: Boolean = false,
+    val accountSyncMsg: String? = null,
 )
 
 class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
@@ -185,7 +188,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             peers = emptyList(), playingHere = false, routeStatus = null,
             renderers = emptyList(), bridgingTo = null,
             playlists = emptyList(), openPlaylist = null, playlistTracks = emptyList(),
-            devices = emptyList(), target = "phone", syncPlan = null, syncMsg = null)
+            devices = emptyList(), target = "phone", syncPlan = null, syncMsg = null,
+            accountSyncBusy = false, accountSyncMsg = null)
     }
 
     fun setQuery(q: String) { _state.value = _state.value.copy(query = q) }
@@ -611,6 +615,32 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                     syncMsg = "Added ${it.added}, removed ${it.removed}" +
                         if (it.failed > 0) ", ${it.failed} failed." else ".")
             }.onFailure { _state.value = _state.value.copy(syncBusy = false, syncMsg = "Apply failed: ${it.message}") }
+        }
+    }
+
+    // -- accounts: adopt credentials from a peer ("Sync accounts") ----------
+
+    /** Ask the connected instance to pull [peerHost]:[peerPort]'s streaming
+     *  credentials (both instances must share the same personal key). Runs off the
+     *  main thread and reports the outcome into [UiState.accountSyncMsg]. */
+    fun syncAccounts(peerHost: String, peerPort: Int) {
+        val client = api ?: return
+        val host = peerHost.trim()
+        if (host.isEmpty()) {
+            _state.value = _state.value.copy(accountSyncMsg = "Enter the server's address first.")
+            return
+        }
+        _state.value = _state.value.copy(accountSyncBusy = true, accountSyncMsg = "Syncing…")
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) { runCatching { client.adoptCredentials(host, peerPort) } }
+            res.onSuccess {
+                val n = it.size
+                _state.value = _state.value.copy(accountSyncBusy = false,
+                    accountSyncMsg = "Synced $n credential${if (n == 1) "" else "s"} from $host.")
+            }.onFailure {
+                _state.value = _state.value.copy(accountSyncBusy = false,
+                    accountSyncMsg = friendly(it, "Couldn't sync accounts. Try again."))
+            }
         }
     }
 
