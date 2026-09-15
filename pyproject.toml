@@ -35,7 +35,7 @@ mesh = ["zeroconf>=0.130"]
 cast = ["PyChromecast>=13"]
 # Everything a network server wants (the GHCR/AUR/.deb install target).
 server = ["zeroconf>=0.130", "PyChromecast>=13"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+dev = ["pytest>=8.0", "ruff>=0.16.5"]
 
 [project.scripts]
 harmony = "harmony.__main__:main"
