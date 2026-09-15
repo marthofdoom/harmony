@@ -1,10 +1,11 @@
 """The Now Playing page.
 
-Large album art of the current track beside the full track list of the playing
-collection (the whole album/playlist, not just what's left), with the current
-track lit by the shared now-playing indicator. Double-click a row to play from
-there; right-click for the usual track menu. A thin view over ``AppState`` —
-it reads ``playback`` + ``current_queue()`` and redraws on ``playback-changed``.
+Large album art of the current track beside the live **active queue** (the current
+track first, then what's actually up next), with the current track lit by the
+shared now-playing indicator. Shuffle + repeat act on the queue; double-click a row
+to jump to it; right-click to reorder (Move Up/Down), remove, or the usual track
+actions. A thin view over ``AppState`` — it reads ``playback`` + ``active_queue()``
+and redraws on ``playback-changed``.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ class NowPlayingPage(Gtk.Box):
         self._art_url: str | None = None
         self._track_key: object = None
         self._queue_sig: object = None
+        self._syncing = False  # guard programmatic control updates from their handlers
 
         self._stack = Gtk.Stack()
         self._stack.set_vexpand(True)
@@ -54,11 +56,26 @@ class NowPlayingPage(Gtk.Box):
         self._artist.add_css_class("dim-label")
         art_col.append(self._title)
         art_col.append(self._artist)
+
+        # Shuffle + repeat, acting on the active queue (mirrors the Now Playing bar).
+        controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, margin_top=6)
+        self._shuffle = Gtk.ToggleButton(icon_name="media-playlist-shuffle-symbolic")
+        self._shuffle.add_css_class("flat")
+        self._shuffle.set_tooltip_text("Shuffle")
+        self._shuffle.connect("toggled", self._on_shuffle_toggled)
+        self._repeat = Gtk.Button.new_from_icon_name("media-playlist-repeat-symbolic")
+        self._repeat.add_css_class("flat")
+        self._repeat.set_tooltip_text("Repeat: off")
+        self._repeat.connect("clicked", self._on_repeat_clicked)
+        controls.append(self._shuffle)
+        controls.append(self._repeat)
+        art_col.append(controls)
         content.append(art_col)
 
         holder: dict[str, Gtk.Widget] = {}
+        self._base_menu = track_menu_builder(state, navigator, lambda: holder["cv"])
         self._cv, self._store, _sel = build_track_column_view(
-            on_row_menu=track_menu_builder(state, navigator, lambda: holder["cv"]),
+            on_row_menu=self._queue_row_menu,
             state=state,
             on_row_activate=lambda t: state.playback_play_from(t),
         )
@@ -78,6 +95,29 @@ class NowPlayingPage(Gtk.Box):
         state.connect("playback-changed", lambda *_a: self._render())
         self._render()
 
+    # -- queue controls -----------------------------------------------------
+
+    def _on_shuffle_toggled(self, button: Gtk.ToggleButton) -> None:
+        if not self._syncing:
+            self.state.playback_set_shuffle(button.get_active())
+
+    def _on_repeat_clicked(self, _button: Gtk.Button) -> None:
+        order = {"off": "all", "all": "one", "one": "off"}
+        self.state.playback_set_repeat(order.get(self.state.playback.repeat, "off"))
+
+    def _queue_row_menu(self, track):
+        """Queue reorder/remove ops for the tapped row, then the standard track menu."""
+        items: list = []
+        queue = self.state.active_queue()
+        idx = next((i for i, t in enumerate(queue) if t.key() == track.key()), -1)
+        if idx > 1:
+            items.append(("Move Up", lambda: self.state.playback_reorder(idx, idx - 1)))
+        if 0 < idx < len(queue) - 1:
+            items.append(("Move Down", lambda: self.state.playback_reorder(idx, idx + 1)))
+        if idx >= 1:
+            items.append(("Remove from Queue", lambda: self.state.playback_remove(track)))
+        return items + self._base_menu(track)
+
     def _render(self) -> None:
         pb = self.state.playback
         if pb.track is None:
@@ -96,13 +136,24 @@ class NowPlayingPage(Gtk.Box):
                 self._art_url = art
                 load_artwork_into(self._art, art)
 
-        # Rebuild the list only when the collection itself changes — not on every
-        # 3s status poll — so selection and scroll position survive. The shared
-        # indicator column tracks the current track on its own.
-        queue = self.state.current_queue()
-        sig = (pb.collection_key, len(queue),
-               queue[0].key() if queue else None,
-               queue[-1].key() if queue else None)
+        # Reflect shuffle/repeat state.
+        self._syncing = True
+        self._shuffle.set_active(pb.shuffle)
+        self._syncing = False
+        self._repeat.set_icon_name(
+            "media-playlist-repeat-song-symbolic" if pb.repeat == "one"
+            else "media-playlist-repeat-symbolic")
+        self._repeat.set_tooltip_text(f"Repeat: {pb.repeat}")
+        if pb.repeat == "off":
+            self._repeat.remove_css_class("accent")
+        else:
+            self._repeat.add_css_class("accent")
+
+        # The live active queue (current track first, then what's up next). Rebuild
+        # only when it actually changes, so selection/scroll survive status polls;
+        # the shared indicator column tracks the current track on its own.
+        queue = self.state.active_queue()
+        sig = (len(queue), tuple(t.key() for t in queue))
         if sig != self._queue_sig:
             self._queue_sig = sig
             replace_tracks(self._store, queue)

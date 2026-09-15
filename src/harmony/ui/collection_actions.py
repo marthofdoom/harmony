@@ -99,6 +99,23 @@ def _play_collection(
     run_async(work, done, lambda exc: state.toast(f"Couldn't play {label} on {name}: {exc}"))
 
 
+def enqueue_collection(
+    state: AppState, *, label: str, fetch_tracks: Callable[[], list[Track]],
+    play_next: bool = False,
+) -> None:
+    """Add a collection's tracks to the active queue (end, or right after current)."""
+    def work() -> list[Track]:
+        return list(fetch_tracks())
+
+    def done(tracks: list[Track]) -> None:
+        if not tracks:
+            state.toast(f"{label} has no tracks to queue.")
+            return
+        (state.playback_play_next if play_next else state.playback_enqueue)(tracks)
+
+    run_async(work, done, lambda exc: state.toast(f"Couldn't queue {label}: {exc}"))
+
+
 def play_track_here(state: AppState, track: Track) -> None:
     """Play one track on *this device* (in-app local playback) — double-click / Enter.
 

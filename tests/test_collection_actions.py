@@ -381,7 +381,7 @@ def test_search_page_album_row_actions_include_play_and_add(fake_state: AppState
 
     labels = [label for label, _cb in page._other_row_actions(album)]
 
-    assert labels[:2] == ["Play on Device", "Add to Playlist…"]
+    assert labels[:4] == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…"]
 
 
 def test_search_page_artist_row_actions_include_play_and_add(fake_state: AppState) -> None:
@@ -391,7 +391,7 @@ def test_search_page_artist_row_actions_include_play_and_add(fake_state: AppStat
 
     labels = [label for label, _cb in page._other_row_actions(artist)]
 
-    assert labels[:2] == ["Play on Device", "Add to Playlist…"]
+    assert labels[:4] == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…"]
 
 
 def test_search_page_playlist_row_actions_include_play_and_add(fake_state: AppState) -> None:
@@ -401,7 +401,7 @@ def test_search_page_playlist_row_actions_include_play_and_add(fake_state: AppSt
 
     labels = [label for label, _cb in page._other_row_actions(playlist)]
 
-    assert labels[:2] == ["Play on Device", "Add to Playlist…"]
+    assert labels[:4] == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…"]
 
 
 def test_search_page_collection_row_actions_omit_play_and_add_without_native_provider(fake_state: AppState) -> None:
@@ -426,7 +426,7 @@ def test_playlists_page_playlist_row_actions_include_play_and_add(fake_state: Ap
 
     labels = [label for label, _cb in page._playlist_row_actions(playlist, wrapper)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Open"]
+    assert labels == ["Play on Device", "Add to Queue", "Play Next", "Add to Playlist…", "Show Similar", "Open"]
 
 
 def test_playlists_page_track_column_view_has_full_track_menu(fake_state: AppState) -> None:

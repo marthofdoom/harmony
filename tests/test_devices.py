@@ -441,6 +441,43 @@ def test_queue_falls_back_to_stopped_without_duration(state: AppState) -> None:
     assert nxt is not None and nxt.id == "t2"
 
 
+def test_playback_enqueue_appends_to_queue_and_collection(state: AppState) -> None:
+    state.toast = lambda *a, **k: None  # type: ignore[method-assign]
+    _seed_queue(state, [_track_n(1), _track_n(2)])
+    state.playback.active_host = "h"
+    state._collection_full = {"h": [_track_n(1), _track_n(2)]}
+    state.playback_enqueue([_track_n(3)])
+    assert [t.id for t in state._queues["h"]] == ["t1", "t2", "t3"]
+    assert [t.id for t in state._collection_full["h"]] == ["t1", "t2", "t3"]
+
+
+def test_playback_play_next_inserts_after_current(state: AppState) -> None:
+    state.toast = lambda *a, **k: None  # type: ignore[method-assign]
+    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
+    state.playback.active_host = "h"
+    state.playback_play_next([_track_n(9)])
+    assert [t.id for t in state._queues["h"]] == ["t1", "t9", "t2", "t3"]  # after current, before rest
+
+
+def test_playback_reorder_never_moves_the_current_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3), _track_n(4)])
+    state.playback.active_host = "h"
+    state.playback_reorder(3, 1)  # move t4 up to slot 1
+    assert [t.id for t in state._queues["h"]] == ["t1", "t4", "t2", "t3"]
+    state.playback_reorder(0, 2)  # can't move the current (index 0)
+    state.playback_reorder(1, 0)  # can't move something onto the current slot
+    assert state._queues["h"][0].id == "t1"
+
+
+def test_playback_remove_skips_the_current_track(state: AppState) -> None:
+    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
+    state.playback.active_host = "h"
+    state.playback_remove(_track_n(2))
+    assert [t.id for t in state._queues["h"]] == ["t1", "t3"]
+    state.playback_remove(_track_n(1))  # the current track — must stay
+    assert state._queues["h"][0].id == "t1"
+
+
 def test_advance_settle_suppresses_transition_advance(state: AppState) -> None:
     # A track that just started opens a settle window: the device's transient
     # "stopped" during the swap must NOT be read as the new track ending (the

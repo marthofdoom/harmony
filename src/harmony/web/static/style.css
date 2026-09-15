@@ -165,6 +165,20 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
          border-radius: var(--r-sm); padding: 0 .3rem; }
 .badge.remote { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
 
+/* Now Playing queue: header controls (shuffle / repeat) + drag-to-reorder */
+.qhead { display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
+.qhead h3 { margin: 0; flex: 1; font-size: 1rem; font-weight: 650; }
+.qctrls { display: flex; gap: var(--sp-1); }
+.qbtn { border: none; background: none; color: var(--muted); cursor: pointer;
+        width: 2.25rem; height: 2.25rem; border-radius: 50%; display: grid; place-items: center; }
+.qbtn:hover { background: var(--row-hover); color: var(--fg); }
+.qbtn.on { color: var(--accent); }
+.qbtn .ico { width: 1.2rem; height: 1.2rem; }
+.trow.reorder { cursor: pointer; }
+.trow.reorder .rowacts { opacity: 1; }          /* keep the grip visible (touch) */
+.trow .grip { cursor: grab; touch-action: none; }
+.trow.dragging { opacity: .55; background: var(--row-hover); }
+
 /* playlist grid */
 .plgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--sp-3); }
 .plcard { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-lg);

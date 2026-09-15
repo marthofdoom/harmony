@@ -188,7 +188,7 @@ private fun ArtistScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntr
                     items(d.topTracks) { t ->
                         TrackRow(t, onPlay = { vm.play(t, d.topTracks) },
                             isPlaying = t.id == state.playback.track?.id,
-                            trailing = { AddToPlaylistButton(vm, state, t) })
+                            trailing = { TrackRowMenu(vm, state, t) })
                     }
                 }
                 if (d.members.isNotEmpty()) {
@@ -299,6 +299,15 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
             else -> LazyColumn(Modifier.fillMaxSize()) {
                 item { AlbumHeader(d, onArtist = { d.artistRef?.let { vm.openArtist(it) } }) }
                 d.bio?.let { bio -> item { BioBlock(bio) } }
+                item {
+                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        androidx.compose.material3.FilledTonalButton(
+                            onClick = { vm.playNext(d.tracks) }) { Text("Play next") }
+                        androidx.compose.material3.FilledTonalButton(
+                            onClick = { vm.addToQueue(d.tracks) }) { Text("Add to queue") }
+                    }
+                }
                 item { SectionHeader("Tracks") }
                 items(d.tracks) { t ->
                     NumberedTrackRow(
@@ -306,6 +315,7 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
                         isPlaying = t.id == state.playback.track?.id,
                         onOpen = { vm.openTrack(t.service, t.id) },
                         onPlay = { vm.play(t, d.tracks) },
+                        menu = { TrackRowMenu(vm, state, t) },
                     )
                 }
                 item { Spacer(Modifier.height(24.dp)) }
@@ -345,7 +355,13 @@ private fun AlbumHeader(d: AlbumDetail, onArtist: () -> Unit) {
 }
 
 @Composable
-private fun NumberedTrackRow(t: Track, isPlaying: Boolean, onOpen: () -> Unit, onPlay: () -> Unit) {
+private fun NumberedTrackRow(
+    t: Track,
+    isPlaying: Boolean,
+    onOpen: () -> Unit,
+    onPlay: () -> Unit,
+    menu: (@Composable () -> Unit)? = null,
+) {
     Row(Modifier.fillMaxWidth().clickable { onOpen() }
         .padding(horizontal = 16.dp, vertical = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
@@ -366,6 +382,7 @@ private fun NumberedTrackRow(t: Track, isPlaying: Boolean, onOpen: () -> Unit, o
             }
         }
         IconButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, "Play") }
+        menu?.invoke()
     }
 }
 
@@ -527,7 +544,7 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
             items(inc.tracks) { t ->
                 TrackRow(t, onPlay = { vm.play(t, inc.tracks) },
                     isPlaying = t.id == state.playback.track?.id,
-                    trailing = { AddToPlaylistButton(vm, state, t) })
+                    trailing = { TrackRowMenu(vm, state, t) })
             }
         }
         if (inc.artists.isNotEmpty()) {
