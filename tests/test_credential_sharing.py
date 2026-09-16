@@ -39,10 +39,17 @@ def _use_settings(monkeypatch: pytest.MonkeyPatch, s: _FakeSettings) -> None:
     monkeypatch.setattr(config, "Settings", type("S", (), {"load": staticmethod(lambda: s)}))
 
 
-def _engine(working: dict[str, bool] | None = None) -> Engine:
-    """An Engine with its service-working probe stubbed (no real providers)."""
+def _engine(working: dict[str, bool] | None = None,
+            valid: dict[str, bool] | None = None) -> Engine:
+    """An Engine with its provider probes stubbed (no real providers).
+
+    ``working`` is the pre-sync validity map (source advertisement / local
+    no-clobber check); ``valid`` is the post-import destination validation used
+    for rollback (defaults to "everything adopted works")."""
     e = Engine()
     e._service_working = lambda: dict(working or {})  # type: ignore[method-assign]
+    v = valid or {}
+    e._service_ok = lambda sv: v.get(sv, True)        # type: ignore[method-assign]
     return e
 
 
@@ -111,6 +118,36 @@ def test_import_keeps_a_working_local_connection(monkeypatch: pytest.MonkeyPatch
     result = _engine({"qobuz": True}).import_credentials(payload)  # local Qobuz works
     assert _FakeCS.store["qobuz.user_auth_token"] == "MINE"  # not clobbered
     assert result["synced"] == [] and result["kept"] == ["qobuz"]
+
+
+def test_import_rolls_back_a_credential_that_fails_on_the_destination(
+    monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """A login can authenticate on the SOURCE yet fail here (YT cookies are
+    IP/session-bound). The adopted credential must be validated on the DESTINATION
+    and rolled back to what was there before, so a sync never breaks a device."""
+    from pathlib import Path
+
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "CredentialStore", _FakeCS)
+    monkeypatch.setattr(config, "config_dir", lambda: tmp_path)
+    _FakeCS.store = {}
+    target = _FakeSettings()
+    mine = tmp_path / "mine.json"                       # my own YT auth, works HERE
+    mine.write_text('{"cookie": "MINE"}', "utf-8")
+    target.ytmusic_auth_file = str(mine)
+    target.ytmusic_auth_kind = "browser"
+    _use_settings(monkeypatch, target)
+
+    # Peer sends a YT token the source calls working, but it won't validate here.
+    token = '{"refresh_token": "RT", "access_token": "AT"}'
+    payload = {"secrets": {}, "settings": {}, "ytmusic_auth": token, "working": {"ytmusic": True}}
+    result = _engine({}, valid={"ytmusic": False}).import_credentials(payload)
+
+    assert result["rolled_back"] == ["ytmusic"]
+    assert result["synced"] == []
+    assert target.ytmusic_auth_kind == "browser"       # restored
+    assert Path(target.ytmusic_auth_file).read_text("utf-8") == '{"cookie": "MINE"}'  # my creds back
 
 
 def test_import_adopts_a_working_source_when_local_is_missing(monkeypatch: pytest.MonkeyPatch) -> None:

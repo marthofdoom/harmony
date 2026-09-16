@@ -264,19 +264,80 @@ class Engine:
     }
     _UTILITY_SECRETS = ("lastfm.api_key", "anthropic.api_key")
 
-    def _service_working(self) -> dict[str, bool]:
-        """Which streaming services are currently authenticated on THIS instance.
+    def _service_ok(self, service_value: str) -> bool:
+        """Real validity: the credentials actually WORK (a live authenticated
+        call), not merely that an auth file loaded. Best-effort — False on any
+        failure, including a login that loaded here but the service rejects
+        (e.g. YouTube cookies that only work from the machine they came from)."""
+        prov = self._provider(service_value)
+        if prov is None:
+            return False
+        try:
+            prov.authenticate()
+            prov.list_playlists()  # authed round-trip; raises on stale/invalid creds
+            return True
+        except Exception:  # noqa: BLE001 - any failure means "not working"
+            return False
 
-        Best-effort — used to decide sync direction (adopt only a working source
-        connection; keep a working local one). Never raises.
-        """
+    def _service_working(self) -> dict[str, bool]:
+        """Which streaming services actually work on THIS instance — a real check,
+        not just "an auth file is loaded". Used to advertise the source's working
+        connections and to protect a working local one. Never raises."""
         out: dict[str, bool] = {}
         try:
-            for svc, prov in self._ensure_providers().items():
-                out[svc.value] = bool(getattr(prov, "is_authenticated", False))
-        except Exception:  # noqa: BLE001 - status is advisory, never fatal
-            pass
+            services = [svc.value for svc in self._ensure_providers()]
+        except Exception:  # noqa: BLE001
+            return out
+        for sv in services:
+            out[sv] = self._service_ok(sv)
         return out
+
+    def _snapshot_service(self, service: str) -> dict[str, Any]:
+        """Capture a service's current credentials so a bad sync can be undone."""
+        from pathlib import Path
+
+        from harmony.config import CredentialStore, Settings
+
+        cs = CredentialStore()
+        s = Settings.load()
+        snap: dict[str, Any] = {
+            "secrets": {k: cs.get(k) for k in self._SERVICE_SECRETS[service]},
+            "settings": {f: getattr(s, f, None) for f in self._SERVICE_SETTINGS[service]},
+        }
+        if service == "ytmusic":
+            snap["ytmusic_auth_kind"] = s.ytmusic_auth_kind
+            snap["ytmusic_auth_file"] = s.ytmusic_auth_file
+            snap["yt_auth_content"] = None
+            if s.ytmusic_auth_file:
+                try:
+                    snap["yt_auth_content"] = Path(s.ytmusic_auth_file).read_text("utf-8")
+                except OSError:
+                    pass
+        return snap
+
+    def _restore_service(self, service: str, snap: dict[str, Any]) -> None:
+        """Roll a service's credentials back to a snapshot (undo a bad sync)."""
+
+        from harmony.config import CredentialStore, Settings, config_dir
+
+        cs = CredentialStore()
+        s = Settings.load()
+        for k, v in snap["secrets"].items():
+            if v is not None:
+                cs.set(k, v)
+        for f, v in snap["settings"].items():
+            if hasattr(s, f):
+                setattr(s, f, v)
+        if service == "ytmusic":
+            s.ytmusic_auth_kind = snap.get("ytmusic_auth_kind") or "browser"
+            content = snap.get("yt_auth_content")
+            if content is not None:
+                path = config_dir() / "ytmusic-auth.json"
+                path.write_text(content, "utf-8")
+                s.ytmusic_auth_file = str(path)
+            else:
+                s.ytmusic_auth_file = snap.get("ytmusic_auth_file") or ""
+        s.save()
 
     def _collect_credentials(self) -> dict[str, Any]:
         """Everything a full instance needs to become an independent credential
@@ -343,6 +404,9 @@ class Engine:
 
         local_working = self._service_working()     # checked BEFORE we reset providers
         source_working = data.get("working")        # None for older peers
+        # Snapshot what we might overwrite, so a login that doesn't actually work
+        # here can be rolled back rather than left broken.
+        snapshots = {svc: self._snapshot_service(svc) for svc in ("qobuz", "ytmusic")}
 
         def adopt(service: str) -> bool:
             if local_working.get(service):
@@ -397,8 +461,23 @@ class Engine:
 
         s.save()
         self._reset_providers()
+
+        # Destination-side safety net: a credential that authenticates on the
+        # SOURCE can still fail here — browser cookies are IP/session-bound, so
+        # the same YouTube login that works on a laptop is rejected from a server.
+        # Validate each adopted service with a real call and roll it back to its
+        # snapshot if it doesn't actually work, so a sync never leaves this
+        # instance worse off than before.
+        rolled_back: list[str] = []
+        for service in list(synced):
+            if not self._service_ok(service):
+                self._restore_service(service, snapshots[service])
+                synced.remove(service)
+                rolled_back.append(service)
+        if rolled_back:
+            self._reset_providers()
         return {"ok": True, "imported": sorted(imported),
-                "synced": synced, "kept": kept}
+                "synced": synced, "kept": kept, "rolled_back": rolled_back}
 
     def adopt_from_peer(self, host: str, port: int) -> dict[str, Any]:
         """Pull a peer's (encrypted) credentials, decrypt with our personal key,
