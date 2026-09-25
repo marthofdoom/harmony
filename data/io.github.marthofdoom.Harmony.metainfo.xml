@@ -46,6 +46,21 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.5" date="2026-09-25">
+      <description>
+        <p>Harmony is now a proper music player on every device. Play an album,
+        playlist or artist and the whole thing becomes your queue; shuffle it,
+        repeat it, reorder it, add to it or play something next. Now Playing
+        shows the full queue everywhere, and the queue survives a restart.</p>
+        <p>Casting keeps going: the Harmony instance next to a speaker or TV now
+        runs that device's queue itself, so tracks advance even when your phone
+        or browser is closed — and every device sees and controls the same queue,
+        including speakers reached through another Harmony instance. Media keys
+        and desktop media controls work, the phone app plays in the background
+        with lock-screen and Bluetooth controls, and syncing accounts now
+        updates the connection status and says exactly what was synced.</p>
+      </description>
+    </release>
     <release version="1.0.4" date="2026-09-15">
       <description>
         <p>Sync your streaming logins between your devices. The desktop and phone
