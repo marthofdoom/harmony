@@ -33,6 +33,8 @@ finish-args:
   - --talk-name=org.freedesktop.secrets
   # System-tray icon (StatusNotifierItem): register with the tray host / watcher.
   - --talk-name=org.kde.StatusNotifierWatcher
+  # MPRIS: media keys, shell media controls, lock screen.
+  - --own-name=org.mpris.MediaPlayer2.io.github.marthofdoom.Harmony
   # One-click "Connect YouTube" reads the user's own browser cookies (read-only)
   # to auto-detect a signed-in session -- no DevTools paste. Firefox works
   # directly; Chromium-family cookies are additionally encrypted with a key from

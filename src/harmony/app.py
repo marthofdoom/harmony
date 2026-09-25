@@ -40,6 +40,13 @@ class HarmonyApplication(Adw.Application):
         self._install_actions()
         self.start_server()
         self._start_tray()
+        self._mpris = None
+        try:  # media keys, shell media controls, lock screen, playerctl
+            from harmony.ui.mpris import Mpris
+
+            self._mpris = Mpris(self, self.state, APP_ID, APP_NAME)
+        except Exception:  # noqa: BLE001 - MPRIS is best-effort (no session bus, etc.)
+            log.debug("MPRIS unavailable", exc_info=True)
 
     def _start_tray(self) -> None:
         try:
@@ -97,6 +104,10 @@ class HarmonyApplication(Adw.Application):
         from harmony import tasks
 
         self.stop_server()
+        if getattr(self, "_mpris", None) is not None:
+            self._mpris.stop()
+        if getattr(self, "state", None) is not None:
+            self.state._save_queue()  # the queue survives the restart
         if self._tray is not None:
             self._tray.stop()
         tasks.shutdown(wait=False)
@@ -120,6 +131,22 @@ class HarmonyApplication(Adw.Application):
         self.add_action(about_action)
 
         self.set_accels_for_action("win.focus-search", ["<Control>f"])
+
+        # Transport shortcuts (Ctrl+ so they never steal keys from a text field).
+        st = self.state
+        for name, accels, fn in (
+            ("play-pause", ["<Control>space"], st.playback_toggle_pause),
+            ("next-track", ["<Control>Right"], st.playback_next),
+            ("previous-track", ["<Control>Left"], st.playback_previous),
+            ("stop", ["<Control>period"], st.playback_stop),
+            ("toggle-shuffle", ["<Control><Shift>s"], lambda: st.playback_set_shuffle(not st.playback.shuffle)),
+            ("cycle-repeat", ["<Control><Shift>r"], lambda: st.playback_set_repeat(
+                {"off": "all", "all": "one", "one": "off"}[st.playback.repeat])),
+        ):
+            action = Gio.SimpleAction.new(name, None)
+            action.connect("activate", lambda *_a, f=fn: f())
+            self.add_action(action)
+            self.set_accels_for_action(f"app.{name}", accels)
 
     def _on_preferences(self, _action: Gio.SimpleAction, _param: None) -> None:
         self.open_preferences()

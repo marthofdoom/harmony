@@ -131,6 +131,8 @@ class AppState(GObject.Object):
             log.debug("engine credentials listener unavailable", exc_info=True)
         self._init_recommender()
         self._init_planner()
+        self.restore_queue()
+        self.connect("playback-changed", lambda *_a: self._schedule_queue_save())
         # Populate the output picker (LAN + peers' devices) once the mesh settles.
         GLib.timeout_add_seconds(8, self.discover_outputs)
 
@@ -152,6 +154,9 @@ class AppState(GObject.Object):
         self._peer_devices: list[Any] = []   # mesh peers' renderers ("via")
         # The one app-wide playback model the Now Playing bar reflects/controls.
         self.playback = PlaybackState()
+        self._save_id: int | None = None
+        self._resume_at = 0            # restored position to seek to on first Play
+        self._remote_has_queue = False  # the device's own queue is loaded (not just mirrored)
         # After a seek, hold the optimistic position until the device/player
         # actually converges: an in-flight status poll started before the seek
         # would otherwise write the pre-seek position back and snap the bar (and
@@ -673,6 +678,7 @@ class AppState(GObject.Object):
             return
         host = host or self.playback.active_host or LOCAL_HOST
         self._switch_output(host)
+        self._resume_at = 0
         self._active_collection = collection_key
         if shuffle:
             self.playback.shuffle = True
@@ -823,6 +829,14 @@ class AppState(GObject.Object):
             return
         from harmony.web.api import track_from_dict
 
+        self._remote_has_queue = bool(snap["tracks"])
+        if not snap["tracks"] and self.queue.tracks and not snap.get("playing"):
+            # The device has no queue (e.g. this app just restarted) but we do:
+            # keep ours on screen; Play loads it onto the device.
+            pb = self.playback
+            pb.volume = snap.get("volume")
+            pb.volume_supported = pb.volume is not None
+            return
         keys = [(d.get("service"), str(d.get("id"))) for d in snap["tracks"]]
         mine = [(t.service.value, t.id) for t in self.queue.tracks]
         if keys != mine:
@@ -990,7 +1004,14 @@ class AppState(GObject.Object):
             return
         pb = self.playback
         if pb.state in ("stopped", "unknown"):
+            resume = self._resume_at
+            self._resume_at = 0
             self.playback_jump(max(self.queue.index, 0))
+            if resume > 5:
+                if host == LOCAL_HOST:
+                    GLib.timeout_add(1500, lambda: (self._get_local_player().seek(resume), False)[1])
+                else:
+                    GLib.timeout_add(3000, lambda: (self._remote_control("seek", resume), False)[1])
             return
         pausing = pb.state in ("playing", "loading")
         pb.state = "paused" if pausing else "playing"
@@ -1043,7 +1064,13 @@ class AppState(GObject.Object):
         if not 0 <= index < len(self.queue.tracks):
             return
         if self._is_remote():
-            self._remote_op("jump", {"index": index}, error="Couldn't play that track.")
+            if self._remote_has_queue:
+                self._remote_op("jump", {"index": index}, error="Couldn't play that track.")
+            else:  # the device's queue is empty (restart, or it was lost): load ours
+                self._remote_op("load", {
+                    "tracks": [self._track_dict(t) for t in self.queue.tracks], "start": index,
+                    "shuffle": self.playback.shuffle, "repeat": self.playback.repeat,
+                    "keep_order": True}, error="Couldn't play that track.")
             return
         self.playback.active_host = LOCAL_HOST
         self._ensure_poller()
@@ -1257,6 +1284,74 @@ class AppState(GObject.Object):
         run_async(work, done, lambda exc: log.debug("device discovery failed: %s", exc))
         self.refresh_peer_devices()
         return GLib.SOURCE_REMOVE
+
+    # -- queue survives a restart --------------------------------------------
+
+    @staticmethod
+    def _queue_file() -> Any:
+        from harmony.config import data_dir
+
+        return data_dir() / "play-queue.json"
+
+    def _schedule_queue_save(self) -> None:
+        if self._save_id is None:
+            self._save_id = GLib.timeout_add_seconds(2, self._save_queue)
+
+    def _save_queue(self) -> bool:
+        self._save_id = None
+        import json
+
+        pb = self.playback
+        data = {
+            "target": pb.active_host, "index": self.queue.index,
+            "position_s": pb.position_s or 0, "shuffle": pb.shuffle, "repeat": pb.repeat,
+            "collection": [self._active_collection[0].value, self._active_collection[1]]
+            if self._active_collection else None,
+            "tracks": [self._track_dict(t) for t in self.queue.tracks],
+        }
+        try:
+            path = self._queue_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_suffix(".tmp")
+            tmp.write_text(json.dumps(data), "utf-8")
+            tmp.replace(path)
+        except OSError as exc:
+            log.debug("couldn't save the queue: %s", exc)
+        return GLib.SOURCE_REMOVE
+
+    def restore_queue(self) -> None:
+        """Bring back the last session's queue, paused on the track it was on."""
+        import json
+
+        from harmony.web.api import track_from_dict
+
+        try:
+            data = json.loads(self._queue_file().read_text("utf-8"))
+            tracks = [track_from_dict(d) for d in data.get("tracks") or []]
+        except (OSError, ValueError, KeyError, TypeError):
+            return
+        if not tracks:
+            return
+        pb = self.playback
+        pb.shuffle, pb.repeat = bool(data.get("shuffle")), data.get("repeat") or "off"
+        self.queue = self._fresh_queue()
+        self.queue.tracks, self.queue.original = tracks, list(tracks)
+        self.queue.index = max(0, min(int(data.get("index") or 0), len(tracks) - 1))
+        coll = data.get("collection")
+        try:
+            self._active_collection = (Service(coll[0]), str(coll[1])) if coll else None
+        except (ValueError, IndexError):
+            self._active_collection = None
+        pb.active_host = data.get("target") or LOCAL_HOST
+        pb.track = self.queue.current()
+        pb.collection_key = self._active_collection
+        pb.state = "stopped"
+        pb.position_s = int(data.get("position_s") or 0)
+        pb.duration_s = getattr(pb.track, "duration_s", None)
+        self._resume_at = pb.position_s
+        self._refresh_nav()
+        self._ensure_poller()
+        self.emit("playback-changed")
 
     def refresh_peer_devices(self) -> None:
         """Fetch mesh peers' renderers (worker) so they show in the output picker."""

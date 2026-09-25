@@ -530,3 +530,30 @@ def test_selecting_a_device_with_nothing_playing_just_switches_view(player) -> N
 def test_split_target() -> None:
     assert AppState.split_target("192.168.1.9") == ("192.168.1.9", None)
     assert AppState.split_target("10.0.0.2:8080/192.168.50.7") == ("192.168.50.7", "10.0.0.2:8080")
+
+
+def test_engine_credential_change_reaches_the_desktop(state: AppState, monkeypatch) -> None:
+    """A sync pull (or a peer pushing creds) writes settings through the engine;
+    the desktop must re-read them and rebuild its providers — the stale-settings
+    bug that left the Qobuz status row unchanged after a sync."""
+    rebuilt: list[bool] = []
+    monkeypatch.setattr(state, "reload_providers", lambda: rebuilt.append(True))
+    other = config_module.Settings.load()
+    other.qobuz_token_saved = True
+    other.qobuz_auth_kind = "token"
+    other.save()
+    assert state.settings.qobuz_token_saved is False
+    state._on_engine_credentials_changed()
+    assert state.settings.qobuz_token_saved is True and state.settings.qobuz_auth_kind == "token"
+    assert rebuilt == [True]
+
+
+def test_engine_reset_notifies_listeners() -> None:
+    from harmony.web.api import Engine
+
+    e = Engine()
+    seen: list[int] = []
+    e.add_credentials_listener(lambda: seen.append(1))
+    e._reset_providers()
+    e.reset_providers(notify=False)
+    assert seen == [1]

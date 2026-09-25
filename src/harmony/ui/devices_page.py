@@ -200,10 +200,19 @@ class DevicesPage(Gtk.Box):
         self.play_pause_button = Gtk.Button(icon_name="media-playback-start-symbolic", tooltip_text="Play/Pause")
         self.stop_button = Gtk.Button(icon_name="media-playback-stop-symbolic", tooltip_text="Stop")
         self.next_button = Gtk.Button(icon_name="media-skip-forward-symbolic", tooltip_text="Next")
-        self.prev_button.connect("clicked", lambda *_a: self._run_device_action(lambda d: d.previous()))
+        # When this device is Harmony's active output, its transport IS Harmony's
+        # queue (prev/next through the queue, stop halts it); otherwise control the
+        # device's own playback (e.g. a WiiM playing its own sources).
+        self.prev_button.connect("clicked", lambda *_a: self.state.playback_previous()
+                                 if self._is_active_output() else
+                                 self._run_device_action(lambda d: d.previous()))
         self.play_pause_button.connect("clicked", self._on_play_pause_clicked)
-        self.stop_button.connect("clicked", lambda *_a: self._run_device_action(lambda d: d.stop()))
-        self.next_button.connect("clicked", lambda *_a: self._run_device_action(lambda d: d.next()))
+        self.stop_button.connect("clicked", lambda *_a: self.state.playback_stop()
+                                 if self._is_active_output() else
+                                 self._run_device_action(lambda d: d.stop()))
+        self.next_button.connect("clicked", lambda *_a: self.state.playback_next()
+                                 if self._is_active_output() else
+                                 self._run_device_action(lambda d: d.next()))
         for button in (self.prev_button, self.play_pause_button, self.stop_button, self.next_button):
             transport.append(button)
         outer.append(transport)
@@ -508,7 +517,15 @@ class DevicesPage(Gtk.Box):
             log.exception("Unexpected device error")
             self.state.toast(f"{prefix}: {exc}")
 
+    def _is_active_output(self) -> bool:
+        pb = self.state.playback
+        return bool(self._selected_host) and pb.active_host == self._selected_host \
+            and pb.track is not None
+
     def _on_play_pause_clicked(self, _button: Gtk.Button) -> None:
+        if self._is_active_output():
+            self.state.playback_toggle_pause()
+            return
         status = self._last_status
         if status is not None and status.state == "playing":
             self._run_device_action(lambda d: d.pause())
