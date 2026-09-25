@@ -1,8 +1,8 @@
 """Casting to LAN devices (WiiM/UPnP) from the web server.
 
-Reuses the gi-free relay + device backends -- the single-track, queue-less
-subset of the desktop's play-to-device. (The multi-track server-side cast queue
-lives in AppState and is a later slice.) GTK-free.
+Reuses the gi-free relay + device backends to play ONE track and control the
+device; the multi-track queue + auto-advance on top of this is
+``harmony.web.device_queue``. GTK-free.
 """
 
 from __future__ import annotations
@@ -113,6 +113,14 @@ class CastController:
             device.stop()
         elif action == "volume":
             device.set_volume(int(level or 0))
+        elif action == "seek":
+            # UPnP AVTransport where the device speaks it (exact); else the
+            # backend's own seek (WiiM httpapi, Chromecast media controller).
+            renderer = self._upnp_renderer(host) if kind != "cast" else None
+            if renderer is not None:
+                renderer.seek(int(level or 0))
+            else:
+                device.seek(int(level or 0))
         else:
             raise ValueError(f"unknown action {action}")
         return {"ok": True}

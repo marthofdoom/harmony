@@ -174,6 +174,9 @@ class WiiMDevice(PlaybackDevice):
     def set_muted(self, muted: bool) -> None:
         self._set(f"mute:{1 if muted else 0}")
 
+    def seek(self, position_s: int) -> None:
+        self._set(f"seek:{max(0, int(position_s))}")
+
     def next(self) -> None:
         self._set("next")
 

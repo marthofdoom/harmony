@@ -172,7 +172,13 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     return
                 self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {},
                                             via=body.get("via") or None))
-            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] in ("pause", "resume", "stop", "volume"):
+            elif len(parts) == 5 and parts[0:2] == ["api", "devices"] and parts[3] == "queue":
+                try:
+                    self._send_json(engine.device_queue_op(parts[2], parts[4], body,
+                                                           via=body.get("via") or None))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
+            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] in ("pause", "resume", "stop", "volume", "seek"):
                 self._send_json(engine.device_control(parts[2], parts[3], body.get("level"),
                                                        via=body.get("via") or None))
             elif parts == ["api", "audio", "receive"]:
@@ -315,6 +321,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     self._send_json(engine.devices(refresh=refresh))
             elif parts == ["api", "peers"]:
                 self._send_json(engine.instances())
+            elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "queue":
+                via = (query.get("via") or [""])[0] or None
+                self._send_json(engine.device_queue(parts[2], via=via))
             elif len(parts) == 4 and parts[0:2] == ["api", "devices"] and parts[3] == "status":
                 via = (query.get("via") or [""])[0] or None
                 self._send_json(engine.device_status(parts[2], via=via))

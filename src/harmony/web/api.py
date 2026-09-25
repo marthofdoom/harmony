@@ -115,6 +115,7 @@ class Engine:
         self._providers: dict[Any, Any] | None = None
         self._streams: dict[str, dict[str, Any]] = {}
         self._cast: Any | None = None
+        self._queues: Any | None = None
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
@@ -1343,9 +1344,16 @@ class Engine:
 
     def cast(self, host: str, service_value: str, track_id: str, meta: dict[str, Any] | None = None,
              via: str | None = None) -> dict[str, Any]:
+        """Play ONE track on a device (replaces any server-side queue there)."""
         if via:
             return self._peer_call(via, "POST", f"/api/devices/{host}/play",
                                    {"service": service_value, "id": track_id, "meta": meta or {}})
+        if self._queues is not None:
+            self._queues.stop(host)
+        return self._cast_direct(host, service_value, track_id, meta)
+
+    def _cast_direct(self, host: str, service_value: str, track_id: str,
+                     meta: dict[str, Any] | None = None) -> dict[str, Any]:
         kind, info = self._device_kind(host)
         return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
 
@@ -1354,8 +1362,51 @@ class Engine:
         if via:
             return self._peer_call(via, "POST", f"/api/devices/{host}/{action}",
                                    {"level": level} if level is not None else {})
+        if action == "stop" and self._queues is not None:
+            self._queues.stop(host)
+        if action == "seek" and self._queues is not None:
+            self._queues.note_seek(host, int(level or 0))
         kind, info = self._device_kind(host)
         return self._caster().control(host, action, level, kind=kind, device_info=info)
+
+    # -- server-owned device queues (auto-advance lives next to the device) --
+
+    def _device_queues(self) -> Any:
+        if self._queues is None:
+            from harmony.web.device_queue import DeviceQueues
+
+            def play(host: str, t: dict[str, Any]) -> Any:
+                meta = {k: t.get(k) for k in ("title", "artist", "album", "art_url", "duration_s")}
+                return self._cast_direct(host, str(t["service"]), str(t["id"]), meta)
+
+            self._queues = DeviceQueues(play, lambda h: self.device_status(h))
+        return self._queues
+
+    def device_queue(self, host: str, via: str | None = None) -> dict[str, Any]:
+        """The device's queue + live status: what every client's Now Playing renders."""
+        if via:
+            return self._peer_call(via, "GET", f"/api/devices/{host}/queue", timeout=6)
+        snap = self._device_queues().snapshot(host)
+        if not snap.get("playing"):
+            try:  # a stopped queue has no poller; read the device once
+                st = self.device_status(host)
+                snap.update({k: st.get(k) for k in ("state", "position_s", "duration_s", "volume")})
+            except Exception as exc:  # noqa: BLE001 - an unreachable device is just "no status"
+                log.debug("device %s status unavailable: %s", host, exc)
+        return snap
+
+    def device_queue_op(self, host: str, op: str, body: dict[str, Any],
+                        via: str | None = None) -> dict[str, Any]:
+        """Apply a queue op (load/next/prev/jump/enqueue/play_next/move/remove/
+        clear/shuffle/repeat/stop). A via device's queue lives on that peer."""
+        if via:  # forward without our via, or the peer would forward it again
+            fwd = {k: v for k, v in body.items() if k != "via"}
+            return self._peer_call(via, "POST", f"/api/devices/{host}/queue/{op}", fwd)
+        if op == "stop":
+            self._device_queues().stop(host)
+            self.device_control(host, "stop")
+            return self._device_queues().snapshot(host)
+        return self._device_queues().op(host, op, body)
 
     def device_status(self, host: str, via: str | None = None) -> dict[str, Any]:
         if via:

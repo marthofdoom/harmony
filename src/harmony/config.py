@@ -240,6 +240,17 @@ class Settings:
         extra = {k: v for k, v in raw.items() if k not in known}
         return cls(**{k: v for k, v in raw.items() if k in known}, _extra=extra)
 
+    def reload(self) -> None:
+        """Re-read the file into THIS object, in place.
+
+        Something else (the in-process engine's credential sync) can write the
+        settings file while a long-lived holder keeps its own copy; reloading in
+        place keeps every reference current — and stops the next ``save()`` from
+        clobbering the newer values on disk with stale ones."""
+        fresh = type(self).load()
+        for name in self.__dataclass_fields__:
+            setattr(self, name, getattr(fresh, name))
+
     def save(self) -> None:
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)

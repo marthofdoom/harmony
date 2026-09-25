@@ -229,6 +229,9 @@ class ChromecastDevice(PlaybackDevice):
     def set_muted(self, muted: bool) -> None:
         self._cast().set_volume_muted(bool(muted))
 
+    def seek(self, position_s: int) -> None:
+        self._mc().seek(max(0, int(position_s)))
+
     def next(self) -> None:
         raise NotSupportedError("Chromecast default receiver has no queue-next")
 

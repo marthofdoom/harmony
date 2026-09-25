@@ -440,11 +440,23 @@ class PreferencesDialog(Adw.PreferencesDialog):
                 self._probe_provider(Service.YTMUSIC)
                 self._probe_provider(Service.QOBUZ)
 
+            # The sync wrote the settings file behind our back; pull it into the
+            # shared Settings object first, or providers rebuild from stale values
+            # (the Qobuz row never flipped) and a later edit here re-saves them.
+            self.settings.reload()
             handler.append(self.state.connect("providers-changed", on_changed))
             self.state.reload_providers()
-            count = len(result.get("imported", []))
-            self.state.toast(f"Synced accounts from {host}"
-                             + (f" — {count} credential{'s' if count != 1 else ''}" if count else ""))
+            synced = result.get("synced", [])
+            kept = result.get("kept", [])
+            rolled = result.get("rolled_back", [])
+            parts = []
+            if synced:
+                parts.append("synced " + ", ".join(synced))
+            if kept:
+                parts.append("kept working " + ", ".join(kept))
+            if rolled:
+                parts.append("didn't work here: " + ", ".join(rolled))
+            self.state.toast(f"Accounts from {host}: " + ("; ".join(parts) or "nothing new to sync"))
 
         run_async(work, done, lambda exc: self.state.toast(f"Couldn't sync accounts: {exc}"))
 

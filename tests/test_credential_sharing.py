@@ -228,3 +228,24 @@ def test_import_oauth_token_writes_file_and_drops_stale(monkeypatch: pytest.Monk
     assert target.ytmusic_auth_file == str(new)
     assert target.ytmusic_auth_kind == "oauth"
     assert not stale.exists()  # superseded auth file removed
+
+
+def test_settings_reload_in_place_picks_up_an_external_write(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
+    """The desktop's long-lived Settings must see what a credential sync wrote to
+    disk — otherwise providers rebuild from stale values and the next save()
+    clobbers the sync."""
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "settings_path", lambda: tmp_path / "settings.json")
+    held = config.Settings.load()
+    held.qobuz_token_saved = False
+    held.save()
+    other = config.Settings.load()           # e.g. the engine's import_credentials
+    other.qobuz_token_saved = True
+    other.qobuz_auth_kind = "token"
+    other.save()
+
+    held.reload()
+    assert held.qobuz_token_saved is True and held.qobuz_auth_kind == "token"
+    held.save()                               # and saving no longer reverts it
+    assert config.Settings.load().qobuz_token_saved is True
