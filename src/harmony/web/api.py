@@ -1349,9 +1349,15 @@ class Engine:
         url = f"http://{host}:{port}{path}"
         resp = requests.request(method, url, json=body, headers=headers, timeout=timeout)
         try:
-            return resp.json()
+            data = resp.json()
         except ValueError:
-            return {"ok": resp.ok}
+            data = {"ok": resp.ok}
+        if not resp.ok:
+            # Surface the peer's failure as a failure here too (not a 200 with an
+            # "error" field the client has to sniff for).
+            msg = data.get("error") if isinstance(data, dict) else None
+            raise RuntimeError(f"peer {via}: {msg or f'HTTP {resp.status_code}'}")
+        return data
 
     def federated_devices(self, refresh: bool = False) -> dict[str, Any]:
         """This instance's devices plus every mesh peer's, so you can cast to a
@@ -1413,7 +1419,11 @@ class Engine:
                 meta["art_url"] = t.get("art_url") or t.get("artwork_url")
                 return self._cast_direct(host, str(t["service"]), str(t["id"]), meta)
 
-            self._queues = DeviceQueues(play, lambda h: self.device_status(h))
+            def stop(host: str) -> Any:
+                kind, info = self._device_kind(host)
+                return self._caster().control(host, "stop", None, kind=kind, device_info=info)
+
+            self._queues = DeviceQueues(play, lambda h: self.device_status(h), stop)
         return self._queues
 
     def device_queue(self, host: str, via: str | None = None) -> dict[str, Any]:

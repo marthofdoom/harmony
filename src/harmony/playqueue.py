@@ -59,7 +59,7 @@ class PlayQueue:
     # -- ops (return the index to start, or None) ----------------------------
 
     def load(self, tracks: list[Any], start: int | None = 0, shuffle: bool | None = None,
-             keep_order: bool = False) -> int | None:
+             keep_order: bool = False, original: list[Any] | None = None) -> int | None:
         """Replace the queue with ``tracks``. ``start=None`` means "shuffle
         play": start at a random track (when shuffle is on). ``keep_order``
         takes the list as already arranged (a hand-off to another output keeps
@@ -69,7 +69,9 @@ class PlayQueue:
             return None
         if shuffle is not None:
             self.shuffle = shuffle
-        self.original = list(tracks)
+        # A hand-off of a shuffled queue passes its real (load) order along, so
+        # turning shuffle off on the new output still restores the album order.
+        self.original = list(original) if original else list(tracks)
         if self.shuffle and not keep_order:
             if start is None:
                 rest = list(tracks)

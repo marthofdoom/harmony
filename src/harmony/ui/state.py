@@ -1228,7 +1228,8 @@ class AppState(GObject.Object):
         eng = self._engine()
         body = {"tracks": [self._track_dict(t) for t in tracks], "start": index,
                 "shuffle": self.playback.shuffle, "repeat": self.playback.repeat,
-                "keep_order": True}
+                "keep_order": True,
+                "original": [self._track_dict(t) for t in (self.queue.original or tracks)]}
 
         def work() -> dict[str, Any]:
             snap = eng.device_queue_op(host, "load", body, via=via)

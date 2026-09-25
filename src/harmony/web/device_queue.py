@@ -77,9 +77,11 @@ class DeviceQueues:
     """
 
     def __init__(self, play: Callable[[str, dict[str, Any]], Any],
-                 status: Callable[[str], dict[str, Any]]) -> None:
+                 status: Callable[[str], dict[str, Any]],
+                 stop: Callable[[str], Any] | None = None) -> None:
         self._play = play
         self._status = status
+        self._stop = stop
         self._lock = threading.RLock()
         self._queues: dict[str, DeviceQueue] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -109,6 +111,7 @@ class DeviceQueues:
 
     def op(self, host: str, name: str, body: dict[str, Any]) -> dict[str, Any]:
         """Apply one queue operation (the single HTTP entry point)."""
+        stop_device = False
         with self._lock:
             dq = self._queues.setdefault(host, DeviceQueue())
             q, idle = dq.q, not dq.playing
@@ -120,9 +123,22 @@ class DeviceQueues:
                 if body.get("repeat") is not None:
                     q.set_repeat(str(body["repeat"]))
                 shuffle = body.get("shuffle")
+                keep = bool(body.get("keep_order"))
+                original = _playable(body.get("original")) if keep else []
+                if original:
+                    # Identity matters (shuffle-off re-anchors by `is`): reuse the
+                    # tracks' dicts for matching entries of the original order.
+                    pool: dict[tuple, list[dict[str, Any]]] = {}
+                    for t in tracks:
+                        pool.setdefault((t["service"], str(t["id"])), []).append(t)
+                    remapped = []
+                    for o in original:
+                        same = pool.get((o["service"], str(o["id"])))
+                        remapped.append(same.pop(0) if same else o)
+                    original = remapped
                 start = q.load(tracks, None if body.get("start") is None else int(body["start"]),
                                shuffle=None if shuffle is None else bool(shuffle),
-                               keep_order=bool(body.get("keep_order")))
+                               keep_order=keep, original=original or None)
             elif name == "jump":
                 start = q.jump(int(body.get("index", -1)))
                 if start is None:
@@ -131,8 +147,10 @@ class DeviceQueues:
                 start = q.advance(manual=True)
                 if start is None:
                     dq.halt()
+                    stop_device = True  # Next past the end: silence the last track too
             elif name == "prev":
-                start = q.previous(dq.last_status.get("position_s"))
+                # A stopped queue has no live position: step back, don't "restart".
+                start = q.previous(dq.last_status.get("position_s") if dq.playing else 0)
             elif name == "enqueue":
                 start = q.enqueue(_playable(body.get("tracks")), idle=idle)
             elif name == "play_next":
@@ -145,6 +163,8 @@ class DeviceQueues:
                     start = None
                 if removed_current and start is None and not idle:
                     dq.halt()  # removed the last, playing track
+            elif name == "stop":
+                dq.halt()
             elif name == "clear":
                 q.clear()
             elif name == "shuffle":
@@ -155,6 +175,11 @@ class DeviceQueues:
                 raise ValueError(f"unknown queue op {name!r}")
         if start is not None:
             self._start_track(host, start)
+        elif stop_device and self._stop is not None:
+            try:
+                self._stop(host)
+            except Exception as exc:  # noqa: BLE001 - the queue is halted either way
+                log.debug("queue: stopping %s failed: %s", host, exc)
         return self.snapshot(host)
 
     # -- device loop ---------------------------------------------------------

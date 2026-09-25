@@ -199,3 +199,33 @@ def test_enqueue_during_playback_doesnt_restart(dqs) -> None:
     queues.op("wiim", "enqueue", {"tracks": [_t(5)]})
     assert played == [("wiim", "0")]
     assert [t["id"] for t in queues.snapshot("wiim")["tracks"]] == ["0", "5"]
+
+
+def test_next_past_the_end_stops_the_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    stopped: list[str] = []
+    queues = DeviceQueues(lambda h, t: None, lambda h: {}, stop=lambda h: stopped.append(h))
+    monkeypatch.setattr(queues, "_ensure_poller", lambda host: None)
+    queues.op("wiim", "load", {"tracks": [_t(0)], "start": 0})
+    snap = queues.op("wiim", "next", {})
+    assert not snap["playing"] and stopped == ["wiim"]
+
+
+def test_keep_order_handoff_still_unshuffles_to_the_album_order(dqs) -> None:
+    queues, _played = dqs
+    album = [_t(i) for i in range(6)]
+    shuffled = [album[i] for i in (3, 0, 5, 1, 4, 2)]
+    queues.op("wiim", "load", {"tracks": shuffled, "start": 0, "shuffle": True,
+                               "keep_order": True, "original": album})
+    assert [t["id"] for t in queues.snapshot("wiim")["tracks"]] == ["3", "0", "5", "1", "4", "2"]
+    snap = queues.op("wiim", "shuffle", {"on": False})
+    assert [t["id"] for t in snap["tracks"]] == ["0", "1", "2", "3", "4", "5"]
+    assert snap["current"]["id"] == "3"
+
+
+def test_prev_on_a_stopped_queue_steps_back(dqs) -> None:
+    queues, played = dqs
+    queues.op("wiim", "load", {"tracks": [_t(0), _t(1)], "start": 1})
+    queues.after_status("wiim", {"state": "playing", "position_s": 50, "duration_s": 100})
+    queues.op("wiim", "stop", {})
+    queues.op("wiim", "prev", {})
+    assert played[-1] == ("wiim", "0")
