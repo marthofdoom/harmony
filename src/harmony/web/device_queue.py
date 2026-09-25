@@ -78,10 +78,14 @@ class DeviceQueues:
 
     def __init__(self, play: Callable[[str, dict[str, Any]], Any],
                  status: Callable[[str], dict[str, Any]],
-                 stop: Callable[[str], Any] | None = None) -> None:
+                 stop: Callable[[str], Any] | None = None,
+                 async_start: bool = False) -> None:
         self._play = play
         self._status = status
         self._stop = stop
+        # Start tracks on a worker so an HTTP op returns at once (the snapshot
+        # already shows the new index); a slow cast doesn't stall the client.
+        self._async_start = async_start
         self._lock = threading.RLock()
         self._queues: dict[str, DeviceQueue] = {}
         self._threads: dict[str, threading.Thread] = {}
@@ -97,6 +101,22 @@ class DeviceQueues:
             dq = self._queues.get(host)
             if dq:
                 dq.halt()
+
+    def note_control(self, host: str, action: str, level: int | None = None) -> None:
+        """Reflect pause/resume/volume in the snapshot now, not at the next poll."""
+        with self._lock:
+            dq = self._queues.get(host)
+            if dq is None:
+                return
+            if action == "pause":
+                dq.last_status = {**dq.last_status, "state": "paused"}
+                dq.prev_state = "paused"
+            elif action == "resume":
+                dq.last_status = {**dq.last_status, "state": "playing"}
+                dq.clock_at = time.monotonic()
+                dq.prev_state = "playing"
+            elif action == "volume" and level is not None:
+                dq.last_status = {**dq.last_status, "volume": int(level)}
 
     def note_seek(self, host: str, position_s: int) -> None:
         """Keep the play clock (the frozen-position fallback) in step with a seek."""
@@ -174,7 +194,15 @@ class DeviceQueues:
             else:
                 raise ValueError(f"unknown queue op {name!r}")
         if start is not None:
-            self._start_track(host, start)
+            if self._async_start:
+                with self._lock:  # show it as starting right away
+                    dq.q.jump(start)
+                    dq.playing = True
+                    dq.settle_until = time.monotonic() + SETTLE_S
+                threading.Thread(target=self._start_track, args=(host, start), daemon=True,
+                                 name=f"harmony-queue-start-{host}").start()
+            else:
+                self._start_track(host, start)
         elif stop_device and self._stop is not None:
             try:
                 self._stop(host)

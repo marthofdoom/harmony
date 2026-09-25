@@ -132,6 +132,7 @@ class Engine:
         self._cast: Any | None = None
         self._queues: Any | None = None
         self._cred_listeners: list[Any] = []
+        self._idle_status: dict[str, tuple[float, dict[str, Any]]] = {}
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
@@ -1403,10 +1404,14 @@ class Engine:
                                    {"level": level} if level is not None else {})
         if action == "stop" and self._queues is not None:
             self._queues.stop(host)
-        if action == "seek" and self._queues is not None:
-            self._queues.note_seek(host, int(level or 0))
         kind, info = self._device_kind(host)
-        return self._caster().control(host, action, level, kind=kind, device_info=info)
+        result = self._caster().control(host, action, level, kind=kind, device_info=info)
+        if self._queues is not None:
+            if action == "seek":
+                self._queues.note_seek(host, int(level or 0))
+            else:
+                self._queues.note_control(host, action, level)
+        return result
 
     # -- server-owned device queues (auto-advance lives next to the device) --
 
@@ -1423,7 +1428,8 @@ class Engine:
                 kind, info = self._device_kind(host)
                 return self._caster().control(host, "stop", None, kind=kind, device_info=info)
 
-            self._queues = DeviceQueues(play, lambda h: self.device_status(h), stop)
+            self._queues = DeviceQueues(play, lambda h: self.device_status(h), stop,
+                                        async_start=True)
         return self._queues
 
     def device_queue(self, host: str, via: str | None = None) -> dict[str, Any]:
@@ -1432,11 +1438,20 @@ class Engine:
             return self._peer_call(via, "GET", f"/api/devices/{host}/queue", timeout=6)
         snap = self._device_queues().snapshot(host)
         if not snap.get("playing"):
-            try:  # a stopped queue has no poller; read the device once
-                st = self.device_status(host)
-                snap.update({k: st.get(k) for k in ("state", "position_s", "duration_s", "volume")})
-            except Exception as exc:  # noqa: BLE001 - an unreachable device is just "no status"
-                log.debug("device %s status unavailable: %s", host, exc)
+            # A stopped queue has no poller: read the device, but at most every
+            # few seconds however many clients poll (an unreachable device would
+            # otherwise block every poll for the full timeout).
+            now = time.monotonic()
+            cached = self._idle_status.get(host)
+            if cached is None or now - cached[0] > 5:
+                try:
+                    st = self.device_status(host)
+                except Exception as exc:  # noqa: BLE001 - unreachable is just "no status"
+                    log.debug("device %s status unavailable: %s", host, exc)
+                    st = {}
+                cached = (now, st)
+                self._idle_status[host] = cached
+            snap.update({k: cached[1].get(k) for k in ("state", "position_s", "duration_s", "volume")})
         return snap
 
     def device_queue_op(self, host: str, op: str, body: dict[str, Any],

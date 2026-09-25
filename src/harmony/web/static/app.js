@@ -5,38 +5,159 @@
 const $ = (id) => document.getElementById(id);
 const audio = $("audio");
 
+// -- the play-queue model ----------------------------------------------------
+// A line-for-line mirror of src/harmony/playqueue.py so the browser output and
+// the server-owned device queues follow the same rules. Index-based: `tracks`
+// is the whole active list (history + current + up next), `index` the playing
+// item. Items are tracked by identity through reorders (duplicates are fine).
+// Every op returns the index to start now, or null to leave playback alone.
+const REPEAT_MODES = ["off", "all", "one"];
+const RESTART_AFTER_S = 3;   // Previous restarts the current track past this point
+
+function shuffledCopy(a) {
+  const r = a.slice();
+  for (let i = r.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [r[i], r[j]] = [r[j], r[i]];
+  }
+  return r;
+}
+
+class PlayQueue {
+  constructor() { this.tracks = []; this.index = -1; this.original = []; this.shuffle = false; this.repeat = "off"; }
+  current() { return this.index >= 0 && this.index < this.tracks.length ? this.tracks[this.index] : null; }
+  upcoming() { return this.index >= 0 ? this.tracks.slice(this.index + 1) : this.tracks.slice(); }
+  // Index after the current one (null = done). Repeat-one only holds on a
+  // natural track end — Next still moves on.
+  following(manual = false) {
+    if (!this.tracks.length) return null;
+    if (this.repeat === "one" && !manual && this.index >= 0) return this.index;
+    if (this.index + 1 < this.tracks.length) return this.index + 1;
+    if (this.repeat === "all") return 0;
+    return null;
+  }
+  // start=null → "shuffle play" (random first track when shuffle is on);
+  // keepOrder → take the list as already arranged (an output hand-off).
+  load(tracks, start = 0, shuffle = null, keepOrder = false) {
+    tracks = tracks.slice();
+    if (!tracks.length) return null;
+    if (shuffle !== null && shuffle !== undefined) this.shuffle = !!shuffle;
+    this.original = tracks.slice();
+    if (this.shuffle && !keepOrder) {
+      let rest;
+      if (start == null) rest = shuffledCopy(tracks);
+      else {
+        start = Math.max(0, Math.min(start, tracks.length - 1));
+        rest = shuffledCopy(tracks.slice(0, start).concat(tracks.slice(start + 1)));
+        rest.unshift(tracks[start]);
+      }
+      this.tracks = rest; this.index = 0;
+    } else {
+      this.tracks = tracks; this.index = Math.max(0, Math.min(start || 0, tracks.length - 1));
+    }
+    return this.index;
+  }
+  jump(i) { if (!(i >= 0 && i < this.tracks.length)) return null; this.index = i; return i; }
+  advance(manual = false) { const n = this.following(manual); if (n !== null) this.index = n; return n; }
+  previous(pos) {
+    if (!this.tracks.length) return null;
+    if ((pos || 0) > RESTART_AFTER_S || this.index < 0) { this.index = Math.max(this.index, 0); return this.index; }
+    if (this.index > 0) this.index -= 1;
+    else if (this.repeat === "all") this.index = this.tracks.length - 1;
+    return this.index;
+  }
+  enqueue(tracks, idle) {
+    if (!tracks.length) return null;
+    const first = this.tracks.length;
+    this.tracks.push(...tracks); this.original.push(...tracks);
+    if (idle) { this.index = first; return first; }
+    return null;
+  }
+  playNext(tracks, idle) {
+    if (!tracks.length) return null;
+    const at = this.index >= 0 ? this.index + 1 : 0;
+    this.tracks.splice(at, 0, ...tracks); this.original.push(...tracks);
+    if (idle) { this.index = at; return at; }
+    return null;
+  }
+  move(src, dst) {
+    const n = this.tracks.length;
+    if (!(src >= 0 && src < n && dst >= 0 && dst < n) || src === dst) return;
+    const cur = this.current();
+    this.tracks.splice(dst, 0, this.tracks.splice(src, 1)[0]);
+    this._reanchor(cur);
+    if (!this.shuffle) this.original = this.tracks.slice();   // a manual order IS the order now
+  }
+  // → [removedCurrent, indexToStart]
+  remove(i) {
+    if (!(i >= 0 && i < this.tracks.length)) return [false, null];
+    const item = this.tracks.splice(i, 1)[0];
+    this.original = this.original.filter((t) => t !== item);
+    if (i < this.index) { this.index -= 1; return [false, null]; }
+    if (i > this.index) return [false, null];
+    if (this.index < this.tracks.length) return [true, this.index];
+    this.index = this.tracks.length - 1;
+    return [true, null];
+  }
+  // Drop everything but the current track (it keeps playing).
+  clear() {
+    const cur = this.current();
+    this.tracks = cur ? [cur] : [];
+    this.original = this.tracks.slice();
+    this.index = cur ? 0 : -1;
+  }
+  setShuffle(on) {
+    on = !!on;
+    if (on === this.shuffle) return;
+    this.shuffle = on;
+    const cur = this.current();
+    if (on) {
+      const head = cur ? this.tracks.slice(0, this.index + 1) : [];
+      this.tracks = head.concat(shuffledCopy(this.upcoming()));
+    } else {
+      const seen = new Set(this.original);
+      this.tracks = this.original.concat(this.tracks.filter((t) => !seen.has(t)));
+      this._reanchor(cur);
+    }
+  }
+  setRepeat(mode) { if (!REPEAT_MODES.includes(mode)) throw new Error("repeat must be off|all|one"); this.repeat = mode; }
+  _reanchor(cur) { if (!cur) return; const i = this.tracks.indexOf(cur); if (i >= 0) this.index = i; }
+}
+
+// The ACTIVE play queue: what auto-advance, prev/next and the Media Session act
+// on. It survives navigation and changes only through explicit play / queue ops
+// (or, on a device, the server's snapshot) — never as a side effect of browsing.
+const pq = new PlayQueue();
+
 const state = {
   // The currently DISPLAYED list (search results / album / playlist). Used only
-  // for rendering + highlighting — NEVER for playback. Reassigned freely as the
-  // user browses.
+  // for rendering + highlighting — NEVER for playback.
   queue: [],
-  // The persistent ACTIVE play queue: what auto-advance, prev/next and the Media
-  // Session act on. It survives navigation and changes ONLY through play / enqueue
-  // / play-next / reorder / auto-advance — never as a side effect of rendering.
-  activeQueue: [],
-  activeIndex: -1,   // index of the playing track within activeQueue
-  sourceOrder: null, // pre-shuffle snapshot of activeQueue, to restore on shuffle-off
-  shuffle: false,    // play the active queue shuffled (upcoming tracks)
-  repeat: "off",     // "off" | "all" | "one"
+  get activeQueue() { return pq.tracks; },
+  get activeIndex() { return pq.index; },
+  get shuffle() { return pq.shuffle; },
+  get repeat() { return pq.repeat; },
   playlist: null, // {service, id, title} when viewing an editable playlist, else null
   target: "browser", // "browser" (this tab's <audio>) or a device host to cast to
   targetVia: null,   // peer "host:port" when the device lives on another instance's LAN
-  devicePaused: false,
   section: "search", // last non-detail view (restored when a detail page is left)
   detail: false,     // true while an artist/album/track detail page is showing
   lidarr: null,      // cached GET /api/lidarr status ({enabled, configured, …}) or null
+  dragging: false,   // a Now Playing row is being dragged (hold off re-renders)
 };
 
-// Shuffle/repeat are user prefs — persisted alongside the personal key.
+// Shuffle/repeat/volume are user prefs — persisted alongside the personal key.
+let _prefVolume = 100;
 try {
   const _p = JSON.parse(localStorage.getItem("harmonyPrefs") || "{}");
   if (_p && typeof _p === "object") {
-    state.shuffle = !!_p.shuffle;
-    if (["off", "all", "one"].includes(_p.repeat)) state.repeat = _p.repeat;
+    pq.shuffle = !!_p.shuffle;
+    if (REPEAT_MODES.includes(_p.repeat)) pq.repeat = _p.repeat;
+    if (typeof _p.volume === "number" && _p.volume >= 0 && _p.volume <= 100) _prefVolume = _p.volume;
   }
 } catch (_e) { /* defaults */ }
 function persistPrefs() {
-  try { localStorage.setItem("harmonyPrefs", JSON.stringify({ shuffle: state.shuffle, repeat: state.repeat })); }
+  try { localStorage.setItem("harmonyPrefs", JSON.stringify({ shuffle: pq.shuffle, repeat: pq.repeat, volume: _prefVolume })); }
   catch (_e) { /* ignore */ }
 }
 
@@ -51,6 +172,7 @@ function setTargetValue(value) {
 }
 // Merge {via} into a device play/control body only when set.
 const withVia = (body) => (state.targetVia ? { ...body, via: state.targetVia } : body);
+const isTouch = () => !!(window.matchMedia && window.matchMedia("(hover: none)").matches);
 
 const ICON = (name, extra) => `<svg class="ico${extra ? " " + extra : ""}" aria-hidden="true"><use href="#i-${name}"></use></svg>`;
 
@@ -271,22 +393,49 @@ function openContextMenu(x, y, items) {
   if (first) first.focus();
 }
 
-function openTrackContextMenu(e, t) {
-  const items = [
-    { label: "Play next", fn: () => playNextTracks([t], t.title) },
-    { label: "Add to queue", fn: () => enqueueTracks([t], t.title) },
-  ];
+// Open a menu either at a right-click (an Event) or under a '⋯' button (an
+// element) — the button is the path on touch, where iOS has no contextmenu.
+function menuAt(src, items) {
+  if (!items.length) {
+    if (!(src instanceof Event)) toast("Nothing to do here.");
+    return;
+  }
+  if (src instanceof Event) { src.preventDefault(); openContextMenu(src.clientX, src.clientY, items); return; }
+  const r = src.getBoundingClientRect();
+  openContextMenu(r.left, r.bottom + 4, items);
+}
+const moreBtn = (label) => `<button class="mini more" type="button" aria-label="${esc(label || "More actions")}" aria-haspopup="menu">${ICON("more")}</button>`;
+
+// `opts.queueIndex` marks a Now Playing queue row (queue actions, never playlist ones).
+function trackMenuItems(t, anchor, opts = {}) {
+  const items = [];
+  if (opts.queueIndex != null) {
+    items.push({ label: "Remove from queue", fn: () => removeFromQueue(opts.queueIndex) });
+  } else {
+    items.push({ label: "Play next", fn: () => playNextTracks([t], t.title) });
+    items.push({ label: "Add to queue", fn: () => enqueueTracks([t], t.title) });
+  }
+  if (opts.playlistIndex != null && state.playlist)
+    items.push({ label: "Remove from this playlist", fn: () => removeFromPlaylist(t, opts.playlistIndex) });
+  items.push({ label: "Add to playlist…", fn: () => openAddMenu(anchor, [t]) });
+  if (t.id) items.push({ label: "Track details", fn: () => navigateTrack(t.service, t.id) });
   if (t.artist_ids && t.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(t.service, t.artist_ids[0]) });
   if (t.album_id)
     items.push({ label: "Go to album", fn: () => navigateAlbum(t.service, t.album_id) });
-  e.preventDefault();
-  openContextMenu(e.clientX, e.clientY, items);
+  return items;
 }
 
-function openAlbumContextMenu(e, a) {
+function openTrackContextMenu(e, t, opts) {
+  const at = { getBoundingClientRect: () => ({ left: e.clientX, right: e.clientX, top: e.clientY, bottom: e.clientY }) };
+  menuAt(e, trackMenuItems(t, at, opts));
+}
+
+function albumMenuItems(a) {
   const items = [];
   if (a.id) {
+    items.push({ label: "Play", fn: () => albumToQueue(a, "play") });
+    items.push({ label: "Shuffle", fn: () => albumToQueue(a, "shuffle") });
     items.push({ label: "Play next", fn: () => albumToQueue(a, "next") });
     items.push({ label: "Add to queue", fn: () => albumToQueue(a, "end") });
     items.push({ label: "Go to album", fn: () => navigateAlbum(a.service, a.id) });
@@ -294,9 +443,80 @@ function openAlbumContextMenu(e, a) {
   if (a.artist_ids && a.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(a.service, a.artist_ids[0]) });
   items.push(...lidarrMenuItems({ kind: "album", title: a.title, artist: a.artist, mbid: a.mbid }));
-  if (!items.length) return;
-  e.preventDefault();
-  openContextMenu(e.clientX, e.clientY, items);
+  return items;
+}
+function openAlbumContextMenu(e, a) { menuAt(e, albumMenuItems(a)); }
+
+// Artists (with a provider id) act through their top tracks.
+async function artistTopTracks(service, id) {
+  const d = await api(`/api/artist/${encodeURIComponent(service)}/${encodeURIComponent(id)}`);
+  return d.top_tracks || [];
+}
+async function artistToQueue(ar, where) {
+  try {
+    const tracks = ar.tracks || await artistTopTracks(ar.service, ar.id);
+    if (!tracks.length) { toastErr("No top tracks to play for this artist."); return; }
+    collectionTo(tracks, where, ar.name ? `${ar.name} top tracks` : "top tracks");
+  } catch (e) { toastErr("Couldn’t load that artist: " + e.message); }
+}
+function artistMenuItems(ar) {
+  const items = [];
+  if (ar.id) {
+    items.push({ label: "Play top tracks", fn: () => artistToQueue(ar, "play") });
+    items.push({ label: "Shuffle top tracks", fn: () => artistToQueue(ar, "shuffle") });
+    items.push({ label: "Play next", fn: () => artistToQueue(ar, "next") });
+    items.push({ label: "Add to queue", fn: () => artistToQueue(ar, "end") });
+    if (!ar.here) items.push({ label: "Go to artist", fn: () => navigateArtist(ar.service, ar.id) });
+  }
+  items.push(...lidarrMenuItems({ kind: "artist", artist: ar.name, mbid: ar.mbid || "" }));
+  return items;
+}
+
+// Playlists act through their track list.
+async function playlistToQueue(p, where) {
+  try {
+    const tracks = p.tracks || (await api(`/api/playlists/${encodeURIComponent(p.service)}/${encodeURIComponent(p.id)}/tracks`)).tracks || [];
+    if (!tracks.length) { toastErr("That playlist is empty."); return; }
+    collectionTo(tracks, where, p.title || "playlist");
+  } catch (e) { toastErr("Couldn’t load that playlist: " + e.message); }
+}
+function playlistMenuItems(p) {
+  const items = [
+    { label: "Play", fn: () => playlistToQueue(p, "play") },
+    { label: "Shuffle", fn: () => playlistToQueue(p, "shuffle") },
+    { label: "Play next", fn: () => playlistToQueue(p, "next") },
+    { label: "Add to queue", fn: () => playlistToQueue(p, "end") },
+  ];
+  if (!p.here) items.push({ label: "Open playlist", fn: () => openPlaylist(p.service, p.id, p.title) });
+  return items;
+}
+
+// One place that turns a whole list into a queue action.
+function collectionTo(tracks, where, label) {
+  if (where === "play") playFrom(tracks, 0);
+  else if (where === "shuffle") playFrom(tracks, null, { shuffle: true });
+  else if (where === "next") playNextTracks(tracks, label);
+  else enqueueTracks(tracks, label);
+}
+
+// Play / Shuffle / ⋯ buttons for a collection header (album, playlist, artist).
+function collectionActsHtml(prefix, opts = {}) {
+  return `<div class="hero-acts">
+    <button class="act" id="${prefix}-play" type="button">${ICON("play")} ${esc(opts.playLabel || "Play")}</button>
+    <button class="act ghost" id="${prefix}-shuffle" type="button">${ICON("shuffle")} Shuffle</button>
+    <button class="act ghost icon-only" id="${prefix}-more" type="button" aria-label="More actions" aria-haspopup="menu">${ICON("more")}</button>
+  </div>`;
+}
+function wireCollectionActs(prefix, getTracks, moreItems) {
+  const run = async (where) => {
+    let tracks;
+    try { tracks = await getTracks(); } catch (e) { toastErr(e.message); return; }
+    if (!tracks || !tracks.length) { toastErr("Nothing playable here."); return; }
+    collectionTo(tracks, where);
+  };
+  if ($(`${prefix}-play`)) $(`${prefix}-play`).onclick = () => run("play");
+  if ($(`${prefix}-shuffle`)) $(`${prefix}-shuffle`).onclick = () => run("shuffle");
+  if ($(`${prefix}-more`)) $(`${prefix}-more`).onclick = (e) => { e.stopPropagation(); menuAt(e.currentTarget, moreItems()); };
 }
 
 const _truncate = (s, n) => (s && s.length > n ? s.slice(0, n - 1) + "…" : (s || ""));
@@ -315,20 +535,29 @@ function trackArtistCell(t) {
   return `<div class="artist">${esc(t.artist)}</div>`;
 }
 
+// Row options:
+//   numbered        album-style track numbers (play button over the number)
+//   reorder         a drag grip (Now Playing queue)
+//   queueRow        a Now Playing queue row: queue actions only — NEVER playlist ones
+//   playlistActions an editable playlist's rows (remove-from-playlist)
 function trackRowHtml(t, i, opts = {}) {
-  const pl = state.playlist;
   const num = opts.numbered ? `<span class="tnum">${t.track_number != null ? t.track_number : i + 1}</span>` : "";
-  const grip = opts.reorder ? `<button class="mini grip" aria-label="Drag to reorder" tabindex="-1">${ICON("drag")}</button>` : "";
+  const grip = opts.reorder ? `<button class="mini grip" type="button" aria-label="Drag to reorder" tabindex="-1">${ICON("drag")}</button>` : "";
+  const title = t.id
+    ? `<a class="tt" href="${routeHref("track", t.service, t.id)}" title="${esc(t.title)}">${esc(t.title)}</a>`
+    : `<span class="tt">${esc(t.title)}</span>`;
   return `
     <div class="trow${opts.numbered ? " numbered" : ""}${opts.reorder ? " reorder" : ""}" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
-      <div class="tlead">${num}<button class="play" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
-      <div class="title"><span class="tt">${esc(t.title)}</span>${opts.hideBadge ? "" : `<span class="badge">${esc(serviceLabel(t.service))}</span>`}</div>
+      <div class="tlead">${num}<button class="play" type="button" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
+      <div class="title">${title}${opts.hideBadge ? "" : `<span class="badge">${esc(serviceLabel(t.service))}</span>`}</div>
       ${trackArtistCell(t)}
       <div class="dur">${fmtTime(t.duration_s)}</div>
       <div class="rowacts">
         ${grip}
-        <button class="mini add" aria-label="Add to playlist">${ICON("add")}</button>
-        ${pl ? `<button class="mini rem" aria-label="Remove from this playlist">${ICON("remove")}</button>` : ""}
+        ${opts.queueRow ? "" : `<button class="mini add" type="button" aria-label="Add to playlist">${ICON("add")}</button>`}
+        ${opts.playlistActions && !opts.queueRow ? `<button class="mini rem" type="button" aria-label="Remove from this playlist">${ICON("remove")}</button>` : ""}
+        ${opts.queueRow ? `<button class="mini qrem" type="button" aria-label="Remove from queue" title="Remove from queue">${ICON("close")}</button>` : ""}
+        ${moreBtn(`More actions for ${t.title || "track"}`)}
       </div>
     </div>`;
 }
@@ -336,27 +565,53 @@ function trackRowHtml(t, i, opts = {}) {
 const tracksHtml = (tracks, opts = {}) =>
   `<div class="tracks">${tracks.map((t, i) => trackRowHtml(t, i, opts)).join("")}</div>`;
 
-// Wire a rendered set of track rows to shared playback + row menus. Clicking a
-// row's play button loads THIS list into the active queue (playFrom) and plays
-// at the clicked index — so browsing never leaks into the active queue, and the
-// active queue is set only by an explicit play. `opts.onPlay(i)` overrides that
-// (the Now Playing queue passes playActive to jump within the active queue);
-// `opts.clickToPlay` makes a single row click play (used by the NP queue).
+// Is row `i` of this list the active track? Queue rows match by index (the
+// queue may hold duplicates); every other list matches on service + id.
+function rowIsCurrent(tracks, i, opts) {
+  const cur = pq.current();
+  if (!cur) return false;
+  return opts.queueRow ? i === pq.index : sameTrack(tracks[i], cur);
+}
+
+// Wire a rendered set of track rows to shared playback + row menus. Playing a
+// row loads THIS list into the active queue (playFrom) at the clicked index —
+// so browsing never leaks into the active queue. `opts.onPlay(i)` overrides
+// that (the Now Playing queue jumps within the active queue). Pressing the
+// play button of the row that is already current toggles pause instead.
+// Desktop: play button or double-click; the title links to the track page.
+// Touch: a tap anywhere on the row (title included) plays; ⋯ has the rest.
 function wireTrackRows(scope, tracks, opts = {}) {
   scope.querySelectorAll(".trow").forEach((row) => {
     const i = Number(row.dataset.i);
-    const play = opts.onPlay ? () => opts.onPlay(i) : () => playFrom(tracks, i);
+    const start = opts.onPlay ? () => opts.onPlay(i) : () => playFrom(tracks, i);
+    const play = () => (rowIsCurrent(tracks, i, opts) && !isStopped() ? togglePlay() : start());
     const pbtn = row.querySelector(".play");
-    if (pbtn) pbtn.addEventListener("click", play);
+    if (pbtn) pbtn.addEventListener("click", (e) => { e.stopPropagation(); play(); });
     const add = row.querySelector(".add");
-    if (add) add.addEventListener("click", (e) => { e.preventDefault(); openAddMenu(e.currentTarget, tracks[i]); });
+    if (add) add.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); openAddMenu(e.currentTarget, [tracks[i]]); });
     const rem = row.querySelector(".rem");
-    if (rem) rem.addEventListener("click", () => removeFromPlaylist(tracks[i], i));
-    row.addEventListener("contextmenu", (e) => openTrackContextMenu(e, tracks[i]));
-    if (opts.clickToPlay)
-      row.addEventListener("click", (e) => { if (!e.target.closest("a, button")) play(); });
-    else
-      row.addEventListener("dblclick", (e) => { if (!e.target.closest("a, button")) play(); });
+    if (rem) rem.addEventListener("click", (e) => { e.stopPropagation(); removeFromPlaylist(tracks[i], i); });
+    const qrem = row.querySelector(".qrem");
+    if (qrem) qrem.addEventListener("click", (e) => { e.stopPropagation(); removeFromQueue(i); });
+    const menuOpts = opts.queueRow ? { queueIndex: i } : opts.playlistActions ? { playlistIndex: i } : {};
+    const more = row.querySelector(".more");
+    if (more) more.addEventListener("click", (e) => {
+      e.preventDefault(); e.stopPropagation();
+      menuAt(e.currentTarget, trackMenuItems(tracks[i], e.currentTarget, menuOpts));
+    });
+    row.addEventListener("contextmenu", (e) => openTrackContextMenu(e, tracks[i], menuOpts));
+    const tt = row.querySelector("a.tt");
+    if (tt) tt.addEventListener("click", (e) => {
+      if (opts.clickToPlay || isTouch()) { e.preventDefault(); play(); }
+    });
+    row.addEventListener("click", (e) => {
+      if (e.target.closest("a, button")) return;
+      if (opts.clickToPlay || isTouch()) play();
+    });
+    row.addEventListener("dblclick", (e) => {
+      if (opts.clickToPlay || isTouch() || e.target.closest("a, button")) return;
+      play();
+    });
   });
 }
 
@@ -364,7 +619,8 @@ function renderTracks(tracks, opts = {}) {
   const list = $("list");
   const pl = state.playlist;
   const toolbar = pl ? `
-    <div class="toolbar-row">
+    <div class="toolbar-row wrap">
+      ${tracks.length ? collectionActsHtml("pl") : ""}
       <span class="muted">${esc(nTracks(tracks.length))}</span>
       <span style="flex:1"></span>
       <button class="act ghost" id="pl-rename">Rename</button>
@@ -377,9 +633,11 @@ function renderTracks(tracks, opts = {}) {
                    opts.query ? "Try a different title or artist." : "Search for a song to get started.");
     list.innerHTML = toolbar + empty; wirePlaylistToolbar(); return;
   }
-  list.innerHTML = toolbar + tracksHtml(tracks, opts);
+  const rowOpts = { ...opts, playlistActions: !!pl };
+  list.innerHTML = toolbar + tracksHtml(tracks, rowOpts);
   state.queue = tracks;
-  wireTrackRows(list, tracks);
+  wireTrackRows(list, tracks, rowOpts);
+  if (pl) wireCollectionActs("pl", () => tracks, () => playlistMenuItems({ ...pl, tracks, here: true }));
   wirePlaylistToolbar();
   highlightPlaying();
 }
@@ -414,27 +672,38 @@ async function removeFromPlaylist(track, i) {
 let _playlistCache = null;
 async function loadPlaylistsSilently() { try { _playlistCache = (await api("/api/playlists")).playlists || []; } catch { /* ignore */ } }
 
-async function openAddMenu(anchor, track) {
+// A playlist can only hold its own service's tracks.
+async function addTracksToPlaylist(service, id, title, tracks) {
+  const ids = tracks.filter((t) => t && t.service === service && t.id).map((t) => t.id);
+  const skipped = tracks.length - ids.length;
+  if (!ids.length) { toastErr(`Only ${serviceLabel(service)} tracks can go in “${title}”.`); return false; }
+  try {
+    await apiPost(`/api/playlists/${encodeURIComponent(service)}/${encodeURIComponent(id)}/add`, { track_ids: ids });
+    toast((ids.length === 1 ? `Added to “${title}”.` : `Added ${nTracks(ids.length)} to “${title}”.`)
+      + (skipped ? ` Skipped ${skipped} from other services.` : ""), "ok");
+    return true;
+  } catch (e) { toastErr("Couldn’t add to the playlist: " + e.message); return false; }
+}
+
+async function openAddMenu(anchor, tracks) {
   if (!_playlistCache) await loadPlaylistsSilently();
   document.querySelectorAll(".addmenu").forEach((m) => m.remove());
   const menu = document.createElement("div");
   menu.className = "addmenu";
   menu.setAttribute("role", "menu");
   menu.innerHTML = (_playlistCache || []).map((p) =>
-    `<div role="menuitem" tabindex="0" data-service="${esc(p.service)}" data-id="${esc(p.id)}">${esc(p.title)} <span class="s">${esc(serviceLabel(p.service))}</span></div>`).join("")
+    `<div role="menuitem" tabindex="0" data-service="${esc(p.service)}" data-id="${esc(p.id)}" data-title="${esc(p.title)}">${esc(p.title)} <span class="s">${esc(serviceLabel(p.service))}</span></div>`).join("")
     + `<div role="menuitem" tabindex="0" class="new" data-new>＋ New playlist…</div>`;
   document.body.appendChild(menu);
   const r = anchor.getBoundingClientRect();
-  menu.style.top = `${Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8)}px`;
-  menu.style.left = `${Math.min(Math.max(8, r.left - 160), window.innerWidth - menu.offsetWidth - 8)}px`;
+  menu.style.top = `${Math.max(8, Math.min(r.bottom + 4, window.innerHeight - menu.offsetHeight - 8))}px`;
+  menu.style.left = `${Math.max(8, Math.min(Math.max(8, r.left - 160), window.innerWidth - menu.offsetWidth - 8))}px`;
   const close = () => menu.remove();
   menu.querySelectorAll("div[data-service]").forEach((row) => row.addEventListener("click", async () => {
     close();
-    try { await apiPost(`/api/playlists/${encodeURIComponent(row.dataset.service)}/${encodeURIComponent(row.dataset.id)}/add`, { track_ids: [track.id] });
-      toast(`Added to “${row.textContent.trim()}”.`, "ok"); }
-    catch (e) { toastErr("Couldn’t add to the playlist: " + e.message); }
+    await addTracksToPlaylist(row.dataset.service, row.dataset.id, row.dataset.title, tracks);
   }));
-  menu.querySelector("[data-new]").addEventListener("click", async () => { close(); await newPlaylist(track); });
+  menu.querySelector("[data-new]").addEventListener("click", async () => { close(); await newPlaylist(tracks); });
   menu.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
   document.addEventListener("keydown", function esc(e) { if (e.key === "Escape") { close(); document.removeEventListener("keydown", esc); } });
   setTimeout(() => document.addEventListener("click", close, { once: true }), 0);
@@ -451,14 +720,24 @@ function renderPlaylists(playlists) {
     $("pl-empty-new").onclick = () => newPlaylist();
     return;
   }
-  list.innerHTML = bar + `<div class="plgrid">${playlists.map((p) => `
-    <div class="plcard" data-service="${esc(p.service)}" data-id="${esc(p.id)}" data-art="${esc(p.artwork_url || "")}">
+  list.innerHTML = bar + `<div class="plgrid">${playlists.map(playlistCardHtml).join("")}</div>`;
+  $("pl-new").onclick = () => newPlaylist();
+  wirePlaylistCards(list);
+}
+
+function playlistCardHtml(p) {
+  return `
+    <div class="plcard" tabindex="0" role="link" data-service="${esc(p.service)}" data-id="${esc(p.id)}" data-art="${esc(p.artwork_url || "")}">
       <div class="art">${ICON("music")}</div>
       <div class="t">${esc(p.title)}</div>
       <div class="s">${esc(serviceLabel(p.service))}${p.track_count != null ? " · " + nTracks(p.track_count) : ""}</div>
-    </div>`).join("")}</div>`;
-  $("pl-new").onclick = () => newPlaylist();
-  list.querySelectorAll(".plcard").forEach((card) => {
+      ${moreBtn(`More actions for ${p.title || "playlist"}`)}
+    </div>`;
+}
+
+// Playlist cards: click opens; ⋯ / right-click → play, shuffle, queue.
+function wirePlaylistCards(scope) {
+  scope.querySelectorAll(".plcard").forEach((card) => {
     const url = card.dataset.art;
     if (url) {
       const img = new Image();
@@ -466,7 +745,13 @@ function renderPlaylists(playlists) {
       img.onload = () => { const slot = card.querySelector(".art"); if (slot) slot.replaceWith(img); };
       img.src = url;
     }
-    card.addEventListener("click", () => openPlaylist(card.dataset.service, card.dataset.id, card.querySelector(".t").textContent));
+    const p = { service: card.dataset.service, id: card.dataset.id, title: card.querySelector(".t").textContent };
+    const open = () => openPlaylist(p.service, p.id, p.title);
+    card.addEventListener("click", (e) => { if (!e.target.closest(".more")) open(); });
+    card.addEventListener("keydown", (e) => { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); } });
+    card.addEventListener("contextmenu", (e) => menuAt(e, playlistMenuItems(p)));
+    const more = card.querySelector(".more");
+    if (more) more.addEventListener("click", (e) => { e.stopPropagation(); menuAt(e.currentTarget, playlistMenuItems(p)); });
   });
 }
 
@@ -475,15 +760,28 @@ function renderPlaylists(playlists) {
 // from the active queue — the playing track may sit at a different index (or
 // not appear at all) in whatever list is on screen.
 const sameTrack = (a, b) => !!(a && b && a.service === b.service && String(a.id) === String(b.id));
-const activeTrack = () => (state.activeIndex >= 0 ? state.activeQueue[state.activeIndex] : null);
+const activeTrack = () => pq.current();
 
+// Light up the current track wherever it's listed: animated bars while
+// playing, still bars while paused/stopped. Queue rows match by index, every
+// other list by service + id.
 function highlightPlaying() {
-  const cur = activeTrack();
+  const cur = pq.current();
+  const playing = isPlaying();
   document.querySelectorAll(".trow").forEach((row) => {
-    const active = !!cur && row.dataset.svc === String(cur.service) && row.dataset.tid === String(cur.id);
+    const inQueue = !!row.closest(".npview");
+    const active = !!cur && (inQueue
+      ? Number(row.dataset.i) === pq.index
+      : row.dataset.svc === String(cur.service) && row.dataset.tid === String(cur.id));
+    const mode = !active ? "" : playing ? "playing" : "paused";
     row.classList.toggle("playing", active);
+    row.classList.toggle("paused", active && !playing);
     const btn = row.querySelector(".play");
-    if (btn) btn.innerHTML = active ? `<span class="eq"><span></span><span></span><span></span></span>` : ICON("play");
+    if (!btn || btn.dataset.mode === mode) return;
+    btn.dataset.mode = mode;
+    const title = row.querySelector(".tt") ? row.querySelector(".tt").textContent : "track";
+    btn.setAttribute("aria-label", mode === "playing" ? "Pause" : mode === "paused" ? "Resume" : `Play ${title}`);
+    btn.innerHTML = mode ? `<span class="eq${mode === "paused" ? " still" : ""}"><span></span><span></span><span></span></span>` : ICON("play");
   });
 }
 
@@ -491,55 +789,101 @@ function highlightPlaying() {
 // Mirrors the desktop's Now Playing page. Reuses the track-row machinery so the
 // current row lights up (highlightPlaying) and clicking one plays that index.
 
+const artOf = (t) => (t && (t.artwork_url || t.art_url)) || "";
+const trackKey = (t) => (t ? `${t.service}:${t.id}` : "");
+
+// Shuffle / repeat toggles, shared by the bottom bar and the Now Playing view
+// (paintModes keeps every copy in step).
+function modeBtnsHtml(cls) {
+  return `<button class="${cls} js-shuffle" type="button" aria-label="Shuffle" title="Shuffle">${ICON("shuffle")}</button>
+    <button class="${cls} js-repeat" type="button" aria-label="Repeat" title="Repeat">${ICON("repeat")}</button>`;
+}
+function paintModes() {
+  document.querySelectorAll(".js-shuffle").forEach((b) => {
+    b.classList.toggle("on", pq.shuffle);
+    b.setAttribute("aria-pressed", String(pq.shuffle));
+    b.title = pq.shuffle ? "Shuffle: on" : "Shuffle: off";
+  });
+  document.querySelectorAll(".js-repeat").forEach((b) => {
+    b.classList.toggle("on", pq.repeat !== "off");
+    const label = `Repeat: ${pq.repeat === "one" ? "this track" : pq.repeat}`;
+    b.setAttribute("aria-label", label); b.title = label;
+    const ico = pq.repeat === "one" ? "repeat-one" : "repeat";
+    if (b.dataset.ico !== ico) { b.dataset.ico = ico; b.innerHTML = ICON(ico); }
+  });
+}
+
 function renderNowPlaying() {
   const list = $("list");
-  const t = activeTrack();
-  if (!t) {
+  if (!pq.tracks.length) {
     list.innerHTML = emptyState("music", "Nothing playing",
       "Play a track, album, or playlist and it shows up here.");
+    _npKey = null;
     return;
   }
-  const repIco = state.repeat === "one" ? "repeat-one" : "repeat";
+  const t = pq.current() || {};
+  const title = t.id ? `<a class="link-plain" href="${routeHref("track", t.service, t.id)}">${esc(t.title || "")}</a>` : esc(t.title || "Not started");
   list.innerHTML = `<div class="detail npview">
     <div class="detail-hero">
-      <div class="detail-art" id="np-view-art" data-art="${esc(t.artwork_url || "")}">${ICON("music")}</div>
+      <div class="detail-art" id="np-view-art" data-art="${esc(artOf(t))}">${ICON("music")}</div>
       <div class="detail-herometa">
-        <div class="detail-kind">Now Playing</div>
-        <h2 class="detail-title" id="np-view-title">${esc(t.title || "")}</h2>
+        <div class="detail-kind" id="np-view-kind">Now Playing</div>
+        <h2 class="detail-title" id="np-view-title">${title}</h2>
         <div class="detail-sub" id="np-view-artist">${esc(t.artist || "")}</div>
+        <div class="npvol" id="np-view-volrow">
+          ${ICON("speaker")}<input id="np-view-vol" type="range" min="0" max="100" value="${esc($("np-vol").value)}" aria-label="Device volume" />
+        </div>
       </div>
     </div>
     <section class="detail-sec">
       <div class="qhead">
-        <h3>Queue</h3>
+        <h3>Queue <span class="muted qcount">${esc(nTracks(pq.tracks.length))}</span></h3>
         <div class="qctrls">
-          <button class="qbtn${state.shuffle ? " on" : ""}" id="np-shuffle" aria-pressed="${state.shuffle}" aria-label="Shuffle" title="Shuffle">${ICON("shuffle")}</button>
-          <button class="qbtn${state.repeat !== "off" ? " on" : ""}" id="np-repeat" aria-label="Repeat: ${state.repeat}" title="Repeat: ${state.repeat}">${ICON(repIco)}</button>
+          ${modeBtnsHtml("qbtn")}
+          <button class="act ghost small" id="np-clear" type="button" title="Remove everything except the current track">Clear</button>
+          <button class="act ghost small" id="np-save" type="button">Save as playlist</button>
         </div>
       </div>
-      ${tracksHtml(state.activeQueue, { reorder: true })}
+      ${tracksHtml(pq.tracks, { reorder: true, queueRow: true })}
     </section>
   </div>`;
-  hydrateArt(list);
-  wireTrackRows(list, state.activeQueue, { onPlay: playActive, clickToPlay: true });
+  _npKey = null;
+  wireTrackRows(list, pq.tracks, { onPlay: jumpTo, clickToPlay: true, queueRow: true });
   wireQueueReorder(list);
-  $("np-shuffle").onclick = toggleShuffle;
-  $("np-repeat").onclick = cycleRepeat;
-  highlightPlaying();
+  wireModeButtons(list);
+  $("np-clear").onclick = clearQueue;
+  $("np-save").onclick = saveQueueAsPlaylist;
+  $("np-view-vol").addEventListener("input", (e) => setVolume(Number(e.target.value)));
+  updateNowPlayingView();
+  paintModes();
 }
 
 // Keep an open Now Playing view in step with a track change without rebuilding
 // the whole list (so the queue's scroll position survives a next/prev).
+let _npKey = null;
 function updateNowPlayingView() {
   const wrap = $("list").querySelector(".npview");
   if (!wrap) return;
-  const t = activeTrack();
-  if (!t) { renderNowPlaying(); return; }
-  const titleEl = $("np-view-title"), artistEl = $("np-view-artist"), artEl = $("np-view-art");
-  if (titleEl) titleEl.textContent = t.title || "";
-  if (artistEl) artistEl.textContent = t.artist || "";
-  if (artEl) { artEl.classList.add("fallback"); artEl.innerHTML = ICON("music"); artEl.dataset.art = t.artwork_url || ""; hydrateArt(wrap); }
+  if (!pq.tracks.length) { renderNowPlaying(); return; }
+  const t = pq.current() || {};
+  const key = `${pq.index}|${trackKey(t)}`;
+  const kind = $("np-view-kind");
+  if (kind) kind.textContent = onDevice() ? `Now Playing · ${currentDeviceName()}` : "Now Playing";
+  const vr = $("np-view-volrow");
+  if (vr) vr.classList.toggle("show", onDevice());
+  if (key !== _npKey) {
+    _npKey = key;
+    const titleEl = $("np-view-title"), artistEl = $("np-view-artist"), artEl = $("np-view-art");
+    if (titleEl) titleEl.innerHTML = t.id ? `<a class="link-plain" href="${routeHref("track", t.service, t.id)}">${esc(t.title || "")}</a>` : esc(t.title || "");
+    if (artistEl) artistEl.textContent = t.artist || "";
+    if (artEl) { artEl.classList.add("fallback"); artEl.innerHTML = ICON("music"); artEl.dataset.art = artOf(t); hydrateArt(artEl.parentElement); }
+  }
   highlightPlaying();
+}
+
+function wireModeButtons(scope) {
+  scope.querySelectorAll(".js-shuffle").forEach((b) => { b.onclick = toggleShuffle; });
+  scope.querySelectorAll(".js-repeat").forEach((b) => { b.onclick = cycleRepeat; });
 }
 
 // Pointer-based drag-to-reorder for the Now Playing queue. Pointer events (not
@@ -555,6 +899,7 @@ function wireQueueReorder(scope) {
       const row = grip.closest(".trow");
       if (!row) return;
       row.classList.add("dragging");
+      state.dragging = true;
       try { grip.setPointerCapture(e.pointerId); } catch (_e) { /* ignore */ }
       const move = (ev) => {
         const others = [...container.querySelectorAll(".trow")].filter((r) => r !== row);
@@ -567,7 +912,8 @@ function wireQueueReorder(scope) {
         grip.removeEventListener("pointerup", up);
         grip.removeEventListener("pointercancel", up);
         row.classList.remove("dragging");
-        commitQueueOrder(container);
+        state.dragging = false;
+        commitQueueOrder(container, row);
       };
       grip.addEventListener("pointermove", move);
       grip.addEventListener("pointerup", up);
@@ -576,15 +922,12 @@ function wireQueueReorder(scope) {
   });
 }
 
-function commitQueueOrder(container) {
-  const cur = activeTrack();
-  const order = [...container.querySelectorAll(".trow")].map((r) => Number(r.dataset.i));
-  if (!order.length) return;
-  const next = order.map((i) => state.activeQueue[i]).filter(Boolean);
-  if (next.length !== state.activeQueue.length) { renderNowPlaying(); return; }
-  state.activeQueue = next;
-  if (cur) { const i = next.findIndex((tr) => sameTrack(tr, cur)); if (i >= 0) state.activeIndex = i; }
-  renderNowPlaying();   // rebuild with fresh indices + handlers
+// A drag moved one row: from its old index to its new DOM position.
+function commitQueueOrder(container, row) {
+  const from = Number(row.dataset.i);
+  const to = [...container.querySelectorAll(".trow")].indexOf(row);
+  if (to < 0 || from === to) { renderNowPlaying(); return; }
+  moveInQueue(from, to);
 }
 
 // -- views ------------------------------------------------------------------
@@ -600,6 +943,7 @@ function highlightNav(view) {
 function setView(view) {
   state.section = view;
   state.detail = false;
+  state.playlist = null;   // only openPlaylist() sets it; never leaks into other views
   highlightNav(view);
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "nowplaying") { $("view-title").textContent = "Now Playing"; renderNowPlaying(); }
@@ -644,10 +988,7 @@ async function renderDevices(refresh) {
   </div>`;
   $("dev-rescan").onclick = () => renderDevices(true);
   list.querySelectorAll(".setout").forEach((b) => b.onclick = () => {
-    const prevOnDevice = onDevice();
-    setTargetValue(b.dataset.target);
-    const sel = $("np-device"); if (sel) sel.value = b.dataset.target;
-    if (!prevOnDevice && onDevice()) audio.pause();
+    switchOutput(b.dataset.target);   // sets the target synchronously; the hand-off runs on
     loadDevices();
     renderDevices();
   });
@@ -708,6 +1049,25 @@ async function renderSync() {
     } catch (e) { syncMsg("Couldn’t apply the plan: " + e.message, "err"); }
     token = null;
   };
+}
+
+// Explain a credential sync: {synced, kept, rolled_back} per service →
+// "Synced Qobuz · kept YouTube Music · couldn't use YouTube Music here, kept
+// your existing login". `worked` = something synced or an existing login kept.
+function adoptResultText(r) {
+  const names = (a) => (a || []).map(serviceLabel).join(" and ");
+  if (!Array.isArray(r.synced)) {   // an older server: only the imported key list
+    const n = (r.imported || []).length;
+    return { text: n ? `Synced ${n} credential(s).` : "Nothing to sync.", worked: n > 0 };
+  }
+  const synced = r.synced || [], kept = r.kept || [], back = r.rolled_back || [];
+  const parts = [];
+  if (synced.length) parts.push(`Synced ${names(synced)}`);
+  if (kept.length) parts.push(`${parts.length ? "kept" : "Kept"} ${names(kept)} (already working here)`);
+  if (back.length) parts.push(`${parts.length ? "couldn’t" : "Couldn’t"} use ${names(back)} here, kept your existing login`);
+  const worked = synced.length > 0 || kept.length > 0;
+  if (!parts.length) return { text: "Nothing synced — that instance has no working logins to share.", worked: false };
+  return { text: parts.join(" · ") + ".", worked };
 }
 
 async function renderAccounts() {
@@ -844,7 +1204,8 @@ async function renderAccounts() {
       msg("Personal key saved.", true);
     } catch (e) { msg("Couldn’t save the key: " + e.message); }
   };
-  const setAdoptMsg = (t, ok) => { const am = $("adopt-msg"); am.textContent = t; am.className = "muted msg" + (ok ? " ok" : ""); };
+  // ok: true → success style, "error" → error style, otherwise neutral.
+  const setAdoptMsg = (t, ok) => { const am = $("adopt-msg"); am.textContent = t; am.className = "muted msg" + (ok === true ? " ok" : ok === "error" ? " err" : ""); };
   $("adopt-go").onclick = async () => {
     const target = ($("adopt-host").value.trim()) || $("adopt-peer").value;
     setAdoptMsg("Syncing…");
@@ -859,13 +1220,15 @@ async function renderAccounts() {
     try {
       const r = await apiPost("/api/credentials/adopt", body);
       if (r.ok) {
-        setAdoptMsg(`Synced ${(r.imported || []).length} credential(s).`, true);
-        if (body.host) { try { await apiPost("/api/peers", body); } catch { /* best-effort */ } }
-        loadAccounts(); setTimeout(renderAccounts, 900);
+        const { text, worked } = adoptResultText(r);
+        setAdoptMsg(text, worked ? true : "error");
+        // Only remember an instance that actually gave us (or confirmed) a working login.
+        if (worked && body.host) { try { await apiPost("/api/peers", body); } catch { /* best-effort */ } }
+        if (worked) { loadAccounts(); setTimeout(renderAccounts, 2500); }
       } else {
-        setAdoptMsg(r.reason || "Nothing to sync — pick an instance or enter host:port.");
+        setAdoptMsg(r.reason || "Nothing to sync — pick an instance or enter host:port.", "error");
       }
-    } catch (e) { setAdoptMsg("Couldn’t sync: " + e.message); }
+    } catch (e) { setAdoptMsg("Couldn’t sync: " + e.message, "error"); }
   };
   $("peer-remember").onclick = async () => {
     const target = $("adopt-host").value.trim();
@@ -962,22 +1325,43 @@ function albumRowsHtml(albums, opts = {}) {
         ${opts.showArtist && a.artist ? `<div class="alb-artist muted">${esc(a.artist)}</div>` : ""}
       </div>`;
     const data = `data-svc="${esc(a.service)}" data-id="${esc(a.id || "")}" data-aids="${esc(aids)}" data-title="${esc(a.title || "")}" data-artist="${esc(a.artist || "")}" data-mbid="${esc(a.mbid || "")}"`;
+    const more = moreBtn(`More actions for ${a.title || "album"}`);
     if (nav)
-      return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}</a>`;
-    return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="badge">credit</span></div>`;
+      return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}<span></span>${more}</a>`;
+    return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="badge">credit</span>${more}</div>`;
   }).join("");
 }
 
 function wireAlbumRows(scope) {
   scope.querySelectorAll(".albrow").forEach((row) => {
-    row.addEventListener("contextmenu", (e) => openAlbumContextMenu(e, {
+    const a = () => ({
       service: row.dataset.svc,
       id: row.dataset.id || null,
       artist_ids: row.dataset.aids ? row.dataset.aids.split(",").filter(Boolean) : [],
       title: row.dataset.title || "",
       artist: row.dataset.artist || "",
       mbid: row.dataset.mbid || "",
-    }));
+    });
+    row.addEventListener("contextmenu", (e) => openAlbumContextMenu(e, a()));
+    const more = row.querySelector(".more");
+    // The ⋯ sits inside the row's link: keep its click from navigating.
+    if (more) more.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); menuAt(e.currentTarget, albumMenuItems(a())); });
+  });
+}
+
+// Artist chips that carry a provider id (smart-search "Artists"): ⋯ and
+// right-click → play / queue the artist's top tracks (+ Lidarr).
+function artistChipHtml(ar) {
+  return `<span class="chipwrap" data-artist-svc="${esc(ar.service)}" data-artist-id="${esc(ar.id)}" data-artist-name="${esc(ar.name)}">
+    <a class="chip" href="${routeHref("artist", ar.service, ar.id)}"><span class="chip-name">${esc(ar.name)}</span><span class="chip-sub muted">${esc(serviceLabel(ar.service))}</span></a>
+    ${moreBtn(`More actions for ${ar.name || "artist"}`)}</span>`;
+}
+function wireArtistChips(scope) {
+  scope.querySelectorAll(".chipwrap[data-artist-id]").forEach((w) => {
+    const ar = { service: w.dataset.artistSvc, id: w.dataset.artistId, name: w.dataset.artistName };
+    w.addEventListener("contextmenu", (e) => menuAt(e, artistMenuItems(ar)));
+    const more = w.querySelector(".more");
+    if (more) more.addEventListener("click", (e) => { e.preventDefault(); e.stopPropagation(); menuAt(e.currentTarget, artistMenuItems(ar)); });
   });
 }
 
@@ -1007,7 +1391,7 @@ function bioHtml(bio) {
   return `<section class="detail-sec"><h3>About</h3><p class="bio-text">${esc(bio.text)}</p>${src}</section>`;
 }
 
-function detailHeader(title, subHtml, artUrl, kind) {
+function detailHeader(title, subHtml, artUrl, kind, actsHtml) {
   return `
     <div class="detail-head">
       <button class="backbtn" id="detail-back" aria-label="Go back">${ICON("prev")} Back</button>
@@ -1018,6 +1402,7 @@ function detailHeader(title, subHtml, artUrl, kind) {
         ${kind ? `<div class="detail-kind">${esc(kind)}</div>` : ""}
         <h2 class="detail-title">${esc(title)}</h2>
         ${subHtml ? `<div class="detail-sub">${subHtml}</div>` : ""}
+        ${actsHtml || ""}
       </div>
     </div>`;
 }
@@ -1063,7 +1448,11 @@ async function renderArtistView(service, id) {
     </section>` : "";
 
   const top = d.top_tracks || [];
-  const topSec = top.length ? `<section class="detail-sec"><h3>Top tracks</h3>${tracksHtml(top)}</section>` : "";
+  const topSec = top.length ? `<section class="detail-sec">
+      <div class="sec-head"><h3>Top tracks</h3>
+        <button class="act ghost small" id="top-play" type="button">${ICON("play")} Play</button>
+        <button class="act ghost small" id="top-shuffle" type="button">${ICON("shuffle")} Shuffle</button></div>
+      ${tracksHtml(top)}</section>` : "";
 
   const members = d.members || [];
   const bands = d.member_of || [];
@@ -1071,8 +1460,11 @@ async function renderArtistView(service, id) {
   if (members.length) peopleSec += `<section class="detail-sec"><h3>Members</h3>${peopleChipsHtml(members, { instruments: true, current: true })}</section>`;
   if (bands.length) peopleSec += `<section class="detail-sec"><h3>Member of</h3>${peopleChipsHtml(bands, {})}</section>`;
 
+  const artistRef = { service, id, name: a.name || "", mbid: d.mbid || "", tracks: top, here: true };
   list.innerHTML = `<div class="detail">
-    ${detailHeader(a.name || "Unknown artist", "", a.image_url, kindLabel)}
+    ${detailHeader(a.name || "Unknown artist", "", a.image_url, kindLabel,
+      top.length ? collectionActsHtml("ar", { playLabel: "Play top tracks" })
+        : `<div class="hero-acts"><button class="act ghost icon-only" id="ar-more" type="button" aria-label="More actions" aria-haspopup="menu">${ICON("more")}</button></div>`)}
     ${bioHtml(a.bio)}
     ${chartSec}
     ${albumsSec}
@@ -1083,11 +1475,17 @@ async function renderArtistView(service, id) {
   hydrateArt(list);
   wireAlbumRows(list);
   wireChips(list);
-  // Right-click the artist hero → "Get with Lidarr" (this artist).
+  // Right-click the artist hero → play/queue the top tracks, "Get with Lidarr".
   const hero = list.querySelector(".detail-hero");
-  if (hero && a.name) { hero.dataset.lidarrArtist = a.name; if (d.mbid) hero.dataset.lidarrMbid = d.mbid; }
+  if (hero) hero.addEventListener("contextmenu", (e) => menuAt(e, artistMenuItems(artistRef)));
+  wireCollectionActs("ar", () => top, () => artistMenuItems(artistRef));
+  if (!top.length && $("ar-more")) $("ar-more").onclick = (e) => menuAt(e.currentTarget, artistMenuItems(artistRef));
   wireLidarrArtistTargets(list);
-  if (top.length) { state.queue = top; wireTrackRows(list, top); highlightPlaying(); }
+  if (top.length) {
+    state.queue = top; wireTrackRows(list, top); highlightPlaying();
+    $("top-play").onclick = () => playFrom(top, 0);
+    $("top-shuffle").onclick = () => playFrom(top, null, { shuffle: true });
+  }
 }
 
 async function renderAlbumView(service, id) {
@@ -1116,13 +1514,25 @@ async function renderAlbumView(service, id) {
     : emptyState("music", "No tracks", "This album has no playable tracks right now.");
 
   list.innerHTML = `<div class="detail">
-    ${detailHeader(al.title || "Album", bits, al.artwork_url, "Album")}
+    ${detailHeader(al.title || "Album", bits, al.artwork_url, "Album", tracks.length ? collectionActsHtml("al") : "")}
     ${bioHtml(d.bio)}
     <section class="detail-sec">${tracksSec}</section>
   </div>`;
   wireBack();
   hydrateArt(list);
-  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
+  if (tracks.length) {
+    const albumRef = { service, id, title: al.title || "", artist: al.artist || "", mbid: al.mbid || "",
+                       artist_ids: ref ? [ref.id] : [] };
+    const items = () => [
+      { label: "Play next", fn: () => playNextTracks(tracks, albumRef.title || "album") },
+      { label: "Add to queue", fn: () => enqueueTracks(tracks, albumRef.title || "album") },
+      { label: "Add all to playlist…", fn: () => openAddMenu($("al-more"), tracks) },
+      ...(ref ? [{ label: "Go to artist", fn: () => navigateArtist(ref.service, ref.id) }] : []),
+      ...lidarrMenuItems({ kind: "album", title: albumRef.title, artist: albumRef.artist, mbid: albumRef.mbid }),
+    ];
+    wireCollectionActs("al", () => tracks, items);
+    state.queue = tracks; wireTrackRows(list, tracks, { numbered: true }); highlightPlaying();
+  }
 }
 
 async function renderTrackView(service, id) {
@@ -1166,8 +1576,11 @@ async function renderTrackView(service, id) {
 
   list.innerHTML = `<div class="detail">
     ${detailHeader(t.title || "Track", meta, t.artwork_url, "Track")}
-    <section class="detail-sec">
-      <button class="act" id="tk-play">${ICON("play")} Play track</button>
+    <section class="detail-sec hero-acts">
+      <button class="act" id="tk-play" type="button">${ICON("play")} Play track</button>
+      <button class="act ghost" id="tk-next" type="button">Play next</button>
+      <button class="act ghost" id="tk-queue" type="button">Add to queue</button>
+      <button class="act ghost icon-only" id="tk-more" type="button" aria-label="More actions" aria-haspopup="menu">${ICON("more")}</button>
     </section>
     ${perfSec}
   </div>`;
@@ -1175,7 +1588,12 @@ async function renderTrackView(service, id) {
   hydrateArt(list);
   wireChips(list);
   wireLidarrArtistTargets(list);
-  $("tk-play").onclick = () => playFrom([t], 0);
+  const tk = { ...t, service: t.service || service, id: t.id || id };
+  $("tk-play").onclick = () => (sameTrack(pq.current(), tk) && !isStopped() ? togglePlay() : playFrom([tk], 0));
+  $("tk-next").onclick = () => playNextTracks([tk], tk.title);
+  $("tk-queue").onclick = () => enqueueTracks([tk], tk.title);
+  $("tk-more").onclick = (e) => menuAt(e.currentTarget,
+    trackMenuItems(tk, e.currentTarget).filter((it) => it.label !== "Track details"));
 }
 
 // -- member-chronology timeline chart (inline SVG, theme-aware, scrollable) --
@@ -1283,16 +1701,10 @@ function renderSmartResults(r, q) {
   const tracks = inc.tracks || [];
   if (tracks.length) html += `<section class="detail-sec"><h3>Tracks</h3>${tracksHtml(tracks)}</section>`;
   if (inc.artists && inc.artists.length) {
-    html += `<section class="detail-sec"><h3>Artists</h3><div class="chips">${inc.artists.map((ar) =>
-      `<a class="chip" href="${routeHref("artist", ar.service, ar.id)}" data-lidarr-artist="${esc(ar.name)}"><span class="chip-name">${esc(ar.name)}</span><span class="chip-sub muted">${esc(serviceLabel(ar.service))}</span></a>`).join("")}</div></section>`;
+    html += `<section class="detail-sec"><h3>Artists</h3><div class="chips">${inc.artists.map(artistChipHtml).join("")}</div></section>`;
   }
   if (inc.playlists && inc.playlists.length) {
-    html += `<section class="detail-sec"><h3>Playlists</h3><div class="plgrid">${inc.playlists.map((p) =>
-      `<div class="plcard" data-service="${esc(p.service)}" data-id="${esc(p.id)}" data-art="${esc(p.artwork_url || "")}">
-        <div class="art">${ICON("music")}</div>
-        <div class="t">${esc(p.title)}</div>
-        <div class="s">${esc(serviceLabel(p.service))}${p.track_count != null ? " · " + nTracks(p.track_count) : ""}</div>
-      </div>`).join("")}</div></section>`;
+    html += `<section class="detail-sec"><h3>Playlists</h3><div class="plgrid">${inc.playlists.map(playlistCardHtml).join("")}</div></section>`;
   }
 
   if (!html) {
@@ -1303,12 +1715,9 @@ function renderSmartResults(r, q) {
   hydrateArt(list);
   wireAlbumRows(list);
   wireLidarrArtistTargets(list);
+  wireArtistChips(list);
   if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
-  list.querySelectorAll(".plcard").forEach((card) => {
-    const url = card.dataset.art;
-    if (url) { const img = new Image(); img.className = "art"; img.alt = ""; img.onload = () => { const slot = card.querySelector(".art"); if (slot) slot.replaceWith(img); }; img.src = url; }
-    card.addEventListener("click", () => openPlaylist(card.dataset.service, card.dataset.id, card.querySelector(".t").textContent));
-  });
+  wirePlaylistCards(list);
 }
 
 async function loadPlaylists() {
@@ -1328,23 +1737,40 @@ async function openPlaylist(service, id, title) {
   catch (e) { $("list").innerHTML = errorState("Couldn’t load tracks", e.message, "t-retry"); $("t-retry").onclick = () => openPlaylist(service, id, title); }
 }
 
-async function newPlaylist(addTrack) {
-  const r = await modalPrompt({ title: "New playlist", okText: "Create", fields: [
-    { name: "title", label: "Title", type: "text", placeholder: "Playlist name" },
-    { name: "service", label: "Service", type: "select", value: "qobuz",
+// Create a playlist (optionally seeded with `addTracks` — only the chosen
+// service's tracks can go in). Returns {service, id, title} or null.
+async function newPlaylist(addTracks, opts = {}) {
+  const tracks = (addTracks || []).filter(Boolean);
+  // Default to the service most of the tracks come from.
+  const counts = {};
+  tracks.forEach((t) => { counts[t.service] = (counts[t.service] || 0) + 1; });
+  const major = Object.keys(counts).sort((a, b) => counts[b] - counts[a])[0];
+  const r = await modalPrompt({ title: opts.dialogTitle || "New playlist", okText: "Create", fields: [
+    { name: "title", label: "Title", type: "text", placeholder: "Playlist name", value: opts.title || "" },
+    { name: "service", label: "Service", type: "select", value: major === "ytmusic" ? "ytmusic" : "qobuz",
       options: [{ value: "qobuz", label: "Qobuz" }, { value: "ytmusic", label: "YouTube Music" }] },
   ] });
-  if (!r || !r.title) return;
-  try {
-    const created = await apiPost("/api/playlists", { service: r.service, title: r.title });
-    toast("Playlist created.", "ok");
-    if (addTrack && created && created.id) {
-      try { await apiPost(`/api/playlists/${encodeURIComponent(r.service)}/${encodeURIComponent(created.id)}/add`, { track_ids: [addTrack.id] }); toast(`Added to “${r.title}”.`, "ok"); }
-      catch { /* non-fatal */ }
-    }
-    _playlistCache = null;
-    if (!state.playlist) loadPlaylists();
-  } catch (e) { toastErr("Couldn’t create the playlist: " + e.message); }
+  if (!r || !r.title) return null;
+  if (tracks.length && !tracks.some((t) => t.service === r.service)) {
+    toastErr(`None of these tracks are on ${serviceLabel(r.service)} — pick the other service.`);
+    return null;
+  }
+  let created;
+  try { created = await apiPost("/api/playlists", { service: r.service, title: r.title }); }
+  catch (e) { toastErr("Couldn’t create the playlist: " + e.message); return null; }
+  _playlistCache = null;
+  if (tracks.length && created && created.id) await addTracksToPlaylist(r.service, created.id, r.title, tracks);
+  else toast("Playlist created.", "ok");
+  if (state.section === "playlists" && !state.detail && !state.playlist && !$("list").querySelector(".npview")) loadPlaylists();
+  else loadPlaylistsSilently();
+  return created && created.id ? { service: r.service, id: created.id, title: r.title } : null;
+}
+
+async function saveQueueAsPlaylist() {
+  if (!pq.tracks.length) { toast("The queue is empty."); return; }
+  const d = new Date();
+  await newPlaylist(pq.tracks.slice(), { dialogTitle: "Save queue as playlist",
+    title: `Queue ${d.toLocaleDateString()} ${d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}` });
 }
 
 function acctStatusText(a) {
@@ -1364,6 +1790,15 @@ async function loadAccounts() {
 }
 
 // -- playback ---------------------------------------------------------------
+//
+// Two outputs share one PlayQueue (`pq`):
+//   * the BROWSER (this tab's <audio>) runs the queue client-side, with the
+//     same rules as src/harmony/playqueue.py;
+//   * a DEVICE (WiiM/UPnP/Chromecast) has its queue OWNED by the instance next
+//     to it, which auto-advances it. We hand it the whole list once (queue/load),
+//     map every control to a queue op, and poll GET /queue every ~2s to mirror
+//     the server's snapshot into `pq` (so auto-advance and other clients show).
+// Switching output hands the queue + position over (switchOutput).
 
 function setArt(url) {
   const el = $("np-art");
@@ -1378,13 +1813,19 @@ function setArt(url) {
 
 function setPlayIcon(playing) {
   const b = $("np-play");
+  const want = playing ? "pause" : "play";
+  if (b.dataset.ico === want) return;
+  b.dataset.ico = want;
   b.setAttribute("aria-label", playing ? "Pause" : "Play");
-  b.innerHTML = ICON(playing ? "pause" : "play");
+  b.innerHTML = ICON(want);
 }
 
 function currentDeviceName() {
+  if (!onDevice()) return "This browser";
   const sel = $("np-device");
-  return sel && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : "device";
+  const v = encodeTarget(state.target, state.targetVia);
+  const o = sel && [...sel.options].find((x) => x.value === v);
+  return o ? o.textContent : state.target;
 }
 
 function updateCastChip() {
@@ -1392,301 +1833,750 @@ function updateCastChip() {
   const np = $("nowplaying");
   if (onDevice()) {
     via.classList.add("show");
-    via.querySelector("span").textContent = `Playing on ${currentDeviceName()}`;
+    via.querySelector("span").textContent = dev.pending ? `Ready on ${currentDeviceName()} — press play` : `Playing on ${currentDeviceName()}`;
     np.classList.add("casting");
   } else { via.classList.remove("show"); np.classList.remove("casting"); }
 }
 
-// Cast progress is driven by a LOCAL clock: while casting to a device we count
-// elapsed seconds ourselves and advance the bar every second, then only *snap*
-// to the device's reported position when that position actually moved between
-// polls (a real seek, or a well-behaved WiiM/UPnP renderer). Chromecast relays
-// report a FROZEN position for a relayed stream, so trusting it verbatim leaves
-// the bar stuck; a frozen/zero reading is ignored and the local clock carries on.
-let devicePoll = null;
-let castPos = 0;              // locally-interpolated position (seconds)
-let castDur = 0;             // known track duration (seconds)
-let castLastReported = null; // last device-reported position, to detect movement
-let _castTick = 0;           // 1s ticks, so we reconcile against the device ~every 2s
+// Browser output: this tab's <audio>, driven by the local PlayQueue.
+const br = {
+  gen: 0,          // bumps on every play request; a stale /api/resolve reply is dropped
+  loaded: null,    // the queue item whose stream is in <audio> (by identity), or null
+  stopped: true,   // stopped / finished / never started — Play (re)starts pq.index
+  resumePos: 0,    // where Play starts when nothing is loaded (restore / hand-off)
+  failures: 0,     // consecutive tracks that failed to start
+};
+// Device output: the server owns the queue; `pq` mirrors its snapshot.
+const dev = {
+  running: false,  // the server's queue is playing (not stopped / finished)
+  paused: false,
+  pos: 0,          // seconds, interpolated between polls, reconciled to position_s
+  dur: 0,
+  sig: "",         // last snapshot's queue signature (re-render the queue on change)
+  lastErr: null,
+  pending: null,   // null | "handoff" | "restore": our queue isn't on the device yet
+  pendingPos: 0,   // …and where it would start
+  gen: 0, applied: 0, inflight: 0,   // ordering of snapshot responses
+  volSetAt: 0,     // user moved the volume recently: don't let a poll yank it back
+  holdUntil: 0,    // after a user pause/resume: the server's status lags ~2s, keep ours
+};
 
-function stopDevicePoll() { if (devicePoll) { clearInterval(devicePoll); devicePoll = null; } }
+// A user action that changes device state optimistically: drop any poll that
+// was already in flight (it predates the action).
+function devFence() { dev.applied = ++dev.gen; }
 
-// A fresh cast track: reset the local clock (and the bar) to 0.
-function resetCastProgress(dur) {
-  castPos = 0;
-  castLastReported = null;
-  _castTick = 0;
-  castDur = dur || 0;
-  if (castDur) { $("np-seek").max = castDur; $("np-dur").textContent = fmtTime(castDur); }
-  $("np-seek").value = 0;
-  $("np-pos").textContent = fmtTime(0);
+const onDeviceLive = () => onDevice() && !dev.pending;
+
+function isPlaying() {
+  if (onDevice()) return !dev.pending && dev.running && !dev.paused;
+  return !!br.loaded && !audio.paused;
+}
+function isStopped() {
+  if (onDevice()) return !!dev.pending || !dev.running;
+  return br.stopped;
+}
+function currentPos() {
+  if (onDevice()) return dev.pending ? dev.pendingPos : dev.pos;
+  return br.loaded ? (audio.currentTime || 0) : br.resumePos;
+}
+function currentDur() {
+  const t = pq.current();
+  if (onDevice()) return dev.dur || (t && t.duration_s) || 0;
+  const d = audio.duration;
+  return br.loaded && isFinite(d) && d > 0 ? d : ((t && t.duration_s) || 0);
 }
 
-function paintCastProgress() {
-  $("np-seek").value = Math.floor(castPos);
-  $("np-pos").textContent = fmtTime(castPos);
-}
+// -- painting -----------------------------------------------------------------
 
-async function pollCastStatus() {
+let seeking = false;       // the user is dragging the seek bar
+let _msPosAt = 0;
+
+function msPosition(pos, dur, force) {
+  if (!("mediaSession" in navigator) || !navigator.mediaSession.setPositionState) return;
+  const now = Date.now();
+  if (!force && now - _msPosAt < 1000) return;
+  _msPosAt = now;
   try {
-    const q = state.targetVia ? `?via=${encodeURIComponent(state.targetVia)}` : "";
-    const s = await api(`/api/devices/${encodeURIComponent(state.target)}/status${q}`);
-    if (s.duration_s) { castDur = s.duration_s; $("np-seek").max = s.duration_s; $("np-dur").textContent = fmtTime(s.duration_s); }
-    if (s.position_s != null) {
-      const rep = Number(s.position_s);
-      const moved = castLastReported == null || Math.abs(rep - castLastReported) >= 1;
-      // Never let a frozen/zeroed reading yank an already-advancing bar back to 0.
-      const zeroMidTrack = rep <= 0 && castPos > 2;
-      if (moved && !zeroMidTrack) {
-        castPos = castDur ? Math.min(Math.max(0, rep), castDur) : Math.max(0, rep);
-        paintCastProgress();
-      }
-      castLastReported = rep;
-    }
-  } catch { /* device may be mid-buffer; ignore */ }
+    if (!dur || !isFinite(dur) || dur <= 0) return;
+    navigator.mediaSession.setPositionState({ duration: dur, position: Math.min(Math.max(0, pos || 0), dur), playbackRate: 1 });
+  } catch { /* ignore */ }
 }
 
-function startDevicePoll() {
-  stopDevicePoll();
-  devicePoll = setInterval(() => {
-    if (!onDevice()) return stopDevicePoll();
-    _castTick++;
-    if (!state.devicePaused) {
-      castPos = castDur ? Math.min(castPos + 1, castDur) : castPos + 1;
-      paintCastProgress();
-    }
-    if (_castTick % 2 === 0) pollCastStatus();   // reconcile with the device ~every 2s
-  }, 1000);
+function paintProgress(force) {
+  const pos = currentPos(), dur = currentDur();
+  const seek = $("np-seek");
+  if (!seeking) {
+    seek.max = Math.max(1, Math.floor(dur || 1));
+    seek.value = Math.floor(dur ? Math.min(pos, dur) : pos);
+    $("np-pos").textContent = fmtTime(pos);
+  }
+  $("np-dur").textContent = fmtTime(dur);
+  msPosition(pos, dur, force);
+}
+
+function paintPlayState() {
+  const playing = isPlaying();
+  setPlayIcon(playing);
+  if ("mediaSession" in navigator) {
+    try { navigator.mediaSession.playbackState = pq.current() ? (playing ? "playing" : "paused") : "none"; } catch { /* ignore */ }
+  }
+  highlightPlaying();
 }
 
 function updateMediaSession(t) {
   if (!("mediaSession" in navigator)) return;
   try {
+    const art = artOf(t);
     navigator.mediaSession.metadata = new MediaMetadata({
       title: t.title || "", artist: t.artist || "", album: t.album || "",
-      artwork: t.artwork_url ? [{ src: t.artwork_url, sizes: "512x512" }] : [],
+      artwork: art ? [{ src: art, sizes: "512x512" }] : [],
     });
   } catch { /* ignore */ }
 }
 
-// -- active queue: load / enqueue / shuffle / repeat / advance --------------
-
-// Replace the active queue with a copy of `list` and play at `index`. This is
-// the ONLY way (besides enqueue / play-next / reorder / auto-advance) the active
-// queue changes — navigation never calls it. With shuffle on, the chosen track
-// stays put and the upcoming tracks are shuffled around it.
-function setActiveQueue(list, index) {
-  state.activeQueue = (list || []).slice();
-  state.activeIndex = index;
-  state.sourceOrder = state.shuffle ? state.activeQueue.slice() : null;
-  if (state.shuffle) shuffleUpcoming();
-}
-
-// Fisher–Yates over the tracks AFTER the current one (current track unmoved).
-function shuffleUpcoming() {
-  const q = state.activeQueue, lo = state.activeIndex + 1;
-  for (let i = q.length - 1; i > lo; i--) {
-    const j = lo + Math.floor(Math.random() * (i - lo + 1));
-    [q[i], q[j]] = [q[j], q[i]];
+let _barKey = null;
+// Bring the bar, the Now Playing view, row indicators and Media Session in
+// line with pq / the output state. Cheap enough to call after any change.
+function paintCurrent() {
+  const t = pq.current();
+  const key = t ? `${pq.index}|${trackKey(t)}` : "";
+  if (t) {
+    $("np-title").textContent = t.title || "";
+    $("np-artist").textContent = t.artist || "";
+    $("nowplaying").classList.remove("empty");
+    if (key !== _barKey) { setArt(artOf(t)); updateMediaSession(t); }
+  } else {
+    $("np-title").textContent = "Nothing playing";
+    $("np-artist").textContent = "";
+    $("nowplaying").classList.add("empty");
+    if (key !== _barKey) setArt("");
   }
-}
-
-function toggleShuffle() {
-  state.shuffle = !state.shuffle;
-  if (state.shuffle) { state.sourceOrder = state.activeQueue.slice(); shuffleUpcoming(); }
-  else if (state.sourceOrder) {
-    // Restore the pre-shuffle order, re-anchoring on the still-playing track.
-    const cur = activeTrack();
-    state.activeQueue = state.sourceOrder.slice();
-    const i = cur ? state.activeQueue.findIndex((t) => sameTrack(t, cur)) : -1;
-    if (i >= 0) state.activeIndex = i;
-    state.sourceOrder = null;
-  }
-  persistPrefs();
-  refreshQueueUi();
-}
-
-function cycleRepeat() {
-  state.repeat = state.repeat === "off" ? "all" : state.repeat === "all" ? "one" : "off";
-  persistPrefs();
-  refreshQueueUi();
+  _barKey = key;
+  updateCastChip();
+  updateNowPlayingView();
+  paintModes();
+  paintPlayState();
+  paintProgress();
+  savePlayback();
 }
 
 // Re-render the Now Playing queue when it is the open view (queue changed).
-function refreshQueueUi() { if ($("list").querySelector(".npview")) renderNowPlaying(); }
+function refreshQueueUi() { if (!state.dragging && $("list").querySelector(".npview")) renderNowPlaying(); }
+function paintAll() { refreshQueueUi(); paintCurrent(); }
 
-// Load a displayed list as the active queue and start playing at `index`.
-function playFrom(list, index) {
-  setActiveQueue(list, index);
-  playActive(state.activeIndex);
-}
+// -- browser output -------------------------------------------------------------
 
-// Append tracks to the END of the active queue (does not interrupt playback;
-// when nothing is playing it just starts at the first appended track).
-function enqueueTracks(tracks, label) {
-  const add = (tracks || []).filter(Boolean);
-  if (!add.length) return;
-  const idle = state.activeIndex < 0 || !state.activeQueue.length;
-  const startAt = state.activeQueue.length;
-  state.activeQueue.push(...add);
-  if (state.sourceOrder) state.sourceOrder.push(...add);
-  if (idle) { playActive(startAt); return; }
-  refreshQueueUi();
-  toast(label ? `Added “${label}” to the queue.` : `Added ${nTracks(add.length)} to the queue.`, "ok");
-}
-
-// Insert tracks immediately AFTER the current track.
-function playNextTracks(tracks, label) {
-  const add = (tracks || []).filter(Boolean);
-  if (!add.length) return;
-  if (state.activeIndex < 0 || !state.activeQueue.length) return enqueueTracks(add, label);
-  const cur = activeTrack();
-  state.activeQueue.splice(state.activeIndex + 1, 0, ...add);
-  if (state.sourceOrder) {
-    const si = cur ? state.sourceOrder.findIndex((t) => sameTrack(t, cur)) : -1;
-    state.sourceOrder.splice(si >= 0 ? si + 1 : state.sourceOrder.length, 0, ...add);
+function clearAudio() {
+  br.loaded = null;
+  try { audio.pause(); } catch { /* ignore */ }
+  if (audio.getAttribute("src")) {
+    audio.removeAttribute("src");
+    try { audio.load(); } catch { /* ignore */ }
   }
-  refreshQueueUi();
-  toast(label ? `“${label}” plays next.` : `${nTracks(add.length)} play next.`, "ok");
 }
 
-// Enqueue / play-next an album: its tracks aren't on the row, so fetch them.
+function stopBrowser() {
+  br.gen++;
+  clearAudio();
+  br.stopped = true;
+  br.resumePos = 0;
+  paintCurrent();
+}
+
+// Play queue item `i` in this tab. A newer request always wins: every call
+// bumps br.gen and a reply for an older generation is ignored.
+async function playBrowserAt(i, { seek = 0, autoplay = true } = {}) {
+  if (pq.jump(i) === null) return;
+  const gen = ++br.gen;
+  const t = pq.current();
+  clearAudio();
+  br.stopped = false;
+  br.resumePos = seek || 0;
+  paintCurrent();
+  let r;
+  try { r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`); }
+  catch (e) { if (gen === br.gen && !onDevice()) trackFailed(t, e.message); return; }
+  if (gen !== br.gen || onDevice()) return;      // superseded (newer play / output switch)
+  br.loaded = t;
+  audio.src = `/stream/${r.token}${keyParam()}`;
+  if (seek > 0) {
+    audio.addEventListener("loadedmetadata", () => {
+      if (gen === br.gen) { try { audio.currentTime = seek; } catch { /* ignore */ } }
+    }, { once: true });
+  }
+  if (!autoplay) { paintPlayState(); return; }
+  try { await audio.play(); }
+  catch (e) {
+    if (gen !== br.gen) return;
+    if (e && e.name === "NotAllowedError") { toast("Press play to start."); }
+    // Media errors surface through the 'error' event (which skips ahead).
+  }
+  if (gen === br.gen) paintPlayState();
+}
+
+// A track wouldn't start: skip to the next one, and stop once every track in
+// the queue has failed in a row (so a dead account can't spin forever).
+function trackFailed(t, msg) {
+  br.failures += 1;
+  const n = pq.following(true);
+  const title = (t && t.title) || "track";
+  if (n === null || br.failures >= pq.tracks.length) {
+    br.failures = 0;
+    stopBrowser();
+    toastErr(pq.tracks.length > 1
+      ? `Couldn’t play “${title}” — stopped, nothing left in the queue would play. (${msg})`
+      : `Couldn’t play “${title}”: ${msg}`);
+    return;
+  }
+  toastErr(`Couldn’t play “${title}” — skipping. (${msg})`);
+  playBrowserAt(n);
+}
+
+audio.addEventListener("error", () => {
+  if (onDevice() || !br.loaded || !audio.getAttribute("src")) return;
+  const t = br.loaded, err = audio.error;
+  const msg = err ? (err.message || `media error ${err.code}`) : "stream error";
+  br.gen++;
+  clearAudio();
+  trackFailed(t, msg);
+});
+audio.addEventListener("playing", () => { br.failures = 0; paintPlayState(); });
+audio.addEventListener("play", () => { if (!onDevice()) paintPlayState(); });
+audio.addEventListener("pause", () => { if (!onDevice()) { paintPlayState(); savePlayback(); } });
+audio.addEventListener("ended", () => {
+  if (onDevice() || !br.loaded) return;
+  const n = pq.following(false);      // repeat-one holds only on a natural end
+  if (n === null) { stopBrowser(); return; }   // finished: stays on the last track
+  playBrowserAt(n);
+});
+audio.addEventListener("loadedmetadata", () => { if (!onDevice()) paintProgress(true); });
+let _posSavedAt = 0;
+audio.addEventListener("timeupdate", () => {
+  if (onDevice()) return;
+  paintProgress();
+  if (Date.now() - _posSavedAt > 5000) { _posSavedAt = Date.now(); savePlayback(); }
+});
+
+// -- device output ---------------------------------------------------------------
+
+const tgtNow = () => ({ host: state.target, via: state.targetVia });
+const sameTgt = (a) => a.host === state.target && (a.via || null) === (state.targetVia || null);
+const devUrl = (tgt, op) => `/api/devices/${encodeURIComponent(tgt.host)}/${op}`;
+const viaBody = (tgt, body) => (tgt.via ? { ...body, via: tgt.via } : body);
+// The server's cast meta reads art_url; the web client's tracks carry artwork_url.
+const wireTrack = (t) => ({ ...t, art_url: t.art_url || t.artwork_url || null, artwork_url: t.artwork_url || t.art_url || null });
+const normTrack = (t) => ({ ...t, artwork_url: t.artwork_url || t.art_url || "" });
+
+// Like api()/apiPost(), but a queue snapshot's own `error` field (the last
+// track that failed to start) is data, not a failed request.
+async function apiSnap(path, body, _retry) {
+  const init = body === undefined ? { headers: keyHeaders() }
+    : { method: "POST", headers: keyHeaders({ "Content-Type": "application/json" }), body: JSON.stringify(body) };
+  const r = await fetch(path, init);
+  if (r.status === 401 && !_retry && await promptKey()) return apiSnap(path, body, true);
+  const j = await r.json().catch(() => ({ error: `HTTP ${r.status}` }));
+  if (!r.ok) throw new Error((j && j.error) || `HTTP ${r.status}`);
+  if (!j || typeof j !== "object" || !Array.isArray(j.tracks)) throw new Error((j && j.error) || "unexpected reply");
+  return j;
+}
+
+async function devQueue(op, body = {}, tgt = tgtNow()) {
+  const g = ++dev.gen;
+  dev.inflight++;
+  try {
+    const snap = await apiSnap(devUrl(tgt, `queue/${op}`), viaBody(tgt, body));
+    if (sameTgt(tgt) && g >= dev.applied) { dev.applied = g; applySnapshot(snap); }
+    return snap;
+  } finally { dev.inflight--; }
+}
+async function devOp(op, body, what) {
+  try { return await devQueue(op, body || {}); }
+  catch (e) { toastErr(`Couldn’t ${what || op} on ${currentDeviceName()}: ${e.message}`); return null; }
+}
+
+let _pollBusy = false;
+async function pollDevice() {
+  if (!onDevice() || dev.inflight || _pollBusy) return;
+  const tgt = tgtNow(), g = ++dev.gen;
+  _pollBusy = true;
+  try {
+    const snap = await apiSnap(devUrl(tgt, "queue") + (tgt.via ? `?via=${encodeURIComponent(tgt.via)}` : ""));
+    if (sameTgt(tgt) && g >= dev.applied && !dev.inflight) { dev.applied = g; applySnapshot(snap); }
+  } catch { /* device mid-buffer / peer blip — the next poll catches up */ }
+  finally { _pollBusy = false; }
+}
+
+// Mirror a server snapshot {tracks, index, shuffle, repeat, playing, error,
+// state, position_s, duration_s, volume} into pq + the device state.
+function applySnapshot(s) {
+  if (!s || !Array.isArray(s.tracks)) return;
+  applyDeviceVolume(s.volume);
+  if (state.dragging) return;          // don't pull rows out from under a drag
+  const running = !!s.playing;
+  if (dev.pending) {
+    // Our queue is waiting for Play. A device busy with its own queue wins; on
+    // a restore, so does any queue the server still holds.
+    if (!(running || (dev.pending === "restore" && s.tracks.length))) { paintCurrent(); return; }
+    if (running && dev.pending === "handoff") toast(`${currentDeviceName()} is already playing — showing its queue.`);
+    dev.pending = null;
+  }
+  const idx = Number.isInteger(s.index) && s.index < s.tracks.length ? s.index : -1;
+  const sig = s.tracks.map(trackKey).join("|") + `#${idx}`;
+  const changed = sig !== dev.sig;
+  if (changed) {
+    const tracks = s.tracks.map(normTrack);
+    pq.tracks = tracks; pq.original = tracks.slice(); pq.index = idx;
+    dev.sig = sig;
+  }
+  pq.shuffle = !!s.shuffle;
+  if (REPEAT_MODES.includes(s.repeat)) pq.repeat = s.repeat;
+  dev.running = running;
+  if (!running || Date.now() >= dev.holdUntil) dev.paused = running && /paus/i.test(s.state || "");
+  const cur = pq.current();
+  dev.dur = Number(s.duration_s) || (cur && cur.duration_s) || 0;
+  dev.pos = running ? Math.max(0, Number(s.position_s) || 0) : 0;
+  if (s.error && s.error !== dev.lastErr) toastErr(`${currentDeviceName()}: ${s.error}`);
+  dev.lastErr = s.error || null;
+  persistPrefs();
+  if (changed) refreshQueueUi();
+  paintCurrent();
+}
+
+// 1s ticker while on a device: interpolate the bar, poll the queue every 2s.
+let devTimer = null, _devTick = 0;
+function stopDevicePoll() { if (devTimer) { clearInterval(devTimer); devTimer = null; } }
+function startDevicePoll() {
+  stopDevicePoll();
+  _devTick = 0;
+  devTimer = setInterval(() => {
+    if (!onDevice()) { stopDevicePoll(); return; }
+    _devTick++;
+    if (isPlaying()) {
+      dev.pos = dev.dur ? Math.min(dev.pos + 1, dev.dur) : dev.pos + 1;
+      paintProgress();
+    }
+    if (_devTick % 2 === 0) pollDevice();
+  }, 1000);
+}
+
+// Put our local queue on the device (a hand-off, or Play on a pending queue):
+// the list exactly as the listener has it, then seek to where they were.
+async function pushQueueToDevice(pos = 0) {
+  if (!pq.current()) return null;
+  dev.pending = null;
+  dev.running = true; dev.paused = false; dev.pos = pos || 0;
+  paintCurrent();
+  const tgt = tgtNow();
+  const snap = await devOp("load", {
+    tracks: pq.tracks.map(wireTrack), start: pq.index,
+    shuffle: pq.shuffle, repeat: pq.repeat, keep_order: true,
+  }, "start playback");
+  if (!snap) {                                   // keep the queue ready for another try
+    if (sameTgt(tgt)) { dev.pending = "handoff"; dev.pendingPos = pos || 0; dev.running = false; paintCurrent(); }
+    return null;
+  }
+  // Give the renderer a moment to start the stream before seeking into it.
+  if (pos > 1) setTimeout(() => { if (sameTgt(tgt) && dev.running) seekTo(pos); }, 1500);
+  return snap;
+}
+
+// -- volume ----------------------------------------------------------------------
+
+function setVolumeSliders(v) {
+  $("np-vol").value = v;
+  const nv = $("np-view-vol");
+  if (nv) nv.value = v;
+}
+function applyDeviceVolume(v) {
+  if (v == null || !onDevice() || Date.now() - dev.volSetAt < 4000) return;
+  const n = Number(v);
+  if (isFinite(n)) setVolumeSliders(Math.round(n));
+}
+let _volSentAt = 0, _volTimer = null;
+function setVolume(v) {
+  v = Math.max(0, Math.min(100, Math.round(v)));
+  setVolumeSliders(v);
+  if (!onDevice()) { audio.volume = v / 100; _prefVolume = v; persistPrefs(); return; }
+  dev.volSetAt = Date.now();
+  const tgt = tgtNow();
+  const send = () => {
+    _volSentAt = Date.now();
+    apiPost(devUrl(tgt, "volume"), viaBody(tgt, { level: v })).catch((e) => toastErr("Couldn’t set the volume: " + e.message));
+  };
+  clearTimeout(_volTimer);
+  // Throttled with a trailing send, so a drag doesn't flood the device.
+  if (Date.now() - _volSentAt > 300) send(); else _volTimer = setTimeout(send, 300);
+}
+
+// -- transport + queue ops (dispatch per output) -----------------------------------
+
+async function seekTo(sec) {
+  if (!pq.current()) return;
+  const dur = currentDur();
+  sec = Math.max(0, dur ? Math.min(sec, Math.max(0, dur - 1)) : sec);
+  if (onDevice()) {
+    if (dev.pending) { dev.pendingPos = sec; paintProgress(true); return; }
+    if (!dev.running) return;
+    dev.pos = sec; paintProgress(true);
+    devFence();
+    const tgt = tgtNow();
+    dev.inflight++;
+    try { await apiPost(devUrl(tgt, "seek"), viaBody(tgt, { level: Math.floor(sec) })); }
+    catch (e) { toastErr("Couldn’t seek: " + e.message); }
+    finally { dev.inflight--; }
+    return;
+  }
+  if (br.loaded) { try { audio.currentTime = sec; } catch { /* ignore */ } }
+  else br.resumePos = sec;
+  paintProgress(true);
+  savePlayback();
+}
+const seekBy = (d) => seekTo(currentPos() + d);
+
+// Start item `i` when the queue lives here (the browser, or a device our queue
+// isn't on yet — which then receives it).
+function startLocal(i, pos = 0) {
+  if (onDevice()) { if (pq.jump(i) === null) return null; return pushQueueToDevice(pos); }
+  return playBrowserAt(i, { seek: pos });
+}
+
+async function togglePlay() {
+  if (!pq.tracks.length) return;
+  if (onDevice()) {
+    if (dev.pending) { if (pq.index < 0) pq.jump(0); return pushQueueToDevice(dev.pendingPos); }
+    if (!dev.running) return devOp("jump", { index: Math.max(0, pq.index) }, "start playback");
+    const action = dev.paused ? "resume" : "pause";
+    dev.paused = !dev.paused; paintCurrent();      // optimistic; later polls confirm
+    devFence();
+    dev.holdUntil = Date.now() + 4000;
+    const tgt = tgtNow();
+    dev.inflight++;
+    try { await apiPost(devUrl(tgt, action), viaBody(tgt, {})); }
+    catch (e) { if (sameTgt(tgt)) { dev.paused = !dev.paused; dev.holdUntil = 0; paintCurrent(); } toastErr(`Couldn’t ${action}: ${e.message}`); }
+    finally { dev.inflight--; }
+    return;
+  }
+  // Only resume <audio> if it holds the CURRENT queue item — never a stale src.
+  if (br.loaded && br.loaded === pq.current() && audio.getAttribute("src")) {
+    if (audio.paused) { br.stopped = false; audio.play().catch(() => { /* 'error' handles it */ }); }
+    else audio.pause();
+    return;
+  }
+  return playBrowserAt(Math.max(0, pq.index), { seek: br.resumePos });
+}
+const doPlay = () => { if (!isPlaying()) togglePlay(); };
+const doPause = () => { if (isPlaying()) togglePlay(); };
+
+function doNext() {
+  if (!pq.tracks.length) return;
+  if (onDeviceLive()) return devOp("next", {}, "skip");
+  const n = pq.advance(true);
+  if (n === null) { if (!onDevice()) stopBrowser(); return; }
+  return startLocal(n);
+}
+
+function doPrev() {
+  if (!pq.tracks.length) return;
+  if (onDeviceLive()) return devOp("prev", {}, "go back");   // server restarts if >3s in
+  const before = pq.current();
+  const i = pq.previous(currentPos());
+  if (i === null) return;
+  // Restarting the loaded track: just rewind it.
+  if (!onDevice() && pq.current() === before && br.loaded === before && audio.getAttribute("src")) {
+    audio.currentTime = 0;
+    if (audio.paused) { br.stopped = false; audio.play().catch(() => {}); }
+    return;
+  }
+  return startLocal(i);
+}
+
+function jumpTo(i) {
+  if (onDeviceLive()) return devOp("jump", { index: i }, "play that track");
+  return startLocal(i);
+}
+
+// Stop: halt playback but keep the queue (and the stopped index) — Play then
+// restarts that track, not the first one.
+function stopPlayback() {
+  if (onDevice()) {
+    if (dev.pending) { dev.pendingPos = 0; paintCurrent(); return; }
+    dev.running = false; dev.paused = false; dev.pos = 0;
+    paintCurrent();
+    devOp("stop", {}, "stop");
+    return;
+  }
+  stopBrowser();
+}
+
+// Load a displayed list as the active queue and play from `index`
+// (index null / opts.shuffle → shuffle-play from a random track, shuffle on).
+function playFrom(list, index, opts = {}) {
+  const keep = [];
+  let start = null;
+  (list || []).forEach((t, i) => {
+    if (t && t.service && t.id != null && t.id !== "") { if (i === index) start = keep.length; keep.push({ ...t }); }
+  });
+  if (!keep.length) { toastErr("Nothing playable here."); return; }
+  if (opts.shuffle) { pq.shuffle = true; persistPrefs(); }
+  const shufflePlay = !!opts.shuffle || index == null;
+  if (!shufflePlay && start === null) start = 0;
+  if (onDevice()) {
+    // Optimistic: show the list now; the server's snapshot (its order) replaces it.
+    pq.load(keep, shufflePlay ? null : start);
+    dev.pending = null; dev.running = true; dev.paused = false; dev.pos = 0; dev.dur = 0;
+    paintAll();
+    // The UNshuffled list: the server applies shuffle itself, and we adopt its order.
+    devOp("load", { tracks: keep.map(wireTrack), start: shufflePlay ? null : start,
+                    shuffle: pq.shuffle, repeat: pq.repeat }, "start playback");
+    return;
+  }
+  pq.load(keep, shufflePlay ? null : start);
+  refreshQueueUi();
+  playBrowserAt(pq.index);
+}
+
+// Nothing is playing (so an enqueue starts what it adds).
+const localIdle = () => (onDevice() ? pq.index < 0 : (br.stopped || pq.index < 0));
+const playable = (tracks) => (tracks || []).filter((t) => t && t.service && t.id != null && t.id !== "").map((t) => ({ ...t }));
+
+// Append tracks to the END of the active queue (starts them if idle).
+function enqueueTracks(tracks, label) {
+  const add = playable(tracks);
+  if (!add.length) return;
+  const msg = label ? `Added “${label}” to the queue.` : `Added ${nTracks(add.length)} to the queue.`;
+  if (onDeviceLive()) {
+    devOp("enqueue", { tracks: add.map(wireTrack) }, "add to the queue").then((s) => { if (s) toast(msg, "ok"); });
+    return;
+  }
+  const start = pq.enqueue(add, localIdle());
+  refreshQueueUi(); paintCurrent();
+  if (start !== null) startLocal(start); else toast(msg, "ok");
+}
+
+// Insert tracks right after the current one (starts them if idle).
+function playNextTracks(tracks, label) {
+  const add = playable(tracks);
+  if (!add.length) return;
+  const msg = label ? `“${label}” plays next.` : `${nTracks(add.length)} play next.`;
+  if (onDeviceLive()) {
+    devOp("play_next", { tracks: add.map(wireTrack) }, "queue that").then((s) => { if (s) toast(msg, "ok"); });
+    return;
+  }
+  const start = pq.playNext(add, localIdle());
+  refreshQueueUi(); paintCurrent();
+  if (start !== null) startLocal(start); else toast(msg, "ok");
+}
+
+// Remove one queue item; removing the playing one plays whatever slid into its slot.
+function removeFromQueue(i) {
+  if (onDeviceLive()) return devOp("remove", { index: i }, "remove that track");
+  const idle = onDevice() || br.stopped;
+  const [removedCur, start] = pq.remove(i);
+  if (removedCur) {
+    if (!idle && start !== null) { startLocal(start); refreshQueueUi(); return; }
+    if (!idle) stopBrowser();
+    else if (onDevice()) dev.pendingPos = 0;
+    else { clearAudio(); br.resumePos = 0; }
+  }
+  refreshQueueUi(); paintCurrent();
+}
+
+// Clear keeps the current track.
+function clearQueue() {
+  if (onDeviceLive()) return devOp("clear", {}, "clear the queue");
+  pq.clear();
+  refreshQueueUi(); paintCurrent();
+}
+
+function moveInQueue(from, to) {
+  if (onDeviceLive()) {
+    devOp("move", { from, to }, "reorder the queue").then((s) => { if (!s) renderNowPlaying(); });
+    return;
+  }
+  pq.move(from, to);
+  refreshQueueUi(); paintCurrent();
+}
+
+function toggleShuffle() {
+  const on = !pq.shuffle;
+  if (onDeviceLive()) { pq.shuffle = on; paintModes(); devOp("shuffle", { on }, "change shuffle"); return; }
+  pq.setShuffle(on);
+  persistPrefs();
+  refreshQueueUi(); paintCurrent();
+}
+
+function cycleRepeat() {
+  const mode = pq.repeat === "off" ? "all" : pq.repeat === "all" ? "one" : "off";
+  if (onDeviceLive()) { pq.repeat = mode; paintModes(); devOp("repeat", { mode }, "change repeat"); return; }
+  pq.setRepeat(mode);
+  persistPrefs(); paintModes(); savePlayback();
+}
+
+// Enqueue / play-next / play an album: its tracks aren't on the row, so fetch them.
 async function albumToQueue(a, where) {
   try {
     const d = await api(`/api/album/${encodeURIComponent(a.service)}/${encodeURIComponent(a.id)}`);
     const tracks = d.tracks || [];
     if (!tracks.length) { toastErr("That album has no playable tracks."); return; }
-    (where === "next" ? playNextTracks : enqueueTracks)(tracks, a.title || "album");
+    collectionTo(tracks, where === "next" ? "next" : where === "play" || where === "shuffle" ? where : "end", a.title || "album");
   } catch (e) { toastErr("Couldn’t load that album: " + e.message); }
 }
 
-// Auto-advance / Next: honour repeat (one → replay; all → wrap; off → stop at end).
-function playNextInQueue(auto) {
-  if (!state.activeQueue.length) return;
-  if (auto && state.repeat === "one") return playActive(state.activeIndex);
-  let i = state.activeIndex + 1;
-  if (i >= state.activeQueue.length) {
-    if (state.repeat === "all") i = 0; else return;
+// -- output switching (hand-offs) ------------------------------------------------
+
+function syncDeviceSelect() {
+  const sel = $("np-device");
+  if (!sel) return;
+  const v = onDevice() ? encodeTarget(state.target, state.targetVia) : "browser";
+  if (![...sel.options].some((o) => o.value === v)) {
+    const o = document.createElement("option");
+    o.value = v;
+    o.textContent = state.targetVia ? `${state.target} (via ${state.targetVia})` : state.target;
+    sel.appendChild(o);
   }
-  playActive(i);
+  sel.value = v;
 }
 
-function playPrevInQueue() {
-  if (!state.activeQueue.length) return;
-  let i = state.activeIndex - 1;
-  if (i < 0) i = state.repeat === "all" ? state.activeQueue.length - 1 : 0;
-  playActive(i);
-}
+// Move playback to another output, carrying the queue and position over:
+//   browser → device: pause <audio>, load the queue there, seek to where we were
+//   device → browser: stop the device, play here from its last position
+//   device → device:  stop the old one, load the new one
+// A paused/stopped queue isn't pushed — it waits on the new output for Play.
+function switchOutput(value) {
+  value = value || "browser";
+  const from = tgtNow();
+  if (value === (from.host === "browser" ? "browser" : encodeTarget(from.host, from.via))) return;
+  const fromDevice = from.host !== "browser";
+  const hadQueue = !!pq.current();
+  const pos = currentPos();
+  const wasPlaying = isPlaying();
+  const wasStopped = fromDevice ? (!dev.pending && !dev.running) : br.stopped;
+  const oldRunning = fromDevice && !dev.pending && dev.running;
 
-async function playActive(i) {
-  if (i < 0 || i >= state.activeQueue.length) return;
-  const t = state.activeQueue[i];
-  state.activeIndex = i;
-  highlightPlaying();
-  updateNowPlayingView();
-  $("np-title").textContent = t.title;
-  $("np-artist").textContent = t.artist;
-  $("nowplaying").classList.remove("empty");
-  setArt(t.artwork_url);
-  updateMediaSession(t);
-  updateCastChip();
-  try {
-    if (onDevice()) {
-      resetCastProgress(t.duration_s);
-      await apiPost(`/api/devices/${encodeURIComponent(state.target)}/play`,
-        withVia({ service: t.service, id: t.id, meta: { title: t.title, artist: t.artist, album: t.album, art_url: t.artwork_url, duration_s: t.duration_s } }));
-      state.devicePaused = false;
-      setPlayIcon(true);
-      startDevicePoll();
-    } else {
-      stopDevicePoll();
-      const r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`);
-      audio.src = `/stream/${r.token}${keyParam()}`;
-      await audio.play();
-    }
-  } catch (e) {
-    toastErr(`Couldn’t play “${t.title}”: ${e.message}`);
-  }
-}
-
-// Stop: halt playback and reset the bar to its "nothing playing" state. For a
-// cast target this tears the cast down via the same device-control stop path the
-// cast flow uses; for the browser it pauses and rewinds the <audio> element.
-function stopPlayback() {
-  if (onDevice()) {
-    apiPost(`/api/devices/${encodeURIComponent(state.target)}/stop`, withVia({})).catch(() => { /* best-effort */ });
-  }
+  setTargetValue(value);
+  syncDeviceSelect();
   stopDevicePoll();
-  try { audio.pause(); } catch { /* ignore */ }
-  try { audio.currentTime = 0; } catch { /* ignore */ }
-  audio.removeAttribute("src");
-  try { audio.load(); } catch { /* ignore */ }
-  state.activeIndex = -1;
-  state.devicePaused = false;
-  castPos = 0; castDur = 0; castLastReported = null;
-  setPlayIcon(false);
-  $("np-seek").value = 0; $("np-seek").max = 1;
-  $("np-pos").textContent = "0:00"; $("np-dur").textContent = "0:00";
-  $("np-title").textContent = "Nothing playing";
-  $("np-artist").textContent = "";
-  $("nowplaying").classList.add("empty");
-  highlightPlaying();
-  updateNowPlayingView();
-}
-$("np-stop").addEventListener("click", stopPlayback);
+  dev.gen++; dev.applied = dev.gen;       // drop replies meant for the old output
+  if (oldRunning) devQueue("stop", {}, from).catch(() => { /* best-effort */ });
+  Object.assign(dev, { running: false, paused: false, pos: 0, dur: 0, sig: "", lastErr: null, pending: null, pendingPos: 0, volSetAt: 0, holdUntil: 0 });
+  if (!fromDevice) { br.gen++; clearAudio(); br.stopped = true; }
 
-$("np-device").addEventListener("change", (e) => {
-  const prev = state.target;
-  setTargetValue(e.target.value);
-  if (prev === "browser" && onDevice()) audio.pause();
-  if (!onDevice()) stopDevicePoll();
-  updateCastChip();
-});
-
-$("np-play").addEventListener("click", async () => {
   if (onDevice()) {
-    if (state.activeIndex < 0) { if (state.activeQueue.length) return playActive(0); return; }
-    try { await apiPost(`/api/devices/${encodeURIComponent(state.target)}/${state.devicePaused ? "resume" : "pause"}`, withVia({}));
-      state.devicePaused = !state.devicePaused; setPlayIcon(!state.devicePaused); } catch { /* ignore */ }
-    return;
+    startDevicePoll();
+    if (hadQueue && wasPlaying) pushQueueToDevice(pos);
+    else {
+      if (hadQueue) { dev.pending = "handoff"; dev.pendingPos = wasStopped ? 0 : pos; }
+      pollDevice();
+    }
+  } else {
+    setVolumeSliders(_prefVolume); audio.volume = _prefVolume / 100;
+    br.stopped = wasStopped || !hadQueue;
+    br.resumePos = wasStopped ? 0 : pos;
+    if (hadQueue && wasPlaying) playBrowserAt(pq.index, { seek: pos });
   }
-  if (!audio.src) { if (state.activeQueue.length) playActive(state.activeIndex >= 0 ? state.activeIndex : 0); return; }
-  audio.paused ? audio.play() : audio.pause();
-});
-$("np-prev").addEventListener("click", () => playPrevInQueue());
-$("np-next").addEventListener("click", () => playNextInQueue(false));
-audio.addEventListener("ended", () => playNextInQueue(true));
-audio.addEventListener("play", () => setPlayIcon(true));
-audio.addEventListener("pause", () => setPlayIcon(false));
-audio.addEventListener("loadedmetadata", () => {
-  $("np-seek").max = Math.floor(audio.duration || 1);
-  $("np-dur").textContent = fmtTime(audio.duration);
-});
-audio.addEventListener("timeupdate", () => {
-  if (!seeking) { $("np-seek").value = Math.floor(audio.currentTime); }
-  $("np-pos").textContent = fmtTime(audio.currentTime);
-});
-let seeking = false;
-$("np-seek").addEventListener("input", () => { if (onDevice()) return; seeking = true; $("np-pos").textContent = fmtTime($("np-seek").value); });
-$("np-seek").addEventListener("change", () => { if (onDevice()) return; audio.currentTime = Number($("np-seek").value); seeking = false; });
-$("np-vol").addEventListener("input", () => {
-  if (onDevice()) { apiPost(`/api/devices/${encodeURIComponent(state.target)}/volume`, withVia({ level: Number($("np-vol").value) })).catch(() => {}); }
-  else { audio.volume = $("np-vol").value / 100; }
+  paintAll();
+  savePlaybackNow();
+}
+
+// -- persistence: the queue survives a reload ---------------------------------------
+
+const QKEY = "harmonyQueue";
+const SLIM_KEYS = ["service", "id", "title", "artist", "album", "artwork_url", "art_url", "duration_s",
+                   "artist_ids", "album_id", "track_number"];
+const slimTrack = (t) => { const o = {}; SLIM_KEYS.forEach((k) => { if (t[k] != null) o[k] = t[k]; }); return o; };
+let _saveT = null;
+function savePlayback() { clearTimeout(_saveT); _saveT = setTimeout(savePlaybackNow, 400); }
+function savePlaybackNow() {
+  clearTimeout(_saveT);
+  try {
+    const orig = pq.original.map((t) => pq.tracks.indexOf(t));
+    localStorage.setItem(QKEY, JSON.stringify({
+      v: 1, tracks: pq.tracks.map(slimTrack), index: pq.index,
+      original: orig.length === pq.tracks.length && orig.every((i) => i >= 0) ? orig : null,
+      pos: Math.floor(currentPos() || 0),
+      target: onDevice() ? encodeTarget(state.target, state.targetVia) : "browser",
+    }));
+  } catch { /* storage full / blocked: not fatal */ }
+}
+window.addEventListener("pagehide", savePlaybackNow);
+document.addEventListener("visibilitychange", () => { if (document.hidden) savePlaybackNow(); });
+
+// Restore the last queue shown PAUSED (no autoplay). On a device, the server's
+// queue is the truth — ours is only a fallback when the device has none.
+function restorePlayback() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem(QKEY) || "null"); } catch { s = null; }
+  if (s && Array.isArray(s.tracks) && s.tracks.length) {
+    const tracks = s.tracks.filter((t) => t && t.service && t.id != null && t.id !== "");
+    if (tracks.length === s.tracks.length) {
+      pq.tracks = tracks;
+      pq.index = Number.isInteger(s.index) && s.index >= 0 && s.index < tracks.length ? s.index : 0;
+      const orig = Array.isArray(s.original) && s.original.length === tracks.length
+        ? s.original.map((i) => tracks[i]).filter(Boolean) : null;
+      pq.original = orig && orig.length === tracks.length ? orig : tracks.slice();
+    }
+  }
+  const pos = s && Number(s.pos) > 0 ? Number(s.pos) : 0;
+  setTargetValue(s && typeof s.target === "string" && s.target ? s.target : "browser");
+  setVolumeSliders(_prefVolume);
+  audio.volume = _prefVolume / 100;
+  if (onDevice()) {
+    if (pq.current()) { dev.pending = "restore"; dev.pendingPos = pos; }
+    startDevicePoll();
+    pollDevice();
+  } else {
+    br.stopped = !pq.current();
+    br.resumePos = pos;
+  }
+  syncDeviceSelect();
+  paintCurrent();
+}
+
+// -- wiring: bar, keyboard, Media Session -------------------------------------------
+
+$("np-play").addEventListener("click", () => togglePlay());
+$("np-prev").addEventListener("click", () => doPrev());
+$("np-next").addEventListener("click", () => doNext());
+$("np-stop").addEventListener("click", () => stopPlayback());
+wireModeButtons($("nowplaying"));
+$("np-seek").addEventListener("input", () => { seeking = true; $("np-pos").textContent = fmtTime(Number($("np-seek").value)); });
+$("np-seek").addEventListener("change", () => { seeking = false; seekTo(Number($("np-seek").value)); });
+$("np-vol").addEventListener("input", () => setVolume(Number($("np-vol").value)));
+$("np-device").addEventListener("change", (e) => switchOutput(e.target.value));
+
+// Keyboard: Space play/pause, ←/→ seek ±10s, Shift+←/→ prev/next, S shuffle,
+// R repeat — unless typing in a field or a dialog/menu is open.
+document.addEventListener("keydown", (e) => {
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+  const el = e.target;
+  if (el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName))) return;
+  if (document.querySelector(".modal-back, .addmenu")) return;
+  const k = e.key;
+  if (k === " " || k === "Spacebar") { e.preventDefault(); togglePlay(); }
+  else if (k === "ArrowRight" && e.shiftKey) { e.preventDefault(); doNext(); }
+  else if (k === "ArrowLeft" && e.shiftKey) { e.preventDefault(); doPrev(); }
+  else if (k === "ArrowRight") { e.preventDefault(); seekBy(10); }
+  else if (k === "ArrowLeft") { e.preventDefault(); seekBy(-10); }
+  else if (k === "s" || k === "S") { e.preventDefault(); toggleShuffle(); }
+  else if (k === "r" || k === "R") { e.preventDefault(); cycleRepeat(); }
 });
 
 if ("mediaSession" in navigator) {
-  const ms = navigator.mediaSession;
-  ms.setActionHandler("play", () => $("np-play").click());
-  ms.setActionHandler("pause", () => $("np-play").click());
-  ms.setActionHandler("previoustrack", () => playPrevInQueue());
-  ms.setActionHandler("nexttrack", () => playNextInQueue(false));
+  const set = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch { /* unsupported */ } };
+  set("play", doPlay);
+  set("pause", doPause);
+  set("stop", stopPlayback);
+  set("previoustrack", doPrev);
+  set("nexttrack", doNext);
+  set("seekto", (d) => { if (d && d.seekTime != null) seekTo(d.seekTime); });
+  set("seekbackward", (d) => seekBy(-((d && d.seekOffset) || 10)));
+  set("seekforward", (d) => seekBy((d && d.seekOffset) || 10));
 }
 
 async function loadDevices() {
   try {
     const devs = (await api("/api/devices?peers=1")).devices || [];
     const sel = $("np-device");
-    const cur = sel.value;
     while (sel.options.length > 1) sel.remove(1);
     for (const d of devs) {
       const o = document.createElement("option");
@@ -1694,8 +2584,10 @@ async function loadDevices() {
       o.textContent = d.via ? `${d.name} (via ${d.via_name || d.via})` : d.name;
       sel.appendChild(o);
     }
-    if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
   } catch { /* no devices */ }
+  syncDeviceSelect();
+  updateCastChip();
+  updateNowPlayingView();
 }
 
 // -- wiring -----------------------------------------------------------------
@@ -1732,6 +2624,7 @@ document.querySelectorAll("#nav li[data-view]").forEach((el) => {
 document.querySelectorAll("#mobilenav button").forEach((el) => el.addEventListener("click", () => goView(el.dataset.view)));
 $("accounts").addEventListener("click", () => goView("accounts"));
 window.addEventListener("hashchange", renderRoute);
+restorePlayback();   // last queue, shown paused (a device's comes from the server)
 loadAccounts();
 loadDevices();
 loadLidarrStatus();

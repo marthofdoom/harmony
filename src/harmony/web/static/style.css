@@ -135,6 +135,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .trow:hover { background: var(--row-hover); }
 .rowacts { display: flex; gap: var(--sp-1); opacity: 0; }
 .trow:hover .rowacts, .trow:focus-within .rowacts { opacity: 1; }
+/* Touch has no hover: row actions (incl. the ⋯ menu) are always visible. */
+@media (hover: none) { .rowacts { opacity: 1; } }
 .mini { border: none; background: none; color: var(--muted); cursor: pointer;
         width: 2rem; height: 2rem; border-radius: 50%; display: grid; place-items: center; }
 .mini:hover { background: var(--row-hover); color: var(--fg); }
@@ -154,13 +156,20 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .trow .play:hover { background: var(--row-hover); }
 .trow .play .ico { width: 1.15rem; height: 1.15rem; }
 .trow .title { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; font-weight: 550; }
-.trow .title .tt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.trow .title .tt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; text-decoration: none; min-width: 0; }
+.trow .title a.tt:hover { text-decoration: underline; }
+@media (hover: none) { .trow { cursor: pointer; } }
+.link-plain { color: inherit; text-decoration: none; }
+.link-plain:hover { text-decoration: underline; }
 .trow .artist, .trow .dur { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .trow .dur { text-align: right; font-variant-numeric: tabular-nums; }
 .eq { display: inline-flex; gap: 2px; align-items: flex-end; height: 1rem; }
 .eq span { width: 3px; background: currentColor; border-radius: 1px; animation: eq 1s ease-in-out infinite; }
 .eq span:nth-child(2) { animation-delay: .2s; } .eq span:nth-child(3) { animation-delay: .4s; }
 @keyframes eq { 0%,100% { height: 30%; } 50% { height: 100%; } }
+/* Paused / stopped: the bars hold still. */
+.eq.still span { animation: none; height: 55%; }
+.eq.still span:nth-child(2) { height: 85%; } .eq.still span:nth-child(3) { height: 40%; }
 .badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border); flex: none;
          border-radius: var(--r-sm); padding: 0 .3rem; }
 .badge.remote { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
@@ -168,7 +177,21 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 /* Now Playing queue: header controls (shuffle / repeat) + drag-to-reorder */
 .qhead { display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-3); }
 .qhead h3 { margin: 0; flex: 1; font-size: 1rem; font-weight: 650; }
-.qctrls { display: flex; gap: var(--sp-1); }
+.qctrls { display: flex; gap: var(--sp-1); align-items: center; flex-wrap: wrap; justify-content: flex-end; }
+.qcount { font-size: 12.5px; font-weight: 400; margin-left: var(--sp-1); }
+.act.small { padding: .3rem .65rem; font-size: 13px; }
+.act.icon-only { padding: .45rem .55rem; }
+.act.icon-only .ico { vertical-align: -.2em; }
+.hero-acts { display: flex; flex-wrap: wrap; gap: var(--sp-2); align-items: center; margin-top: var(--sp-3); }
+.detail-sec.hero-acts { margin-top: 0; }
+.toolbar-row.wrap { flex-wrap: wrap; }
+.toolbar-row .hero-acts { margin-top: 0; }
+.sec-head .act.small { flex: none; }
+/* device volume inside Now Playing (shown while casting — phones hide the bar's) */
+.npvol { display: none; align-items: center; gap: var(--sp-2); margin-top: var(--sp-3); color: var(--muted); max-width: 260px; }
+.npvol.show { display: flex; }
+.npvol .ico { width: 1.1rem; height: 1.1rem; flex: none; }
+.npvol input { flex: 1; accent-color: var(--accent); }
 .qbtn { border: none; background: none; color: var(--muted); cursor: pointer;
         width: 2.25rem; height: 2.25rem; border-radius: 50%; display: grid; place-items: center; }
 .qbtn:hover { background: var(--row-hover); color: var(--fg); }
@@ -182,7 +205,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 /* playlist grid */
 .plgrid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: var(--sp-3); }
 .plcard { background: var(--card); border: 1px solid var(--border); border-radius: var(--r-lg);
-          padding: var(--sp-3); cursor: pointer; }
+          padding: var(--sp-3); cursor: pointer; position: relative; }
+.plcard .more { position: absolute; top: calc(var(--sp-3) + 4px); right: calc(var(--sp-3) + 4px);
+                background: var(--card); box-shadow: var(--shadow-1); opacity: 0; }
+.plcard:hover .more, .plcard:focus-within .more { opacity: 1; }
+@media (hover: none) { .plcard .more { opacity: 1; } }
 .plcard:hover { border-color: var(--accent); }
 .plcard .art { width: 100%; aspect-ratio: 1; border-radius: var(--r-md); background: var(--row-hover);
                object-fit: cover; margin-bottom: var(--sp-2); display: grid; place-items: center; color: var(--muted); }
@@ -206,6 +233,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 #np-art { width: 44px; height: 44px; border-radius: var(--r-sm); background: var(--row-hover);
           object-fit: cover; flex: none; display: grid; place-items: center; color: var(--muted); }
 #np-art.fallback { padding: 10px; }
+#np-art { overflow: hidden; }
+#np-art .ico { width: 100%; height: 100%; }
 #np-meta { min-width: 150px; max-width: 240px; }
 #np-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #np-artist { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -229,7 +258,9 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
              border-radius: var(--r-md); padding: .35rem .4rem; font: inherit; max-width: 150px; }
 #nowplaying.empty { color: var(--muted); }
 #nowplaying.empty #np-transport button, #nowplaying.empty #np-seek { opacity: .45; pointer-events: none; }
-#nowplaying.casting #np-seek { opacity: .5; pointer-events: none; }
+#np-transport .mode { color: var(--muted); }
+#np-transport .mode.on { color: var(--accent); }
+#np-transport .mode .ico { width: 1.1rem; height: 1.1rem; }
 
 /* -- shared blocks (accounts / sync cards, muted text) -------------------- */
 .muted { color: var(--muted); }
@@ -294,7 +325,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 
 /* album rows (discography / smart search) */
 .albrows { display: flex; flex-direction: column; }
-.albrow { display: grid; grid-template-columns: 3.2rem 2.4rem 1fr auto; gap: var(--sp-3); align-items: center;
+.albrow { display: grid; grid-template-columns: 3.2rem 2.4rem 1fr auto auto; gap: var(--sp-3); align-items: center;
           padding: var(--sp-2); border-radius: var(--r-md); color: inherit; text-decoration: none; cursor: pointer; }
 .albrow:hover { background: var(--row-hover); }
 .albrow.info { cursor: default; color: var(--muted); }
@@ -305,6 +336,10 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .alb-art .artimg { width: 100%; height: 100%; object-fit: cover; }
 .alb-art .ico { width: 1.1rem; height: 1.1rem; }
 .alb-meta { min-width: 0; }
+.albrow .more { opacity: 0; }
+.albrow:hover .more, .albrow:focus-within .more, .albrow .more:focus-visible { opacity: 1; }
+@media (hover: none) { .albrow .more { opacity: 1; } }
+.chipwrap { display: inline-flex; align-items: center; gap: 2px; max-width: 100%; }
 .alb-title { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .alb-artist { font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 
@@ -326,6 +361,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .trow.numbered.playing .tlead .play { opacity: 1; }
 .trow.numbered:hover .tlead .tnum, .trow.numbered:focus-within .tlead .tnum,
 .trow.numbered.playing .tlead .tnum { opacity: 0; }
+/* Touch: no hover to reveal the play button over the track number — show it. */
+@media (hover: none) {
+  .trow.numbered .tlead .play { opacity: 1; }
+  .trow.numbered .tlead .tnum { opacity: 0; }
+}
 
 /* performers */
 .perf { display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-start; }
@@ -376,26 +416,29 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
   #search { flex-basis: 100%; max-width: none; margin-left: 0; }
 
   /* track rows: drop the separate artist/duration columns for width */
-  .trow { grid-template-columns: 2rem 1fr auto; }
+  .trow { grid-template-columns: 2.75rem 1fr auto; }
+  .tlead { width: 2.75rem; height: 2.75rem; }
   .trow .artist, .trow .dur { display: none; }
   .rowacts { opacity: 1; }               /* no hover on touch — always show */
   .mini, .trow .play { width: 2.75rem; height: 2.75rem; }
 
-  /* now playing: art + meta + transport on row 1, seek full-width on row 2 */
-  #nowplaying { flex-wrap: wrap; gap: .4rem .6rem; padding: var(--sp-2) var(--sp-3); }
+  /* now playing: art + meta + output on row 1, the whole transport (shuffle,
+     prev, play, next, repeat, stop) on row 2, seek full-width on row 3 */
+  #nowplaying { flex-wrap: wrap; gap: .3rem .6rem; padding: var(--sp-2) var(--sp-3); }
   #np-art { width: 40px; height: 40px; }
-  #np-meta { display: block; flex: 1 1 auto; min-width: 0; max-width: none; }
-  #np-transport { order: 3; }
+  #np-meta { display: block; flex: 1 1 0; min-width: 0; max-width: none; }
+  #np-device { order: 2; max-width: 128px; }
+  #np-transport { order: 3; flex-basis: 100%; justify-content: space-evenly; }
   #np-transport button { width: 2.75rem; height: 2.75rem; }
-  #np-device { order: 2; max-width: 130px; }
   #np-seekwrap { order: 4; flex-basis: 100%; }
-  #np-vol { display: none; }              /* phones use hardware volume */
-  #toast { bottom: calc(9rem + env(safe-area-inset-bottom, 0px)); }
+  #np-vol { display: none; }              /* phones: hardware volume; casting → Now Playing view */
+  .albrow { grid-template-columns: 2.6rem 1fr auto auto; }
+  .detail-hero { flex-wrap: wrap; }
+  #toast { bottom: calc(12rem + env(safe-area-inset-bottom, 0px)); }
 
   /* detail pages: smaller hero, and the album-row art column drops out */
   .detail-hero { gap: var(--sp-3); }
   .detail-art { width: 104px; height: 104px; }
   .detail-title { font-size: 1.3rem; }
-  .albrow { grid-template-columns: 2.6rem 1fr auto; }
   .albrow .alb-art { display: none; }
 }

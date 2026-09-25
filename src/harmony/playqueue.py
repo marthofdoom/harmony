@@ -102,8 +102,11 @@ class PlayQueue:
     def previous(self, position_s: float | None = None) -> int | None:
         if not self.tracks:
             return None
-        if (position_s or 0) > RESTART_AFTER_S or self.index < 0:
-            return max(self.index, 0)
+        if self.index < 0:
+            self.index = 0
+            return 0
+        if (position_s or 0) > RESTART_AFTER_S:
+            return self.index
         if self.index > 0:
             self.index -= 1
         elif self.repeat == "all":

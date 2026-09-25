@@ -40,6 +40,8 @@
       <symbol id="i-repeat" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></symbol>
       <symbol id="i-repeat-one" viewBox="0 0 24 24"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/><text x="12" y="14.5" font-size="8" fill="currentColor" stroke="none" text-anchor="middle">1</text></symbol>
       <symbol id="i-drag" viewBox="0 0 24 24"><path d="M8 7h8M8 12h8M8 17h8"/></symbol>
+      <symbol id="i-more" viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.6" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.6" fill="currentColor" stroke="none"/></symbol>
+      <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18"/></symbol>
     </defs>
   </svg>
 
@@ -74,10 +76,12 @@
       <div id="np-via"><svg class="ico" style="width:.9rem;height:.9rem"><use href="#i-cast"></use></svg><span></span></div>
     </div>
     <div id="np-transport">
-      <button id="np-prev" aria-label="Previous track"><svg class="ico"><use href="#i-prev"></use></svg></button>
-      <button id="np-play" class="play" aria-label="Play"><svg class="ico"><use href="#i-play"></use></svg></button>
-      <button id="np-next" aria-label="Next track"><svg class="ico"><use href="#i-next"></use></svg></button>
-      <button id="np-stop" aria-label="Stop"><svg class="ico"><use href="#i-stop"></use></svg></button>
+      <button id="np-shuffle" class="mode js-shuffle" type="button" aria-label="Shuffle" aria-pressed="false" title="Shuffle (S)"><svg class="ico"><use href="#i-shuffle"></use></svg></button>
+      <button id="np-prev" type="button" aria-label="Previous track" title="Previous (Shift+←)"><svg class="ico"><use href="#i-prev"></use></svg></button>
+      <button id="np-play" class="play" type="button" aria-label="Play" title="Play / pause (Space)"><svg class="ico"><use href="#i-play"></use></svg></button>
+      <button id="np-next" type="button" aria-label="Next track" title="Next (Shift+→)"><svg class="ico"><use href="#i-next"></use></svg></button>
+      <button id="np-repeat" class="mode js-repeat" type="button" aria-label="Repeat: off" title="Repeat (R)"><svg class="ico"><use href="#i-repeat"></use></svg></button>
+      <button id="np-stop" type="button" aria-label="Stop" title="Stop"><svg class="ico"><use href="#i-stop"></use></svg></button>
     </div>
     <div id="np-seekwrap">
       <span class="time" id="np-pos">0:00</span>
