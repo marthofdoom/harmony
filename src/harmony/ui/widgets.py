@@ -339,6 +339,7 @@ def build_track_column_view(
     on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None = None,
     state: object | None = None,
     on_row_activate: Callable[[Track], None] | None = None,
+    on_play_from: Callable[[list[Track], int], None] | None = None,
 ) -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
     """Build a multi-select ``Gtk.ColumnView`` for track lists.
 
@@ -359,16 +360,23 @@ def build_track_column_view(
     ``playback-changed`` and to its own store's changes, so newly-loaded results
     also reflect what's playing.
 
-    ``on_row_activate``, if given, is called with a row's ``Track`` when the row
-    is activated (double-click or Enter) -- wired to play the track on the
-    active device.
+    ``on_play_from``, if given, is called with ``(all tracks, row index)`` when
+    a row is activated (double-click or Enter) -- play the list from that row.
+    ``on_row_activate`` is the single-track variant (the Now Playing queue).
     """
     store = Gio.ListStore(item_type=TrackObject)
     selection = Gtk.MultiSelection(model=store)
     column_view = Gtk.ColumnView(model=selection)
     column_view.add_css_class("data-table")
     column_view.set_show_row_separators(True)
-    if on_row_activate is not None:
+    if on_play_from is not None:
+        # Activating a row plays the WHOLE list from that row (a real queue),
+        # the way every music player treats an album or playlist.
+        def _on_activate_list(_cv: Gtk.ColumnView, position: int) -> None:
+            tracks = [store.get_item(i).track for i in range(store.get_n_items())]
+            on_play_from(tracks, position)
+        column_view.connect("activate", _on_activate_list)
+    elif on_row_activate is not None:
         def _on_activate(_cv: Gtk.ColumnView, position: int) -> None:
             item = store.get_item(position)
             if isinstance(item, TrackObject):

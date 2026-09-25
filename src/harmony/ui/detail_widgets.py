@@ -21,7 +21,9 @@ from gi.repository import Adw, Gtk  # noqa: E402
 from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     play_collection_on_device,
-    play_track_here,
+    play_from_list,
+    play_toolbar,
+    queue_actions,
 )
 from harmony.ui.entity_nav import Navigator, load_artwork_into, track_from_dict  # noqa: E402
 from harmony.ui.widgets import (  # noqa: E402
@@ -139,6 +141,7 @@ def track_menu_builder(state: Any, navigator: Navigator, anchor_getter: Callable
     def build(track: Any) -> list[tuple[str, Callable[[], None]]]:
         anchor = anchor_getter()
         actions: list[tuple[str, Callable[[], None]]] = [
+            *queue_actions(state, lambda: [track]),
             ("Play on Device",
              lambda: play_collection_on_device(anchor, state, label=track.title, fetch_tracks=lambda: [track])),
             ("Add to Playlist…",
@@ -155,19 +158,29 @@ def track_menu_builder(state: Any, navigator: Navigator, anchor_getter: Callable
 
 
 def tracks_widget(track_dicts: list[dict[str, Any]], state: Any, navigator: Navigator,
-                  *, title: str | None = None) -> Gtk.Widget:
-    """A titled, naturally-sized track list reusing Search's column view."""
+                  *, title: str | None = None,
+                  collection_key: tuple[Any, str] | None = None) -> Gtk.Widget:
+    """A titled, naturally-sized track list reusing Search's column view, with
+    Play / Shuffle / Play Next / Add to Queue for the whole list above it.
+    Double-click plays the list from that row."""
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+    tracks = [track_from_dict(d) for d in track_dicts]
+    header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
     if title:
-        heading = Gtk.Label(label=title, xalign=0.0)
+        heading = Gtk.Label(label=title, xalign=0.0, hexpand=True)
         heading.add_css_class("heading")
-        box.append(heading)
+        header.append(heading)
+    if tracks:
+        header.append(play_toolbar(state, lambda: tracks, collection_key=collection_key))
+        box.append(header)
+    elif title:
+        box.append(header)
     holder: dict[str, Gtk.Widget] = {}
     column_view, store, _sel = build_track_column_view(
         on_row_menu=track_menu_builder(state, navigator, lambda: holder["cv"]), state=state,
-        on_row_activate=lambda t: play_track_here(state, t))
+        on_play_from=lambda ts, i: play_from_list(state, ts, i, collection_key=collection_key))
     holder["cv"] = column_view
-    replace_tracks(store, [track_from_dict(d) for d in track_dicts])
+    replace_tracks(store, tracks)
     scroller = Gtk.ScrolledWindow(child=column_view)
     scroller.set_propagate_natural_height(True)
     scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)

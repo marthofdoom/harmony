@@ -40,21 +40,7 @@ def state(monkeypatch: pytest.MonkeyPatch, tmp_path) -> AppState:
     GObject.Object.__init__(obj)
     obj.settings = config_module.Settings.load()
     obj._device_session = None
-    obj._local_player = None
-    # Playback model + queue engine state that __init__ would have set up.
-    from harmony.ui.state import PlaybackState
-
-    obj.playback = PlaybackState()
-    obj._now_playing = {}
-    obj._upnp_cache = {}
-    obj._queues = {}
-    obj._queue_prev_state = {}
-    obj._queue_armed = {}
-    obj._advance_settle = {}
-    obj._queue_poll_ids = {}
-    obj._collection_full = {}
-    obj._collection_key = {}
-    obj._history = {}
+    obj._init_playback()
     return obj
 
 
@@ -267,14 +253,7 @@ def test_add_device_survives_a_reload(monkeypatch: pytest.MonkeyPatch, tmp_path)
     assert reloaded.known_devices == [{"host": "192.168.1.50", "name": "Living Room", "kind": "wiim"}]
 
 
-# -- play_track_on_device: UPnP-first with an httpapi fallback ----------------
-
-
-class _FakeProvider:
-    service = Service.YTMUSIC
-
-    def resolve_stream(self, track_id: str, *, max_quality: bool = False) -> StreamSource:
-        return StreamSource(url="http://cdn/stream", mime_type="audio/mp4", container="m4a")
+# -- device play: UPnP-first with an httpapi fallback (CastController) --------
 
 
 class _FakeRelay:
@@ -289,273 +268,265 @@ class _FakeRelay:
         return f"http://relay/{token}"
 
 
-def _ready_to_play(state: AppState) -> AppState:
-    state._relay = _FakeRelay()
-    state._now_playing = {}
-    state._upnp_cache = {}
-    state.providers = {Service.YTMUSIC: _FakeProvider()}
-    return state
+def _caster(monkeypatch, renderer, device=None):
+    from harmony.web.cast import CastController
+
+    ctrl = CastController(lambda s, t: StreamSource(url="http://cdn/stream", mime_type="audio/mp4",
+                                                     container="m4a"))
+    ctrl._relay = _FakeRelay()
+    monkeypatch.setattr(ctrl, "_upnp_renderer", lambda host: renderer)
+    monkeypatch.setattr(ctrl, "_device", lambda host, kind="wiim", info=None: device)
+    return ctrl
 
 
-def _a_track() -> Track:
-    return Track(id="vid", title="Song", service=Service.YTMUSIC, artists=["Artist"],
-                 album="Album", duration_s=222, artwork_url="http://art")
+_META = {"title": "Song", "artist": "Artist", "album": "Album", "duration_s": 222, "art_url": "http://art"}
 
 
-def test_play_uses_upnp_when_available(state: AppState, monkeypatch) -> None:
-    _ready_to_play(state)
+def test_cast_uses_upnp_when_available(monkeypatch) -> None:
     played: dict = {}
 
     class _Renderer:
         def play_media(self, url, **kw):
             played.update(url=url, **kw)
 
-    def _no_httpapi(host):
-        raise AssertionError("httpapi must not be used when UPnP works")
-
-    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: _Renderer())
-    monkeypatch.setattr(state, "device_for", _no_httpapi)
-
-    state.play_track_on_device(_a_track(), "192.168.1.9")
-
+    ctrl = _caster(monkeypatch, _Renderer())
+    ctrl.cast("192.168.1.9", "ytmusic", "vid", _META)
     assert played["url"] == "http://relay/tok"
     assert played["title"] == "Song" and played["artist"] == "Artist"
     assert played["duration_s"] == 222 and played["mime"] == "audio/mp4"
-    assert state._relay.registered[-1]["allow_icy"] is False  # passthrough for UPnP
-    assert state._now_playing["192.168.1.9"] == ("Song", "Artist")
+    assert ctrl._relay.registered[-1]["allow_icy"] is False  # passthrough for UPnP
 
 
-def test_play_falls_back_to_httpapi_without_upnp(state: AppState, monkeypatch) -> None:
-    _ready_to_play(state)
+def test_cast_falls_back_to_httpapi_without_upnp(monkeypatch) -> None:
     played: dict = {}
 
     class _Device:
         def play_url(self, url):
             played["url"] = url
 
-    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: None)
-    monkeypatch.setattr(state, "device_for", lambda host: _Device())
-
-    state.play_track_on_device(_a_track(), "192.168.1.9")
-
+    ctrl = _caster(monkeypatch, None, _Device())
+    ctrl.cast("192.168.1.9", "ytmusic", "vid", _META)
     assert played["url"] == "http://relay/tok"
-    assert state._relay.registered[-1]["allow_icy"] is True  # ICY best-effort for httpapi
+    assert ctrl._relay.registered[-1]["allow_icy"] is True  # ICY best-effort for httpapi
 
 
-def test_play_falls_back_when_upnp_raises(state: AppState, monkeypatch) -> None:
-    _ready_to_play(state)
-    played: dict = {}
-
-    class _BadRenderer:
-        def play_media(self, url, **kw):
-            raise RuntimeError("no route to device")
-
-    class _Device:
-        def play_url(self, url):
-            played["url"] = url
-
-    monkeypatch.setattr(state, "_upnp_renderer_for", lambda host: _BadRenderer())
-    monkeypatch.setattr(state, "device_for", lambda host: _Device())
-
-    state.play_track_on_device(_a_track(), "192.168.1.9")
-
-    assert played["url"] == "http://relay/tok"  # UPnP failed -> httpapi still played it
-
-
-# -- play_tracks_on_device: album/playlist queue advance ----------------------
+# -- the desktop's active queue (shared PlayQueue model) ------------------------
 
 
 def _track_n(n: int) -> Track:
-    return Track(id=f"t{n}", title=f"Song {n}", service=Service.YTMUSIC, artists=["A"])
+    return Track(id=f"t{n}", title=f"Song {n}", service=Service.YTMUSIC, artists=["A"],
+                 duration_s=100)
 
 
-def _seed_queue(state: AppState, tracks: list) -> None:
-    state._queues = {"h": tracks}
-    state._queue_prev_state = {"h": ""}
-    state._queue_poll_ids = {}
-    state._queue_armed = {"h": False}
+class _FakeLocalPlayer:
+    def __init__(self) -> None:
+        self.loaded: list[str] = []
+        self.stopped = 0
+
+    def load_and_play(self, url, headers):
+        self.loaded.append(url)
+
+    def stop(self):
+        self.stopped += 1
+
+    def seek(self, pos):
+        return True
+
+    def pause(self):
+        pass
+
+    def resume(self):
+        pass
 
 
-def test_queue_advances_when_position_reaches_duration(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
-    assert state._next_after_status("h", "playing", 10, 200) is None  # mid-track: arm, no advance
-    nxt = state._next_after_status("h", "playing", 199, 200)          # near end -> advance
-    assert nxt is not None and nxt.id == "t2"
-    assert [t.id for t in state._queues["h"]] == ["t2", "t3"]
+class _Provider:
+    def __init__(self) -> None:
+        self.resolved: list[str] = []
+
+    def resolve_stream(self, track_id, *, max_quality=False):
+        self.resolved.append(track_id)
+        return StreamSource(url=f"http://cdn/{track_id}", mime_type="audio/flac", container="flac")
 
 
-def test_queue_progress_advances_exactly_once(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state._next_after_status("h", "playing", 10, 200)                 # arm
-    assert state._next_after_status("h", "playing", 199, 200).id == "t2"  # advance
-    # A second near-end reading before the next track starts must not advance again.
-    assert state._next_after_status("h", "playing", 200, 200) is None
-    assert [t.id for t in state._queues["h"]] == ["t2"]
+class _FakeEngine:
+    """The engine's device-queue API backed by a REAL DeviceQueues (fake device)."""
+
+    def __init__(self) -> None:
+        from harmony.web.device_queue import DeviceQueues
+
+        self.cast: list[tuple[str, str]] = []
+        self.controls: list[tuple[str, str, object, object]] = []
+        self.queues = DeviceQueues(lambda h, t: self.cast.append((h, t["id"])), lambda h: {})
+        self.queues._ensure_poller = lambda host: None
+        self.op_vias: list = []
+
+    def device_queue_op(self, host, op, body, via=None):
+        self.op_vias.append(via)
+        if op == "stop":
+            self.queues.stop(host)
+            return self.queues.snapshot(host)
+        return self.queues.op(host, op, body)
+
+    def device_queue(self, host, via=None):
+        return self.queues.snapshot(host)
+
+    def device_control(self, host, action, level=None, via=None):
+        self.controls.append((host, action, level, via))
+        return {"ok": True}
 
 
-def test_queue_rearms_for_the_next_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state._next_after_status("h", "playing", 10, 200)                 # arm t1
-    state._next_after_status("h", "playing", 199, 200)               # advance to t2, disarm
-    assert state._next_after_status("h", "playing", 5, 200) is None   # re-arm on t2
-    assert state._next_after_status("h", "playing", 199, 200) is None  # t2 was last -> clear
-    assert "h" not in state._queues
+@pytest.fixture
+def player(state: AppState, monkeypatch):
+    """A state wired for playback: inline async, a fake local player/provider/engine."""
+    monkeypatch.setattr("harmony.ui.state.run_async",
+                        lambda fn, done=None, err=None: _inline(fn, done, err))
+    monkeypatch.setattr("harmony.ui.state.on_main", lambda fn, *a: fn(*a))
+    monkeypatch.setattr("harmony.ui.state.GLib.timeout_add", lambda *a: 1)
+    state._local_player = _FakeLocalPlayer()
+    prov = _Provider()
+    state.providers = {Service.YTMUSIC: prov}
+    eng = _FakeEngine()
+    monkeypatch.setattr(AppState, "_engine", staticmethod(lambda: eng))
+    toasts: list[str] = []
+    state.connect("toast", lambda _s, t: toasts.append(t))
+    return state, prov, eng, toasts
 
 
-def test_queue_advance_records_history(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state._next_after_status("h", "playing", 10, 200)   # arm
-    state._next_after_status("h", "playing", 199, 200)  # advance t1 -> t2
-    assert [t.id for t in state._history["h"]] == ["t1"]  # finished track remembered for "previous"
+def _inline(fn, done, err):
+    try:
+        r = fn()
+    except Exception as exc:  # noqa: BLE001
+        if err:
+            err(exc)
+        return
+    if done:
+        done(r)
 
 
-def test_repeat_one_replays_current_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state.playback.repeat = "one"
-    state._next_after_status("h", "playing", 10, 200)          # arm
-    nxt = state._next_after_status("h", "playing", 199, 200)   # near end
-    assert nxt is not None and nxt.id == "t1"                  # same track again
-    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]  # queue untouched
+def test_play_list_here_queues_the_whole_album_from_the_clicked_track(player) -> None:
+    state, prov, _eng, _t = player
+    tracks = [_track_n(i) for i in range(1, 5)]
+    state.play_list(tracks, 2)
+    assert prov.resolved == ["t3"]
+    assert [t.id for t in state.active_queue()] == ["t1", "t2", "t3", "t4"]
+    assert state.queue_index() == 2 and state.playback.track.id == "t3"
+    assert state.playback.has_next and state.playback.has_prev
 
 
-def test_repeat_all_refills_after_last_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1)])
-    state._collection_full = {"h": [_track_n(1), _track_n(2)]}
-    state.playback.repeat = "all"
-    state._next_after_status("h", "playing", 10, 200)          # arm
-    nxt = state._next_after_status("h", "playing", 199, 200)   # last track ends -> wrap
-    assert nxt is not None and nxt.id == "t1"
-    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]  # refilled from the collection
+def test_local_track_end_advances_then_stops_at_the_end(player) -> None:
+    state, prov, _eng, _t = player
+    state.play_list([_track_n(1), _track_n(2)], 0)
+    state._on_local_eos()
+    assert prov.resolved == ["t1", "t2"]
+    state._on_local_eos()
+    assert state.playback.state == "stopped"
+    assert [t.id for t in state.active_queue()] == ["t1", "t2"]  # queue kept for replay
 
 
-def test_queue_does_not_advance_while_mid_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    assert state._next_after_status("h", "playing", 30, 200) is None
-    assert len(state._queues["h"]) == 2
+def test_repeat_one_replays_on_natural_end_but_next_moves_on(player) -> None:
+    state, prov, _eng, _t = player
+    state.play_list([_track_n(1), _track_n(2)], 0)
+    state.playback_set_repeat("one")
+    state._on_local_eos()
+    state.playback_next()
+    assert prov.resolved == ["t1", "t1", "t2"]
 
 
-def test_queue_falls_back_to_stopped_without_duration(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state._queue_prev_state = {"h": "playing"}
-    nxt = state._next_after_status("h", "stopped", None, None)  # no duration -> state edge
-    assert nxt is not None and nxt.id == "t2"
-
-
-def test_playback_enqueue_appends_to_queue_and_collection(state: AppState) -> None:
-    state.toast = lambda *a, **k: None  # type: ignore[method-assign]
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state.playback.active_host = "h"
-    state._collection_full = {"h": [_track_n(1), _track_n(2)]}
-    state.playback_enqueue([_track_n(3)])
-    assert [t.id for t in state._queues["h"]] == ["t1", "t2", "t3"]
-    assert [t.id for t in state._collection_full["h"]] == ["t1", "t2", "t3"]
-
-
-def test_playback_play_next_inserts_after_current(state: AppState) -> None:
-    state.toast = lambda *a, **k: None  # type: ignore[method-assign]
-    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
-    state.playback.active_host = "h"
-    state.playback_play_next([_track_n(9)])
-    assert [t.id for t in state._queues["h"]] == ["t1", "t9", "t2", "t3"]  # after current, before rest
-
-
-def test_playback_reorder_never_moves_the_current_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3), _track_n(4)])
-    state.playback.active_host = "h"
-    state.playback_reorder(3, 1)  # move t4 up to slot 1
-    assert [t.id for t in state._queues["h"]] == ["t1", "t4", "t2", "t3"]
-    state.playback_reorder(0, 2)  # can't move the current (index 0)
-    state.playback_reorder(1, 0)  # can't move something onto the current slot
-    assert state._queues["h"][0].id == "t1"
-
-
-def test_playback_remove_skips_the_current_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1), _track_n(2), _track_n(3)])
-    state.playback.active_host = "h"
-    state.playback_remove(_track_n(2))
-    assert [t.id for t in state._queues["h"]] == ["t1", "t3"]
-    state.playback_remove(_track_n(1))  # the current track — must stay
-    assert state._queues["h"][0].id == "t1"
-
-
-def test_advance_settle_suppresses_transition_advance(state: AppState) -> None:
-    # A track that just started opens a settle window: the device's transient
-    # "stopped" during the swap must NOT be read as the new track ending (the
-    # skip-skips-two bug), even on the no-duration state-edge path.
-    import time as _time
-
-    _seed_queue(state, [_track_n(1), _track_n(2)])
-    state._queue_prev_state = {"h": "playing"}
-    state._advance_settle = {"h": _time.monotonic() + 30}
-    assert state._next_after_status("h", "stopped", None, None) is None  # suppressed
-    assert [t.id for t in state._queues["h"]] == ["t1", "t2"]            # nothing popped
-    # Once the window lapses, the same edge advances exactly once.
-    state._advance_settle = {"h": 0.0}
-    state._queue_prev_state = {"h": "playing"}
-    nxt = state._next_after_status("h", "stopped", None, None)
-    assert nxt is not None and nxt.id == "t2"
-
-
-def test_queue_clears_after_last_track(state: AppState) -> None:
-    _seed_queue(state, [_track_n(1)])
-    state._queue_prev_state = {"h": "playing"}
-    assert state._next_after_status("h", "stopped", None, None) is None
-    assert "h" not in state._queues  # emptied and cleared
-
-
-def test_play_tracks_sets_queue_and_plays_head(state: AppState, monkeypatch) -> None:
-    state._queues = {}
-    state._queue_prev_state = {}
-    state._queue_poll_ids = {}
-    played: list = []
-    monkeypatch.setattr(state, "_play_one", lambda t, h: played.append((t.id, h)))
-    monkeypatch.setattr("harmony.ui.state.on_main", lambda fn, *a: None)  # don't start the real poller
-
-    state.play_tracks_on_device([_track_n(1), _track_n(2), _track_n(3)], "192.168.1.9")
-
-    assert played == [("t1", "192.168.1.9")]  # only the head plays synchronously
-    assert [t.id for t in state._queues["192.168.1.9"]] == ["t1", "t2", "t3"]
-
-
-def test_play_empty_track_list_is_a_noop(state: AppState, monkeypatch) -> None:
-    state._queues = {}
-    monkeypatch.setattr(state, "_play_one", lambda t, h: (_ for _ in ()).throw(AssertionError("must not play")))
-    state.play_tracks_on_device([], "192.168.1.9")
-    assert state._queues == {}
-
-
-# -- device handoff: one active stream moves (whole queue) --------------------
-
-
-def test_selecting_a_device_moves_the_whole_queue(state: AppState, monkeypatch) -> None:
-    monkeypatch.setattr("harmony.ui.state.run_async", lambda fn, *a, **k: fn())  # inline
-    monkeypatch.setattr("harmony.ui.state.on_main", lambda fn, *a: None)
-    stopped: list = []
-    played: list = []
-    monkeypatch.setattr(state, "device_for",
-                        lambda h: type("D", (), {"stop": lambda s, hh=h: stopped.append(hh)})())
-    monkeypatch.setattr(state, "_play_one", lambda t, h: played.append((t.id, h)))
-    # A three-track queue is streaming on device A (current track at the front).
-    q = [_track_n(1), _track_n(2), _track_n(3)]
-    state._queues = {"A": q}
-    state._collection_full = {"A": list(q)}
-    state._collection_key = {"A": ("k", "id")}
-    state.playback.active_host = "A"
-    state.playback.track = q[0]
+def test_enqueue_while_playing_does_not_interrupt(player) -> None:
+    """The audit's bug: enqueue during a single track replaced it."""
+    state, prov, _eng, toasts = player
+    state.play_list([_track_n(1)], 0)
     state.playback.state = "playing"
-
-    state.playback_set_active_device("B")
-
-    assert "A" in stopped                              # old device stopped
-    assert state.playback.active_host == "B"
-    assert [t.id for t in state._queues["B"]] == ["t1", "t2", "t3"]  # whole queue moved, order kept
-    assert state._collection_key["B"] == ("k", "id")   # collection context carried over
-    assert played == [("t1", "B")]                     # resumes from the current track on B
+    state.playback_enqueue([_track_n(2), _track_n(3)])
+    assert prov.resolved == ["t1"]
+    assert [t.id for t in state.active_queue()] == ["t1", "t2", "t3"]
+    assert toasts[-1] == "Added 2 to the queue"
 
 
-def test_selecting_a_device_with_nothing_playing_just_switches_view(state: AppState) -> None:
-    state._queues = {}
-    state.playback.active_host = "A"
-    state.playback.track = None
-    state.playback_set_active_device("B")
-    assert state.playback.active_host == "B"
+def test_play_next_then_jump_plays_that_exact_row(player) -> None:
+    """The audit's bug: jump-to looked in the original collection and restarted it."""
+    state, prov, _eng, _t = player
+    state.play_list([_track_n(1), _track_n(2)], 0)
+    state.playback.state = "playing"
+    state.playback_play_next([_track_n(9)])
+    assert [t.id for t in state.active_queue()] == ["t1", "t9", "t2"]
+    state.playback_jump(1)
+    assert prov.resolved[-1] == "t9" and state.queue_index() == 1
+
+
+def test_previous_restarts_after_three_seconds_else_goes_back(player) -> None:
+    state, prov, _eng, _t = player
+    state.play_list([_track_n(1), _track_n(2)], 1)
+    state.playback.state = "playing"
+    state.playback.position_s = 40
+    state.playback_previous()
+    assert prov.resolved == ["t2"]            # restarted in place (seek), no re-resolve
+    state.playback.position_s = 1
+    state.playback_previous()
+    assert prov.resolved[-1] == "t1"
+
+
+def test_remove_and_clear(player) -> None:
+    state, _prov, _eng, _t = player
+    state.play_list([_track_n(1), _track_n(2), _track_n(3)], 1)
+    state.playback.state = "playing"
+    state.playback_remove_at(0)
+    assert [t.id for t in state.active_queue()] == ["t2", "t3"] and state.queue_index() == 0
+    state.playback_clear()
+    assert [t.id for t in state.active_queue()] == ["t2"]
+
+
+def test_a_failed_resolve_skips_but_all_failing_stops(player) -> None:
+    state, prov, _eng, toasts = player
+
+    def boom(track_id, *, max_quality=False):
+        raise RuntimeError("geo-blocked")
+
+    prov.resolve_stream = boom
+    state.play_list([_track_n(1), _track_n(2)], 0)
+    assert state.playback.state == "stopped"
+    assert sum("geo-blocked" in t for t in toasts) == 2  # tried both, then stopped
+
+
+def test_device_playback_hands_the_list_to_the_engine_queue(player) -> None:
+    state, prov, eng, _t = player
+    state.play_list([_track_n(1), _track_n(2), _track_n(3)], 1, host="192.168.1.9")
+    assert eng.cast == [("192.168.1.9", "t2")]        # the engine's queue started it
+    assert prov.resolved == []                         # nothing resolved locally
+    assert [t.id for t in state.active_queue()] == ["t1", "t2", "t3"]
+    assert state.queue_index() == 1
+    state.playback_next()
+    assert eng.cast[-1] == ("192.168.1.9", "t3")
+
+
+def test_peer_device_goes_via_the_peer(player) -> None:
+    state, _prov, eng, _t = player
+    state.play_list([_track_n(1)], 0, host="10.0.0.2:8080/192.168.50.7")
+    assert eng.cast == [("192.168.50.7", "t1")]
+    assert eng.op_vias[-1] == "10.0.0.2:8080"
+    state.playback_set_volume(30)
+    assert eng.controls[-1] == ("192.168.50.7", "volume", 30, "10.0.0.2:8080")
+
+
+def test_switching_output_moves_the_whole_queue_in_order(player) -> None:
+    state, prov, eng, _t = player
+    state.play_list([_track_n(1), _track_n(2), _track_n(3)], 1)   # here, on t2
+    state.playback.state = "playing"
+    state.playback_set_active_device("192.168.1.9")
+    local = state._local_player
+    assert local.stopped >= 1                                     # old output stopped
+    assert eng.cast == [("192.168.1.9", "t2")]                    # resumes the current track
+    assert [t.id for t in state.active_queue()] == ["t1", "t2", "t3"]
+    state.playback_set_active_device("__local__")                 # and back
+    assert prov.resolved[-1] == "t2"
+
+
+def test_selecting_a_device_with_nothing_playing_just_switches_view(player) -> None:
+    state, _prov, eng, _t = player
+    state.playback_set_active_device("192.168.1.9")
+    assert state.playback.active_host == "192.168.1.9" and eng.cast == []
+
+
+def test_split_target() -> None:
+    assert AppState.split_target("192.168.1.9") == ("192.168.1.9", None)
+    assert AppState.split_target("10.0.0.2:8080/192.168.50.7") == ("192.168.50.7", "10.0.0.2:8080")

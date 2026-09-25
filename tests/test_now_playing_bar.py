@@ -11,7 +11,7 @@ from gi.repository import GObject  # noqa: E402
 from harmony import config as config_module  # noqa: E402
 from harmony.models import Service, Track  # noqa: E402
 from harmony.ui.now_playing_bar import NowPlayingBar  # noqa: E402
-from harmony.ui.state import AppState, PlaybackState  # noqa: E402
+from harmony.ui.state import AppState  # noqa: E402
 
 
 @pytest.fixture
@@ -21,12 +21,7 @@ def state(monkeypatch, tmp_path) -> AppState:
     GObject.Object.__init__(obj)
     obj.settings = config_module.Settings.load()
     obj._device_session = None
-    obj._local_player = None
-    obj.playback = PlaybackState()
-    for attr in ("_now_playing", "_upnp_cache", "_queues", "_queue_prev_state",
-                 "_queue_armed", "_queue_poll_ids", "_collection_full",
-                 "_collection_key", "_history"):
-        setattr(obj, attr, {})
+    obj._init_playback()
     return obj
 
 

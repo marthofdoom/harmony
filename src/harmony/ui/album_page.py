@@ -82,7 +82,13 @@ class AlbumPage(Adw.NavigationPage):
             self._content.append(group)
 
         tracks = data.get("tracks") or []
-        self._content.append(tracks_widget(tracks, self.state, self.nav, title="Tracks"))
+        key = None
+        if album.get("service") and album.get("id"):
+            from harmony.models import Service
+
+            key = (Service(album["service"]), str(album["id"]))
+        self._content.append(tracks_widget(tracks, self.state, self.nav, title="Tracks",
+                                           collection_key=key))
         self._stack.set_visible_child_name("content")
 
     def _on_error(self, exc: BaseException) -> None:

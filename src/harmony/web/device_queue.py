@@ -121,7 +121,8 @@ class DeviceQueues:
                     q.set_repeat(str(body["repeat"]))
                 shuffle = body.get("shuffle")
                 start = q.load(tracks, None if body.get("start") is None else int(body["start"]),
-                               shuffle=None if shuffle is None else bool(shuffle))
+                               shuffle=None if shuffle is None else bool(shuffle),
+                               keep_order=bool(body.get("keep_order")))
             elif name == "jump":
                 start = q.jump(int(body.get("index", -1)))
                 if start is None:
@@ -239,14 +240,18 @@ class DeviceQueues:
                 dur = cur.get("duration_s") if isinstance(cur, dict) else None
             # Trust the device's position when it moves; otherwise the play clock.
             raw_before, dq.raw_pos = dq.raw_pos, pos
-            if pos is None or (pos == raw_before and state == "playing"):
+            clocked = pos is None or (pos == raw_before and state == "playing")
+            if clocked:
                 pos = max(pos or 0, int(dq.clock))
             dq.last_status = {**st, "position_s": pos, "duration_s": dur}
             if not dq.playing or time.monotonic() < dq.settle_until:
                 return None
             has_dur = bool(dur and dur > 0 and pos is not None)
-            near_end = has_dur and pos >= dur - END_EPSILON_S
-            if has_dur and not near_end:
+            # Only the device's own clock may declare "near the end": the play
+            # clock runs ahead while a cast buffers, so a clock-driven track ends
+            # on the device going idle instead (the branch below).
+            near_end = has_dur and not clocked and pos >= dur - END_EPSILON_S
+            if has_dur and not near_end and state == "playing":
                 dq.armed = True
             ended = False
             if near_end and dq.armed:

@@ -156,7 +156,23 @@ def test_frozen_position_device_advances_by_play_clock(dqs, monkeypatch: pytest.
         assert queues.after_status("cast", {"state": "playing", "position_s": 0, "duration_s": 100}) is None
     assert queues.snapshot("cast")["position_s"] == 96                # clock-driven progress
     now[0] += 2
-    assert queues.after_status("cast", {"state": "playing", "position_s": 0, "duration_s": 100}) == 1
+    # The clock alone never ends a track (it runs ahead while a cast buffers)…
+    assert queues.after_status("cast", {"state": "playing", "position_s": 0, "duration_s": 100}) is None
+    # …the device going idle near the clock's end does.
+    now[0] += 2
+    assert queues.after_status("cast", {"state": "stopped", "position_s": None, "duration_s": None}) == 1
+
+
+def test_frozen_device_stopped_mid_track_halts(dqs, monkeypatch: pytest.MonkeyPatch) -> None:
+    queues, _played = dqs
+    queues.op("cast", "load", {"tracks": [_t(0), _t(1)], "start": 0})
+    now = [time.monotonic()]
+    monkeypatch.setattr(dqmod.time, "monotonic", lambda: now[0])
+    for _ in range(10):
+        now[0] += 2
+        queues.after_status("cast", {"state": "playing", "position_s": 0, "duration_s": 100})
+    assert queues.after_status("cast", {"state": "stopped", "position_s": 0, "duration_s": 100}) is None
+    assert not queues.snapshot("cast")["playing"]
 
 
 def test_stop_from_the_device_mid_track_halts_instead_of_skipping(dqs) -> None:

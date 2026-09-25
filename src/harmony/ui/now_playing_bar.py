@@ -11,6 +11,7 @@ I/O off the main loop, and redraws on the ``playback-changed`` signal.
 from __future__ import annotations
 
 import logging
+from typing import Any
 
 import gi
 
@@ -77,6 +78,13 @@ class NowPlayingBar(Gtk.Box):
         meta.append(self._title)
         meta.append(self._artist)
         meta.append(self._quality)
+        # Clicking the art/title opens the Now Playing page (the full queue).
+        self.on_open_now_playing: Any = None
+        opener = Gtk.GestureClick()
+        opener.connect("released", lambda *_a: self.on_open_now_playing and self.on_open_now_playing())
+        meta.add_controller(opener)
+        meta.set_cursor_from_name("pointer")
+        meta.set_tooltip_text("Show Now Playing")
         self.append(meta)
 
         # -- transport ------------------------------------------------------
@@ -278,14 +286,14 @@ class NowPlayingBar(Gtk.Box):
         self._quality.set_label(quality or "")
         self._quality.set_visible(bool(quality))
 
-        playing = pb.state == "playing"
+        playing = pb.state in ("playing", "loading")
         self._play.set_icon_name(
             "media-playback-pause-symbolic" if playing else "media-playback-start-symbolic"
         )
         self._play.set_tooltip_text("Pause" if playing else "Play")
         self._prev.set_sensitive(pb.has_prev)
         self._next.set_sensitive(pb.has_next)
-        self._stop.set_sensitive(pb.state in ("playing", "paused"))
+        self._stop.set_sensitive(pb.state in ("playing", "paused", "loading"))
 
         # seek bar (don't fight the user mid-drag). Reconcile the local
         # interpolation baseline to the freshly-polled position so drift from

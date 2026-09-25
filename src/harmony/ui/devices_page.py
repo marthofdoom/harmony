@@ -317,6 +317,7 @@ class DevicesPage(Gtk.Box):
         # Discovered devices drop straight into the list and playback pickers —
         # no manual add. Pin one (the button on its row) to keep it.
         self.state.set_discovered_devices(infos)
+        self.state.refresh_peer_devices()
         if not infos:
             self.state.toast("No devices found on the network.")
             return

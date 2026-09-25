@@ -289,7 +289,7 @@ def test_track_menu_actions_full_providers() -> None:
 
     labels = [label for label, _cb in track_menu_actions(Gtk.Button(), state, track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Find on Other Service"]
+    assert labels == ["Play Next", "Add to Queue", "Play on Device", "Add to Playlist…", "Show Similar", "Find on Other Service"]
 
 
 def test_track_menu_actions_no_other_service_configured() -> None:
@@ -299,7 +299,7 @@ def test_track_menu_actions_no_other_service_configured() -> None:
 
     labels = [label for label, _cb in track_menu_actions(Gtk.Button(), state, track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar"]
+    assert labels == ["Play Next", "Add to Queue", "Play on Device", "Add to Playlist…", "Show Similar"]
 
 
 def test_track_menu_actions_no_providers_at_all() -> None:
@@ -308,7 +308,7 @@ def test_track_menu_actions_no_providers_at_all() -> None:
 
     labels = [label for label, _cb in track_menu_actions(Gtk.Button(), state, track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…"]
+    assert labels == ["Play Next", "Add to Queue", "Play on Device", "Add to Playlist…"]
 
 
 def test_track_menu_actions_show_similar_toasts_when_recommender_unavailable(no_real_popup) -> None:
@@ -438,4 +438,4 @@ def test_playlists_page_track_column_view_has_full_track_menu(fake_state: AppSta
 
     labels = [label for label, _cb in page._track_row_actions(track)]
 
-    assert labels == ["Play on Device", "Add to Playlist…", "Show Similar", "Find on Other Service"]
+    assert labels == ["Play Next", "Add to Queue", "Play on Device", "Add to Playlist…", "Show Similar", "Find on Other Service"]

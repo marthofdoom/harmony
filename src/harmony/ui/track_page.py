@@ -19,6 +19,7 @@ gi.require_version("Adw", "1")
 from gi.repository import Adw, Gtk  # noqa: E402
 
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.collection_actions import play_toolbar  # noqa: E402
 from harmony.ui.detail_widgets import artwork_header  # noqa: E402
 from harmony.ui.entity_nav import Navigator  # noqa: E402
 from harmony.ui.widgets import error_status_page, loading_status_page  # noqa: E402
@@ -70,6 +71,11 @@ class TrackPage(Adw.NavigationPage):
             bits.append(str(track["year"]))
         subtitle = " · ".join(b for b in bits if b)
         self._content.append(artwork_header(track.get("artwork_url"), title, subtitle))
+        if track.get("id") and track.get("service"):
+            from harmony.ui.entity_nav import track_from_dict
+
+            the_track = track_from_dict(track)
+            self._content.append(play_toolbar(self.state, lambda: [the_track]))
 
         # Navigation to the album + performing artists.
         nav_group = Adw.PreferencesGroup(title="Go to")

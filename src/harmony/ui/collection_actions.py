@@ -116,20 +116,64 @@ def enqueue_collection(
     run_async(work, done, lambda exc: state.toast(f"Couldn't queue {label}: {exc}"))
 
 
+def play_from_list(state: AppState, tracks: list[Track], index: int = 0, *,
+                   collection_key: tuple[Service, str] | None = None,
+                   shuffle: bool = False) -> None:
+    """Play ``tracks`` from ``index`` as the active queue, on the current output
+    (this computer when nothing is playing) — double-click / Enter / Play."""
+    state.play_list(tracks, index, collection_key=collection_key, shuffle=shuffle)
+
+
 def play_track_here(state: AppState, track: Track) -> None:
-    """Play one track on *this device* (in-app local playback) — double-click / Enter.
+    """Play one track (a list of one) on the current output."""
+    state.play_list([track])
 
-    Always targets the local player rather than whatever remote device is active,
-    so a double-click is a predictable "play it here now" without a device prompt.
-    Blocking play runs on a worker; the outcome toasts.
-    """
-    from harmony.ui.state import LOCAL_HOST
 
-    run_async(
-        lambda: state.play_track_on_device(track, LOCAL_HOST),
-        lambda _r: state.toast(f"Playing “{track.title}” on this device"),
-        lambda exc: state.toast(f"Couldn't play “{track.title}”: {exc}"),
-    )
+def queue_actions(state: AppState, tracks: Callable[[], list[Track]]) -> list[tuple[str, Callable[[], None]]]:
+    """"Play Next" / "Add to Queue" menu entries for already-loaded tracks."""
+    return [
+        ("Play Next", lambda: state.playback_play_next(tracks())),
+        ("Add to Queue", lambda: state.playback_enqueue(tracks())),
+    ]
+
+
+def play_toolbar(state: AppState, get_tracks: Callable[[], list[Track]], *,
+                 collection_key: tuple[Service, str] | Callable[[], tuple[Service, str] | None]
+                 | None = None) -> Gtk.Widget:
+    """Play · Shuffle · Play Next · Add to Queue for a whole list (album,
+    playlist, artist top tracks). Every button acts on the full list.
+    ``collection_key`` may be a callable (a page whose collection changes)."""
+    def key() -> tuple[Service, str] | None:
+        return collection_key() if callable(collection_key) else collection_key
+
+    box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+
+    def with_tracks(fn: Callable[[list[Track]], None]) -> Callable[..., None]:
+        def run(*_a: object) -> None:
+            tracks = list(get_tracks())
+            if tracks:
+                fn(tracks)
+            else:
+                state.toast("Nothing to play here yet.")
+        return run
+
+    play = Gtk.Button(css_classes=["suggested-action", "pill"])
+    play.set_child(Adw.ButtonContent(icon_name="media-playback-start-symbolic", label="Play"))
+    play.connect("clicked", with_tracks(
+        lambda ts: play_from_list(state, ts, 0, collection_key=key())))
+    shuffle = Gtk.Button(css_classes=["pill"])
+    shuffle.set_child(Adw.ButtonContent(icon_name="media-playlist-shuffle-symbolic", label="Shuffle"))
+    shuffle.connect("clicked", with_tracks(
+        lambda ts: play_from_list(state, ts, collection_key=key(), shuffle=True)))
+    nxt = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Play Next",
+                     css_classes=["flat", "circular"])
+    nxt.connect("clicked", with_tracks(state.playback_play_next))
+    add = Gtk.Button(icon_name="view-list-bullet-symbolic", tooltip_text="Add to Queue",
+                     css_classes=["flat", "circular"])
+    add.connect("clicked", with_tracks(state.playback_enqueue))
+    for w in (play, shuffle, nxt, add):
+        box.append(w)
+    return box
 
 
 # -- add a collection's tracks to a playlist ---------------------------------------
@@ -248,6 +292,7 @@ def track_menu_actions(parent: Gtk.Widget, state: AppState, track: Track) -> lis
     identical menu Search's own track list already has.
     """
     actions: list[tuple[str, Callable[[], None]]] = [
+        *queue_actions(state, lambda: [track]),
         ("Play on Device", lambda: play_collection_on_device(parent, state, label=track.title, fetch_tracks=lambda: [track])),
         ("Add to Playlist…", lambda: add_collection_to_playlist(parent, state, label=track.title, fetch_tracks=lambda: [track])),
     ]

@@ -20,7 +20,8 @@ from harmony.ui.collection_actions import (  # noqa: E402
     add_collection_to_playlist,
     enqueue_collection,
     play_collection_on_device,
-    play_track_here,
+    play_from_list,
+    play_toolbar,
     track_menu_actions,
 )
 from harmony.ui.similar_dialog import present_similar  # noqa: E402
@@ -242,7 +243,8 @@ class PlaylistsPage(Gtk.Box):
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
             on_row_menu=self._track_row_actions, state=self.state,
-            on_row_activate=lambda t: play_track_here(self.state, t),
+            on_play_from=lambda ts, i: play_from_list(self.state, ts, i,
+                                                      collection_key=self._selected_key()),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")
@@ -256,6 +258,10 @@ class PlaylistsPage(Gtk.Box):
         # "Remove Selected" is the one action tied to the track selection, so it
         # stays out front; the playlist-level actions collapse into an overflow
         # menu instead of six always-visible buttons.
+        # Play / Shuffle / Play Next / Add to Queue for the whole playlist.
+        bar.pack_start(play_toolbar(self.state, self._loaded_tracks,
+                                    collection_key=self._selected_key))
+
         self.remove_tracks_button = Gtk.Button(label="Remove Selected")
         self.remove_tracks_button.connect("clicked", self._on_remove_tracks_clicked)
         bar.pack_start(self.remove_tracks_button)
@@ -332,6 +338,13 @@ class PlaylistsPage(Gtk.Box):
             set_stack_status(self.track_stack, "empty", error_status_page(exc, title="Couldn't load tracks"))
 
         run_async(work, done, error)
+
+    def _loaded_tracks(self) -> list[Track]:
+        return [self.track_store.get_item(i).track for i in range(self.track_store.get_n_items())]
+
+    def _selected_key(self) -> tuple[Service, str] | None:
+        p = self._selected_playlist
+        return (p.service, p.id) if p is not None else None
 
     def _track_row_actions(self, track: Track) -> list[tuple[str, Callable[[], None]]]:
         """Right-click menu for a track row: same shape as Search's own track list."""

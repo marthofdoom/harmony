@@ -71,6 +71,21 @@ def track_to_dict(t: Any) -> dict[str, Any]:
     }
 
 
+def track_from_dict(d: dict[str, Any]) -> Any:
+    """Inverse of :func:`track_to_dict` (a queue snapshot back into ``Track``s)."""
+    from harmony.models import Service, Track
+
+    artist = d.get("artist") or ""
+    return Track(
+        id=str(d["id"]), title=d.get("title") or "", service=Service(d["service"]),
+        artists=[a.strip() for a in artist.split(",")] if artist else [],
+        artist_ids=list(d.get("artist_ids") or []), album=d.get("album"),
+        album_id=d.get("album_id"), duration_s=d.get("duration_s"),
+        track_number=d.get("track_number"), year=d.get("year"), isrc=d.get("isrc"),
+        artwork_url=d.get("artwork_url") or d.get("art_url"),
+    )
+
+
 def playlist_to_dict(p: Any) -> dict[str, Any]:
     return {
         "id": p.id,
@@ -116,6 +131,7 @@ class Engine:
         self._streams: dict[str, dict[str, Any]] = {}
         self._cast: Any | None = None
         self._queues: Any | None = None
+        self._cred_listeners: list[Any] = []
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
@@ -476,6 +492,8 @@ class Engine:
                 synced.remove(service)
                 rolled_back.append(service)
         if rolled_back:
+            dropped = {k for sv in rolled_back for k in self._SERVICE_SECRETS.get(sv, ())}
+            imported = [k for k in imported if k not in dropped]
             self._reset_providers()
         return {"ok": True, "imported": sorted(imported),
                 "synced": synced, "kept": kept, "rolled_back": rolled_back}
@@ -540,8 +558,23 @@ class Engine:
             self._onboard = Onboarding(on_change=self._reset_providers, status=self.accounts)
         return self._onboard
 
-    def _reset_providers(self) -> None:
+    def add_credentials_listener(self, fn: Any) -> None:
+        """Call ``fn()`` (from whatever thread changed them) whenever this
+        engine's credentials change — a sync pull, a peer pushing to us, an
+        onboarding step. The desktop uses it to rebuild its own providers."""
+        self._cred_listeners.append(fn)
+
+    def reset_providers(self, notify: bool = True) -> None:
         self._providers = None  # force a re-warm with freshly-saved credentials
+        if notify:
+            for fn in list(self._cred_listeners):
+                try:
+                    fn()
+                except Exception:  # noqa: BLE001 - a listener must not break the engine
+                    log.exception("credentials listener failed")
+
+    def _reset_providers(self) -> None:
+        self.reset_providers()
 
     def set_qobuz_token(self, token: str) -> dict[str, Any]:
         return self._onboarding().set_qobuz_token(token)
@@ -1376,7 +1409,8 @@ class Engine:
             from harmony.web.device_queue import DeviceQueues
 
             def play(host: str, t: dict[str, Any]) -> Any:
-                meta = {k: t.get(k) for k in ("title", "artist", "album", "art_url", "duration_s")}
+                meta = {k: t.get(k) for k in ("title", "artist", "album", "duration_s")}
+                meta["art_url"] = t.get("art_url") or t.get("artwork_url")
                 return self._cast_direct(host, str(t["service"]), str(t["id"]), meta)
 
             self._queues = DeviceQueues(play, lambda h: self.device_status(h))
@@ -1403,9 +1437,15 @@ class Engine:
             fwd = {k: v for k, v in body.items() if k != "via"}
             return self._peer_call(via, "POST", f"/api/devices/{host}/queue/{op}", fwd)
         if op == "stop":
+            # Halting the queue always succeeds; stopping the device is best-effort
+            # (an unreachable speaker mustn't leave the queue running).
             self._device_queues().stop(host)
-            self.device_control(host, "stop")
-            return self._device_queues().snapshot(host)
+            snap = self._device_queues().snapshot(host)
+            try:
+                self.device_control(host, "stop")
+            except Exception as exc:  # noqa: BLE001 - report, don't fail the stop
+                snap["error"] = f"couldn't reach the device to stop it: {exc}"
+            return snap
         return self._device_queues().op(host, op, body)
 
     def device_status(self, host: str, via: str | None = None) -> dict[str, Any]:

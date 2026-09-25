@@ -1,11 +1,12 @@
 """The Now Playing page.
 
-Large album art of the current track beside the live **active queue** (the current
-track first, then what's actually up next), with the current track lit by the
-shared now-playing indicator. Shuffle + repeat act on the queue; double-click a row
-to jump to it; right-click to reorder (Move Up/Down), remove, or the usual track
-actions. A thin view over ``AppState`` — it reads ``playback`` + ``active_queue()``
-and redraws on ``playback-changed``.
+Large album art of the current track beside the whole **active queue** (what's
+played, the current track, and what's up next), with the current track lit by
+the shared now-playing indicator. Shuffle + repeat act on the queue; double-click
+a row to jump to it; right-click to reorder, remove, or the usual track actions;
+Clear keeps only what's playing; the queue can be added to a playlist. A thin
+view over ``AppState`` — it reads ``playback`` + ``active_queue()`` and redraws
+on ``playback-changed``.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ gi.require_version("Adw", "1")
 
 from gi.repository import Adw, Gtk  # noqa: E402
 
+from harmony.ui.collection_actions import add_collection_to_playlist  # noqa: E402
 from harmony.ui.detail_widgets import track_menu_builder  # noqa: E402
 from harmony.ui.entity_nav import Navigator, load_artwork_into  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
@@ -77,11 +79,27 @@ class NowPlayingPage(Gtk.Box):
         self._cv, self._store, _sel = build_track_column_view(
             on_row_menu=self._queue_row_menu,
             state=state,
-            on_row_activate=lambda t: state.playback_play_from(t),
+            on_play_from=lambda _ts, i: state.playback_jump(i),
         )
         holder["cv"] = self._cv
+        queue_col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, hexpand=True)
+        head = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        self._queue_label = Gtk.Label(xalign=0.0, hexpand=True, label="Queue")
+        self._queue_label.add_css_class("heading")
+        head.append(self._queue_label)
+        save = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Add queue to a playlist…",
+                          css_classes=["flat"])
+        save.connect("clicked", lambda b: add_collection_to_playlist(
+            b, state, label="the queue", fetch_tracks=state.active_queue))
+        clear = Gtk.Button(label="Clear", tooltip_text="Remove everything except what's playing",
+                           css_classes=["flat"])
+        clear.connect("clicked", lambda *_a: state.playback_clear())
+        head.append(save)
+        head.append(clear)
+        queue_col.append(head)
         scroller = Gtk.ScrolledWindow(child=self._cv, vexpand=True, hexpand=True)
-        content.append(scroller)
+        queue_col.append(scroller)
+        content.append(queue_col)
         self._stack.add_named(content, "content")
 
         # -- empty state ---------------------------------------------------
@@ -106,17 +124,25 @@ class NowPlayingPage(Gtk.Box):
         self.state.playback_set_repeat(order.get(self.state.playback.repeat, "off"))
 
     def _queue_row_menu(self, track):
-        """Queue reorder/remove ops for the tapped row, then the standard track menu."""
+        """Queue ops for the right-clicked row, then the standard track menu."""
         items: list = []
         queue = self.state.active_queue()
-        idx = next((i for i, t in enumerate(queue) if t.key() == track.key()), -1)
-        if idx > 1:
+        idx = next((i for i, t in enumerate(queue) if t is track), -1)
+        if idx < 0:
+            return self._base_menu(track)
+        items.append(("Play", lambda: self.state.playback_jump(idx)))
+        if idx > 0:
             items.append(("Move Up", lambda: self.state.playback_reorder(idx, idx - 1)))
-        if 0 < idx < len(queue) - 1:
+        if idx < len(queue) - 1:
             items.append(("Move Down", lambda: self.state.playback_reorder(idx, idx + 1)))
-        if idx >= 1:
-            items.append(("Remove from Queue", lambda: self.state.playback_remove(track)))
-        return items + self._base_menu(track)
+        current = self.state.queue_index()
+        if idx != current and current >= 0:
+            target = current + 1 if idx > current else current
+            if idx != target:
+                items.append(("Play After This Track", lambda: self.state.playback_reorder(idx, target)))
+        items.append(("Remove from Queue", lambda: self.state.playback_remove_at(idx)))
+        base = [a for a in self._base_menu(track) if a[0] not in ("Play Next", "Add to Queue")]
+        return items + base
 
     def _render(self) -> None:
         pb = self.state.playback
@@ -153,7 +179,10 @@ class NowPlayingPage(Gtk.Box):
         # only when it actually changes, so selection/scroll survive status polls;
         # the shared indicator column tracks the current track on its own.
         queue = self.state.active_queue()
-        sig = (len(queue), tuple(t.key() for t in queue))
+        sig = tuple(id(t) for t in queue)
         if sig != self._queue_sig:
             self._queue_sig = sig
             replace_tracks(self._store, queue)
+        idx = self.state.queue_index()
+        upcoming = max(0, len(queue) - idx - 1) if idx >= 0 else len(queue)
+        self._queue_label.set_label(f"Queue · {len(queue)} tracks · {upcoming} up next")
