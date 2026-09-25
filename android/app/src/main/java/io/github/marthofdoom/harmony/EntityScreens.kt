@@ -17,12 +17,16 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Album
 import androidx.compose.material.icons.filled.ErrorOutline
+import androidx.compose.material.icons.filled.Info
+import androidx.compose.material.icons.automirrored.filled.PlaylistAdd
+import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.OpenInNew
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
@@ -66,7 +70,7 @@ fun DetailHost(vm: HarmonyViewModel, state: UiState) {
     when (entry.kind) {
         DetailKind.ARTIST -> ArtistScreen(vm, state, entry)
         DetailKind.ALBUM -> AlbumScreen(vm, state, entry)
-        DetailKind.TRACK -> TrackScreen(vm, entry)
+        DetailKind.TRACK -> TrackScreen(vm, state, entry)
     }
 }
 
@@ -109,10 +113,11 @@ private fun albumYear(album: Album): String? =
     album.year?.toString() ?: album.date?.take(4)?.ifBlank { null }
 
 @Composable
-private fun AlbumRow(album: Album, onClick: (() -> Unit)?) {
+private fun AlbumRow(album: Album, onClick: (() -> Unit)?,
+                     onAction: ((ListAction) -> Unit)? = null) {
     val base = Modifier.fillMaxWidth()
     val clickable = if (onClick != null) base.clickable { onClick() } else base
-    Row(clickable.padding(horizontal = 16.dp, vertical = 8.dp),
+    Row(clickable.padding(start = 16.dp, end = if (onAction != null) 4.dp else 16.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
         NetworkImage(album.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
         Spacer(Modifier.width(12.dp))
@@ -125,7 +130,18 @@ private fun AlbumRow(album: Album, onClick: (() -> Unit)?) {
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
+        if (onAction != null) ListActionMenu(onAction)
     }
+}
+
+/** An album row that opens the album and offers whole-album play/queue actions
+ *  (informational rows with no id get neither). */
+@Composable
+private fun PlayableAlbumRow(vm: HarmonyViewModel, al: Album) {
+    val id = al.id
+    AlbumRow(al,
+        onClick = id?.let { { vm.openAlbum(al.service, it) } },
+        onAction = id?.let { { action: ListAction -> vm.albumAction(al.service, it, action) } })
 }
 
 @Composable
@@ -174,20 +190,26 @@ private fun ArtistScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntr
                     item { SectionHeader(if (d.kind == "person") "Performed on" else "Albums") }
                     items(d.albums) { al ->
                         // Person rows with a null id are informational (not navigable).
-                        AlbumRow(al, onClick = al.id?.let { id -> { vm.openAlbum(al.service, id) } })
+                        PlayableAlbumRow(vm, al)
                     }
                 }
                 if (d.singles.isNotEmpty()) {
                     item { SectionHeader("Singles") }
-                    items(d.singles) { al ->
-                        AlbumRow(al, onClick = al.id?.let { id -> { vm.openAlbum(al.service, id) } })
-                    }
+                    items(d.singles) { al -> PlayableAlbumRow(vm, al) }
                 }
                 if (d.topTracks.isNotEmpty()) {
                     item { SectionHeader("Top tracks") }
-                    items(d.topTracks) { t ->
-                        TrackRow(t, onPlay = { vm.play(t, d.topTracks) },
-                            isPlaying = t.id == state.playback.track?.id,
+                    item {
+                        ListActionsRow(
+                            onPlay = { vm.playAll(d.topTracks, shuffle = false) },
+                            onShuffle = { vm.playAll(d.topTracks, shuffle = true) },
+                            onPlayNext = { vm.playNext(d.topTracks) },
+                            onAddToQueue = { vm.addToQueue(d.topTracks) },
+                        )
+                    }
+                    itemsIndexed(d.topTracks) { i, t ->
+                        TrackRow(t, onPlay = { vm.playFrom(d.topTracks, i) },
+                            playState = state.rowPlay(t),
                             trailing = { TrackRowMenu(vm, state, t) })
                     }
                 }
@@ -299,22 +321,23 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
             else -> LazyColumn(Modifier.fillMaxSize()) {
                 item { AlbumHeader(d, onArtist = { d.artistRef?.let { vm.openArtist(it) } }) }
                 d.bio?.let { bio -> item { BioBlock(bio) } }
-                item {
-                    Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        androidx.compose.material3.FilledTonalButton(
-                            onClick = { vm.playNext(d.tracks) }) { Text("Play next") }
-                        androidx.compose.material3.FilledTonalButton(
-                            onClick = { vm.addToQueue(d.tracks) }) { Text("Add to queue") }
-                    }
+                if (d.tracks.isNotEmpty()) item {
+                    ListActionsRow(
+                        onPlay = { vm.playAll(d.tracks, shuffle = false) },
+                        onShuffle = { vm.playAll(d.tracks, shuffle = true) },
+                        onPlayNext = { vm.playNext(d.tracks) },
+                        onAddToQueue = { vm.addToQueue(d.tracks) },
+                    )
                 }
                 item { SectionHeader("Tracks") }
-                items(d.tracks) { t ->
+                itemsIndexed(d.tracks) { i, t ->
+                    // Tapping a row plays the album from that track; the info icon
+                    // opens the track's details.
                     NumberedTrackRow(
                         t,
-                        isPlaying = t.id == state.playback.track?.id,
+                        playState = state.rowPlay(t),
                         onOpen = { vm.openTrack(t.service, t.id) },
-                        onPlay = { vm.play(t, d.tracks) },
+                        onPlay = { vm.playFrom(d.tracks, i) },
                         menu = { TrackRowMenu(vm, state, t) },
                     )
                 }
@@ -357,16 +380,18 @@ private fun AlbumHeader(d: AlbumDetail, onArtist: () -> Unit) {
 @Composable
 private fun NumberedTrackRow(
     t: Track,
-    isPlaying: Boolean,
+    playState: RowPlay,
     onOpen: () -> Unit,
     onPlay: () -> Unit,
     menu: (@Composable () -> Unit)? = null,
 ) {
-    Row(Modifier.fillMaxWidth().clickable { onOpen() }
-        .padding(horizontal = 16.dp, vertical = 8.dp),
+    val isPlaying = playState != RowPlay.NONE
+    Row(Modifier.fillMaxWidth().clickable { onPlay() }
+        .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
         Box(Modifier.size(32.dp), contentAlignment = Alignment.Center) {
-            Text(t.trackNumber?.toString() ?: "–", style = MaterialTheme.typography.bodyMedium,
+            if (isPlaying) PlayingIndicator(playState)
+            else Text(t.trackNumber?.toString() ?: "–", style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.width(8.dp))
@@ -381,7 +406,9 @@ private fun NumberedTrackRow(
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
-        IconButton(onClick = onPlay) { Icon(Icons.Filled.PlayArrow, "Play") }
+        IconButton(onClick = onOpen) {
+            Icon(Icons.Filled.Info, "Track details", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
         menu?.invoke()
     }
 }
@@ -389,7 +416,7 @@ private fun NumberedTrackRow(
 // ── Track ─────────────────────────────────────────────────────────────────
 
 @Composable
-private fun TrackScreen(vm: HarmonyViewModel, entry: DetailEntry) {
+private fun TrackScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry) {
     val d = entry.track
     Column(Modifier.fillMaxSize()) {
         DetailBar(d?.track?.title ?: "Track", onBack = { vm.popDetail() })
@@ -400,7 +427,13 @@ private fun TrackScreen(vm: HarmonyViewModel, entry: DetailEntry) {
                 body = entry.error, modifier = Modifier.fillMaxSize())
             d == null -> Loading()
             else -> LazyColumn(Modifier.fillMaxSize()) {
-                item { TrackHeader(d.track, onPlay = { vm.play(d.track) }) }
+                item {
+                    TrackHeader(d.track,
+                        onPlay = { vm.play(d.track) },
+                        onPlayNext = { vm.playNext(d.track) },
+                        onAddToQueue = { vm.addToQueue(d.track) },
+                        menu = { AddToPlaylistButton(vm, state, d.track) })
+                }
                 d.albumRef?.let { ref ->
                     item { SectionHeader("Album") }
                     item {
@@ -445,7 +478,8 @@ private fun TrackScreen(vm: HarmonyViewModel, entry: DetailEntry) {
 }
 
 @Composable
-private fun TrackHeader(track: Track, onPlay: () -> Unit) {
+private fun TrackHeader(track: Track, onPlay: () -> Unit, onPlayNext: () -> Unit,
+                        onAddToQueue: () -> Unit, menu: @Composable () -> Unit) {
     Column(Modifier.fillMaxWidth().padding(16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Surface(shape = RoundedCornerShape(12.dp), shadowElevation = 6.dp) {
             NetworkImage(track.artworkUrl, Modifier.size(200.dp).clip(RoundedCornerShape(12.dp)))
@@ -468,8 +502,20 @@ private fun TrackHeader(track: Track, onPlay: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         Spacer(Modifier.height(16.dp))
-        androidx.compose.material3.Button(onClick = onPlay) {
-            Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text("Play")
+        Row(verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.material3.Button(onClick = onPlay) {
+                Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(8.dp)); Text("Play")
+            }
+            menu()
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            androidx.compose.material3.TextButton(onClick = onPlayNext) {
+                Icon(Icons.AutoMirrored.Filled.PlaylistPlay, null); Spacer(Modifier.width(6.dp)); Text("Play next")
+            }
+            androidx.compose.material3.TextButton(onClick = onAddToQueue) {
+                Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null); Spacer(Modifier.width(6.dp)); Text("Add to queue")
+            }
         }
     }
 }
@@ -528,22 +574,18 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
             }
             if (artist.albums.isNotEmpty()) {
                 item { SectionHeader("Discography") }
-                items(artist.albums) { al ->
-                    AlbumRow(al, onClick = al.id?.let { id -> { vm.openAlbum(al.service, id) } })
-                }
+                items(artist.albums) { al -> PlayableAlbumRow(vm, al) }
             }
         }
         if (smart.albums.isNotEmpty()) {
             item { SectionHeader("Albums") }
-            items(smart.albums) { al ->
-                AlbumRow(al, onClick = al.id?.let { id -> { vm.openAlbum(al.service, id) } })
-            }
+            items(smart.albums) { al -> PlayableAlbumRow(vm, al) }
         }
         if (inc.tracks.isNotEmpty()) {
             item { SectionHeader("Songs") }
-            items(inc.tracks) { t ->
-                TrackRow(t, onPlay = { vm.play(t, inc.tracks) },
-                    isPlaying = t.id == state.playback.track?.id,
+            itemsIndexed(inc.tracks) { i, t ->
+                TrackRow(t, onPlay = { vm.playFrom(inc.tracks, i) },
+                    playState = state.rowPlay(t),
                     trailing = { TrackRowMenu(vm, state, t) })
             }
         }
@@ -554,7 +596,8 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
         if (inc.playlists.isNotEmpty()) {
             item { SectionHeader("Playlists") }
             items(inc.playlists) { pl ->
-                Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp),
+                Row(Modifier.fillMaxWidth().clickable { vm.openPlaylistFromSearch(pl) }
+                    .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     NetworkImage(pl.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
                     Spacer(Modifier.width(12.dp))
@@ -566,6 +609,7 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    ListActionMenu { vm.playlistAction(pl, it) }
                 }
             }
         }

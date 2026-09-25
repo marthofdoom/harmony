@@ -5,6 +5,19 @@ the legend in the [docs index](README.md). Current release: **1.0.4** (pre-1.0 p
 
 ## Done
 
+- **A real music player on every surface, one federated queue** — play an
+  album/playlist/artist as a queue (Play, Shuffle, double-click/tap from a
+  row), Play Next / Add to Queue everywhere, a Now Playing view with jump,
+  reorder, remove, clear and add-to-playlist, shuffle/repeat, and a queue that
+  survives restarts. One queue model (`harmony.playqueue`) on desktop, web and
+  Android. **The instance next to a cast device owns that device's queue** and
+  auto-advances it (a play clock covers Chromecast's frozen position); a
+  peer's device ("via") hands the whole queue to that peer, so a phone, a
+  browser and the desktop all see and control the same queue. Output
+  switches carry queue + position. Desktop: MPRIS (media keys, shell
+  controls). Web: Media Session. Android: background MediaSessionService
+  (notification, lock screen, Bluetooth). *Real WiiM/Chromecast/phone runs
+  still to confirm.*
 - **Lidarr acquisition** — "Get with Lidarr" on any album or artist (right-click
   a result) hands the request to a configured Lidarr instance (add + monitor +
   search), matched exactly by MusicBrainz id when Harmony knows it. Harmony

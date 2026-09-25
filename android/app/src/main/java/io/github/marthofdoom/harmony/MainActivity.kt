@@ -1,7 +1,13 @@
 package io.github.marthofdoom.harmony
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.activity.viewModels
+import androidx.core.content.ContextCompat
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,6 +23,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -37,6 +44,11 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.ClearAll
+import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.Refresh
+import androidx.compose.material.icons.automirrored.filled.VolumeUp
 import androidx.compose.material.icons.filled.Cloud
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.LibraryMusic
@@ -110,17 +122,30 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 
 class MainActivity : ComponentActivity() {
+    private val vm: HarmonyViewModel by viewModels()
+    private val askNotifications =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { /* best-effort */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        // Android 13+: the playback notification (transport controls) needs this.
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
+                != PackageManager.PERMISSION_GRANTED) {
+            askNotifications.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
         setContent {
             HarmonyTheme {
                 Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-                    App()
+                    App(vm)
                 }
             }
         }
     }
+
+    override fun onStart() { super.onStart(); vm.setUiVisible(true) }
+    override fun onStop() { vm.setUiVisible(false); super.onStop() }
 }
 
 @Composable
@@ -218,7 +243,13 @@ private fun ConnectScreen(vm: HarmonyViewModel, state: UiState) {
                 .imePadding()
                 .padding(16.dp)
         ) {
-            Text("On your network", style = MaterialTheme.typography.titleMedium)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("On your network", style = MaterialTheme.typography.titleMedium,
+                    modifier = Modifier.weight(1f))
+                TextButton(onClick = { vm.rescan() }) {
+                    Icon(Icons.Filled.Refresh, null); Spacer(Modifier.width(4.dp)); Text("Rescan")
+                }
+            }
             Spacer(Modifier.height(8.dp))
             if (state.discovered.isEmpty()) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -230,7 +261,9 @@ private fun ConnectScreen(vm: HarmonyViewModel, state: UiState) {
                 state.discovered.forEach { inst ->
                     Card(
                         Modifier.fillMaxWidth().padding(vertical = 4.dp)
-                            .clickable { vm.connect(inst.baseUrl, key.ifBlank { null }) }
+                            .clickable(enabled = state.conn != ConnState.CONNECTING) {
+                                vm.connect(inst.baseUrl, key.ifBlank { null })
+                            }
                     ) {
                         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                             Icon(Icons.Filled.Cloud, null)
@@ -240,7 +273,7 @@ private fun ConnectScreen(vm: HarmonyViewModel, state: UiState) {
                                 Text("${inst.host}:${inst.port}", style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
-                            if (state.conn == ConnState.CONNECTING) {
+                            if (state.conn == ConnState.CONNECTING && state.connectingUrl == inst.baseUrl) {
                                 CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                             }
                         }
@@ -279,7 +312,9 @@ private fun ConnectScreen(vm: HarmonyViewModel, state: UiState) {
                 enabled = host.isNotBlank() && state.conn != ConnState.CONNECTING,
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                if (state.conn == ConnState.CONNECTING) {
+                val manualConnecting = state.conn == ConnState.CONNECTING &&
+                    state.discovered.none { it.baseUrl == state.connectingUrl }
+                if (manualConnecting) {
                     CircularProgressIndicator(Modifier.size(18.dp), strokeWidth = 2.dp)
                     Spacer(Modifier.width(8.dp)); Text("Connecting…")
                 } else Text("Connect")
@@ -295,11 +330,31 @@ private fun normalizeBaseUrl(hostPort: String): String {
 
 // ── Connected (Search / Now Playing) ─────────────────────────────────────
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
+    // Now Playing opened from the mini player overlays everything; Back closes it.
+    if (state.nowPlayingOpen) {
+        BackHandler { vm.showNowPlaying(false) }
+        Column(Modifier.fillMaxSize()) {
+            TopAppBar(
+                title = { Text("Now playing") },
+                navigationIcon = {
+                    IconButton(onClick = { vm.showNowPlaying(false) }) {
+                        Icon(Icons.Filled.KeyboardArrowDown, "Close")
+                    }
+                },
+            )
+            Box(Modifier.weight(1f)) { NowPlayingScreen(vm, state) }
+        }
+        return
+    }
     // An open entity (artist/album/track) overlays the whole tab shell; Back pops it.
     if (state.detailStack.isNotEmpty()) {
-        DetailHost(vm, state)
+        Column(Modifier.fillMaxSize()) {
+            Box(Modifier.weight(1f)) { DetailHost(vm, state) }
+            MiniPlayer(vm, state, Modifier.navigationBarsPadding())
+        }
         return
     }
     val tab = state.tab
@@ -308,6 +363,9 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
         // top inset. This Scaffold adds none of its own, so insets apply once.
         contentWindowInsets = WindowInsets(0, 0, 0, 0),
         bottomBar = {
+          Column {
+            // Persistent mini player above the tabs (not on Now Playing itself).
+            if (tab != 4) MiniPlayer(vm, state)
             NavigationBar {
                 NavigationBarItem(selected = tab == 0, onClick = { vm.setTab(0) },
                     icon = { Icon(Icons.Filled.Search, null) }, label = { Text("Search") })
@@ -320,6 +378,7 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
                 NavigationBarItem(selected = tab == 4, onClick = { vm.setTab(4) },
                     icon = { Icon(Icons.Filled.MusicNote, null) }, label = { Text("Playing") })
             }
+          }
         }
     ) { pad ->
         Box(Modifier.padding(pad)) {
@@ -360,6 +419,8 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
         )
     }
 
+    // A playlist opened from search may not be one of yours: no edit actions then.
+    val owned = open != null && state.playlists.any { it.service == open.service && it.id == open.id }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
             title = { Text(open?.title ?: "Library", maxLines = 1, overflow = TextOverflow.Ellipsis) },
@@ -370,7 +431,7 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
             },
             actions = {
                 if (open != null) {
-                    TextButton(
+                    if (owned) TextButton(
                         onClick = { showDelete = true },
                         colors = ButtonDefaults.textButtonColors(
                             contentColor = MaterialTheme.colorScheme.error),
@@ -411,7 +472,7 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
                 LazyColumn(Modifier.fillMaxSize()) {
                     items(state.playlists) { pl ->
                         Row(Modifier.fillMaxWidth().clickable { vm.openPlaylist(pl) }
-                            .padding(horizontal = 16.dp, vertical = 8.dp),
+                            .padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
                             verticalAlignment = Alignment.CenterVertically) {
                             NetworkImage(pl.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
                             Spacer(Modifier.width(12.dp))
@@ -424,18 +485,31 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                             }
+                            ListActionMenu { vm.playlistAction(pl, it) }
                         }
                     }
                 }
             }
         } else {
+            val tracks = state.playlistTracks
             LazyColumn(Modifier.fillMaxSize()) {
-                items(state.playlistTracks) { t ->
-                    TrackRow(t, onPlay = { vm.play(t, state.playlistTracks) },
-                        isPlaying = t.id == state.playback.track?.id,
+                if (tracks.isNotEmpty()) {
+                    item {
+                        ListActionsRow(
+                            onPlay = { vm.playAll(tracks, shuffle = false) },
+                            onShuffle = { vm.playAll(tracks, shuffle = true) },
+                            onPlayNext = { vm.playNext(tracks) },
+                            onAddToQueue = { vm.addToQueue(tracks) },
+                        )
+                    }
+                }
+                itemsIndexed(tracks) { i, t ->
+                    TrackRow(t, onPlay = { vm.playFrom(tracks, i) },
+                        playState = state.rowPlay(t),
                         trailing = {
-                            IconButton(onClick = { vm.removeFromPlaylist(t) }) {
-                                Icon(Icons.Filled.Close, "Remove")
+                            TrackRowMenu(vm, state, t)
+                            if (owned) IconButton(onClick = { vm.removeFromPlaylist(t) }) {
+                                Icon(Icons.Filled.Close, "Remove from playlist")
                             }
                         })
                 }
@@ -828,23 +902,144 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
 fun TrackRow(
     t: Track,
     onPlay: () -> Unit,
-    isPlaying: Boolean = false,
+    playState: RowPlay = RowPlay.NONE,
     trailing: @Composable (() -> Unit)? = null,
 ) {
-    Row(Modifier.fillMaxWidth().clickable { onPlay() }.padding(horizontal = 16.dp, vertical = 8.dp),
+    Row(Modifier.fillMaxWidth().clickable { onPlay() }.padding(start = 16.dp, end = 4.dp, top = 8.dp, bottom = 8.dp),
         verticalAlignment = Alignment.CenterVertically) {
-        NetworkImage(t.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
+        Box(contentAlignment = Alignment.Center) {
+            NetworkImage(t.artworkUrl, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)))
+            if (playState != RowPlay.NONE) {
+                Surface(shape = RoundedCornerShape(6.dp),
+                    color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.45f),
+                    modifier = Modifier.size(48.dp)) {}
+                PlayingIndicator(playState, tint = MaterialTheme.colorScheme.inversePrimary)
+            }
+        }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(t.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodyLarge,
-                color = if (isPlaying) MaterialTheme.colorScheme.primary
+                color = if (playState != RowPlay.NONE) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurface)
             Text(listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         trailing?.invoke()
+    }
+}
+
+/** The "this row is the current track" marker: an equalizer while playing, a
+ *  pause glyph while paused. */
+@Composable
+fun PlayingIndicator(playState: RowPlay, tint: androidx.compose.ui.graphics.Color = MaterialTheme.colorScheme.primary,
+                     modifier: Modifier = Modifier) {
+    when (playState) {
+        RowPlay.PLAYING -> Icon(Icons.Filled.GraphicEq, "Playing", modifier.size(24.dp), tint = tint)
+        RowPlay.PAUSED -> Icon(Icons.Filled.Pause, "Paused", modifier.size(24.dp), tint = tint)
+        RowPlay.NONE -> {}
+    }
+}
+
+/** Play / Shuffle (primary) + Play next / Add to queue for a whole list. */
+@Composable
+fun ListActionsRow(
+    onPlay: () -> Unit,
+    onShuffle: () -> Unit,
+    onPlayNext: (() -> Unit)? = null,
+    onAddToQueue: (() -> Unit)? = null,
+) {
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Button(onClick = onPlay, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Filled.PlayArrow, null); Spacer(Modifier.width(6.dp)); Text("Play")
+            }
+            FilledTonalButton(onClick = onShuffle, modifier = Modifier.weight(1f)) {
+                Icon(Icons.Filled.Shuffle, null); Spacer(Modifier.width(6.dp)); Text("Shuffle")
+            }
+        }
+        if (onPlayNext != null || onAddToQueue != null) {
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                if (onPlayNext != null) TextButton(onClick = onPlayNext) {
+                    Icon(Icons.AutoMirrored.Filled.PlaylistPlay, null); Spacer(Modifier.width(6.dp)); Text("Play next")
+                }
+                if (onAddToQueue != null) TextButton(onClick = onAddToQueue) {
+                    Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null); Spacer(Modifier.width(6.dp)); Text("Add to queue")
+                }
+            }
+        }
+    }
+}
+
+/** Overflow menu for a whole album/playlist row: play, shuffle, queue. */
+@Composable
+fun ListActionMenu(onAction: (ListAction) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    Box {
+        IconButton(onClick = { expanded = true }) { Icon(Icons.Filled.MoreVert, "More actions") }
+        DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+            DropdownMenuItem(text = { Text("Play") },
+                leadingIcon = { Icon(Icons.Filled.PlayArrow, null) },
+                onClick = { onAction(ListAction.PLAY); expanded = false })
+            DropdownMenuItem(text = { Text("Shuffle") },
+                leadingIcon = { Icon(Icons.Filled.Shuffle, null) },
+                onClick = { onAction(ListAction.SHUFFLE); expanded = false })
+            DropdownMenuItem(text = { Text("Play next") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistPlay, null) },
+                onClick = { onAction(ListAction.PLAY_NEXT); expanded = false })
+            DropdownMenuItem(text = { Text("Add to queue") },
+                leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) },
+                onClick = { onAction(ListAction.ADD_TO_QUEUE); expanded = false })
+        }
+    }
+}
+
+/** Persistent mini player: current track, play/pause, next. Tapping it opens
+ *  Now Playing. Hidden when nothing is queued. */
+@Composable
+fun MiniPlayer(vm: HarmonyViewModel, state: UiState, modifier: Modifier = Modifier) {
+    val t = state.playback.track
+    if (t == null && !state.playingHere) return
+    val playing = state.playback.isPlaying
+    Surface(tonalElevation = 3.dp, modifier = modifier.fillMaxWidth()) {
+        Column {
+            val dur = state.playback.durationMs
+            if (dur > 0 && !state.playingHere) {
+                androidx.compose.material3.LinearProgressIndicator(
+                    progress = { (state.playback.positionMs.toFloat() / dur).coerceIn(0f, 1f) },
+                    modifier = Modifier.fillMaxWidth().height(2.dp),
+                )
+            }
+            Row(Modifier.fillMaxWidth().clickable { vm.showNowPlaying(true) }
+                .padding(start = 12.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                NetworkImage(t?.artworkUrl, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)))
+                Spacer(Modifier.width(12.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(if (state.playingHere) "Hub audio" else t?.title ?: "",
+                        maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodyMedium)
+                    val sub = if (state.playingHere) state.instanceName ?: ""
+                              else listOfNotNull(t?.artist?.ifBlank { null },
+                                  state.targetName?.takeIf { state.target != PHONE }?.let { "on $it" })
+                                  .joinToString(" · ")
+                    Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+                if (state.buffering) {
+                    CircularProgressIndicator(Modifier.size(20.dp).padding(end = 4.dp), strokeWidth = 2.dp)
+                }
+                IconButton(onClick = { vm.togglePlayPause() }) {
+                    Icon(if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
+                        if (playing) "Pause" else "Play")
+                }
+                if (!state.playingHere) IconButton(onClick = { vm.next() }) {
+                    Icon(Icons.Filled.SkipNext, "Next")
+                }
+            }
+        }
     }
 }
 
@@ -896,7 +1091,7 @@ fun AddToPlaylistButton(vm: HarmonyViewModel, state: UiState, track: Track) {
 @Composable
 private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
     val pb = state.playback
-    val onDevice = state.target != "phone"
+    val onDevice = state.target != PHONE
 
     // Nothing to show and not streaming hub audio: an empty state, not a dead transport.
     if (pb.track == null && !state.playingHere) {
@@ -916,12 +1111,10 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
         return
     }
 
-    // When playingHere with no track, we're streaming the hub's live audio.
-    val title = pb.track?.title ?: "Hub audio"
-    val subtitle = pb.track?.artist?.ifBlank { null } ?: state.instanceName ?: ""
-    // The whole collection this playback started from (album/playlist/search list),
-    // mirroring the desktop's Now Playing. Shown only when there's more than the
-    // single track, with the current one highlighted and tappable to jump.
+    // When playingHere we're streaming the hub's live audio (the queue is kept).
+    val title = if (state.playingHere) "Hub audio" else pb.track?.title ?: ""
+    val subtitle = if (state.playingHere) state.instanceName ?: ""
+                   else pb.track?.artist?.ifBlank { null } ?: ""
     val queue = state.queue
 
     // Big art + transport live in a header above the queue; the whole thing scrolls
@@ -940,7 +1133,8 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                     shadowElevation = 8.dp,
                     modifier = Modifier.padding(bottom = 24.dp),
                 ) {
-                    NetworkImage(pb.track?.artworkUrl, Modifier.size(280.dp).clip(RoundedCornerShape(14.dp)))
+                    NetworkImage(if (state.playingHere) null else pb.track?.artworkUrl,
+                        Modifier.size(280.dp).clip(RoundedCornerShape(14.dp)))
                 }
                 Text(title, style = MaterialTheme.typography.titleLarge,
                     maxLines = 1, overflow = TextOverflow.Ellipsis)
@@ -950,17 +1144,11 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                 Spacer(Modifier.height(24.dp))
 
                 val dur = pb.durationMs.coerceAtLeast(0)
-                val pos = pb.positionMs.coerceIn(0, if (dur > 0) dur else pb.positionMs)
+                val pos = pb.positionMs.coerceIn(0, if (dur > 0) dur else pb.positionMs.coerceAtLeast(0))
                 // While dragging, show the drag position; only commit on release so the
-                // slider doesn't fight the 500ms progress ticker.
+                // slider doesn't fight the progress ticker / device polling.
                 var dragPos by remember { mutableStateOf<Float?>(null) }
-                if (onDevice) {
-                    // The local slider only reflects this phone's player; when casting, the
-                    // device owns transport.
-                    Text("Playback controls are on the device.",
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
-                } else if (pb.track != null && dur > 0) {
+                if (!state.playingHere && pb.track != null && dur > 0) {
                     val livePos = pos.toFloat() / dur
                     Slider(
                         value = dragPos ?: livePos,
@@ -975,24 +1163,29 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                             style = MaterialTheme.typography.labelSmall)
                         Text(formatMs(dur), style = MaterialTheme.typography.labelSmall)
                     }
+                } else if (!state.playingHere && pb.track != null && pos > 0) {
+                    Text(formatMs(pos), style = MaterialTheme.typography.labelSmall)
                 }
                 Spacer(Modifier.height(16.dp))
-                val playing = if (onDevice) !state.devicePaused else pb.isPlaying
-                val hasQueue = state.queue.isNotEmpty()
+                val playing = pb.isPlaying
+                val hasQueue = queue.isNotEmpty() && !state.playingHere
                 Row(verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     // Shuffle: tinted when on.
-                    IconButton(onClick = { vm.toggleShuffle() }) {
-                        Icon(Icons.Filled.Shuffle, "Shuffle",
+                    IconButton(onClick = { vm.toggleShuffle() }, enabled = !state.playingHere) {
+                        Icon(Icons.Filled.Shuffle, if (state.shuffle) "Shuffle on" else "Shuffle off",
                             tint = if (state.shuffle) MaterialTheme.colorScheme.primary
                                    else MaterialTheme.colorScheme.onSurfaceVariant)
                     }
                     IconButton(onClick = { vm.prev() }, enabled = hasQueue) {
                         Icon(Icons.Filled.SkipPrevious, "Previous", Modifier.size(32.dp))
                     }
-                    FilledIconButton(onClick = { vm.togglePlayPause() }, enabled = pb.track != null,
+                    FilledIconButton(onClick = { vm.togglePlayPause() },
                         modifier = Modifier.size(72.dp)) {
-                        Icon(
+                        if (state.buffering) {
+                            CircularProgressIndicator(Modifier.size(36.dp), strokeWidth = 3.dp,
+                                color = MaterialTheme.colorScheme.onPrimary)
+                        } else Icon(
                             if (playing) Icons.Filled.Pause else Icons.Filled.PlayArrow,
                             contentDescription = if (playing) "Pause" else "Play",
                             modifier = Modifier.size(40.dp),
@@ -1002,7 +1195,7 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                         Icon(Icons.Filled.SkipNext, "Next", Modifier.size(32.dp))
                     }
                     // Repeat: off → all → one; tinted when not off, filled-one icon for "one".
-                    IconButton(onClick = { vm.cycleRepeat() }) {
+                    IconButton(onClick = { vm.cycleRepeat() }, enabled = !state.playingHere) {
                         Icon(
                             if (state.repeatMode == RepeatMode.ONE) Icons.Filled.RepeatOne
                             else Icons.Filled.Repeat,
@@ -1011,41 +1204,71 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                                        MaterialTheme.colorScheme.onSurfaceVariant
                                    else MaterialTheme.colorScheme.primary)
                     }
+                    IconButton(onClick = { vm.stopPlayback() }) {
+                        Icon(Icons.Filled.Stop, "Stop", tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                    }
                 }
                 if (onDevice) {
                     Spacer(Modifier.height(8.dp))
-                    Text("Casting to ${state.devices.firstOrNull { it.host == state.target }?.name ?: "a device"}",
+                    Text("Playing on ${state.targetName ?: state.target}",
                         style = MaterialTheme.typography.labelMedium,
                         color = MaterialTheme.colorScheme.primary)
+                    // Device volume (the phone's own volume is the hardware keys).
+                    var dragVol by remember { mutableStateOf<Float?>(null) }
+                    val vol = state.deviceVolume
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Icon(Icons.AutoMirrored.Filled.VolumeUp, "Device volume",
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant)
+                        Spacer(Modifier.width(8.dp))
+                        Slider(
+                            value = dragVol ?: ((vol ?: 0) / 100f),
+                            enabled = vol != null,
+                            onValueChange = { dragVol = it },
+                            onValueChangeFinished = {
+                                dragVol?.let { vm.setVolume((it * 100).toInt()) }
+                                dragVol = null
+                            },
+                            modifier = Modifier.weight(1f),
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(vol?.let { "${((dragVol ?: (it / 100f)) * 100).toInt()}" } ?: "–",
+                            style = MaterialTheme.typography.labelSmall)
+                    }
                 }
                 Spacer(Modifier.height(16.dp))
                 OutputSelector(vm, state)
             }
         }
 
-        // The active play queue: tap a row to jump to it; reorder upcoming tracks with
-        // the up/down affordances (drag is heavy in Compose without an extra library).
-        if (queue.size > 1) {
+        // The active play queue: tap a row to jump to it; reorder with the up/down
+        // affordances; remove a row; clear everything but the current track.
+        if (queue.isNotEmpty()) {
             item {
                 Row(Modifier.fillMaxWidth()
-                    .padding(start = 16.dp, end = 16.dp, top = 8.dp, bottom = 4.dp),
+                    .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 4.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.AutoMirrored.Filled.QueueMusic, null,
                         tint = MaterialTheme.colorScheme.onSurfaceVariant)
                     Spacer(Modifier.width(8.dp))
-                    Text("Queue", style = MaterialTheme.typography.titleSmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text("Queue · ${queue.size}", style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f))
+                    if (queue.size > 1) TextButton(onClick = { vm.clearQueue() }) {
+                        Icon(Icons.Filled.ClearAll, null); Spacer(Modifier.width(4.dp)); Text("Clear")
+                    }
                 }
             }
             itemsIndexed(queue, key = { i, t -> "$i-${t.service}-${t.id}" }) { i, t ->
                 QueueRow(
                     track = t,
-                    isCurrent = i == state.activeIndex,
+                    playState = if (i == state.activeIndex && !state.playingHere)
+                        (if (pb.isPlaying) RowPlay.PLAYING else RowPlay.PAUSED) else RowPlay.NONE,
                     canMoveUp = i > 0,
                     canMoveDown = i < queue.size - 1,
                     onTap = { vm.jumpTo(i) },
                     onMoveUp = { vm.moveQueueItem(i, i - 1) },
                     onMoveDown = { vm.moveQueueItem(i, i + 1) },
+                    onRemove = { vm.removeFromQueue(i) },
                 )
             }
             item { Spacer(Modifier.height(24.dp)) }
@@ -1054,20 +1277,30 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
 }
 
 /** One row in the active-queue list: art, title/artist, current highlight, and
- *  up/down reorder controls. Tapping the row jumps playback to it. */
+ *  up/down/remove controls. Tapping the row jumps playback to it. */
 @Composable
 private fun QueueRow(
     track: Track,
-    isCurrent: Boolean,
+    playState: RowPlay,
     canMoveUp: Boolean,
     canMoveDown: Boolean,
     onTap: () -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
+    onRemove: () -> Unit,
 ) {
-    Row(Modifier.fillMaxWidth().clickable { onTap() }.padding(horizontal = 16.dp, vertical = 4.dp),
+    val isCurrent = playState != RowPlay.NONE
+    Row(Modifier.fillMaxWidth().clickable { onTap() }.padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
         verticalAlignment = Alignment.CenterVertically) {
-        NetworkImage(track.artworkUrl, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)))
+        Box(contentAlignment = Alignment.Center) {
+            NetworkImage(track.artworkUrl, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)))
+            if (isCurrent) {
+                Surface(shape = RoundedCornerShape(6.dp),
+                    color = MaterialTheme.colorScheme.scrim.copy(alpha = 0.45f),
+                    modifier = Modifier.size(40.dp)) {}
+                PlayingIndicator(playState, tint = MaterialTheme.colorScheme.inversePrimary)
+            }
+        }
         Spacer(Modifier.width(12.dp))
         Column(Modifier.weight(1f)) {
             Text(track.title, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -1080,14 +1313,13 @@ private fun QueueRow(
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
         IconButton(onClick = onMoveUp, enabled = canMoveUp) {
-            Icon(Icons.Filled.ArrowUpward, "Move up",
-                tint = if (canMoveUp) MaterialTheme.colorScheme.onSurfaceVariant
-                       else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f))
+            Icon(Icons.Filled.ArrowUpward, "Move up")
         }
         IconButton(onClick = onMoveDown, enabled = canMoveDown) {
-            Icon(Icons.Filled.ArrowDownward, "Move down",
-                tint = if (canMoveDown) MaterialTheme.colorScheme.onSurfaceVariant
-                       else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.3f))
+            Icon(Icons.Filled.ArrowDownward, "Move down")
+        }
+        IconButton(onClick = onRemove) {
+            Icon(Icons.Filled.Close, "Remove from queue")
         }
     }
 }
@@ -1096,9 +1328,11 @@ private fun QueueRow(
 @Composable
 private fun OutputSelector(vm: HarmonyViewModel, state: UiState) {
     var expanded by remember { mutableStateOf(false) }
-    val label = if (state.target == "phone") "This phone"
-    else state.devices.firstOrNull { it.host == state.target }?.name ?: state.target
-    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+    val label = if (state.target == PHONE) "This phone" else state.targetName ?: state.target
+    ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = {
+        expanded = it
+        if (it) vm.loadDevices()
+    }) {
         OutlinedTextField(
             value = label, onValueChange = {}, readOnly = true, label = { Text("Output") },
             leadingIcon = { Icon(Icons.Filled.Speaker, null) },
@@ -1107,10 +1341,12 @@ private fun OutputSelector(vm: HarmonyViewModel, state: UiState) {
         )
         ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
             DropdownMenuItem(text = { Text("This phone") },
-                onClick = { vm.setTarget("phone"); expanded = false })
+                onClick = { vm.setTarget(null); expanded = false })
             state.devices.forEach { d ->
-                DropdownMenuItem(text = { Text("${d.name} · ${d.kind}") },
-                    onClick = { vm.setTarget(d.host); expanded = false })
+                val where = d.viaName ?: d.via
+                DropdownMenuItem(
+                    text = { Text(listOfNotNull(d.name, d.kind, where?.let { "via $it" }).joinToString(" · ")) },
+                    onClick = { vm.setTarget(d); expanded = false })
             }
         }
     }

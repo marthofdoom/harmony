@@ -59,6 +59,15 @@ class Discovery(context: Context) {
             .onFailure { Log.w(TAG, "discoverServices failed", it) }
     }
 
+    /** Forget what was found and browse again (the Rescan button). Leaves this
+     *  phone's own advertisement registered. */
+    fun rescan() {
+        discoveryListener?.let { runCatching { nsd.stopServiceDiscovery(it) } }
+        discoveryListener = null
+        _instances.value = emptyList()
+        start()
+    }
+
     private fun resolve(info: NsdServiceInfo) {
         // A fresh listener per resolve avoids the "listener already in use" error
         // on older Android when several services resolve at once.

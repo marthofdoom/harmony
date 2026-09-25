@@ -150,7 +150,30 @@ data class Account(val service: String, val authenticated: Boolean, val account:
 data class Playlist(val service: String, val id: String, val title: String,
                     val trackCount: Int?, val artworkUrl: String?)
 
-data class Device(val host: String, val name: String, val kind: String)
+/** A playback renderer. [via] ("host:port") is set for a federated device that is
+ *  reached through a peer instance; every call for it must carry that via. */
+data class Device(val host: String, val name: String, val kind: String,
+                  val via: String? = null, val viaName: String? = null)
+
+/** GET/POST /api/devices/{host}/queue[...] — the server-owned device queue plus
+ *  the device's live status (position already corrected server-side). */
+data class DeviceSnapshot(
+    val tracks: List<Track>,
+    val index: Int,
+    val shuffle: Boolean,
+    val repeat: RepeatMode,
+    val playing: Boolean,
+    val error: String?,
+    val state: String?,
+    val positionS: Double?,
+    val durationS: Double?,
+    val volume: Int?,
+)
+
+/** POST /api/credentials/adopt — which services were adopted, which were kept
+ *  (already working here), and which were rolled back (didn't work here). */
+data class AdoptResult(val synced: List<String>, val kept: List<String>,
+                       val rolledBack: List<String>, val imported: List<String>)
 
 data class SyncPlan(val token: String?, val adds: Int, val removes: Int,
                     val unmatched: Int, val notes: List<String>)
@@ -381,36 +404,79 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
      *  streaming credentials and decrypt them with the shared personal key. Both
      *  instances must carry the same key. Returns the imported secret keys;
      *  throws ApiError (the peer/decrypt failure surfaces as a 502 with `error`). */
-    fun adoptCredentials(peerHost: String, peerPort: Int): List<String> {
+    fun adoptCredentials(peerHost: String, peerPort: Int): AdoptResult {
         val o = JSONObject(post("/api/credentials/adopt",
             JSONObject().put("host", peerHost).put("port", peerPort)))
-        val arr = o.optJSONArray("imported") ?: return emptyList()
-        return (0 until arr.length()).mapNotNull { i -> arr.optString(i).ifEmpty { null } }
+        return AdoptResult(
+            synced = parseStrList(o.optJSONArray("synced")),
+            kept = parseStrList(o.optJSONArray("kept")),
+            rolledBack = parseStrList(o.optJSONArray("rolled_back")),
+            imported = parseStrList(o.optJSONArray("imported")),
+        )
     }
 
     // -- cast to a hub device ----------------------------------------------
 
+    /** This instance's devices plus every mesh peer's (federated ones carry `via`). */
     fun devices(): List<Device> {
-        val arr = JSONObject(get("/api/devices")).optJSONArray("devices") ?: return emptyList()
+        val arr = JSONObject(get("/api/devices?peers=1")).optJSONArray("devices") ?: return emptyList()
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             Device(o.getString("host"), o.optString("name").ifEmpty { o.getString("host") },
-                o.optString("kind").ifEmpty { "device" })
+                o.optString("kind").ifEmpty { "device" }, optStr(o, "via"), optStr(o, "via_name"))
         }
     }
 
-    fun castPlay(host: String, track: Track) {
-        val meta = JSONObject().put("title", track.title).put("artist", track.artist)
-            .put("album", track.album ?: JSONObject.NULL).put("art_url", track.artworkUrl ?: JSONObject.NULL)
-            .put("duration_s", track.durationS ?: JSONObject.NULL)
-        post("/api/devices/${enc(host)}/play",
-            JSONObject().put("service", track.service).put("id", track.id).put("meta", meta))
+    /** The server-owned queue + live status for a device. */
+    fun deviceQueue(host: String, via: String?): DeviceSnapshot {
+        val q = if (via.isNullOrEmpty()) "" else "?via=" + enc(via)
+        return parseSnapshot(JSONObject(get("/api/devices/${enc(host)}/queue$q")))
     }
 
-    fun deviceControl(host: String, action: String, level: Int? = null) {
+    /** Apply one queue op (load/jump/next/prev/enqueue/play_next/move/remove/clear/
+     *  shuffle/repeat/stop) on the instance that owns the device's queue. */
+    fun deviceQueueOp(host: String, op: String, body: JSONObject = JSONObject(), via: String?): DeviceSnapshot {
+        if (!via.isNullOrEmpty()) body.put("via", via)
+        return parseSnapshot(JSONObject(post("/api/devices/${enc(host)}/queue/$op", body)))
+    }
+
+    /** pause / resume / stop / volume {level 0..100} / seek {level seconds}. */
+    fun deviceControl(host: String, action: String, level: Int? = null, via: String? = null) {
         val body = JSONObject()
         if (level != null) body.put("level", level)
+        if (!via.isNullOrEmpty()) body.put("via", via)
         post("/api/devices/${enc(host)}/$action", body)
+    }
+
+    companion object {
+        /** A track as the server's queue expects it. */
+        fun trackJson(t: Track): JSONObject = JSONObject()
+            .put("service", t.service).put("id", t.id)
+            .put("title", t.title).put("artist", t.artist)
+            .put("album", t.album ?: JSONObject.NULL)
+            .put("art_url", t.artworkUrl ?: JSONObject.NULL)
+            .put("duration_s", t.durationS ?: JSONObject.NULL)
+
+        fun tracksJson(ts: List<Track>): JSONArray = JSONArray().apply { ts.forEach { put(trackJson(it)) } }
+    }
+
+    private fun parseSnapshot(o: JSONObject): DeviceSnapshot {
+        if (o.has("error") && !o.has("tracks") && !o.isNull("error")) {
+            throw ApiError(o.optString("error"), 502)
+        }
+        fun optDouble(k: String): Double? = if (o.isNull(k) || !o.has(k)) null else o.optDouble(k).takeIf { !it.isNaN() }
+        return DeviceSnapshot(
+            tracks = parseTracks(o.optJSONArray("tracks")),
+            index = o.optInt("index", -1),
+            shuffle = o.optBoolean("shuffle"),
+            repeat = RepeatMode.fromWire(optStr(o, "repeat")),
+            playing = o.optBoolean("playing"),
+            error = optStr(o, "error"),
+            state = optStr(o, "state")?.lowercase(),
+            positionS = optDouble("position_s"),
+            durationS = optDouble("duration_s"),
+            volume = optDouble("volume")?.toInt(),
+        )
     }
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
@@ -433,7 +499,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         title = o.optString("title"), artist = o.optString("artist"),
         album = optStr(o, "album"),
         durationS = optInt(o, "duration_s"),
-        artworkUrl = optStr(o, "artwork_url"),
+        artworkUrl = optStr(o, "artwork_url") ?: optStr(o, "art_url"),
         trackNumber = optInt(o, "track_number"),
         year = optInt(o, "year"),
         isrc = optStr(o, "isrc"),
