@@ -143,6 +143,11 @@ class Engine:
         self._lib_lock = threading.Lock()
         self._scan_lock = threading.Lock()
         self._scan_state: dict[str, Any] = {"running": False}
+        # Scans queued or running. Counted from the moment one is requested, so
+        # status never shows the PREVIOUS scan's "finished" while a new one is
+        # still waiting to start (the scan thread may not have run yet).
+        self._scans_pending = 0
+        self._pending_lock = threading.Lock()
         self._lidarr_cache: dict[str, tuple[float, Any]] = {}
         self._http_port: int | None = None
 
@@ -1054,7 +1059,7 @@ class Engine:
         out: dict[str, Any] = {
             "enabled": bool(s.library_enabled), "paths": list(s.library_paths),
             "path_map": list(s.lidarr_path_map), "tags": has_mutagen(),
-            "scan": dict(self._scan_state),
+            "scan": self._scan_status(),
             "missing": [p for p in s.library_paths if not os.path.isdir(p)],
         }
         try:
@@ -1112,9 +1117,16 @@ class Engine:
         else:
             targets = self._library_targets(paths, s.library_paths)
         if not targets:
-            return {"ok": False, "reason": "no library folders to scan", "scan": dict(self._scan_state)}
+            return {"ok": False, "reason": "no library folders to scan", "scan": self._scan_status()}
 
         def run() -> None:
+            try:
+                scan()
+            finally:
+                with self._pending_lock:
+                    self._scans_pending -= 1
+
+        def scan() -> None:
             with self._scan_lock:
                 self._scan_state = {"running": True, "started": time.time(),
                                     "paths": [str(t) for t in targets]}
@@ -1131,11 +1143,20 @@ class Engine:
                                         "error": str(exc)}
                 self._lidarr_cache.pop("albums", None)
 
+        with self._pending_lock:
+            self._scans_pending += 1
         if wait:
             run()
         else:
             threading.Thread(target=run, daemon=True, name="harmony-library-scan").start()
-        return {"ok": True, "scan": dict(self._scan_state)}
+        return {"ok": True, "scan": self._scan_status()}
+
+    def _scan_status(self) -> dict[str, Any]:
+        state = dict(self._scan_state)
+        with self._pending_lock:
+            if self._scans_pending:
+                state["running"] = True
+        return state
 
     @staticmethod
     def _library_targets(paths: list[str], roots: list[str]) -> list[Any]:
