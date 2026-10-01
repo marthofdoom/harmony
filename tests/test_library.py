@@ -660,3 +660,106 @@ def test_cast_meta_art_is_made_absolute_for_the_device(server, monkeypatch):
     assert seen["art_url"] == f"http://127.0.0.1:{server.engine._http_port}/art/abc.def"
     server.engine._cast_direct("127.0.0.1", "qobuz", "t1", {"art_url": "https://cdn/x.jpg"})
     assert seen["art_url"] == "https://cdn/x.jpg"
+
+
+# -- review fixes ---------------------------------------------------------------------
+
+
+def test_album_delete_with_boolean_deleted_files_does_not_crash(server):
+    # Lidarr sends deletedFiles as a *bool* on AlbumDelete/ArtistDelete.
+    assert webhook_paths({"eventType": "AlbumDelete", "artist": {"path": "/m/A"},
+                          "deletedFiles": True})["dirs"] == ["/m/A"]
+    _enable(server)
+    shutil.rmtree(server.root / "Björk")
+    r = _post(server.url + "/api/lidarr/webhook", {
+        "eventType": "ArtistDelete", "artist": {"path": str(server.root / "Björk")},
+        "deletedFiles": True})
+    assert r["ok"] and r["rescanning"] == [str(server.root / "Björk")]
+    assert _wait_scan(server.engine)["stats"]["artists"] == 1
+
+
+def test_dotdot_paths_cannot_escape_the_library(server, tmp_path):
+    outside = tmp_path / "private"
+    _wav(outside / "secret.wav")
+    _enable(server, [str(server.root / "Nightwish")])
+    sneaky = str(server.root / "Nightwish" / ".." / ".." / "private")
+    assert _post(server.url + "/api/library/scan", {"paths": [sneaky]})["ok"] is False
+    r = _post(server.url + "/api/lidarr/webhook", {
+        "eventType": "Download", "trackFiles": [{"path": sneaky + "/secret.wav"}]})
+    assert r["indexed"] == 0 and r["outside_library"] == [sneaky + "/secret.wav"]
+    assert _json(server.url + "/api/library")["stats"]["tracks"] == 3
+    assert not library.within(sneaky, [server.root / "Nightwish"])
+
+
+def test_a_missing_library_folder_keeps_its_tracks(server):
+    _enable(server)
+    hidden = server.root.with_name("music-unmounted")
+    server.root.rename(hidden)                       # the share "unmounts"
+    _post(server.url + "/api/library/scan", {})
+    st = _wait_scan(server.engine)
+    assert st["stats"]["tracks"] == 5 and st["missing"] == [str(server.root)]
+    # A webhook for a folder on the missing share mustn't prune it either.
+    _post(server.url + "/api/lidarr/webhook", {
+        "eventType": "AlbumDelete", "artist": {"path": str(server.root / "Nightwish")}})
+    assert _json(server.url + "/api/library")["stats"]["tracks"] == 5
+    hidden.rename(server.root)
+
+
+def test_untagged_compilation_stays_one_album(lib):
+    pytest.importorskip("mutagen")
+    comp = lib.root / "Various Artists" / "Now 80 (2010)"
+    for i, artist in enumerate(["A-ha", "Toto", "Europe"], 1):
+        f = _wav(comp / f"0{i} - Song {i}.wav")
+        _tag(f, title=f"Song {i}", artist=artist, album="Now 80", track=str(i))  # no albumartist
+    lib.index.scan([lib.root])
+    found = lib.index.search("now 80", kinds=("albums",))["albums"]
+    assert len(found) == 1 and found[0]["track_count"] == 3
+    assert found[0]["album_artist"] == "Various Artists"
+    tracks = lib.index.album_tracks(found[0]["album_id"])
+    assert [t["artist"] for t in tracks] == ["A-ha", "Toto", "Europe"]
+
+
+def test_library_tracks_refused_via_a_peer(server):
+    _enable(server)
+    t = {"service": "local", "id": "x", "title": "Nemo"}
+    for url, body in ((server.url + "/api/devices/10.0.0.9/queue/load", {"tracks": [t], "via": "peer:8080"}),
+                      (server.url + "/api/devices/10.0.0.9/play", {"service": "local", "id": "x", "via": "peer:8080"})):
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            _post(url, body)
+        assert exc.value.code == 400 and b"only on this instance" in exc.value.read()
+
+
+def test_relay_serves_library_m4a_as_a_file_even_when_icy_is_asked(tmp_path):
+    from harmony.models import StreamSource
+    from harmony.playback.relay import RelayServer
+
+    p = tmp_path / "alac.m4a"
+    p.write_bytes(b"\x00\x00\x00\x20ftypM4A " + bytes(200))
+    relay = RelayServer(bind_host="127.0.0.1", port=0)
+    relay.start()
+    try:
+        src = StreamSource(url=p.as_uri(), mime_type="audio/mp4", container="m4a")
+        token = relay.register(lambda: src, title="T", artist="A", allow_icy=True)
+        req = urllib.request.Request(f"http://127.0.0.1:{relay.port}/play/{token}",
+                                     headers={"Icy-MetaData": "1"})
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310
+            assert resp.headers.get("icy-metaint") is None
+            assert resp.read() == p.read_bytes()
+    finally:
+        relay.stop()
+
+
+def test_connect_library_saves_path_map_and_scans_once(server, monkeypatch):
+    from harmony.config import Settings
+
+    fake = _FakeLidarr()
+    monkeypatch.setattr(server.engine, "_lidarr_client", lambda: (fake, Settings.load()))
+    scans = []
+    real = server.engine.library_scan
+    monkeypatch.setattr(server.engine, "library_scan", lambda *a, **k: scans.append(a) or real(*a, **k))
+    r = _post(server.url + "/api/lidarr/connect-library", {
+        "callback_url": "http://h:1", "path_map": [{"remote": "/data/music", "local": str(server.root)}]})
+    assert r["roots"] == [str(server.root)] and r["missing"] == []
+    assert len(scans) == 1
+    assert Settings.load().lidarr_path_map == [{"remote": "/data/music", "local": str(server.root)}]
+    assert _wait_scan(server.engine)["stats"]["tracks"] == 5

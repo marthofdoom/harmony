@@ -258,8 +258,12 @@ def webhook_paths(payload: dict[str, Any]) -> dict[str, Any]:
     dirs: list[str] = []
 
     def paths_of(items: Any) -> list[str]:
+        # On AlbumDelete/ArtistDelete Lidarr sends ``deletedFiles`` as a *bool*
+        # ("files were deleted too"); only a list carries paths.
+        if not isinstance(items, list):
+            return []
         out = []
-        for it in items or []:
+        for it in items:
             if isinstance(it, dict) and it.get("path"):
                 out.append(str(it["path"]))
         return out

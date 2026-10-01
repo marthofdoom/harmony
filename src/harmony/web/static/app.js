@@ -1486,8 +1486,8 @@ async function renderAccounts() {
   if ($("li-connect")) $("li-connect").onclick = async () => {
     setMsg("li-loop-msg", "Connecting…");
     try {
-      await apiPost("/api/library/config", { path_map: parsePathMap($("li-pm").value) });
-      const r = await apiPost("/api/lidarr/connect-library", { callback_url: $("li-cb").value.trim() });
+      const r = await apiPost("/api/lidarr/connect-library", {
+        callback_url: $("li-cb").value.trim(), path_map: parsePathMap($("li-pm").value) });
       state.library = r.library;
       const bits = [`Library folders: ${(r.roots || []).join(", ") || "none"}.`,
         r.tested ? "Lidarr reached this server — imports will appear automatically."

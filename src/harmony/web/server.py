@@ -175,8 +175,11 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not service or not track_id:
                     self._send_json({"error": "missing service or id"}, status=400)
                     return
-                self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {},
-                                            via=body.get("via") or None))
+                try:
+                    self._send_json(engine.cast(parts[2], service, track_id, body.get("meta") or {},
+                                                via=body.get("via") or None))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
             elif len(parts) == 5 and parts[0:2] == ["api", "devices"] and parts[3] == "queue":
                 try:
                     self._send_json(engine.device_queue_op(parts[2], parts[4], body,
@@ -271,8 +274,12 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not base:
                     host = self.headers.get("Host") or ""
                     base = f"http://{host}" if host else ""
+                path_map = body.get("path_map")
+                if path_map is not None and not isinstance(path_map, list):
+                    self._send_json({"error": "path_map must be a list"}, status=400)
+                    return
                 try:
-                    self._send_json(engine.lidarr_connect_library(base))
+                    self._send_json(engine.lidarr_connect_library(base, path_map=path_map))
                 except ValueError as exc:
                     self._send_json({"error": str(exc)}, status=400)
             elif parts == ["api", "library", "config"]:
