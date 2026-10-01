@@ -426,7 +426,7 @@ async function waitForScan(onDone) {
   for (let i = 0; i < 600; i++) {
     await new Promise((res) => setTimeout(res, 1500));
     const st = await loadLibraryStatus();
-    if (!st || !(st.scan && st.scan.running)) { onDone(st); return; }
+    if (!st || !(st.scan && st.scan.running)) { loadAccounts(); onDone(st); return; }  // refresh the sidebar's "Library · N tracks"
   }
 }
 
