@@ -46,4 +46,7 @@ dependencies {
     implementation("androidx.media3:media3-session:1.4.1")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation("junit:junit:4.13.2")
+    // Local unit tests run against a stub android.jar whose org.json throws
+    // "not mocked"; the real implementation lets tests build/inspect JSON.
+    testImplementation("org.json:json:20240303")
 }
