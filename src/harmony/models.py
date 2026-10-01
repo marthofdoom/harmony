@@ -90,6 +90,15 @@ class Track:
         return ", ".join(self.artists)
 
     @property
+    def location_label(self) -> str:
+        """Where this track plays from: "Library" for a library track, and for
+        a streaming track the Library has a copy of (``raw["library_id"]``,
+        which plays instead); otherwise the service's name."""
+        if self.service is Service.LOCAL or self.raw.get("library_id"):
+            return Service.LOCAL.label
+        return self.service.label
+
+    @property
     def duration_text(self) -> str:
         if not self.duration_s:
             return "--:--"

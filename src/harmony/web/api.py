@@ -47,6 +47,8 @@ def _classify_yt_auth(text: str | None) -> str | None:
 # Resolved provider stream URLs expire (Qobuz/YouTube sign them for ~minutes),
 # so tokens the browser holds are short-lived and pruned.
 _STREAM_TTL_S = 1800
+# Streaming rows per response checked against the Library up front.
+_ANNOTATE_MAX = 300
 
 
 def _artists(obj: Any) -> str:
@@ -68,6 +70,7 @@ def track_to_dict(t: Any) -> dict[str, Any]:
         "year": getattr(t, "year", None),
         "isrc": getattr(t, "isrc", None),
         "artwork_url": t.artwork_url,
+        **({"library_id": t.raw["library_id"]} if (getattr(t, "raw", None) or {}).get("library_id") else {}),
     }
 
 
@@ -83,6 +86,7 @@ def track_from_dict(d: dict[str, Any]) -> Any:
         album_id=d.get("album_id"), duration_s=d.get("duration_s"),
         track_number=d.get("track_number"), year=d.get("year"), isrc=d.get("isrc"),
         artwork_url=d.get("artwork_url") or d.get("art_url"),
+        raw={"library_id": d["library_id"]} if d.get("library_id") else {},
     )
 
 
@@ -150,24 +154,63 @@ class Engine:
         self._pending_lock = threading.Lock()
         self._lidarr_cache: dict[str, tuple[float, Any]] = {}
         self._http_port: int | None = None
+        # Streaming track → its Library copy, learned when a page lists it, so
+        # playing it from anywhere (browser, phone, speaker, desktop) uses the
+        # Library. Bounded LRU; misses fall back to matching on title/artist.
+        from collections import OrderedDict
+
+        self._lib_alias: OrderedDict[tuple[str, str], str] = OrderedDict()
+        self._libprov: Any | None = None
+        self._libprov_lock = threading.Lock()
+        self._providers_lock = threading.Lock()
+        self._lib_match_cache: dict[str, tuple[float, str | None]] = {}
 
     # -- providers ----------------------------------------------------------
 
+    def _library_provider(self) -> Any:
+        """The Library service: this instance's own folders (when enabled)
+        federated with every key-matching peer's library, so each client plays
+        any library on the mesh. Built on its own — no network, no streaming
+        logins — so the desktop can ask for it from its main loop."""
+        with self._libprov_lock:
+            if self._libprov is None:
+                from harmony.config import Settings
+                from harmony.library_federation import FederatedLibraryProvider
+
+                own = None
+                if Settings.load().library_enabled:
+                    from harmony.providers.local import LocalLibraryProvider
+
+                    index, signer = self._library()
+                    own = LocalLibraryProvider(index, signer)
+                self._libprov = FederatedLibraryProvider(
+                    own, peers=lambda: self.instances().get("instances", []),
+                    key=lambda: Settings.load().personal_key or None)
+            return self._libprov
+
+    def _plock(self, service_value: str) -> Any:
+        """The provider lock for a service — none for the Library, whose index
+        is thread-safe and whose peer calls must not stall (or deadlock with) a
+        peer doing the same to us."""
+        import contextlib
+
+        return contextlib.nullcontext() if service_value == "local" else self._lock
+
     def _ensure_providers(self) -> dict[Any, Any]:
-        if self._providers is None:
+        if self._providers is not None:
+            return self._providers
+        with self._providers_lock:
+            if self._providers is not None:  # built by a concurrent caller
+                return self._providers
             from harmony.config import CredentialStore, Settings
+            from harmony.models import Service
             from harmony.providers import build_providers
 
             settings = Settings.load()
             providers = build_providers(settings, CredentialStore())
-            # The local library is server/web-only: added here (not in
-            # build_providers, which the desktop shares) when it's enabled.
-            if settings.library_enabled:
-                from harmony.models import Service
-                from harmony.providers.local import LocalLibraryProvider
-
-                index, signer = self._library()
-                providers[Service.LOCAL] = LocalLibraryProvider(index, signer)
+            # Added here, not in build_providers: the desktop's own provider set
+            # has no mesh to federate over.
+            providers[Service.LOCAL] = self._library_provider()
             # build_providers constructs but does not authenticate; load each
             # provider's stored credentials (e.g. the Qobuz token) so search,
             # is_authenticated, and streaming all reflect reality -- the desktop
@@ -200,8 +243,12 @@ class Engine:
 
         settings = Settings.load()
         out = []
+        # Probing peers' libraries is network I/O: never under the engine lock.
+        lib_active = self._library_provider().active()
         with self._lock:
             for svc, prov in self._ensure_providers().items():
+                if svc.value == "local" and not lib_active:
+                    continue  # no library here or on any peer: nothing to show
                 try:
                     authed = bool(prov.is_authenticated)
                 except Exception:  # noqa: BLE001
@@ -587,6 +634,7 @@ class Engine:
 
     def reset_providers(self, notify: bool = True) -> None:
         self._providers = None  # force a re-warm with freshly-saved credentials
+        self._libprov = None
         if notify:
             for fn in list(self._cred_listeners):
                 try:
@@ -622,20 +670,21 @@ class Engine:
 
     def search(self, query: str, kinds: tuple[str, ...], limit: int = 25) -> dict[str, Any]:
         results: dict[str, list] = {"tracks": [], "albums": [], "artists": [], "playlists": []}
-        with self._lock:
-            for svc, prov in self._ensure_providers().items():
-                try:
+        for svc, prov in self._ensure_providers().items():
+            try:
+                with self._plock(svc.value):
                     r = prov.search(query, kinds=kinds, limit=limit)
-                except Exception as exc:  # noqa: BLE001 - one service failing must not kill search
-                    log.warning("search failed for %s: %s", svc.value, exc)
-                    continue
-                results["tracks"] += [track_to_dict(t) for t in r.tracks]
-                results["albums"] += [album_to_dict(a) for a in r.albums]
-                results["artists"] += [artist_to_dict(a) for a in r.artists]
-                results["playlists"] += [playlist_to_dict(p) for p in r.playlists]
+            except Exception as exc:  # noqa: BLE001 - one service failing must not kill search
+                log.warning("search failed for %s: %s", svc.value, exc)
+                continue
+            results["tracks"] += [track_to_dict(t) for t in r.tracks]
+            results["albums"] += [album_to_dict(a) for a in r.albums]
+            results["artists"] += [artist_to_dict(a) for a in r.artists]
+            results["playlists"] += [playlist_to_dict(p) for p in r.playlists]
         # Album results read chronologically; tracks keep the providers'
         # popularity/relevance order, which is what a track search wants.
         results["albums"].sort(key=lambda a: (a["year"] is None, a["year"] or 0, (a["title"] or "").lower()))
+        self._annotate_library(results["tracks"])
         return results
 
     # -- entity detail pages + smart search --------------------------------
@@ -735,7 +784,7 @@ class Engine:
         prov = self._provider(service_value)
         if prov is None:
             raise KeyError(service_value)
-        with self._lock:
+        with self._plock(service_value):
             detail = self._try(prov.get_artist_detail, artist_id)
             albums = self._try(prov.get_artist_albums, artist_id) or []
             top = self._try(lambda: prov.get_artist_top_tracks(artist_id, limit=10)) or []
@@ -748,7 +797,7 @@ class Engine:
         if kind == "person":
             from harmony.enrich import entities
             pd = entities.performed_discography(name, db=self._entity_db())
-            with self._lock:
+            with self._plock(service_value):
                 albums_out = self._map_performed_albums(
                     prov, service_value, pd["albums"] if pd else [])
             singles_out: list[dict[str, Any]] = []
@@ -775,7 +824,7 @@ class Engine:
             "mbid": overlay["mbid"] if overlay else None,
             "albums": albums_out,
             "singles": singles_out,
-            "top_tracks": [track_to_dict(t) for t in top],
+            "top_tracks": self._annotate_library([track_to_dict(t) for t in top]),
             "members": overlay["members"] if overlay else [],
             "member_of": [
                 {"name": b["name"], "mbid": b.get("mbid"), "spans": b.get("spans", []), "ref": None}
@@ -806,7 +855,7 @@ class Engine:
         prov = self._provider(service_value)
         if prov is None:
             raise KeyError(service_value)
-        with self._lock:
+        with self._plock(service_value):
             header = self._try(prov.get_album_detail, album_id)
             tracks = self._try(prov.get_album_tracks, album_id) or []
 
@@ -829,14 +878,14 @@ class Engine:
             "album": album_dict,
             "artist_ref": artist_ref,
             "bio": None,
-            "tracks": [track_to_dict(t) for t in tracks],
+            "tracks": self._annotate_library([track_to_dict(t) for t in tracks]),
         }
 
     def track_page(self, service_value: str, track_id: str) -> dict[str, Any]:
         prov = self._provider(service_value)
         if prov is None:
             raise KeyError(service_value)
-        with self._lock:
+        with self._plock(service_value):
             track = self._try(prov.get_track, track_id)
         if track is None:
             raise KeyError(track_id)
@@ -859,7 +908,7 @@ class Engine:
             for aid, nm in zip(track.artist_ids, track.artists, strict=False)
         ]
         return {
-            "track": track_to_dict(track),
+            "track": self._annotate_library([track_to_dict(track)])[0],
             "album_ref": album_ref,
             "artist_refs": artist_refs,
             "performers": performers,
@@ -875,17 +924,17 @@ class Engine:
         albums: list[Any] = []
         tracks: list[Any] = []
         playlists: list[Any] = []
-        with self._lock:
-            for svc, prov in provs:
-                try:
+        for svc, prov in provs:
+            try:
+                with self._plock(svc.value):
                     r = prov.search(query, kinds=("artists", "albums", "tracks", "playlists"), limit=8)
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("smart search failed for %s: %s", svc.value, exc)
-                    continue
-                artists += r.artists
-                albums += r.albums
-                tracks += r.tracks
-                playlists += r.playlists
+            except Exception as exc:  # noqa: BLE001
+                log.warning("smart search failed for %s: %s", svc.value, exc)
+                continue
+            artists += r.artists
+            albums += r.albums
+            tracks += r.tracks
+            playlists += r.playlists
 
         from rapidfuzz import fuzz
         q = query.lower()
@@ -905,11 +954,11 @@ class Engine:
             if kind == "person":
                 from harmony.enrich import entities
                 pd = entities.performed_discography(best_artist.name, db=self._entity_db())
-                with self._lock:
+                with self._plock(svc_value):
                     section_albums = self._map_performed_albums(
                         prov, svc_value, pd["albums"] if pd else [])
             else:
-                with self._lock:
+                with self._plock(svc_value):
                     a_albums = self._try(prov.get_artist_albums, best_artist.id) or []
                 section_albums = [album_to_dict(a) for a in _sort_albums_chrono(a_albums)]
             artist_section = {
@@ -931,7 +980,7 @@ class Engine:
             "artist": artist_section,
             "albums": [album_to_dict(a) for a in mine_first(_sort_albums_chrono(albums))],
             "incidental": {
-                "tracks": [track_to_dict(t) for t in mine_first(tracks)],
+                "tracks": self._annotate_library([track_to_dict(t) for t in mine_first(tracks)]),
                 "artists": [
                     _artist_ref(a.service.value, a.id, a.name)
                     for a in artists if a.id != chosen_id
@@ -957,12 +1006,80 @@ class Engine:
         s = Settings.load()
         return LidarrClient(s.lidarr_url, CredentialStore().get(LIDARR_API_KEY) or ""), s
 
-    def lidarr_status(self) -> dict[str, Any]:
+    # Lidarr is shared across the mesh: an instance without its own uses the
+    # peer that has one configured (typically the server next to Lidarr) —
+    # requests, downloads and album states all go there. Peers are asked for
+    # their OWN Lidarr only (?own=1), so forwarding can never loop.
+
+    def _own_lidarr_configured(self) -> bool:
         from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
         s = Settings.load()
+        return bool(s.lidarr_url and CredentialStore().get(LIDARR_API_KEY))
+
+    def _lidarr_peer(self) -> dict[str, Any] | None:
+        """The mesh peer whose own Lidarr is configured + enabled (cached 60s)."""
+        from harmony.config import Settings
+
+        if self._own_lidarr_configured() or not Settings.load().lidarr_mesh:
+            return None
+        hit = self._lidarr_cache.get("peer")
+        if hit is not None and time.monotonic() - hit[0] < 60:
+            return hit[1]
+        peers = self.instances().get("instances", [])
+        found = None
+        if peers:
+            from concurrent.futures import ThreadPoolExecutor
+
+            def probe(p: dict[str, Any]) -> dict[str, Any] | None:
+                via = f"{p.get('host')}:{p.get('port')}"
+                try:
+                    st = self._peer_call(via, "GET", "/api/lidarr?own=1", timeout=3)
+                except Exception:  # noqa: BLE001 - absent/old/foreign peer
+                    return None
+                if st.get("configured") and st.get("enabled"):
+                    return {"via": via, "name": p.get("name") or p.get("host"), "status": st}
+                return None
+
+            with ThreadPoolExecutor(max_workers=min(8, len(peers))) as pool:
+                found = next((r for r in pool.map(probe, peers) if r), None)
+        self._lidarr_cache["peer"] = (time.monotonic(), found)
+        return found
+
+    def lidarr_available(self) -> bool:
+        """Non-blocking "is Get with Lidarr usable?" for UI built on a main loop
+        (the desktop's menus): the last known answer, refreshed in the
+        background when it's over a minute old."""
+        hit = self._lidarr_cache.get("available")
+        if hit is None or time.monotonic() - hit[0] > 60:
+            if not getattr(self, "_lidarr_avail_running", False):
+                self._lidarr_avail_running = True
+
+                def refresh() -> None:
+                    try:
+                        st = self.lidarr_status()
+                        ok = bool(st.get("enabled") and st.get("configured"))
+                    except Exception:  # noqa: BLE001
+                        ok = False
+                    self._lidarr_cache["available"] = (time.monotonic(), ok)
+                    self._lidarr_avail_running = False
+
+                threading.Thread(target=refresh, daemon=True, name="harmony-lidarr-status").start()
+        return bool(hit[1]) if hit else False
+
+    def lidarr_status(self, own: bool = False) -> dict[str, Any]:
+        from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
+        s = Settings.load()
+        if not own and not self._own_lidarr_configured():
+            peer = self._lidarr_peer()
+            if peer is not None:
+                st = peer["status"]
+                return {"enabled": True, "configured": True, "ok": st.get("ok", True),
+                        "version": st.get("version"), "url": s.lidarr_url,
+                        "via": peer["name"], "via_addr": peer["via"], "mesh": True, "mesh_enabled": True,
+                        "local": {"enabled": bool(s.lidarr_enabled), "configured": False}}
         configured = bool(s.lidarr_url and CredentialStore().get(LIDARR_API_KEY))
         out: dict[str, Any] = {"enabled": bool(s.lidarr_enabled), "configured": configured,
-                               "url": s.lidarr_url}
+                               "url": s.lidarr_url, "mesh_enabled": bool(s.lidarr_mesh)}
         if configured:
             try:
                 out["version"] = self._lidarr_client()[0].status().get("version")
@@ -986,9 +1103,12 @@ class Engine:
     def lidarr_save_config(self, *, url: str | None = None, api_key: str | None = None,
                            enabled: bool | None = None, root_folder: str | None = None,
                            quality_profile_id: int | None = None,
-                           metadata_profile_id: int | None = None) -> dict[str, Any]:
+                           metadata_profile_id: int | None = None,
+                           mesh: bool | None = None) -> dict[str, Any]:
         from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
         s = Settings.load()
+        if mesh is not None:
+            s.lidarr_mesh = bool(mesh)
         if url is not None:
             s.lidarr_url = url.strip()
         if enabled is not None:
@@ -1002,10 +1122,23 @@ class Engine:
         s.save()
         if api_key:  # only replace the stored key when a fresh one is provided
             CredentialStore().set(LIDARR_API_KEY, api_key.strip())
+        self._lidarr_cache.pop("peer", None)  # own Lidarr may now take over from a peer's
         return self.lidarr_status()
 
     def lidarr_request(self, kind: str, *, title: str = "", artist: str = "",
                        mbid: str | None = None) -> dict[str, Any]:
+        if not self._own_lidarr_configured():
+            peer = self._lidarr_peer()
+            if peer is not None:
+                body = {"kind": kind, "title": title, "artist": artist}
+                if mbid:
+                    body["mbid"] = mbid
+                out = self._peer_call(peer["via"], "POST", "/api/lidarr/request", body, timeout=60)
+                return {**out, "via": peer["name"]}
+        return self._lidarr_request_own(kind, title=title, artist=artist, mbid=mbid)
+
+    def _lidarr_request_own(self, kind: str, *, title: str = "", artist: str = "",
+                            mbid: str | None = None) -> dict[str, Any]:
         """Ask Lidarr to acquire an album or artist. ``mbid`` (a MusicBrainz
         release-group/artist id, from the entity layer) makes the match exact."""
         client, s = self._lidarr_client()
@@ -1073,6 +1206,12 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 - status must not raise
             out["stats"] = {"tracks": 0, "albums": 0, "artists": 0}
             out["error"] = str(exc)
+        # Libraries shared by peers on the mesh (federated into the Library).
+        try:
+            prov = self._library_provider()
+            out["peers"] = prov.library_peers() if prov is not None else []
+        except Exception:  # noqa: BLE001
+            out["peers"] = []
         return out
 
     def library_save_config(self, *, enabled: bool | None = None,
@@ -1185,19 +1324,155 @@ class Engine:
                 out.append(Path(p))
         return out
 
-    def library_overview(self, *, order: str = "recent", limit: int = 60,
-                         offset: int = 0) -> dict[str, Any]:
-        """Browse the library: albums (newest first by default) + all artists."""
-        from harmony.models import Service
+    # -- "plays from the Library by default" --------------------------------
 
-        prov = self._ensure_providers().get(Service.LOCAL)
-        if prov is None:
-            return {"enabled": False, "albums": [], "artists": [], "stats": None}
-        albums = prov.list_albums(order=order, limit=limit, offset=offset)
-        artists = [{"id": a["id"], "name": a["name"], "service": "local",
-                    "album_count": a["album_count"]} for a in prov.list_artists()]
+    def _library_preferred(self) -> bool:
+        from harmony.config import Settings
+
+        try:
+            return bool(Settings.load().library_preferred)
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _remember_alias(self, service_value: str, track_id: str, library_id: str) -> None:
+        key = (service_value, str(track_id))
+        self._lib_alias[key] = library_id
+        self._lib_alias.move_to_end(key)
+        while len(self._lib_alias) > 50_000:
+            self._lib_alias.popitem(last=False)
+
+    def _forget_library_match(self, service_value: str, track_id: str) -> None:
+        lib = self._lib_alias.pop((service_value, str(track_id)), None)
+        if lib is not None:
+            for k in [k for k, (_, v) in self._lib_match_cache.items() if v == lib]:
+                self._lib_match_cache.pop(k, None)
+
+    @staticmethod
+    def _match_key(d: dict[str, Any]) -> str:
+        return "|".join(str(d.get(k) or "").lower() for k in ("isrc", "title", "artist", "duration_s"))
+
+    def _match_library(self, items: list[dict[str, Any]]) -> list[str | None]:
+        """Library ids for ``items`` (cached 10 min, misses included)."""
+        prov = self._library_provider()
+        if prov is None or not items:
+            return [None] * len(items)
+        now = time.monotonic()
+        out: list[str | None] = [None] * len(items)
+        todo: list[int] = []
+        for i, d in enumerate(items):
+            hit = self._lib_match_cache.get(self._match_key(d))
+            if hit and now - hit[0] < 600:
+                out[i] = hit[1]
+            else:
+                todo.append(i)
+        if todo:
+            try:
+                found = prov.match([items[i] for i in todo]) if prov.active() else [None] * len(todo)
+            except Exception as exc:  # noqa: BLE001 - matching is best-effort
+                log.info("library match failed: %s", exc)
+                return out  # a failure isn't "no copy": don't cache it
+            for i, lib in zip(todo, found, strict=True):
+                out[i] = lib
+                self._lib_match_cache[self._match_key(items[i])] = (now, lib)
+            if len(self._lib_match_cache) > 50_000:
+                self._lib_match_cache.clear()
+        return out
+
+    def _annotate_library(self, tracks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Mark streaming tracks the Library has (``library_id``) so clients
+        show where they'll play from, and remember the copy for playback."""
+        if not tracks or not self._library_preferred():
+            return tracks
+        # A long playlist is matched up front only for its first rows; the rest
+        # are matched when played (resolve/cast pass the track's details).
+        todo = [d for d in tracks if d.get("service") != "local" and d.get("title")][:_ANNOTATE_MAX]
+        for d, lib in zip(todo, self._match_library(todo), strict=True):
+            if lib:
+                d["library_id"] = lib
+                self._remember_alias(str(d["service"]), str(d["id"]), lib)
+        return tracks
+
+    def _prefer_library(self, service_value: str, track_id: str,
+                        meta: dict[str, Any] | None = None) -> tuple[str, str]:
+        """``("local", library id)`` when the Library has this streaming track,
+        else the track unchanged. Uses what a page already matched, else the
+        track's title/artist when the caller passes them."""
+        if service_value == "local" or not self._library_preferred():
+            return service_value, track_id
+        lib = self._lib_alias.get((service_value, str(track_id)))
+        if lib is None and meta and meta.get("title"):
+            lib = self._match_library([meta])[0]
+            if lib:
+                self._remember_alias(service_value, str(track_id), lib)
+        return ("local", lib) if lib else (service_value, track_id)
+
+    def library_alternative(self, service_value: str, track_id: str,
+                            meta: dict[str, Any] | None = None) -> str | None:
+        """The Library id to play instead of a streaming track, if any (desktop)."""
+        svc, tid = self._prefer_library(service_value, track_id, meta)
+        return tid if svc == "local" and service_value != "local" else None
+
+    def library_overview(self, *, order: str = "recent", limit: int = 60) -> dict[str, Any]:
+        """Browse the Library: albums + artists across this instance's library
+        and every peer's (own first)."""
+        prov = self._library_provider()
+        if prov is None or not prov.active():
+            return {"enabled": False, "albums": [], "artists": [], "stats": None, "peers": []}
+        albums, artists = prov.browse(order=order, limit=limit)
         return {"enabled": True, "albums": [album_to_dict(a) for a in albums],
-                "artists": artists, "stats": prov.index.stats()}
+                "artists": artists,
+                "stats": prov.own.index.stats() if prov.own is not None else None,
+                "peers": prov.library_peers()}
+
+    # -- own-library endpoints peers federate over (never the federated view,
+    #    so a peer asking us can't recurse into our peers) -------------------
+
+    def _own_library(self) -> Any:
+        prov = self._library_provider()
+        own = getattr(prov, "own", None)
+        if own is None:
+            raise KeyError("library")
+        return own
+
+    def library_own_status(self) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        s = Settings.load()
+        prov = self._library_provider()
+        own = getattr(prov, "own", None)
+        return {"enabled": bool(s.library_enabled and own is not None),
+                "stats": own.index.stats() if own is not None else {"tracks": 0}}
+
+    def library_own_search(self, query: str, kinds: tuple[str, ...], limit: int = 25) -> dict[str, Any]:
+        r = self._own_library().search(query, kinds=kinds, limit=limit)
+        return {"tracks": [track_to_dict(t) for t in r.tracks],
+                "albums": [album_to_dict(a) for a in r.albums],
+                "artists": [artist_to_dict(a) for a in r.artists]}
+
+    def library_own_album(self, album_id: str) -> dict[str, Any]:
+        own = self._own_library()
+        return {"album": album_to_dict(own.get_album_detail(album_id)),
+                "tracks": [track_to_dict(t) for t in own.get_album_tracks(album_id)]}
+
+    def library_own_artist(self, artist_id: str) -> dict[str, Any]:
+        own = self._own_library()
+        return {"artist": artist_to_dict(own.get_artist_detail(artist_id)),
+                "albums": [album_to_dict(a) for a in own.get_artist_albums(artist_id)],
+                "top_tracks": [track_to_dict(t) for t in own.get_artist_top_tracks(artist_id)]}
+
+    def library_own_track(self, track_id: str) -> dict[str, Any]:
+        return {"track": track_to_dict(self._own_library().get_track(track_id))}
+
+    def library_own_match(self, tracks: list[dict[str, Any]]) -> dict[str, Any]:
+        own = self._own_library()
+        # Keep positions: the asking peer pairs ids with its list by index.
+        return {"ids": own.index.match_tracks([t if isinstance(t, dict) else {} for t in tracks])}
+
+    def library_own_browse(self, *, order: str = "recent", limit: int = 60) -> dict[str, Any]:
+        own = self._own_library()
+        return {"albums": [album_to_dict(a) for a in own.list_albums(order=order, limit=limit)],
+                "artists": [{"id": a["id"], "name": a["name"], "album_count": a["album_count"]}
+                            for a in own.list_artists()]}
 
     # -- Lidarr ↔ library: import webhook, downloads, per-album state ------
 
@@ -1322,6 +1597,12 @@ class Engine:
         """What Lidarr is downloading right now (cached a few seconds)."""
         from harmony.lidarr import queue_item
 
+        if not self._own_lidarr_configured():
+            peer = self._lidarr_peer()
+            if peer is not None:
+                return {**self._peer_call(peer["via"], "GET", "/api/lidarr/queue", timeout=10),
+                        "via": peer["name"]}
+
         client, _ = self._lidarr_client()
         records = self._lidarr_cached("queue", 4.0, client.queue)
         return {"items": [queue_item(r) for r in records]}
@@ -1403,6 +1684,26 @@ class Engine:
                 elif la.get("monitored"):
                     entry.update(state="wanted", have=have, total=total)
             out.append(entry)
+        # No Lidarr here: the mesh's Lidarr instance knows what's downloading or
+        # wanted (and its library copies, reachable through the federation).
+        if not lidarr_on:
+            peer = self._lidarr_peer()
+            ask = [i for i, e in enumerate(out) if e["state"] == "none"]
+            if peer is not None and ask:
+                try:
+                    theirs = self._peer_call(peer["via"], "POST", "/api/library/state",
+                                             {"albums": [albums[i] for i in ask]}, timeout=10)
+                    from harmony.library_federation import fed_id
+
+                    for i, st in zip(ask, theirs.get("states") or [], strict=False):
+                        if st.get("state") in (None, "none"):
+                            continue
+                        if st.get("ref"):
+                            st = {**st, "ref": {**st["ref"], "id": fed_id(st["ref"]["id"], peer["via"])}}
+                        out[i] = {**st, "via": peer["name"]}
+                    lidarr_on = bool(theirs.get("lidarr"))
+                except Exception as exc:  # noqa: BLE001 - our own states still answer
+                    lidarr_error = str(exc)
         result: dict[str, Any] = {"states": out, "lidarr": lidarr_on}
         if lidarr_error:
             result["lidarr_error"] = lidarr_error
@@ -1424,7 +1725,7 @@ class Engine:
             raise KeyError(service_value)
         with self._lock:
             tracks = prov.get_playlist_tracks(playlist_id)
-        return {"tracks": [track_to_dict(t) for t in tracks]}
+        return {"tracks": self._annotate_library([track_to_dict(t) for t in tracks])}
 
     # -- playlist editing ---------------------------------------------------
 
@@ -1524,13 +1825,12 @@ class Engine:
 
     # -- streaming ----------------------------------------------------------
 
-    def resolve(self, service_value: str, track_id: str) -> dict[str, Any]:
-        """Resolve a track to a short-lived stream token the browser can play."""
-        prov = self._provider(service_value)
-        if prov is None:
-            raise KeyError(service_value)
-        with self._lock:
-            source = prov.resolve_stream(track_id, max_quality=True)
+    def resolve(self, service_value: str, track_id: str,
+                meta: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Resolve a track to a short-lived stream token the browser can play
+        (from the Library when it has the song — see _prefer_library)."""
+        asked = service_value
+        service_value, track_id, source = self._resolve_preferring_library(service_value, track_id, meta)
         token = secrets.token_urlsafe(16)
         self._streams[token] = {
             "url": source.url,
@@ -1543,7 +1843,22 @@ class Engine:
             "id": track_id,
         }
         self._prune()
-        return {"token": token, "mime": source.mime_type, "label": source.label}
+        return {"token": token, "mime": source.mime_type, "label": source.label,
+                "service": service_value, "from_library": service_value == "local" and asked != "local"}
+
+    def _resolve_preferring_library(self, service_value: str, track_id: str,
+                                    meta: dict[str, Any] | None = None) -> tuple[str, str, Any]:
+        """``(service, id, StreamSource)`` — the Library's copy when it has the
+        song and it resolves; otherwise (peer offline, file gone) the original
+        stream, and the stale match is forgotten."""
+        svc, tid = self._prefer_library(service_value, track_id, meta)
+        if svc != service_value:
+            try:
+                return svc, tid, self._resolve_source(svc, tid)
+            except Exception as exc:  # noqa: BLE001 - fall back to the stream
+                log.info("library copy %s unavailable (%s); streaming %s instead", tid, exc, service_value)
+                self._forget_library_match(service_value, track_id)
+        return service_value, track_id, self._resolve_source(service_value, track_id)
 
     def refresh_stream(self, token: str) -> dict[str, Any] | None:
         """Re-resolve a token's provider URL (its CDN URL expired mid-playback)."""
@@ -1563,7 +1878,7 @@ class Engine:
         prov = self._provider(service_value)
         if prov is None:
             raise KeyError(service_value)
-        with self._lock:
+        with self._plock(service_value):
             return prov.resolve_stream(track_id, max_quality=True)
 
     # -- LAN mesh -----------------------------------------------------------
@@ -1800,9 +2115,10 @@ class Engine:
              via: str | None = None) -> dict[str, Any]:
         """Play ONE track on a device (replaces any server-side queue there)."""
         if via:
-            self._no_library_via([{"service": service_value}], via)
+            t = self._library_for_peer([{"service": service_value, "id": track_id, **(meta or {})}], via)[0]
             return self._peer_call(via, "POST", f"/api/devices/{host}/play",
-                                   {"service": service_value, "id": track_id, "meta": meta or {}})
+                                   {"service": service_value, "id": t["id"], "meta": {
+                                       **(meta or {}), **({"art_url": t["art_url"]} if t.get("art_url") else {})}})
         if self._queues is not None:
             self._queues.stop(host)
         return self._cast_direct(host, service_value, track_id, meta)
@@ -1810,12 +2126,21 @@ class Engine:
     def _cast_direct(self, host: str, service_value: str, track_id: str,
                      meta: dict[str, Any] | None = None) -> dict[str, Any]:
         kind, info = self._device_kind(host)
+        asked = (service_value, track_id)
+        service_value, track_id = self._prefer_library(service_value, track_id, meta)
         art = (meta or {}).get("art_url")
         if isinstance(art, str) and art.startswith("/"):
             # Library artwork is a path on this server; a renderer needs a URL
             # it can fetch (the /art/ capability path needs no personal key).
             meta = dict(meta or {})
             meta["art_url"] = self._absolute_url(art, host)
+        if (service_value, track_id) != asked:
+            try:
+                return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
+            except Exception as exc:  # noqa: BLE001 - the library copy failed: play the stream
+                log.info("library copy %s couldn't cast (%s); streaming instead", track_id, exc)
+                self._forget_library_match(*asked)
+                service_value, track_id = asked
         return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
 
     def device_control(self, host: str, action: str, level: int | None = None,
@@ -1853,14 +2178,33 @@ class Engine:
                                         async_start=True)
         return self._queues
 
-    @staticmethod
-    def _no_library_via(tracks: list[Any], via: str) -> None:
-        """Library tracks (and their /art/ paths) only resolve on the instance
-        that holds the files; a peer can't stream them to its speaker. Say so
-        plainly instead of failing on the peer with "isn't in the library"."""
-        if any(isinstance(t, dict) and t.get("service") == "local" for t in tracks):
-            raise ValueError(f"Library tracks play only on this instance's own devices, "
-                             f"not on a speaker reached through {via}.")
+    def _library_for_peer(self, tracks: list[Any], via: str) -> list[Any]:
+        """Re-address this instance's library tracks for a peer that will play
+        them: a bare id becomes ``id@<us as the peer reaches us>`` (the peer's
+        federated Library resolves it back here) and a relative /art/ path an
+        absolute URL. Peers' own ``id@host`` ids pass through unchanged."""
+        from harmony.library_federation import fed_id, split_id
+
+        peer_host, peer_port = self._split_hostport(via)
+        me = None
+        out = []
+        for t in tracks:
+            if isinstance(t, dict) and t.get("service") == "local":
+                raw, owner = split_id(str(t.get("id")))
+                if owner == f"{peer_host}:{peer_port}":
+                    out.append({**t, "id": raw})  # the peer's own track: its bare id
+                    continue
+            if isinstance(t, dict) and t.get("service") == "local" and split_id(str(t.get("id")))[1] is None:
+                if me is None:
+                    from harmony.playback.relay import RelayServer
+
+                    me = f"{RelayServer._local_ip_for(peer_host)}:{self._http_port or 8080}"
+                t = {**t, "id": fed_id(str(t["id"]), me)}
+                for k in ("art_url", "artwork_url"):
+                    if isinstance(t.get(k), str) and t[k].startswith("/"):
+                        t[k] = self._absolute_url(t[k], peer_host)
+            out.append(t)
+        return out
 
     def device_queue(self, host: str, via: str | None = None) -> dict[str, Any]:
         """The device's queue + live status: what every client's Now Playing renders."""
@@ -1889,8 +2233,9 @@ class Engine:
         """Apply a queue op (load/next/prev/jump/enqueue/play_next/move/remove/
         clear/shuffle/repeat/stop). A via device's queue lives on that peer."""
         if via:  # forward without our via, or the peer would forward it again
-            self._no_library_via(body.get("tracks") or [], via)
             fwd = {k: v for k, v in body.items() if k != "via"}
+            if isinstance(fwd.get("tracks"), list):
+                fwd["tracks"] = self._library_for_peer(fwd["tracks"], via)
             return self._peer_call(via, "POST", f"/api/devices/{host}/queue/{op}", fwd)
         if op == "stop":
             # Halting the queue always succeeds; stopping the device is best-effort

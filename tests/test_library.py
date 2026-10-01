@@ -46,12 +46,12 @@ def _wav(path: Path, seconds: float = 1.0) -> Path:
 def _tag(path: Path, **tags: str) -> None:
     """ID3-tag a WAV (title/artist/album/albumartist/track/date/rg/art)."""
     mutagen_wave = pytest.importorskip("mutagen.wave")
-    from mutagen.id3 import APIC, TALB, TDRC, TIT2, TPE1, TPE2, TRCK, TXXX
+    from mutagen.id3 import APIC, TALB, TDRC, TIT2, TPE1, TPE2, TRCK, TSRC, TXXX
 
     f = mutagen_wave.WAVE(str(path))
     f.add_tags()
     frames = {"title": TIT2, "artist": TPE1, "album": TALB, "albumartist": TPE2,
-              "track": TRCK, "date": TDRC}
+              "track": TRCK, "date": TDRC, "isrc": TSRC}
     for key, frame in frames.items():
         if key in tags:
             f.tags.add(frame(encoding=3, text=tags[key]))
@@ -721,14 +721,21 @@ def test_untagged_compilation_stays_one_album(lib):
     assert [t["artist"] for t in tracks] == ["A-ha", "Toto", "Europe"]
 
 
-def test_library_tracks_refused_via_a_peer(server):
+def test_library_tracks_go_to_a_peer_readdressed(server, monkeypatch):
+    # A peer's federated Library resolves "<id>@<us>" back here, so library
+    # tracks can play on a speaker reached through that peer.
     _enable(server)
-    t = {"service": "local", "id": "x", "title": "Nemo"}
-    for url, body in ((server.url + "/api/devices/10.0.0.9/queue/load", {"tracks": [t], "via": "peer:8080"}),
-                      (server.url + "/api/devices/10.0.0.9/play", {"service": "local", "id": "x", "via": "peer:8080"})):
-        with pytest.raises(urllib.error.HTTPError) as exc:
-            _post(url, body)
-        assert exc.value.code == 400 and b"only on this instance" in exc.value.read()
+    sent = []
+    monkeypatch.setattr(server.engine, "_peer_call",
+                        lambda via, method, path, body=None, timeout=15: sent.append((path, body)) or {"ok": True})
+    me = f"127.0.0.1:{server.engine._http_port}"
+    _post(server.url + "/api/devices/10.0.0.9/queue/load",
+          {"tracks": [{"service": "local", "id": "x", "title": "Nemo"}], "via": "127.0.0.1:8080"})
+    _post(server.url + "/api/devices/10.0.0.9/play",
+          {"service": "local", "id": "y", "meta": {"art_url": "/art/a.b"}, "via": "127.0.0.1:8080"})
+    assert sent[0] == ("/api/devices/10.0.0.9/queue/load",
+                       {"tracks": [{"service": "local", "id": f"x@{me}", "title": "Nemo"}]})
+    assert sent[1][1]["id"] == f"y@{me}" and sent[1][1]["meta"]["art_url"] == f"http://{me}/art/a.b"
 
 
 def test_relay_serves_library_m4a_as_a_file_even_when_icy_is_asked(tmp_path):
@@ -765,6 +772,168 @@ def test_connect_library_saves_path_map_and_scans_once(server, monkeypatch):
     assert len(scans) == 1
     assert Settings.load().lidarr_path_map == [{"remote": "/data/music", "local": str(server.root)}]
     assert _wait_scan(server.engine)["stats"]["tracks"] == 5
+
+
+# -- the Library plays a song it has, whichever page it was picked from ---------------
+
+
+def test_match_tracks_rules(lib):
+    pytest.importorskip("mutagen")
+    _tag(lib.files["hunter"], title="Hunter", artist="Björk", album="Homogenic",
+         albumartist="Björk", track="1", isrc="GBUM71701001")
+    lib.index.scan([lib.root])
+    m = lib.index.match_tracks([
+        {"isrc": "gbum71701001", "title": "Totally Different"},                       # ISRC wins
+        {"title": "Nemo - 2004 Remaster", "artist": "Nightwish", "duration_s": 2},    # suffix ignored
+        {"title": "Nemo (Live)", "artist": "Nightwish"},                              # another recording
+        {"title": "Nemo", "artist": "Someone Else"},                                  # wrong artist
+        {"title": "Nemo", "artist": "Nightwish", "duration_s": 300},                  # wrong length
+        {"title": "Jóga", "artist": "bjork"},                                         # accents folded
+    ])
+    ids = {k: library.track_id_for(lib.files[k]) for k in ("hunter", "nemo", "joga")}
+    assert m == [ids["hunter"], ids["nemo"], None, None, None, ids["joga"]]
+
+
+def _with_streaming_service(server, monkeypatch):
+    """Give the server a (fake) Qobuz whose catalog has a song the Library also has."""
+    from conftest import FakeProvider
+
+    import harmony.providers as providers
+    from harmony.models import Service, Track
+
+    q = FakeProvider(Service.QOBUZ, [
+        Track(id="q-nemo", title="Nemo (Remastered)", service=Service.QOBUZ, artists=["Nightwish"],
+              album="Once", duration_s=1),
+        Track(id="q-other", title="Wish I Had an Angel (Live)", service=Service.QOBUZ,
+              artists=["Nightwish"], duration_s=1)])
+    q.is_authenticated = True
+    q.resolve_stream = lambda tid, max_quality=False: pytest.fail("streamed instead of the library")
+    monkeypatch.setattr(providers, "build_providers", lambda *a, **k: {Service.QOBUZ: q})
+    server.engine.reset_providers(notify=False)
+    return q
+
+
+def test_library_copy_plays_by_default_from_a_streaming_page(server, monkeypatch):
+    _enable(server)
+    _with_streaming_service(server, monkeypatch)
+    r = _json(server.url + "/api/search?q=nemo&kinds=tracks")
+    nemo = next(t for t in r["tracks"] if t["id"] == "q-nemo")
+    lib_id = library.track_id_for(server.files["nemo"])
+    assert nemo["service"] == "qobuz" and nemo["library_id"] == lib_id       # badge: "Library"
+    assert "library_id" not in next(t for t in r["tracks"] if t["id"] == "q-other")
+    # Playing the Qobuz row streams the Library's file.
+    res = _json(server.url + "/api/resolve?service=qobuz&id=q-nemo")
+    assert res["from_library"] is True and res["service"] == "local"
+    assert _get(server.url + f"/stream/{res['token']}")[2] == server.files["nemo"].read_bytes()
+
+
+def test_track_details_find_the_library_copy_without_a_page(server, monkeypatch):
+    # e.g. a queue restored after a restart: nothing listed it yet this session.
+    _enable(server)
+    _with_streaming_service(server, monkeypatch)
+    res = _json(server.url + "/api/resolve?service=qobuz&id=never-listed&title=Nemo&artist=Nightwish")
+    assert res["from_library"] is True
+
+
+def test_casting_a_streaming_track_plays_the_library_copy(server, monkeypatch):
+    _enable(server)
+    _with_streaming_service(server, monkeypatch)
+    _json(server.url + "/api/search?q=nemo&kinds=tracks")
+    seen = []
+
+    class Caster:
+        def cast(self, host, service, track_id, meta, kind, device_info):
+            seen.append((service, track_id))
+            return {"ok": True}
+
+    monkeypatch.setattr(server.engine, "_caster", lambda: Caster())
+    monkeypatch.setattr(server.engine, "_device_kind", lambda host: ("wiim", {}))
+    server.engine._cast_direct("10.0.0.5", "qobuz", "q-nemo", {"title": "Nemo (Remastered)"})
+    assert seen == [("local", library.track_id_for(server.files["nemo"]))]
+
+
+def test_preferring_the_library_can_be_turned_off(server, monkeypatch):
+    from harmony.config import Settings
+
+    _enable(server)
+    q = _with_streaming_service(server, monkeypatch)
+    s = Settings.load()
+    s.library_preferred = False
+    s.save()
+    r = _json(server.url + "/api/search?q=nemo&kinds=tracks")
+    assert all("library_id" not in t for t in r["tracks"])
+    q.resolve_stream = lambda tid, max_quality=False: __import__("harmony.models", fromlist=["x"]).StreamSource(
+        url=server.files["dark"].as_uri(), mime_type="audio/wav")
+    assert _json(server.url + "/api/resolve?service=qobuz&id=q-nemo")["from_library"] is False
+
+
+def test_desktop_asks_the_engine_for_the_library_copy(server, monkeypatch):
+    _enable(server)
+    _with_streaming_service(server, monkeypatch)
+    alt = server.engine.library_alternative("qobuz", "x", {"title": "Nemo", "artist": "Nightwish"})
+    assert alt == library.track_id_for(server.files["nemo"])
+    assert server.engine.library_alternative("local", alt) is None
+
+
+# -- one Lidarr for the whole mesh ------------------------------------------------------
+
+
+def _mesh_lidarr(server, monkeypatch, own_status=None):
+    """A peer ("server", 10.0.0.2:8080) whose own Lidarr is configured."""
+    calls = []
+    monkeypatch.setattr(server.engine, "instances",
+                        lambda: {"instances": [{"name": "server", "host": "10.0.0.2", "port": 8080}]})
+
+    def peer_call(via, method, path, body=None, timeout=15):
+        calls.append((via, method, path, body))
+        if path == "/api/lidarr?own=1":
+            return own_status or {"enabled": True, "configured": True, "ok": True, "version": "2.5"}
+        if path == "/api/lidarr/request":
+            return {"ok": True, "kind": body["kind"], "title": body.get("title") or body.get("artist")}
+        if path == "/api/lidarr/queue":
+            return {"items": [{"title": "OK Computer", "progress": 40.0}]}
+        if path == "/api/library/state":
+            return {"lidarr": True, "states": [
+                {"title": "OK Computer", "state": "downloading", "progress": 40.0},
+                {"title": "Kid A", "state": "library", "ref": {"service": "local", "id": "al9", "title": "Kid A"}}]}
+        raise AssertionError(path)
+
+    monkeypatch.setattr(server.engine, "_peer_call", peer_call)
+    return calls
+
+
+def test_an_instance_without_lidarr_uses_the_meshs(server, monkeypatch):
+    calls = _mesh_lidarr(server, monkeypatch)
+    st = _json(server.url + "/api/lidarr")
+    assert st["enabled"] and st["configured"] and st["via"] == "server"        # menus light up
+    r = _post(server.url + "/api/lidarr/request", {"kind": "album", "title": "OK Computer", "artist": "Radiohead"})
+    assert r["via"] == "server" and r["title"] == "OK Computer"
+    assert ("10.0.0.2:8080", "POST", "/api/lidarr/request",
+            {"kind": "album", "title": "OK Computer", "artist": "Radiohead"}) in calls
+    assert _json(server.url + "/api/lidarr/queue")["items"][0]["progress"] == 40.0
+    states = _post(server.url + "/api/library/state", {"albums": [
+        {"title": "OK Computer", "artist": "Radiohead"}, {"title": "Kid A", "artist": "Radiohead"}]})
+    assert [s["state"] for s in states["states"]] == ["downloading", "library"]
+    assert states["states"][1]["ref"]["id"] == "al9@10.0.0.2:8080"            # playable via federation
+    assert server.engine.lidarr_status(own=True)["configured"] is False       # never forwarded twice
+
+
+def test_own_lidarr_wins_over_the_meshs(server, monkeypatch):
+    from harmony.config import Settings
+
+    calls = _mesh_lidarr(server, monkeypatch)
+    s = Settings.load()
+    s.lidarr_url, s.lidarr_enabled = "http://lidarr.local:8686", True
+    s.save()
+    monkeypatch.setenv("HARMONY_LIDARR_API_KEY", "k")
+    st = server.engine.lidarr_status()
+    assert "via" not in st and calls == []
+
+
+def test_a_peer_without_lidarr_isnt_used(server, monkeypatch):
+    _mesh_lidarr(server, monkeypatch, own_status={"enabled": False, "configured": False})
+    st = _json(server.url + "/api/lidarr")
+    assert "via" not in st and st["configured"] is False
 
 
 def test_smart_search_puts_the_library_first() -> None:

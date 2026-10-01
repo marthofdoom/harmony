@@ -43,6 +43,7 @@ import androidx.compose.material.icons.automirrored.filled.PlaylistPlay
 import androidx.compose.material.icons.automirrored.filled.QueueMusic
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ArrowDownward
+import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.ArrowUpward
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.ClearAll
@@ -219,6 +220,11 @@ fun serviceLabel(service: String): String = when (service.lowercase()) {
     "tidal" -> "Tidal"
     else -> service.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
 }
+
+/** Where a track plays from — "Library" when the Library has it (its copy plays
+ *  instead of the stream), else the service — the same indicator as the web/desktop. */
+val Track.location: String get() =
+    if (libraryId != null || service.lowercase() == "local") "Library" else serviceLabel(service)
 
 /** Plural-aware track count, or null when unknown (so callers can hide it). */
 fun trackCountLabel(count: Int?): String? = when {
@@ -926,7 +932,7 @@ fun TrackRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (playState != RowPlay.NONE) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurface)
-            Text(listOfNotNull(t.artist.ifBlank { null }, t.album).joinToString(" · "),
+            Text(listOfNotNull(t.artist.ifBlank { null }, t.album, t.location).joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -978,7 +984,7 @@ fun ListActionsRow(
 
 /** Overflow menu for a whole album/playlist row: play, shuffle, queue. */
 @Composable
-fun ListActionMenu(onAction: (ListAction) -> Unit) {
+fun ListActionMenu(lidarr: Boolean = false, onAction: (ListAction) -> Unit) {
     var expanded by remember { mutableStateOf(false) }
     Box {
         IconButton(onClick = { expanded = true }) { Icon(Icons.Filled.MoreVert, "More actions") }
@@ -995,6 +1001,11 @@ fun ListActionMenu(onAction: (ListAction) -> Unit) {
             DropdownMenuItem(text = { Text("Add to queue") },
                 leadingIcon = { Icon(Icons.AutoMirrored.Filled.PlaylistAdd, null) },
                 onClick = { onAction(ListAction.ADD_TO_QUEUE); expanded = false })
+            if (lidarr) {
+                DropdownMenuItem(text = { Text("Get with Lidarr") },
+                    leadingIcon = { Icon(Icons.Filled.Download, null) },
+                    onClick = { onAction(ListAction.GET_WITH_LIDARR); expanded = false })
+            }
         }
     }
 }
@@ -1311,7 +1322,7 @@ private fun QueueRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (isCurrent) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurface)
-            Text(listOfNotNull(track.artist.ifBlank { null }, track.album).joinToString(" · "),
+            Text(listOfNotNull(track.artist.ifBlank { null }, track.album, track.location).joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)

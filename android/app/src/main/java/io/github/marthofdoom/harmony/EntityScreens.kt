@@ -40,6 +40,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -114,7 +115,7 @@ private fun albumYear(album: Album): String? =
 
 @Composable
 private fun AlbumRow(album: Album, onClick: (() -> Unit)?,
-                     onAction: ((ListAction) -> Unit)? = null) {
+                     onAction: ((ListAction) -> Unit)? = null, lidarr: Boolean = false) {
     val base = Modifier.fillMaxWidth()
     val clickable = if (onClick != null) base.clickable { onClick() } else base
     Row(clickable.padding(start = 16.dp, end = if (onAction != null) 4.dp else 16.dp, top = 8.dp, bottom = 8.dp),
@@ -130,7 +131,7 @@ private fun AlbumRow(album: Album, onClick: (() -> Unit)?,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
-        if (onAction != null) ListActionMenu(onAction)
+        if (onAction != null) ListActionMenu(lidarr = lidarr, onAction = onAction)
     }
 }
 
@@ -139,9 +140,14 @@ private fun AlbumRow(album: Album, onClick: (() -> Unit)?,
 @Composable
 private fun PlayableAlbumRow(vm: HarmonyViewModel, al: Album) {
     val id = al.id
+    val lidarr = vm.state.collectAsState().value.lidarrAvailable && al.service != "local"
     AlbumRow(al,
         onClick = id?.let { { vm.openAlbum(al.service, it) } },
-        onAction = id?.let { { action: ListAction -> vm.albumAction(al.service, it, action) } })
+        onAction = id?.let { { action: ListAction ->
+            if (action == ListAction.GET_WITH_LIDARR) vm.getWithLidarr("album", al.title, al.artist)
+            else vm.albumAction(al.service, it, action)
+        } },
+        lidarr = lidarr)
 }
 
 @Composable
@@ -400,8 +406,12 @@ private fun NumberedTrackRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (isPlaying) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurface)
-            if (t.artist.isNotBlank()) {
-                Text(t.artist, maxLines = 1, overflow = TextOverflow.Ellipsis,
+            // An album's tracks share its service; only flag the ones that will
+            // play from the Library instead (like the web album page).
+            val sub = listOfNotNull(t.artist.ifBlank { null },
+                t.location.takeIf { t.libraryId != null }).joinToString(" · ")
+            if (sub.isNotBlank()) {
+                Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }

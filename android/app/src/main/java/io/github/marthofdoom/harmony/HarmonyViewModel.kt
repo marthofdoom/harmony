@@ -19,7 +19,7 @@ enum class ConnState { DISCONNECTED, CONNECTING, CONNECTED }
 enum class DetailKind { ARTIST, ALBUM, TRACK }
 
 /** Whole-list actions offered on album / playlist rows. */
-enum class ListAction { PLAY, SHUFFLE, PLAY_NEXT, ADD_TO_QUEUE }
+enum class ListAction { PLAY, SHUFFLE, PLAY_NEXT, ADD_TO_QUEUE, GET_WITH_LIDARR }
 
 /** One entry on the entity-navigation back stack. It carries its own loaded
  *  payload so going back never refetches. `key` disambiguates duplicate routes. */
@@ -72,6 +72,9 @@ data class UiState(
     val repeatMode: RepeatMode = RepeatMode.OFF,
     val buffering: Boolean = false,
     val message: String? = null,
+    /** The connected instance can take "Get with Lidarr" — its own Lidarr or
+     *  the one configured on the mesh (it forwards the request there). */
+    val lidarrAvailable: Boolean = false,
     // audio routing
     val peers: List<Instance> = emptyList(),
     val playingHere: Boolean = false,
@@ -216,7 +219,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 val name = _state.value.discovered.firstOrNull { it.baseUrl == baseUrl }?.name ?: baseUrl
                 _state.value = _state.value.copy(conn = ConnState.CONNECTED, instanceName = name,
                     connectingUrl = null)
-                refreshPeers(); loadLibrary(); loadDevices()
+                refreshPeers(); loadLibrary(); loadDevices(); loadLidarr()
             }.onFailure {
                 _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, connectingUrl = null,
                     message = friendly(it, "Couldn't connect. Check the address and key, then try again."))
@@ -406,6 +409,26 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     fun albumAction(service: String, id: String, action: ListAction) =
         withTracks("Couldn't load that album. Try again.", { it.album(service, id).tracks }) { runListAction(it, action) }
 
+    private fun loadLidarr() {
+        val client = api ?: return
+        viewModelScope.launch {
+            val ok = withContext(Dispatchers.IO) { runCatching { client.lidarrAvailable() }.getOrDefault(false) }
+            _state.value = _state.value.copy(lidarrAvailable = ok)
+        }
+    }
+
+    /** "Get with Lidarr" for an album or artist; the instance forwards it to
+     *  the mesh's Lidarr when it has none of its own. */
+    fun getWithLidarr(kind: String, title: String, artist: String) {
+        val client = api ?: return
+        viewModelScope.launch {
+            val r = withContext(Dispatchers.IO) { runCatching { client.lidarrRequest(kind, title, artist) } }
+            _state.value = _state.value.copy(message = r.fold(
+                { "Sent “$it” to Lidarr." },
+                { friendly(it, "Lidarr couldn't take that. Try again.") }))
+        }
+    }
+
     /** Whole-playlist actions from a playlist row. */
     fun playlistAction(pl: Playlist, action: ListAction) =
         withTracks("Couldn't load that playlist. Try again.", { it.playlistTracks(pl.service, pl.id) }) { runListAction(it, action) }
@@ -415,6 +438,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         ListAction.SHUFFLE -> playAll(tracks, shuffle = true)
         ListAction.PLAY_NEXT -> playNext(tracks)
         ListAction.ADD_TO_QUEUE -> addToQueue(tracks)
+        ListAction.GET_WITH_LIDARR -> Unit  // not a track action; see getWithLidarr
     }
 
     // -- library / playlists ------------------------------------------------

@@ -312,7 +312,7 @@ class SearchPage(Gtk.Box):
         ``_show_artist_albums``). Albums/playlists still load straight into
         the track view, same as before.
         """
-        provider = self.state.providers.get(item.service)
+        provider = self.state.provider_for(item.service)
         if provider is None:
             self.state.toast(f"No provider configured for {item.service.label}")
             return
@@ -348,7 +348,7 @@ class SearchPage(Gtk.Box):
     # -- artist drill-down: artist -> albums, with an explicit "most popular" ----
 
     def _show_artist_albums(self, artist: Artist) -> None:
-        provider = self.state.providers.get(artist.service)
+        provider = self.state.provider_for(artist.service)
         if provider is None:
             self.state.toast(f"No provider configured for {artist.service.label}")
             return
@@ -394,7 +394,7 @@ class SearchPage(Gtk.Box):
         artist = self._showing_artist
         if artist is None:
             return
-        provider = self.state.providers.get(artist.service)
+        provider = self.state.provider_for(artist.service)
         if provider is None:
             self.state.toast(f"No provider configured for {artist.service.label}")
             return
@@ -651,7 +651,7 @@ class SearchPage(Gtk.Box):
         # Play on Device / Add to Playlist need the item's own native
         # provider -- get_album_tracks/get_artist_top_tracks/get_playlist_tracks
         # only resolve against the service the id came from, no fallback.
-        native_provider = self.state.providers.get(item.service)
+        native_provider = self.state.provider_for(item.service)
         if isinstance(item, Artist):
             label = item.name
             fetch_tracks = (lambda p=native_provider: p.get_artist_top_tracks(item.id)) if native_provider else None
@@ -714,6 +714,13 @@ class SearchPage(Gtk.Box):
                     ),
                 ))
         actions.append(("Open", lambda: self._open_item(item)))
+        if isinstance(item, Album | Artist) and item.service is not Service.LOCAL:
+            from harmony.ui.entity_nav import lidarr_actions
+
+            if isinstance(item, Album):
+                actions += lidarr_actions(self.state, "album", title=item.title, artist=item.artist_name)
+            else:
+                actions += lidarr_actions(self.state, "artist", artist=item.name)
         return actions
 
     def _on_back_to_results(self, _button: Gtk.Button) -> None:
@@ -808,6 +815,11 @@ class SearchPage(Gtk.Box):
         artist_ids = album.get("artist_ids") or []
         if artist_ids:
             actions.append(("Go to Artist", lambda: nav and nav.go_to_artist(album["service"], artist_ids[0])))
+        if album.get("service") != "local":
+            from harmony.ui.entity_nav import lidarr_actions
+
+            actions += lidarr_actions(self.state, "album", title=album.get("title") or "",
+                                      artist=album.get("artist") or "", mbid=album.get("mbid"))
         return actions
 
     def _artist_refs_group(self, title: str, refs: list[dict], nav: object) -> Adw.PreferencesGroup:
