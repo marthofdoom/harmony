@@ -184,7 +184,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .albstate.st-library { border-color: var(--accent); color: inherit; }
 .albstate .act.small { flex: none; }
 /* Lidarr downloads (Library view). */
-.dl { display: grid; grid-template-columns: 1fr 8rem 3rem; gap: var(--sp-3); align-items: center;
+.dl { display: grid; grid-template-columns: minmax(0, 1fr) 8rem 3rem; gap: var(--sp-3); align-items: center;
       padding: var(--sp-2) 0; border-bottom: 1px solid var(--border); }
 .dl-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dl-sub { font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -192,7 +192,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .dl-bar { height: .4rem; border-radius: 1rem; background: var(--border); overflow: hidden; }
 .dl-bar span { display: block; height: 100%; background: var(--accent); }
 .dl-pct { font-size: 12px; text-align: right; font-variant-numeric: tabular-nums; }
-@media (max-width: 640px) { .dl { grid-template-columns: 1fr 4.5rem 2.6rem; } }
+@media (max-width: 640px) { .dl { grid-template-columns: minmax(0, 1fr) 4.5rem 2.6rem; } }
 
 /* Now Playing queue: header controls (shuffle / repeat) + drag-to-reorder */
 .qhead { display: flex; align-items: center; gap: var(--sp-2); margin: 0 0 var(--sp-3); }

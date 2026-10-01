@@ -969,12 +969,18 @@ class Engine:
             }
 
         chosen_id = best_artist.id if best_artist is not None else None
+        # Your own library leads every list: a match you already own beats a
+        # streaming result (each group keeps its usual order).
+        def mine_first(items: list[Any]) -> list[Any]:
+            return ([x for x in items if x.service.value == "local"]
+                    + [x for x in items if x.service.value != "local"])
+
         return {
             "query": query,
             "artist": artist_section,
-            "albums": [album_to_dict(a) for a in _sort_albums_chrono(albums)],
+            "albums": [album_to_dict(a) for a in mine_first(_sort_albums_chrono(albums))],
             "incidental": {
-                "tracks": self._annotate_library([track_to_dict(t) for t in tracks]),
+                "tracks": self._annotate_library([track_to_dict(t) for t in mine_first(tracks)]),
                 "artists": [
                     _artist_ref(a.service.value, a.id, a.name)
                     for a in artists if a.id != chosen_id
