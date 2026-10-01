@@ -1,7 +1,7 @@
 # Roadmap & status
 
 A snapshot of what exists and what's next. Honest maturity, not aspiration — see
-the legend in the [docs index](README.md). Current release: **1.0.6** (pre-1.0 polish; not yet billed stable).
+the legend in the [docs index](README.md). Current release: **1.0.7** (pre-1.0 polish; not yet billed stable).
 
 ## Done
 
@@ -35,6 +35,13 @@ the legend in the [docs index](README.md). Current release: **1.0.6** (pre-1.0 p
   doesn't build the library provider. *Live Lidarr + device runs still to
   confirm (built against Lidarr's API; e2e against a generated library and a
   fake Lidarr).*
+- **Federated Library + library-first playback + mesh-wide Lidarr** (1.0.7) —
+  each instance's Library is its own folders plus every key-matching peer's, so
+  the desktop, phone and web play any library on the mesh (peer tracks stream
+  from the owning instance). A song plays from the Library whenever it has it
+  (ISRC, else title/artist/length), marked "Library" on every client, with a
+  fallback to the stream. An instance without Lidarr uses the mesh's ("Get with
+  Lidarr" on web, desktop and Android). *Real multi-device runs still to confirm.*
 - **Entity navigation** — every artist, album, and track has its own page,
   reachable by clicking a name or right-clicking a row on all three surfaces
   (desktop, web, Android). Artist pages carry a Wikipedia bio, a chronological

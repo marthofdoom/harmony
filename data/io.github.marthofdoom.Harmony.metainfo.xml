@@ -46,6 +46,18 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.7" date="2026-10-01">
+      <description>
+        <p>One library for all your devices. Every Harmony instance now shares
+        its music folders with the others that use your personal key, so the
+        desktop app and the phone play the server's library without being
+        pointed at the server.</p>
+        <p>A song plays from your library whenever it's there, even when you
+        pick it on Qobuz or YouTube Music, and those tracks are marked
+        "Library". "Get with Lidarr" now works on every instance, using the
+        Lidarr set up on your server.</p>
+      </description>
+    </release>
     <release version="1.0.6" date="2026-10-01">
       <description>
         <p>Play your own music folders anywhere. Point the Harmony server at the
