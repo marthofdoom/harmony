@@ -49,6 +49,8 @@ self.addEventListener("fetch", (event) => {
   if (url.origin !== location.origin) return;
   // Live data must never be served from cache.
   if (url.pathname.startsWith("/api/") || url.pathname.startsWith("/stream/") || url.pathname === "/healthz") return;
+  // Library covers: HTTP-cached by the browser; never pile them into the shell cache.
+  if (url.pathname.startsWith("/art/")) return;
 
   // Icons/images: cache-first (immutable within a release).
   if (isImage(url.pathname)) {

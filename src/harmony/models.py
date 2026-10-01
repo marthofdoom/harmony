@@ -14,10 +14,13 @@ from typing import Any
 class Service(StrEnum):
     YTMUSIC = "ytmusic"
     QOBUZ = "qobuz"
+    #: The instance's own music folders (``harmony.library``) — typically where
+    #: Lidarr files what it acquires. Server/web only: the desktop doesn't build it.
+    LOCAL = "local"
 
     @property
     def label(self) -> str:
-        return {"ytmusic": "YouTube Music", "qobuz": "Qobuz"}[self.value]
+        return {"ytmusic": "YouTube Music", "qobuz": "Qobuz", "local": "Library"}[self.value]
 
 
 @dataclass(slots=True)

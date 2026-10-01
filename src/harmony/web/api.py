@@ -139,6 +139,12 @@ class Engine:
         self._onboard: Any | None = None
         self._audio_router: Any | None = None
         self._devices_cache: tuple[float, list[dict[str, Any]]] | None = None
+        self._lib: tuple[Any, Any] | None = None
+        self._lib_lock = threading.Lock()
+        self._scan_lock = threading.Lock()
+        self._scan_state: dict[str, Any] = {"running": False}
+        self._lidarr_cache: dict[str, tuple[float, Any]] = {}
+        self._http_port: int | None = None
 
     # -- providers ----------------------------------------------------------
 
@@ -147,7 +153,16 @@ class Engine:
             from harmony.config import CredentialStore, Settings
             from harmony.providers import build_providers
 
-            providers = build_providers(Settings.load(), CredentialStore())
+            settings = Settings.load()
+            providers = build_providers(settings, CredentialStore())
+            # The local library is server/web-only: added here (not in
+            # build_providers, which the desktop shares) when it's enabled.
+            if settings.library_enabled:
+                from harmony.models import Service
+                from harmony.providers.local import LocalLibraryProvider
+
+                index, signer = self._library()
+                providers[Service.LOCAL] = LocalLibraryProvider(index, signer)
             # build_providers constructs but does not authenticate; load each
             # provider's stored credentials (e.g. the Qobuz token) so search,
             # is_authenticated, and streaming all reflect reality -- the desktop
@@ -303,7 +318,7 @@ class Engine:
         connections and to protect a working local one. Never raises."""
         out: dict[str, bool] = {}
         try:
-            services = [svc.value for svc in self._ensure_providers()]
+            services = [svc.value for svc in self._ensure_providers() if svc.value != "local"]
         except Exception:  # noqa: BLE001
             return out
         for sv in services:
@@ -994,6 +1009,340 @@ class Engine:
             return {"ok": True, "kind": "artist", "title": added.get("artistName", artist or title)}
         raise KeyError(kind)
 
+    # -- local library (harmony.library) -----------------------------------
+    #
+    # The far end of the Lidarr loop: Lidarr files an album into a music
+    # folder, the import webhook rescans that folder, and the album is
+    # searchable/playable/castable everywhere as the "local" service.
+
+    def _library(self) -> tuple[Any, Any]:
+        """The (lazily opened) library index + artwork signer."""
+        with self._lib_lock:
+            if self._lib is None:
+                from harmony import config
+                from harmony.library import ArtSigner, LibraryIndex
+
+                directory = config.data_dir()
+                self._lib = (LibraryIndex(directory / "library.db"), ArtSigner.for_dir(directory))
+            return self._lib
+
+    def set_http_port(self, port: int) -> None:
+        self._http_port = int(port)
+
+    def _absolute_url(self, path: str, peer_host: str) -> str:
+        """``path`` on this server as a URL ``peer_host`` can reach."""
+        from harmony.playback.relay import RelayServer
+
+        ip = RelayServer._local_ip_for(peer_host)
+        return f"http://{ip}:{self._http_port or 8080}{path}"
+
+    def library_art(self, token: str) -> tuple[bytes, str] | None:
+        """Cover bytes for a signed ``/art/<album>.<sig>`` path (None if invalid)."""
+        index, signer = self._library()
+        album_id = signer.verify(token.rsplit("/", 1)[-1])
+        if album_id is None:
+            return None
+        return index.album_art(album_id)
+
+    def library_status(self) -> dict[str, Any]:
+        import os
+
+        from harmony.config import Settings
+        from harmony.library import has_mutagen
+
+        s = Settings.load()
+        out: dict[str, Any] = {
+            "enabled": bool(s.library_enabled), "paths": list(s.library_paths),
+            "path_map": list(s.lidarr_path_map), "tags": has_mutagen(),
+            "scan": dict(self._scan_state),
+            "missing": [p for p in s.library_paths if not os.path.isdir(p)],
+        }
+        try:
+            out["stats"] = self._library()[0].stats()
+        except Exception as exc:  # noqa: BLE001 - status must not raise
+            out["stats"] = {"tracks": 0, "albums": 0, "artists": 0}
+            out["error"] = str(exc)
+        return out
+
+    def library_save_config(self, *, enabled: bool | None = None,
+                            paths: list[str] | None = None,
+                            path_map: list[dict[str, str]] | None = None,
+                            scan: bool = True) -> dict[str, Any]:
+        from harmony.config import Settings
+
+        s = Settings.load()
+        if enabled is not None:
+            s.library_enabled = bool(enabled)
+        if paths is not None:
+            clean: list[str] = []
+            for p in paths:
+                p = str(p or "").strip()
+                if p:
+                    p = p.rstrip("/") or "/"
+                    if p not in clean:
+                        clean.append(p)
+            s.library_paths = clean
+        if path_map is not None:
+            s.lidarr_path_map = [
+                {"remote": str(m.get("remote") or "").strip(), "local": str(m.get("local") or "").strip()}
+                for m in path_map if str(m.get("remote") or "").strip()]
+        s.save()
+        self.reset_providers(notify=False)
+        if paths is not None:
+            try:
+                self._library()[0].prune_outside(s.library_paths)
+            except Exception:  # noqa: BLE001
+                log.exception("library: prune after folder change failed")
+        if scan and s.library_enabled and s.library_paths:
+            self.library_scan()
+        return self.library_status()
+
+    def library_scan(self, paths: list[str] | None = None, *, wait: bool = False) -> dict[str, Any]:
+        """(Re)index the library folders — or just ``paths`` — on a worker thread.
+
+        Only folders inside a configured library folder are scanned, so a
+        webhook (or a client) can't point the indexer elsewhere on disk."""
+        from pathlib import Path
+
+        from harmony.config import Settings
+
+        s = Settings.load()
+        roots = [Path(p) for p in s.library_paths]
+        if paths is None:
+            targets = roots
+        else:
+            targets = []
+            for p in paths:
+                tp = Path(p)
+                if any(tp == r or tp.is_relative_to(r) for r in roots):
+                    targets.append(tp)
+                else:
+                    log.info("library: ignoring %s (outside the library folders)", p)
+        if not targets:
+            return {"ok": False, "reason": "no library folders to scan", "scan": dict(self._scan_state)}
+
+        def run() -> None:
+            with self._scan_lock:
+                self._scan_state = {"running": True, "started": time.time(),
+                                    "paths": [str(t) for t in targets]}
+                try:
+                    report = self._library()[0].scan(targets)
+                    self._scan_state = {"running": False, "finished": time.time(),
+                                        "full": paths is None, **report.as_dict()}
+                    log.info("library scan %s: %s", [str(t) for t in targets], report.as_dict())
+                except Exception as exc:  # noqa: BLE001
+                    log.exception("library scan failed")
+                    self._scan_state = {"running": False, "finished": time.time(),
+                                        "error": str(exc)}
+                self._lidarr_cache.pop("albums", None)
+
+        if wait:
+            run()
+        else:
+            threading.Thread(target=run, daemon=True, name="harmony-library-scan").start()
+        return {"ok": True, "scan": dict(self._scan_state)}
+
+    def library_overview(self, *, order: str = "recent", limit: int = 60,
+                         offset: int = 0) -> dict[str, Any]:
+        """Browse the library: albums (newest first by default) + all artists."""
+        from harmony.models import Service
+
+        prov = self._ensure_providers().get(Service.LOCAL)
+        if prov is None:
+            return {"enabled": False, "albums": [], "artists": [], "stats": None}
+        albums = prov.list_albums(order=order, limit=limit, offset=offset)
+        artists = [{"id": a["id"], "name": a["name"], "service": "local",
+                    "album_count": a["album_count"]} for a in prov.list_artists()]
+        return {"enabled": True, "albums": [album_to_dict(a) for a in albums],
+                "artists": artists, "stats": prov.index.stats()}
+
+    # -- Lidarr ↔ library: import webhook, downloads, per-album state ------
+
+    def _lidarr_cached(self, key: str, ttl: float, fn: Any) -> Any:
+        hit = self._lidarr_cache.get(key)
+        now = time.monotonic()
+        if hit is not None and now - hit[0] < ttl:
+            return hit[1]
+        value = fn()
+        self._lidarr_cache[key] = (now, value)
+        return value
+
+    def lidarr_webhook(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Lidarr Connect → Webhook callback: reindex what an import/rename/delete
+        touched (paths mapped onto this machine), so the album is playable
+        everywhere the moment Lidarr files it."""
+        from pathlib import Path
+
+        from harmony.config import Settings
+        from harmony.library import map_path
+        from harmony.lidarr import webhook_paths
+
+        s = Settings.load()
+        plan = webhook_paths(payload or {})
+        event = plan["event"]
+        self._lidarr_cache.pop("queue", None)
+        if event in ("Download", "AlbumDownload", "Rename", "Retag", "TrackRetag",
+                     "ArtistDelete", "AlbumDelete", "TrackFileDelete"):
+            self._lidarr_cache.pop("albums", None)
+        if event == "Test":
+            return {"ok": True, "event": "Test", "library": bool(s.library_enabled)}
+        if not s.library_enabled or not s.library_paths:
+            return {"ok": True, "event": event, "indexed": 0,
+                    "note": "library not enabled; nothing to index"}
+        pm = s.lidarr_path_map
+        files = [map_path(p, pm) for p in plan["files"]]
+        deleted = [map_path(p, pm) for p in plan["deleted"]]
+        dirs = [map_path(p, pm) for p in plan["dirs"]]
+        index = self._library()[0]
+        removed = 0
+        roots = [Path(r) for r in s.library_paths]
+
+        def inside(p: str) -> bool:
+            return any(Path(p) == r or Path(p).is_relative_to(r) for r in roots)
+        for p in deleted:
+            if inside(p) and not Path(p).exists():
+                removed += index.remove_under(p)
+        # Index imported files synchronously (a handful per album — fast), so a
+        # client refreshing right after the import already sees the album.
+        targets = [p for p in files if inside(p)]
+        report = index.scan(targets, prune=False) if targets else None
+        if dirs:
+            self.library_scan(dirs)
+        skipped = [p for p in files + dirs if not inside(p)]
+        if skipped:
+            log.warning("lidarr webhook: %d path(s) outside the library folders (path mapping?): %s",
+                        len(skipped), skipped[:3])
+        return {"ok": True, "event": event,
+                "indexed": (report.added + report.updated) if report else 0,
+                "removed": removed + (report.removed if report else 0),
+                "rescanning": [d for d in dirs if inside(d)],
+                "outside_library": skipped}
+
+    def lidarr_connect_library(self, callback_base: str) -> dict[str, Any]:
+        """One click from "Lidarr configured" to the full loop:
+
+        * add Lidarr's root folders (path-mapped) as library folders and enable
+          the library (kicking off the first scan);
+        * register — or update — the "Harmony" Connect → Webhook in Lidarr,
+          pointed at ``<callback_base>/api/lidarr/webhook`` (with the personal key
+          when one is set), so every import is indexed as it lands.
+        """
+        from urllib.parse import quote
+
+        from harmony.config import Settings
+        from harmony.library import map_path
+
+        client, s = self._lidarr_client()
+        roots = [map_path(str(f.get("path") or ""), s.lidarr_path_map)
+                 for f in client.root_folders() if f.get("path")]
+        paths = list(s.library_paths)
+        for r in roots:
+            r = r.rstrip("/") or "/"
+            if r not in paths:
+                paths.append(r)
+        status = self.library_save_config(enabled=True, paths=paths)
+
+        base = (callback_base or "").strip().rstrip("/")
+        if not base:
+            raise ValueError("missing the URL Lidarr should call back on")
+        url = f"{base}/api/lidarr/webhook"
+        key = Settings.load().personal_key
+        if key:
+            url += "?key=" + quote(key, safe="")
+        notification = client.register_webhook(url)
+        tested, test_error = False, None
+        try:
+            client.test_webhook(notification)
+            tested = True
+        except Exception as exc:  # noqa: BLE001 - registration stands; report reachability
+            test_error = str(exc)
+        return {"ok": True, "webhook_url": url.split("?", 1)[0], "webhook_id": notification.get("id"),
+                "tested": tested, "test_error": test_error, "roots": roots,
+                "missing": status.get("missing", []), "library": status}
+
+    def lidarr_queue(self) -> dict[str, Any]:
+        """What Lidarr is downloading right now (cached a few seconds)."""
+        from harmony.lidarr import queue_item
+
+        client, _ = self._lidarr_client()
+        records = self._lidarr_cached("queue", 4.0, client.queue)
+        return {"items": [queue_item(r) for r in records]}
+
+    def album_states(self, albums: list[dict[str, Any]]) -> dict[str, Any]:
+        """Where each album stands on the acquire → index → play path.
+
+        ``albums`` is ``[{title, artist, mbid?}]``; each gets a ``state``:
+        ``library`` (indexed here — with a ``ref`` to play the local copy),
+        ``downloading`` (in Lidarr's queue, with ``progress``), ``imported``
+        (Lidarr has the files but this library doesn't — usually a path
+        mapping/folder issue), ``wanted`` (monitored in Lidarr, not yet got),
+        or ``none``. Works without Lidarr (library check only)."""
+        from harmony.config import LIDARR_API_KEY, CredentialStore, Settings
+        from harmony.library import norm
+        from harmony.lidarr import queue_item
+
+        s = Settings.load()
+        index = self._library()[0] if s.library_enabled else None
+        lidarr_on = bool(s.lidarr_enabled and s.lidarr_url and CredentialStore().get(LIDARR_API_KEY))
+        lidarr_albums: list[dict[str, Any]] = []
+        queue: list[dict[str, Any]] = []
+        lidarr_error = None
+        if lidarr_on:
+            try:
+                client, _ = self._lidarr_client()
+                lidarr_albums = self._lidarr_cached("albums", 120.0, client.albums)
+                queue = [queue_item(r) for r in self._lidarr_cached("queue", 4.0, client.queue)]
+            except Exception as exc:  # noqa: BLE001 - library state still answers
+                lidarr_error = str(exc)
+        by_mbid = {a.get("foreignAlbumId"): a for a in lidarr_albums if a.get("foreignAlbumId")}
+
+        from rapidfuzz import fuzz
+
+        def lidarr_match(title: str, artist: str, mbid: str | None) -> dict[str, Any] | None:
+            if mbid and mbid in by_mbid:
+                return by_mbid[mbid]
+            nt, na = norm(title), norm(artist)
+            best, best_score = None, 0.0
+            for a in lidarr_albums:
+                score = fuzz.token_sort_ratio(nt, norm(a.get("title")))
+                if na:
+                    score = 0.65 * score + 0.35 * fuzz.token_sort_ratio(
+                        na, norm((a.get("artist") or {}).get("artistName")))
+                if score > best_score and score >= 88:
+                    best, best_score = a, score
+            return best
+
+        out = []
+        for item in albums or []:
+            title = str(item.get("title") or "")
+            artist = str(item.get("artist") or "")
+            mbid = item.get("mbid") or None
+            entry: dict[str, Any] = {"title": title, "artist": artist, "state": "none"}
+            local = index.find_album(title, artist, mbid=mbid) if index is not None else None
+            if local is not None:
+                entry.update(state="library", ref={"service": "local", "id": local["album_id"],
+                                                   "title": local["album"]},
+                             track_count=local["track_count"])
+                out.append(entry)
+                continue
+            la = lidarr_match(title, artist, mbid) if lidarr_albums else None
+            if la is not None:
+                q = next((d for d in queue if d.get("album_id") == la.get("id")), None)
+                stats = la.get("statistics") or {}
+                have = int(stats.get("trackFileCount") or 0)
+                total = int(stats.get("totalTrackCount") or stats.get("trackCount") or 0)
+                if q is not None:
+                    entry.update(state="downloading", progress=q["progress"], status=q["status"])
+                elif total and have >= total:
+                    entry.update(state="imported")
+                elif la.get("monitored"):
+                    entry.update(state="wanted", have=have, total=total)
+            out.append(entry)
+        result: dict[str, Any] = {"states": out, "lidarr": lidarr_on}
+        if lidarr_error:
+            result["lidarr_error"] = lidarr_error
+        return result
+
     def playlists(self) -> dict[str, Any]:
         out = []
         with self._lock:
@@ -1395,6 +1744,12 @@ class Engine:
     def _cast_direct(self, host: str, service_value: str, track_id: str,
                      meta: dict[str, Any] | None = None) -> dict[str, Any]:
         kind, info = self._device_kind(host)
+        art = (meta or {}).get("art_url")
+        if isinstance(art, str) and art.startswith("/"):
+            # Library artwork is a path on this server; a renderer needs a URL
+            # it can fetch (the /art/ capability path needs no personal key).
+            meta = dict(meta or {})
+            meta["art_url"] = self._absolute_url(art, host)
         return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
 
     def device_control(self, host: str, action: str, level: int | None = None,

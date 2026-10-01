@@ -108,6 +108,14 @@ you run across your whole home. What that unlocks:
   with Lidarr*: Harmony hands your Lidarr instance the request (add, monitor,
   search), matched by MusicBrainz id when known. Harmony discovers and plays;
   Lidarr fetches. Needs only a Lidarr URL + API key.
+- **Local library** (server/web + Android) — point the server at your music
+  folders and they become a service like any other: search, album/artist pages,
+  queue, play in the browser or app, cast to your speakers. With Lidarr, one
+  click (*Accounts → Lidarr → Connect Lidarr to library*) adopts Lidarr's root
+  folders and registers an import webhook, so an album you *Get with Lidarr* is
+  playable everywhere moments after it lands. Albums found on other services
+  show where they stand: *In library*, *↓ 42%*, *Wanted*. Tags via `mutagen`
+  (in the `server` extra); without it names come from Lidarr's folder layout.
 
 ## Requirements
 

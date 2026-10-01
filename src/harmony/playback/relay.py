@@ -34,6 +34,7 @@ from urllib.parse import urlsplit
 import requests
 
 from ..models import StreamSource
+from ..streamio import file_url_path, is_file_url, open_stream
 
 log = logging.getLogger(__name__)
 
@@ -124,6 +125,10 @@ def _spawn_adts_remux(source: StreamSource) -> subprocess.Popen[bytes]:
     # -reconnect* make ffmpeg re-open the HTTP fetch (resuming by byte offset) if
     # the CDN throttles or drops a single long connection mid-song -- googlevideo
     # does exactly that, which was truncating tracks partway through.
+    if is_file_url(source.url):  # a library file: no HTTP options apply
+        args = ["ffmpeg", "-nostdin", "-loglevel", "error",
+                "-i", str(file_url_path(source.url)), "-vn", "-c:a", "copy", "-f", "adts", "pipe:1"]
+        return subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
     args = [
         "ffmpeg", "-nostdin", "-loglevel", "error",
         "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
@@ -338,6 +343,14 @@ class _Handler(BaseHTTPRequestHandler):
     def _open_upstream(
         self, url: str, headers: dict[str, str], token: str
     ) -> requests.Response | None:
+        if is_file_url(url):
+            # A local-library track: serve the file itself (Range-aware).
+            try:
+                return open_stream(url, headers)  # type: ignore[no-any-return]
+            except OSError:
+                log.exception("relay: local file unavailable for token %s", token)
+                self.send_error(404, "Library file is missing")
+                return None
         try:
             return requests.get(
                 url, headers=headers, stream=True, timeout=_UPSTREAM_TIMEOUT_S, allow_redirects=True

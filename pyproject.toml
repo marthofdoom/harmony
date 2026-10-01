@@ -33,9 +33,12 @@ mesh = ["zeroconf>=0.130"]
 # harmony.playback.chromecast, so a build without it still runs (Cast just
 # unavailable). Pulls zeroconf transitively.
 cast = ["PyChromecast>=13"]
+# Local library tag reading (harmony.library). Optional + soft-imported: without
+# it the scanner reads Lidarr's Artist/Album (Year)/NN - Title layout instead.
+library = ["mutagen>=1.47"]
 # Everything a network server wants (the GHCR/AUR/.deb install target).
-server = ["zeroconf>=0.130", "PyChromecast>=13"]
-dev = ["pytest>=8.0", "ruff>=0.6"]
+server = ["zeroconf>=0.130", "PyChromecast>=13", "mutagen>=1.47"]
+dev = ["pytest>=8.0", "ruff>=0.6", "mutagen>=1.47"]
 
 [project.scripts]
 harmony = "harmony.__main__:main"
