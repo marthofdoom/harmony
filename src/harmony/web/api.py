@@ -1107,17 +1107,10 @@ class Engine:
         from harmony.config import Settings
 
         s = Settings.load()
-        roots = [Path(p) for p in s.library_paths]
         if paths is None:
-            targets = roots
+            targets = [Path(p) for p in s.library_paths]
         else:
-            targets = []
-            for p in paths:
-                tp = Path(p)
-                if any(tp == r or tp.is_relative_to(r) for r in roots):
-                    targets.append(tp)
-                else:
-                    log.info("library: ignoring %s (outside the library folders)", p)
+            targets = self._library_targets(paths, s.library_paths)
         if not targets:
             return {"ok": False, "reason": "no library folders to scan", "scan": dict(self._scan_state)}
 
@@ -1126,7 +1119,9 @@ class Engine:
                 self._scan_state = {"running": True, "started": time.time(),
                                     "paths": [str(t) for t in targets]}
                 try:
-                    report = self._library()[0].scan(targets)
+                    # A whole library folder that's missing is an unmounted share,
+                    # not a deletion: keep its tracks (prune_missing=False).
+                    report = self._library()[0].scan(targets, prune_missing=paths is not None)
                     self._scan_state = {"running": False, "finished": time.time(),
                                         "full": paths is None, **report.as_dict()}
                     log.info("library scan %s: %s", [str(t) for t in targets], report.as_dict())
@@ -1141,6 +1136,27 @@ class Engine:
         else:
             threading.Thread(target=run, daemon=True, name="harmony-library-scan").start()
         return {"ok": True, "scan": dict(self._scan_state)}
+
+    @staticmethod
+    def _library_targets(paths: list[str], roots: list[str]) -> list[Any]:
+        """The ``paths`` that really lie inside a library folder (``..`` and
+        symlinks resolved — the webhook and clients can't steer the indexer
+        elsewhere on disk) and whose library folder is present (an unmounted
+        share must not read as "everything under it was deleted")."""
+        from pathlib import Path
+
+        from harmony.library import within
+
+        out = []
+        for p in paths:
+            owner = next((r for r in roots if within(p, [r])), None)
+            if owner is None:
+                log.info("library: ignoring %s (outside the library folders)", p)
+            elif not Path(owner).is_dir():
+                log.warning("library: %s is missing (unmounted?); not touching %s", owner, p)
+            else:
+                out.append(Path(p))
+        return out
 
     def library_overview(self, *, order: str = "recent", limit: int = 60,
                          offset: int = 0) -> dict[str, Any]:
@@ -1195,30 +1211,43 @@ class Engine:
         dirs = [map_path(p, pm) for p in plan["dirs"]]
         index = self._library()[0]
         removed = 0
-        roots = [Path(r) for r in s.library_paths]
-
-        def inside(p: str) -> bool:
-            return any(Path(p) == r or Path(p).is_relative_to(r) for r in roots)
-        for p in deleted:
-            if inside(p) and not Path(p).exists():
+        for p in self._library_targets(deleted, s.library_paths):
+            if not p.exists():
                 removed += index.remove_under(p)
-        # Index imported files synchronously (a handful per album — fast), so a
-        # client refreshing right after the import already sees the album.
-        targets = [p for p in files if inside(p)]
-        report = index.scan(targets, prune=False) if targets else None
-        if dirs:
-            self.library_scan(dirs)
-        skipped = [p for p in files + dirs if not inside(p)]
+        # Index imported files right away (a handful per album — fast), so a
+        # client refreshing after the import already sees the album. Under the
+        # scan lock, so it can't interleave with a running full scan; if that
+        # scan is long, hand the files to the background scanner instead.
+        targets = self._library_targets(files, s.library_paths)
+        report = None
+        queued = False
+        if targets:
+            if self._scan_lock.acquire(timeout=20):
+                try:
+                    report = index.scan(targets, prune=False)
+                finally:
+                    self._scan_lock.release()
+            else:
+                self.library_scan([str(t) for t in targets])
+                queued = True
+        rescan = self._library_targets(dirs, s.library_paths)
+        if rescan:
+            self.library_scan([str(d) for d in rescan])
+        accepted = {str(t) for t in targets} | {str(d) for d in rescan}
+        skipped = [p for p in files + dirs if str(Path(p)) not in accepted]
         if skipped:
-            log.warning("lidarr webhook: %d path(s) outside the library folders (path mapping?): %s",
+            log.warning("lidarr webhook: %d path(s) not indexed (outside the library "
+                        "folders — path mapping? — or the folder is missing): %s",
                         len(skipped), skipped[:3])
         return {"ok": True, "event": event,
                 "indexed": (report.added + report.updated) if report else 0,
                 "removed": removed + (report.removed if report else 0),
-                "rescanning": [d for d in dirs if inside(d)],
+                "queued": queued,
+                "rescanning": [str(d) for d in rescan],
                 "outside_library": skipped}
 
-    def lidarr_connect_library(self, callback_base: str) -> dict[str, Any]:
+    def lidarr_connect_library(self, callback_base: str,
+                               path_map: list[dict[str, str]] | None = None) -> dict[str, Any]:
         """One click from "Lidarr configured" to the full loop:
 
         * add Lidarr's root folders (path-mapped) as library folders and enable
@@ -1233,14 +1262,16 @@ class Engine:
         from harmony.library import map_path
 
         client, s = self._lidarr_client()
-        roots = [map_path(str(f.get("path") or ""), s.lidarr_path_map)
+        mappings = s.lidarr_path_map if path_map is None else path_map
+        roots = [map_path(str(f.get("path") or ""), mappings)
                  for f in client.root_folders() if f.get("path")]
         paths = list(s.library_paths)
         for r in roots:
             r = r.rstrip("/") or "/"
             if r not in paths:
                 paths.append(r)
-        status = self.library_save_config(enabled=True, paths=paths)
+        # One save (folders + mappings) → one provider reset and one scan.
+        status = self.library_save_config(enabled=True, paths=paths, path_map=path_map)
 
         base = (callback_base or "").strip().rstrip("/")
         if not base:
@@ -1290,24 +1321,31 @@ class Engine:
         if lidarr_on:
             try:
                 client, _ = self._lidarr_client()
-                lidarr_albums = self._lidarr_cached("albums", 120.0, client.albums)
+                # Normalised once per cache fill, not per request × per album.
+                lidarr_albums = self._lidarr_cached("albums", 120.0, lambda: [
+                    {**a, "_nt": norm(a.get("title")),
+                     "_na": norm((a.get("artist") or {}).get("artistName"))}
+                    for a in client.albums()])
                 queue = [queue_item(r) for r in self._lidarr_cached("queue", 4.0, client.queue)]
             except Exception as exc:  # noqa: BLE001 - library state still answers
                 lidarr_error = str(exc)
         by_mbid = {a.get("foreignAlbumId"): a for a in lidarr_albums if a.get("foreignAlbumId")}
 
-        from rapidfuzz import fuzz
+        from rapidfuzz import fuzz, process
+
+        titles = [a["_nt"] for a in lidarr_albums]
 
         def lidarr_match(title: str, artist: str, mbid: str | None) -> dict[str, Any] | None:
             if mbid and mbid in by_mbid:
                 return by_mbid[mbid]
             nt, na = norm(title), norm(artist)
+            # Shortlist by title in rapidfuzz's C loop, then weigh in the artist.
+            # (A title under 81.5 can't reach the 88 combined bar: .65·81.5 + 35 = 88.)
             best, best_score = None, 0.0
-            for a in lidarr_albums:
-                score = fuzz.token_sort_ratio(nt, norm(a.get("title")))
-                if na:
-                    score = 0.65 * score + 0.35 * fuzz.token_sort_ratio(
-                        na, norm((a.get("artist") or {}).get("artistName")))
+            for _, tscore, i in process.extract(nt, titles, scorer=fuzz.token_sort_ratio,
+                                                score_cutoff=81, limit=25):
+                a = lidarr_albums[i]
+                score = (0.65 * tscore + 0.35 * fuzz.token_sort_ratio(na, a["_na"])) if na else tscore
                 if score > best_score and score >= 88:
                     best, best_score = a, score
             return best
@@ -1735,6 +1773,7 @@ class Engine:
              via: str | None = None) -> dict[str, Any]:
         """Play ONE track on a device (replaces any server-side queue there)."""
         if via:
+            self._no_library_via([{"service": service_value}], via)
             return self._peer_call(via, "POST", f"/api/devices/{host}/play",
                                    {"service": service_value, "id": track_id, "meta": meta or {}})
         if self._queues is not None:
@@ -1787,6 +1826,15 @@ class Engine:
                                         async_start=True)
         return self._queues
 
+    @staticmethod
+    def _no_library_via(tracks: list[Any], via: str) -> None:
+        """Library tracks (and their /art/ paths) only resolve on the instance
+        that holds the files; a peer can't stream them to its speaker. Say so
+        plainly instead of failing on the peer with "isn't in the library"."""
+        if any(isinstance(t, dict) and t.get("service") == "local" for t in tracks):
+            raise ValueError(f"Library tracks play only on this instance's own devices, "
+                             f"not on a speaker reached through {via}.")
+
     def device_queue(self, host: str, via: str | None = None) -> dict[str, Any]:
         """The device's queue + live status: what every client's Now Playing renders."""
         if via:
@@ -1814,6 +1862,7 @@ class Engine:
         """Apply a queue op (load/next/prev/jump/enqueue/play_next/move/remove/
         clear/shuffle/repeat/stop). A via device's queue lives on that peer."""
         if via:  # forward without our via, or the peer would forward it again
+            self._no_library_via(body.get("tracks") or [], via)
             fwd = {k: v for k, v in body.items() if k != "via"}
             return self._peer_call(via, "POST", f"/api/devices/{host}/queue/{op}", fwd)
         if op == "stop":

@@ -35,7 +35,7 @@ import sqlite3
 import threading
 import time
 import unicodedata
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -279,7 +279,6 @@ def _mutagen_tags(path: Path) -> FileTags | None:
     return out
 
 
-_LIDARR_FILE_RE = re.compile(r"^(?:.+? - )?(?:.+? - )?(\d{1,3})\s*[-.]\s*(.+)$")
 _LEADING_NUM_RE = re.compile(r"^(?:(\d)[-.])?(\d{1,3})\s*[-._ ]\s*(.+)$")
 _ALBUM_YEAR_RE = re.compile(r"^(.*?)\s*[(\[](\d{4})[)\]]\s*$")
 
@@ -330,8 +329,27 @@ def read_tags(path: Path) -> FileTags:
         if not getattr(tags, name):
             setattr(tags, name, getattr(fallback, name))
     if not tags.album_artist:
-        tags.album_artist = tags.artist or fallback.album_artist
+        # No album-artist tag. When the file sits in an <Artist>/<Album> folder
+        # for this very album, the folder names the album artist — that keeps a
+        # compilation ("Various Artists/Now 80/…", a different artist per
+        # track) one album instead of one album per track artist.
+        if fallback.album_artist and norm(fallback.album) == norm(tags.album):
+            tags.album_artist = fallback.album_artist
+        else:
+            tags.album_artist = tags.artist or fallback.album_artist
     return tags
+
+
+def resolve(path: str | Path) -> Path:
+    """``path`` made absolute with ``..``/symlinks resolved (no I/O failure)."""
+    return Path(os.path.realpath(os.path.expanduser(str(path))))
+
+
+def within(path: str | Path, roots: Iterable[str | Path]) -> bool:
+    """True when ``path`` really is (inside) one of ``roots`` — compared after
+    resolving ``..`` and symlinks, so ``/music/../etc`` is NOT inside ``/music``."""
+    p = resolve(path)
+    return any(p == r or p.is_relative_to(r) for r in (resolve(x) for x in roots))
 
 
 def has_mutagen() -> bool:
@@ -535,7 +553,7 @@ class LibraryIndex:
             "duration_s": tags.duration_s, "isrc": tags.isrc,
             "mb_releasegroup": tags.mb_releasegroup, "mb_release": tags.mb_release,
             "mb_artist": tags.mb_artist, "mime": mime, "haystack": haystack,
-            "added_at": existing["added_at"] if existing else time.time(),
+            "added_at": existing["added_at"] if existing else self._added_at(path),
         }
         cols = ", ".join(row)
         marks = ", ".join("?" for _ in row)
@@ -543,20 +561,33 @@ class LibraryIndex:
             self._conn.execute(f"INSERT OR REPLACE INTO tracks ({cols}) VALUES ({marks})",
                                tuple(row.values()))
 
+    def _added_at(self, path: Path) -> float:
+        """Keep a row's first-seen time even when another scan wrote it meanwhile."""
+        with self._lock:
+            row = self._conn.execute("SELECT added_at FROM tracks WHERE path = ?",
+                                     (str(path),)).fetchone()
+        return row["added_at"] if row else time.time()
+
     def scan(self, roots: Iterable[str | Path], *, prune: bool = True,
-             progress: Callable[[ScanReport], None] | None = None) -> ScanReport:
+             prune_missing: bool = True) -> ScanReport:
         """Index every audio file under ``roots`` (a folder, a sub-folder, or one
         file). Unchanged files (same size + mtime) are skipped. With ``prune``,
         rows under a scanned root whose file is gone are removed — so a rescan of
         one album folder (what the Lidarr webhook does) also catches deletions.
+
+        A root that doesn't exist at all is dropped from the index only with
+        ``prune_missing`` — right for a deleted album folder, wrong for a library
+        folder on a share that's merely unmounted (full scans pass False).
         """
         started = time.monotonic()
         report = ScanReport()
         for root in roots:
             root_path = Path(root)
             if not root_path.exists():
-                if prune:
+                if prune and prune_missing:
                     report.removed += self.remove_under(root_path)
+                else:
+                    log.warning("library: %s is missing — keeping its tracks", root_path)
                 continue
             with self._lock:
                 known = {r["path"]: _row_dict(r) for r in self._conn.execute(
@@ -585,8 +616,6 @@ class LibraryIndex:
                     report.updated += 1
                 else:
                     report.added += 1
-                if progress and report.scanned % 200 == 0:
-                    progress(report)
             if prune:
                 gone = [p for p in known if p not in seen]
                 with self._lock:
@@ -609,11 +638,10 @@ class LibraryIndex:
 
     def prune_outside(self, roots: Iterable[str | Path]) -> int:
         """Drop rows that no longer sit under any configured library folder."""
-        roots = [Path(r) for r in roots]
+        roots = [resolve(r) for r in roots]
         with self._lock:
             paths = [r["path"] for r in self._conn.execute("SELECT path FROM tracks")]
-            gone = [p for p in paths
-                    if not any(Path(p) == r or Path(p).is_relative_to(r) for r in roots)]
+            gone = [p for p in paths if not within(p, roots)]
             for p in gone:
                 self._conn.execute("DELETE FROM tracks WHERE path = ?", (p,))
             self._conn.commit()
@@ -775,12 +803,6 @@ class LibraryIndex:
                 best, best_score = _row_dict(r), score
         return best
 
-    def album_dir(self, album_id: str) -> Path | None:
-        with self._lock:
-            row = self._conn.execute("SELECT path FROM tracks WHERE album_id = ? LIMIT 1",
-                                     (album_id,)).fetchone()
-        return Path(row["path"]).parent if row else None
-
     def album_art(self, album_id: str) -> tuple[bytes, str] | None:
         """Cover bytes for an album: a folder image, else the embedded picture."""
         with self._lock:
@@ -816,5 +838,5 @@ def _like_prefix(path: Path) -> str:
 __all__ = [
     "AUDIO_TYPES", "ArtSigner", "FileTags", "LibraryIndex", "ScanReport", "album_id_for",
     "artist_id_for", "has_mutagen", "iter_audio_files", "map_path", "norm", "read_tags",
-    "track_id_for",
+    "resolve", "track_id_for", "within",
 ]

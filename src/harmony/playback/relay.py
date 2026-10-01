@@ -308,6 +308,9 @@ class _Handler(BaseHTTPRequestHandler):
         # (no Range), so metadata blocks land at fixed offsets.
         wants_icy = (
             entry.allow_icy
+            # A library .m4a may be ALAC, which can't be rewrapped as ADTS; serve
+            # the file itself (renderers play m4a files fine, just without ICY).
+            and not (is_file_url(source.url) and _is_aac_mp4(source))
             and self.headers.get("Icy-MetaData") == "1"
             and bool(entry.title or entry.artist)
         )
