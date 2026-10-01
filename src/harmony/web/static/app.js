@@ -186,6 +186,11 @@ const fmtTime = (s) => {
 const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])));
 const serviceLabel = (s) => ({ ytmusic: "YouTube Music", qobuz: "Qobuz", local: "Library" }[s] || s);
+// Where a track plays from: the Library when it has a copy (it plays instead),
+// else its service. Same badge for every source.
+const locationLabel = (t) => (t.library_id ? "Library" : serviceLabel(t.service));
+const locationBadge = (t) => `<span class="badge${t.library_id || t.service === "local" ? " lib" : ""}"${
+  t.library_id ? ` title="Plays from your library (also on ${esc(serviceLabel(t.service))})"` : ""}>${esc(locationLabel(t))}</span>`;
 const nTracks = (n) => (n == null ? "" : `${n} ${n === 1 ? "track" : "tracks"}`);
 const deviceIcon = (d) => (d.host === "browser" ? "computer" : d.kind === "cast" ? "tv" : "speaker");
 const deviceKindLabel = (d) => (d.kind === "cast" ? "Chromecast" : d.kind === "wiim" ? "WiiM" : (d.kind || "device"));
@@ -302,7 +307,7 @@ const lidarrEnabled = () => !!(state.lidarr && state.lidarr.enabled);
 async function sendToLidarr(body, label) {
   try {
     const r = await apiPost("/api/lidarr/request", body);
-    toast(`Sent “${r.title || label}” to Lidarr.`, "ok");
+    toast(`Sent “${r.title || label}” to ${r.via ? r.via + "’s " : ""}Lidarr.`, "ok");
   } catch (e) { toastErr("Lidarr couldn’t take that: " + e.message); }
 }
 
@@ -418,9 +423,11 @@ async function refreshDownloads() {
 
 function libraryStatsText(st) {
   const s = st.stats || {};
-  const parts = [`${s.albums || 0} albums`, `${s.artists || 0} artists`, `${s.tracks || 0} tracks`];
+  const parts = st.enabled ? [`${s.albums || 0} albums`, `${s.artists || 0} artists`, `${s.tracks || 0} tracks`] : [];
+  // Libraries on other instances are federated into this one.
+  (st.peers || []).forEach((p) => parts.push(`${p.name}: ${(p.stats || {}).tracks || 0} tracks`));
   if (st.scan && st.scan.running) parts.push("scanning…");
-  return parts.join(" · ");
+  return parts.join(" · ") || "No music yet";
 }
 async function waitForScan(onDone) {
   for (let i = 0; i < 600; i++) {
@@ -435,7 +442,7 @@ async function renderLibrary() {
   clearInterval(_libTimer); _libTimer = null;
   list.innerHTML = loadingState("Loading your library…");
   const st = await loadLibraryStatus();
-  if (!st || !st.enabled) {
+  if (!st || (!st.enabled && !(st.peers || []).length)) {
     list.innerHTML = emptyState("music", "Your library is off",
       "Point Harmony at your music folders — where Lidarr files what it gets — to search and play them everywhere.",
       { id: "lib-setup", label: "Set up library" });
@@ -451,7 +458,7 @@ async function renderLibrary() {
     ? `<p class="muted msg err">Missing folder${st.missing.length > 1 ? "s" : ""}: ${st.missing.map(esc).join(", ")}</p>` : "";
   list.innerHTML = `<div class="detail">
     <div class="sec-head"><span class="muted" id="lib-stats">${esc(libraryStatsText(st))}</span>
-      <button class="act ghost small" id="lib-rescan" type="button">${ICON("sync")} Rescan</button></div>
+      ${st.enabled ? `<button class="act ghost small" id="lib-rescan" type="button">${ICON("sync")} Rescan</button>` : ""}</div>
     ${warn}
     ${dl}
     ${albums.length ? `<section class="detail-sec"><h3>Recently added</h3>
@@ -462,7 +469,7 @@ async function renderLibrary() {
   hydrateArt(list);
   wireAlbumRows(list);
   wireArtistChips(list);
-  $("lib-rescan").onclick = async () => {
+  if ($("lib-rescan")) $("lib-rescan").onclick = async () => {
     try { await apiPost("/api/library/scan", {}); } catch (e) { toastErr("Couldn’t rescan: " + e.message); return; }
     $("lib-stats").textContent = "Scanning…";
     waitForScan(() => { if (state.section === "library" && !state.detail) renderLibrary(); });
@@ -693,7 +700,7 @@ function trackRowHtml(t, i, opts = {}) {
   return `
     <div class="trow${opts.numbered ? " numbered" : ""}${opts.reorder ? " reorder" : ""}" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
       <div class="tlead">${num}<button class="play" type="button" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
-      <div class="title">${title}${opts.hideBadge ? "" : `<span class="badge">${esc(serviceLabel(t.service))}</span>`}</div>
+      <div class="title">${title}${opts.hideBadge ? "" : locationBadge(t)}</div>
       ${trackArtistCell(t)}
       <div class="dur">${fmtTime(t.duration_s)}</div>
       <div class="rowacts">
@@ -1227,7 +1234,7 @@ async function renderAccounts() {
   try { lib = await api("/api/library"); state.library = lib; } catch { /* show form anyway */ }
   // Options (root folders / profiles) only exist once Lidarr is reachable.
   let lopts = null;
-  if (lidarr.configured) { try { lopts = await api("/api/lidarr/options"); } catch { /* degrade */ } }
+  if (lidarr.configured && !lidarr.via) { try { lopts = await api("/api/lidarr/options"); } catch { /* degrade */ } }
   const status = (svc) => accounts.find((a) => a.service === svc) || { authenticated: false };
   const q = status("qobuz"), y = status("ytmusic");
   const badge = (a) => a.stale ? "session expired" : a.authenticated ? "signed in" + (a.account ? " · " + esc(a.account) : "") : "signed out";
@@ -1235,14 +1242,18 @@ async function renderAccounts() {
   // Lidarr integration block: URL + API key + enable, plus root/profile
   // dropdowns once the instance is reachable. Degrades to just the form when
   // Lidarr is unconfigured or unreachable.
-  const liBadge = lidarr.configured
+  // Lidarr is shared over the mesh: without one of its own, this instance uses
+  // the peer's that has one configured (e.g. the server next to Lidarr).
+  const liBadge = lidarr.via ? `via ${esc(lidarr.via)}` : lidarr.configured
     ? (lidarr.ok ? (lidarr.version ? "v" + esc(lidarr.version) : "connected") : "unreachable")
     : "not configured";
-  const liStatusText = lidarr.configured
+  const liStatusText = lidarr.via
+    ? `“Get with Lidarr” uses ${esc(lidarr.via)}’s Lidarr${lidarr.version ? " v" + esc(lidarr.version) : ""}. Set one up here only to use a different Lidarr from this instance.`
+    : lidarr.configured
     ? (lidarr.ok ? `Connected to Lidarr${lidarr.version ? " v" + esc(lidarr.version) : ""}.`
                  : `Lidarr is unreachable: ${esc(lidarr.error || "unknown error")}`)
     : "";
-  const liStatusCls = lidarr.configured ? (lidarr.ok ? " ok" : " err") : "";
+  const liStatusCls = lidarr.via ? " ok" : lidarr.configured ? (lidarr.ok ? " ok" : " err") : "";
   const pmText = (lib.path_map || []).map((m) => `${m.remote} => ${m.local}`).join("\n");
   const libBadge = lib.enabled ? esc(libraryStatsText(lib)) : "off";
   const libScan = lib.scan || {};
@@ -1252,7 +1263,7 @@ async function renderAccounts() {
   const libMissing = (lib.missing || []).length ? ` Missing: ${lib.missing.map(esc).join(", ")}.` : "";
   // The loop back from Lidarr: its root folders become library folders and an
   // import webhook keeps the index current. Only offered once Lidarr is reachable.
-  const liLoop = lidarr.configured ? `
+  const liLoop = lidarr.configured && !lidarr.via ? `
         <details class="field"${lib.enabled ? "" : " open"}><summary class="muted">Library loop — play what Lidarr gets</summary>
           <p class="muted field">Adds Lidarr’s root folders to this server’s library and registers a
           webhook in Lidarr, so every album it imports is searchable and playable everywhere moments later.</p>
@@ -1348,11 +1359,15 @@ async function renderAccounts() {
         <label class="muted field">Server URL</label>
         <input id="li-url" type="text" class="field" placeholder="http://192.168.1.10:8686" value="${esc(lidarr.url || "")}" autocomplete="off" />
         <label class="muted field">API key</label>
-        <input id="li-key" type="password" class="field" placeholder="${lidarr.configured ? "•••••••• (leave blank to keep)" : "Lidarr API key"}" autocomplete="off" />
+        <input id="li-key" type="password" class="field" placeholder="${lidarr.configured && !lidarr.via ? "•••••••• (leave blank to keep)" : "Lidarr API key"}" autocomplete="off" />
         ${liOpts}
         <label class="field" style="display:flex;gap:.5rem;align-items:center">
-          <input id="li-enabled" type="checkbox"${lidarr.enabled ? " checked" : ""} /> <span>Enable “Get with Lidarr”</span>
+          <input id="li-enabled" type="checkbox"${(lidarr.via ? (lidarr.local || {}).enabled : lidarr.enabled) ? " checked" : ""} /> <span>Enable “Get with Lidarr”</span>
         </label>
+        ${lidarr.configured && !lidarr.via ? "" : `<label class="field" style="display:flex;gap:.5rem;align-items:center">
+          <input id="li-mesh" type="checkbox"${lidarr.mesh_enabled !== false ? " checked" : ""} />
+          <span>Use a Lidarr from another instance${lidarr.via ? ` (${esc(lidarr.via)})` : ""} when this one has none</span>
+        </label>`}
         <div class="field-acts"><button class="act" id="li-save">Save</button></div>
         <p id="li-msg" class="muted msg${liStatusCls}">${liStatusText}</p>
         ${liLoop}
@@ -1508,6 +1523,7 @@ async function renderAccounts() {
   if ($("li-save")) $("li-save").onclick = async () => {
     const lm = $("li-msg"); lm.textContent = "Saving…"; lm.className = "muted msg";
     const body = { url: $("li-url").value.trim(), enabled: $("li-enabled").checked };
+    if ($("li-mesh")) body.mesh = $("li-mesh").checked;
     const key = $("li-key").value.trim();
     if (key) body.api_key = key;   // only overwrites the stored key when non-empty
     if ($("li-root")) body.root_folder = $("li-root").value;
@@ -2225,7 +2241,10 @@ async function playBrowserAt(i, { seek = 0, autoplay = true } = {}) {
   br.resumePos = seek || 0;
   paintCurrent();
   let r;
-  try { r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}`); }
+  // Track details let the server play the Library's copy of a song it has.
+  const meta = ["title", "artist", "isrc", "duration_s"].filter((k) => t[k])
+    .map((k) => `&${k}=${encodeURIComponent(t[k])}`).join("");
+  try { r = await api(`/api/resolve?service=${encodeURIComponent(t.service)}&id=${encodeURIComponent(t.id)}${meta}`); }
   catch (e) { if (gen === br.gen && !onDevice()) trackFailed(t, e.message); return; }
   if (gen !== br.gen || onDevice()) return;      // superseded (newer play / output switch)
   br.loaded = t;

@@ -73,6 +73,11 @@ class ArtistPage(Adw.NavigationPage):
         artist_ids = album.get("artist_ids") or []
         if artist_ids:
             actions.append(("Go to Artist", lambda: self.nav.go_to_artist(album["service"], artist_ids[0])))
+        if album.get("service") != "local":
+            from harmony.ui.entity_nav import lidarr_actions
+
+            actions += lidarr_actions(self.state, "album", title=album.get("title") or "",
+                                      artist=album.get("artist") or "", mbid=album.get("mbid"))
         return actions
 
     def _populate(self, data: dict[str, Any]) -> None:

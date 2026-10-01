@@ -26,6 +26,8 @@ data class Track(
     val trackNumber: Int? = null,
     val year: Int? = null,
     val isrc: String? = null,
+    /** The Library's copy of a streaming track (it plays instead), if any. */
+    val libraryId: String? = null,
 )
 
 // ── Entity navigation + smart search models (see api-contract) ─────────────
@@ -241,6 +243,19 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
     /** Spec-ordered search: a confident artist match (+ discography) first, then
      *  album-title matches, then incidental tracks/artists/playlists. Fires on
      *  submit only — MB discography is rate-limited to ~1 req/s upstream. */
+    /** Whether "Get with Lidarr" works through this instance (own or mesh Lidarr). */
+    fun lidarrAvailable(): Boolean {
+        val o = JSONObject(get("/api/lidarr"))
+        return o.optBoolean("enabled") && o.optBoolean("configured")
+    }
+
+    /** Ask the instance's (or the mesh's) Lidarr to get an album/artist; returns its title. */
+    fun lidarrRequest(kind: String, title: String, artist: String): String {
+        val body = JSONObject().put("kind", kind).put("title", title).put("artist", artist)
+        val o = JSONObject(post("/api/lidarr/request", body))
+        return o.optString("title").ifBlank { title.ifBlank { artist } }
+    }
+
     fun smartSearch(query: String, service: String): SmartSearch {
         val q = URLEncoder.encode(query, "UTF-8")
         val s = URLEncoder.encode(service, "UTF-8")
@@ -461,6 +476,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             .put("album", t.album ?: JSONObject.NULL)
             .put("art_url", t.artworkUrl?.let { serverRelative(it) } ?: JSONObject.NULL)
             .put("duration_s", t.durationS ?: JSONObject.NULL)
+            .put("library_id", t.libraryId ?: JSONObject.NULL)
 
         private val ART_PATH = Regex("^https?://[^/]+(/art/[^/?#]+)$")
 
@@ -515,6 +531,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         trackNumber = optInt(o, "track_number"),
         year = optInt(o, "year"),
         isrc = optStr(o, "isrc"),
+        libraryId = optStr(o, "library_id"),
     )
 
     private fun parseTracks(arr: JSONArray?): List<Track> {

@@ -259,7 +259,7 @@ _TRACK_COLUMNS: list[tuple[str, Callable[[Track], str], bool]] = [
     ("Artist", lambda t: t.artist_name, True),
     ("Album", lambda t: t.album or "", True),
     ("Duration", lambda t: t.duration_text, False),
-    ("Service", lambda t: t.service.label, False),
+    ("Service", lambda t: t.location_label, False),
 ]
 
 

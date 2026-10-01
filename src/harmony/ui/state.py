@@ -179,6 +179,20 @@ class AppState(GObject.Object):
             log.exception("Failed to open database")
             return None
 
+    def provider_for(self, service: Service) -> Any | None:
+        """The provider for ``service``. The Library (``local``) lives in the
+        embedded engine — this instance's folders federated with every peer's
+        library over the mesh — so it's taken from there, not built here."""
+        provider = self.providers.get(service)
+        if provider is None and service is Service.LOCAL:
+            try:
+                # Just the Library provider: building it needs no network or
+                # streaming logins, so this is safe from the main loop.
+                provider = self._engine()._library_provider()
+            except Exception as exc:  # noqa: BLE001 - no engine, no library
+                log.info("library unavailable: %s", exc)
+        return provider
+
     def _build_providers(self) -> tuple[dict[Service, Any], dict[Service, str]]:
         """Construct provider instances from settings/credentials.
 
@@ -747,9 +761,27 @@ class AppState(GObject.Object):
         gen = self._play_gen
         self._seek_settle_until = 0.0
         self._mark_now_playing(LOCAL_HOST, track, state="loading")
-        provider = self.providers.get(track.service)
+        provider = self.provider_for(track.service)
 
         def work() -> Any:
+            # The Library (this computer's or a peer's) plays a song it has,
+            # whichever service's page it was picked from.
+            if track.service is not Service.LOCAL:
+                try:
+                    lib_id = self._engine().library_alternative(
+                        track.service.value, track.id,
+                        {"title": track.title, "artist": track.artist_name,
+                         "isrc": track.isrc, "duration_s": track.duration_s})
+                except Exception as exc:  # noqa: BLE001 - fall back to streaming
+                    log.info("library lookup failed: %s", exc)
+                    lib_id = None
+                library = self.provider_for(Service.LOCAL) if lib_id else None
+                if library is not None:
+                    try:
+                        return library.resolve_stream(lib_id, max_quality=True)
+                    except Exception as exc:  # noqa: BLE001 - copy gone/peer offline: stream it
+                        log.info("library copy unavailable (%s); streaming instead", exc)
+                        self._engine()._forget_library_match(track.service.value, track.id)
             if provider is None:
                 raise RuntimeError(f"No provider configured for {track.service.label}")
             # The in-app player decodes locally, so ask for the highest tier.

@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
 
 from harmony import __version__
+from harmony.errors import ProviderError
 from harmony.web.api import Engine
 
 log = logging.getLogger(__name__)
@@ -266,7 +267,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     url=body.get("url"), api_key=body.get("api_key"),
                     enabled=body.get("enabled"), root_folder=body.get("root_folder"),
                     quality_profile_id=body.get("quality_profile_id"),
-                    metadata_profile_id=body.get("metadata_profile_id")))
+                    metadata_profile_id=body.get("metadata_profile_id"),
+                    mesh=body.get("mesh")))
             elif parts == ["api", "lidarr", "webhook"]:
                 self._send_json(engine.lidarr_webhook(body))
             elif parts == ["api", "lidarr", "connect-library"]:
@@ -294,6 +296,12 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             elif parts == ["api", "library", "scan"]:
                 paths = body.get("paths")
                 self._send_json(engine.library_scan(paths if isinstance(paths, list) else None))
+            elif parts == ["api", "library", "own", "match"]:
+                tracks = body.get("tracks")
+                if not isinstance(tracks, list):
+                    self._send_json({"error": "tracks must be a list"}, status=400)
+                    return
+                self._send_json(engine.library_own_match(tracks[:500]))
             elif parts == ["api", "library", "state"]:
                 albums = body.get("albums")
                 if not isinstance(albums, list):
@@ -347,22 +355,46 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             elif len(parts) == 4 and parts[0:2] == ["api", "track"]:
                 self._send_json(engine.track_page(parts[2], parts[3]))
             elif parts == ["api", "lidarr"]:
-                self._send_json(engine.lidarr_status())
+                # ?own=1: only this instance's own Lidarr (what peers ask, so a
+                # Lidarr shared over the mesh is never forwarded twice).
+                own = (query.get("own") or ["0"])[0] in ("1", "true", "yes")
+                self._send_json(engine.lidarr_status(own=own))
             elif parts == ["api", "lidarr", "options"]:
                 self._send_json(engine.lidarr_options())
             elif parts == ["api", "lidarr", "queue"]:
                 self._send_json(engine.lidarr_queue())
             elif parts == ["api", "library"]:
                 self._send_json(engine.library_status())
-            elif parts == ["api", "library", "browse"]:
+            elif parts in (["api", "library", "browse"], ["api", "library", "own", "browse"]):
                 try:
                     limit = max(1, min(500, int((query.get("limit") or ["60"])[0])))
-                    offset = max(0, int((query.get("offset") or ["0"])[0]))
                 except ValueError:
-                    self._send_json({"error": "limit/offset must be numbers"}, status=400)
+                    self._send_json({"error": "limit must be a number"}, status=400)
                     return
                 order = (query.get("order") or ["recent"])[0]
-                self._send_json(engine.library_overview(order=order, limit=limit, offset=offset))
+                if parts[2] == "own":
+                    self._send_json(engine.library_own_browse(order=order, limit=limit))
+                else:
+                    self._send_json(engine.library_overview(order=order, limit=limit))
+            # Own-library endpoints that peers federate over (see library_federation).
+            elif parts == ["api", "library", "own", "status"]:
+                self._send_json(engine.library_own_status())
+            elif parts == ["api", "library", "own", "search"]:
+                q = (query.get("q") or [""])[0].strip()
+                kinds = tuple((query.get("kinds") or ["tracks"])[0].split(","))
+                try:
+                    limit = max(1, min(100, int((query.get("limit") or ["25"])[0])))
+                except ValueError:
+                    limit = 25
+                self._send_json(engine.library_own_search(q, kinds, limit) if q
+                                else {"tracks": [], "albums": [], "artists": []})
+            elif len(parts) == 5 and parts[0:3] == ["api", "library", "own"] and parts[3] in ("album", "artist", "track"):
+                fn = {"album": engine.library_own_album, "artist": engine.library_own_artist,
+                      "track": engine.library_own_track}[parts[3]]
+                try:
+                    self._send_json(fn(parts[4]))
+                except ProviderError as exc:
+                    self._send_json({"error": str(exc)}, status=404)
             elif parts == ["api", "playlists"]:
                 self._send_json(engine.playlists())
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":
@@ -401,7 +433,12 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 if not service or not track_id:
                     self._send_json({"error": "missing service or id"}, status=400)
                     return
-                self._send_json(engine.resolve(service, track_id))
+                # Optional track details let the Library stand in for a song it
+                # has even when no page listed it first (e.g. a restored queue).
+                meta = {k: (query.get(k) or [None])[0] for k in ("title", "artist", "isrc", "duration_s")}
+                meta = {k: v for k, v in meta.items() if v}
+                self._send_json(engine.resolve(service, track_id, meta) if meta
+                                else engine.resolve(service, track_id))
             else:
                 self._send_json({"error": "not found"}, status=404)
         except KeyError as exc:
@@ -523,7 +560,8 @@ def make_server(host: str, port: int) -> ThreadingHTTPServer:
     httpd = ThreadingHTTPServer((host, port), HarmonyHTTPRequestHandler)
     httpd.daemon_threads = True
     get_engine().set_http_port(httpd.server_address[1])
-    get_engine().start_mesh(port, bind_host=host)  # best-effort; skips a loopback bind
+    get_engine().start_mesh(port, bind_host=host)
+    get_engine().lidarr_available()  # warm the cached "Get with Lidarr" check (background)  # best-effort; skips a loopback bind
     _schedule_credential_adoption()
     return httpd
 

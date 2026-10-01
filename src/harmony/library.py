@@ -95,6 +95,7 @@ CREATE INDEX IF NOT EXISTS tracks_album ON tracks(album_id);
 CREATE INDEX IF NOT EXISTS tracks_album_artist ON tracks(album_artist_id);
 CREATE INDEX IF NOT EXISTS tracks_artist ON tracks(artist_id);
 CREATE INDEX IF NOT EXISTS tracks_rg ON tracks(mb_releasegroup);
+CREATE INDEX IF NOT EXISTS tracks_isrc ON tracks(isrc);
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
@@ -340,6 +341,28 @@ def read_tags(path: Path) -> FileTags:
     return tags
 
 
+# Version noise that doesn't make a different recording: "(Remastered 2011)",
+# "- 2009 Remaster", "(feat. X)", "[Explicit]", "(Mono)". Live/acoustic/remix
+# versions are different recordings and are deliberately NOT stripped.
+_TITLE_NOISE_RE = re.compile(
+    # The WHOLE bracket must be noise — "(Clean Bandit Remix)" or "(Stereo
+    # Love)" are other recordings/titles and are kept.
+    r"\s*(?:[(\[]\s*(?:(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?(?:\s*version)?"
+    r"|(?:feat\.?|ft\.?|featuring)\s+[^)\]]+|explicit|clean(?:\s*version)?|mono|stereo"
+    r"|(?:single|album)\s*version|bonus\s*track|deluxe(?:\s*edition)?)\s*[)\]]"
+    r"|-\s*(?:\d{4}\s*)?remaster(?:ed)?(?:\s*\d{4})?(?:\s*version)?)\s*$", re.IGNORECASE)
+
+
+def core_title(title: str | None) -> str:
+    """A title without remaster/feature/explicit suffixes, normalised."""
+    t = title or ""
+    while True:
+        stripped = _TITLE_NOISE_RE.sub("", t)
+        if stripped == t:
+            return norm(t)
+        t = stripped
+
+
 def resolve(path: str | Path) -> Path:
     """``path`` made absolute with ``..``/symlinks resolved (no I/O failure)."""
     return Path(os.path.realpath(os.path.expanduser(str(path))))
@@ -550,7 +573,7 @@ class LibraryIndex:
             "album_artist": album_artist, "album_artist_id": artist_id_for(album_artist),
             "album_id": album_id_for(album_artist, album), "track_no": tags.track_no,
             "disc_no": tags.disc_no, "year": tags.year, "date": tags.date,
-            "duration_s": tags.duration_s, "isrc": tags.isrc,
+            "duration_s": tags.duration_s, "isrc": (tags.isrc or "").strip().upper() or None,
             "mb_releasegroup": tags.mb_releasegroup, "mb_release": tags.mb_release,
             "mb_artist": tags.mb_artist, "mime": mime, "haystack": haystack,
             "added_at": existing["added_at"] if existing else self._added_at(path),
@@ -770,6 +793,50 @@ class LibraryIndex:
                       if fuzz.token_set_ratio(q, norm(r["name"])) >= 60]
             ranked.sort(key=lambda r: -fuzz.token_sort_ratio(q, norm(r["name"])))
             out["artists"] = ranked[:limit]
+        return out
+
+    def match_tracks(self, items: Iterable[dict[str, Any]]) -> list[str | None]:
+        """The library's copy of each track, or None — so a song found on a
+        streaming service plays from the library when it's there.
+
+        Exact by ISRC when both sides have one; otherwise the same core title
+        (remaster/feat. suffixes ignored), a confident artist match, and — when
+        both durations are known — lengths within 4 seconds.
+        """
+        from rapidfuzz import fuzz
+
+        out: list[str | None] = []
+        for it in items:
+            found: str | None = None
+            isrc = (it.get("isrc") or "").strip().upper()
+            if isrc:
+                with self._lock:
+                    row = self._conn.execute("SELECT id FROM tracks WHERE isrc = ? LIMIT 1",
+                                             (isrc,)).fetchone()
+                found = row["id"] if row else None
+            title = core_title(it.get("title"))
+            artist = norm(it.get("artist"))
+            if found is None and title:
+                word = max(title.split(), key=len)
+                with self._lock:
+                    rows = self._conn.execute(
+                        "SELECT id, title, artist, album_artist, duration_s FROM tracks "
+                        "WHERE haystack LIKE ? LIMIT 200", (f"%{word}%",)).fetchall()
+                try:
+                    dur = int(float(it.get("duration_s") or 0)) or None
+                except (TypeError, ValueError):
+                    dur = None
+                best = 0.0
+                for r in rows:
+                    if core_title(r["title"]) != title:
+                        continue
+                    if dur and r["duration_s"] and abs(dur - int(r["duration_s"])) > 4:
+                        continue
+                    score = max(fuzz.token_set_ratio(artist, norm(r["artist"])),
+                                fuzz.token_set_ratio(artist, norm(r["album_artist"]))) if artist else 100
+                    if score >= 85 and score > best:
+                        best, found = score, r["id"]
+            out.append(found)
         return out
 
     def find_album(self, title: str, artist: str = "", *,

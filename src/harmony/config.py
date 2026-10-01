@@ -201,11 +201,17 @@ class Settings:
     # Same idea as the *arr "remote path mappings". Applied to webhook paths and
     # to Lidarr's root folders when they're adopted as library folders.
     lidarr_path_map: list[dict[str, str]] = field(default_factory=list)
+    # Without a Lidarr of its own, use the one configured on the mesh (the
+    # server next to Lidarr). Off = no "Get with Lidarr" on this instance.
+    lidarr_mesh: bool = True
 
     # Local library (harmony.library): music folders this instance indexes and
     # serves as the "local" service — where Lidarr's imports land. Server/web.
     library_enabled: bool = False
     library_paths: list[str] = field(default_factory=list)
+    # Play a song from the Library (this instance's or a peer's) when it's
+    # there, even when it was picked from a Qobuz/YouTube Music page.
+    library_preferred: bool = True
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its

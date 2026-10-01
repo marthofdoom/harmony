@@ -65,6 +65,7 @@ def track_from_dict(d: dict[str, Any]) -> Track:
         year=d.get("year"),
         track_number=d.get("track_number"),
         artwork_url=d.get("artwork_url"),
+        raw={"library_id": d["library_id"]} if d.get("library_id") else {},
     )
 
 
@@ -94,6 +95,46 @@ def album_from_dict(d: dict[str, Any]) -> Album:
 _ART_CACHE: dict[str, Any] = {}
 
 
+def lidarr_actions(state: Any, kind: str, *, title: str = "", artist: str = "",
+                   mbid: str | None = None) -> list[tuple[str, Any]]:
+    """A "Get with Lidarr" menu action for an album/artist, when a Lidarr is
+    usable — this instance's own, or the one configured on the mesh (the
+    server next to Lidarr): the engine forwards the request there."""
+    if state is None or kind not in ("album", "artist"):
+        return []
+    from harmony.web.server import get_engine
+
+    engine = get_engine()
+    if not engine.lidarr_available():  # cached; never blocks the main loop
+        return []
+
+    def get() -> None:
+        from harmony.tasks import run_async
+
+        def done(r: dict[str, Any]) -> None:
+            where = f"{r['via']}’s Lidarr" if r.get("via") else "Lidarr"
+            state.toast(f"Sent “{r.get('title') or title or artist}” to {where}.")
+
+        def failed(exc: BaseException) -> None:
+            state.toast(f"Lidarr couldn’t take that: {exc}")
+
+        run_async(lambda: engine.lidarr_request(kind, title=title, artist=artist, mbid=mbid),
+                  done, failed)
+
+    return [("Get with Lidarr", get)]
+
+
+def art_fetch_url(url: str) -> str:
+    """A fetchable URL for artwork. This instance's library covers are
+    server-relative ``/art/...`` paths (so web clients on any origin work);
+    the desktop fetches them from its own embedded server."""
+    if url.startswith("/"):
+        from harmony.web.server import get_engine
+
+        return f"http://127.0.0.1:{get_engine()._http_port or 8080}{url}"
+    return url
+
+
 def load_artwork_into(
     image: Gtk.Image, url: str | None, *, fallback_icon: str = "emblem-music-symbolic"
 ) -> None:
@@ -117,7 +158,7 @@ def load_artwork_into(
         import requests
         from gi.repository import GdkPixbuf
 
-        data = requests.get(url, timeout=8).content
+        data = requests.get(art_fetch_url(url), timeout=8).content
         loader = GdkPixbuf.PixbufLoader()
         loader.write(data)
         loader.close()

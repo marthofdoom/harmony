@@ -367,7 +367,9 @@ class NowPlayingBar(Gtk.Box):
             import requests
             from gi.repository import GdkPixbuf
 
-            data = requests.get(url, timeout=8).content
+            from harmony.ui.entity_nav import art_fetch_url
+
+            data = requests.get(art_fetch_url(url), timeout=8).content
             loader = GdkPixbuf.PixbufLoader()
             loader.write(data)
             loader.close()

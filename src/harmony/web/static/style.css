@@ -173,6 +173,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .badge { font-size: 11px; color: var(--muted); border: 1px solid var(--border); flex: none;
          border-radius: var(--r-sm); padding: 0 .3rem; }
 .badge.remote { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
+.badge.lib { color: var(--accent); border-color: var(--accent); }
 /* Album state (library loop): in library / downloading / wanted / in Lidarr. */
 .badge.st { white-space: nowrap; }
 .badge.st-library { background: var(--accent); color: var(--accent-fg); border-color: transparent; }
