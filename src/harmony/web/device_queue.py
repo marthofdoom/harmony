@@ -295,7 +295,9 @@ class DeviceQueues:
             raw_before, dq.raw_pos = dq.raw_pos, pos
             clocked = pos is None or (pos == raw_before and state == "playing")
             if clocked:
-                pos = max(pos or 0, int(dq.clock))
+                # round() first: the clock is a sum of float deltas, so 96s of
+                # play can read 95.99999999999989 and must not truncate to 95.
+                pos = max(pos or 0, int(round(dq.clock, 6)))
             dq.last_status = {**st, "position_s": pos, "duration_s": dur}
             if not dq.playing or time.monotonic() < dq.settle_until:
                 return None
