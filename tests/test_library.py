@@ -239,6 +239,8 @@ def server(tmp_path, monkeypatch):
     monkeypatch.setattr(providers, "build_providers", lambda *a, **k: {})
     monkeypatch.setenv("HARMONY_LIDARR_API_KEY", "")
     engine = Engine()
+    # Offline: no MusicBrainz/Wikipedia overlay on search and artist pages.
+    monkeypatch.setattr(engine, "_mb_enabled", lambda: False)
     monkeypatch.setattr(srv, "_engine", engine)
 
     root = tmp_path / "music"
