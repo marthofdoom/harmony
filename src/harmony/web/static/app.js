@@ -143,6 +143,7 @@ const state = {
   section: "search", // last non-detail view (restored when a detail page is left)
   detail: false,     // true while an artist/album/track detail page is showing
   lidarr: null,      // cached GET /api/lidarr status ({enabled, configured, …}) or null
+  library: null,     // cached GET /api/library status ({enabled, paths, stats, scan, …}) or null
   dragging: false,   // a Now Playing row is being dragged (hold off re-renders)
 };
 
@@ -184,7 +185,7 @@ const fmtTime = (s) => {
 };
 const esc = (s) => (s == null ? "" : String(s).replace(/[&<>"]/g, (c) =>
   ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c])));
-const serviceLabel = (s) => ({ ytmusic: "YouTube Music", qobuz: "Qobuz" }[s] || s);
+const serviceLabel = (s) => ({ ytmusic: "YouTube Music", qobuz: "Qobuz", local: "Library" }[s] || s);
 const nTracks = (n) => (n == null ? "" : `${n} ${n === 1 ? "track" : "tracks"}`);
 const deviceIcon = (d) => (d.host === "browser" ? "computer" : d.kind === "cast" ? "tv" : "speaker");
 const deviceKindLabel = (d) => (d.kind === "cast" ? "Chromecast" : d.kind === "wiim" ? "WiiM" : (d.kind || "device"));
@@ -333,6 +334,143 @@ function wireLidarrArtistTargets(scope) {
   });
 }
 
+// -- local library + the Lidarr loop ----------------------------------------
+// The instance's music folders are the "local" service (search, pages, play,
+// cast like any other). Albums found elsewhere get a state badge — in library /
+// downloading / wanted — so "Get with Lidarr" visibly closes the loop.
+
+async function loadLibraryStatus() {
+  try { state.library = await api("/api/library"); }
+  catch { state.library = null; }
+  return state.library;
+}
+const libraryEnabled = () => !!(state.library && state.library.enabled);
+
+const ALBUM_STATE = {
+  library: { label: "In library", title: "In your library — right-click to play the local copy" },
+  downloading: { label: "", title: "Lidarr is downloading this" },
+  wanted: { label: "Wanted", title: "Monitored in Lidarr — not downloaded yet" },
+  imported: { label: "In Lidarr", title: "Lidarr has the files, but they're not in this library — check the library folders / path mapping" },
+};
+function albumStateLabel(st) {
+  if (st.state === "downloading") return `↓ ${Math.round(st.progress || 0)}%`;
+  if (st.state === "wanted" && st.total) return `Wanted · ${st.have || 0}/${st.total}`;
+  return (ALBUM_STATE[st.state] || {}).label || "";
+}
+
+// Badge every non-library album row in `scope` with where it stands
+// (one batched request; silently skipped when neither library nor Lidarr is on).
+async function annotateAlbumStates(scope) {
+  if (!libraryEnabled() && !lidarrEnabled()) return;
+  const rows = [...scope.querySelectorAll(".albrow")].filter((r) => r.dataset.svc !== "local" && r.dataset.title);
+  if (!rows.length) return;
+  let r;
+  try {
+    r = await apiPost("/api/library/state", { albums: rows.map((row) => ({
+      title: row.dataset.title, artist: row.dataset.artist, mbid: row.dataset.mbid || null })) });
+  } catch { return; }
+  (r.states || []).forEach((st, i) => {
+    const row = rows[i];
+    if (!row || !row.isConnected || st.state === "none") return;
+    const slot = row.querySelector(".alb-state");
+    if (slot) slot.innerHTML = `<span class="badge st st-${esc(st.state)}" title="${esc((ALBUM_STATE[st.state] || {}).title || "")}">${esc(albumStateLabel(st))}</span>`;
+    if (st.ref) row.dataset.localId = st.ref.id;
+  });
+}
+
+// The status line under a (non-library) album's header.
+async function renderAlbumState(slot, album) {
+  if (!slot || (!libraryEnabled() && !lidarrEnabled())) return;
+  let r;
+  try { r = await apiPost("/api/library/state", { albums: [{ title: album.title, artist: album.artist, mbid: album.mbid || null }] }); }
+  catch { return; }
+  const st = (r.states || [])[0];
+  if (!st || st.state === "none" || !slot.isConnected) return;
+  const text = {
+    library: "This album is in your library.",
+    downloading: `Lidarr is downloading this album (${Math.round(st.progress || 0)}%).`,
+    wanted: `Wanted in Lidarr${st.total ? ` — ${st.have || 0} of ${st.total} tracks so far` : ""}.`,
+    imported: "Lidarr has this album, but it isn't in this library yet — check the library folders or path mapping.",
+  }[st.state] || "";
+  slot.innerHTML = `<div class="albstate st-${esc(st.state)}"><span>${esc(text)}</span>${st.ref
+    ? `<button class="act small" id="als-play" type="button">${ICON("play")} Play library copy</button>
+       <a class="link" href="${routeHref("album", "local", st.ref.id)}">Open</a>` : ""}</div>`;
+  if (st.ref && $("als-play")) $("als-play").onclick = () => albumToQueue({ service: "local", id: st.ref.id, title: st.ref.title }, "play");
+}
+
+let _libTimer = null;
+function downloadsHtml(items) {
+  if (!items.length) return `<p class="muted">Nothing downloading right now.</p>`;
+  return items.map((d) => `<div class="dl">
+      <div class="dl-meta"><div class="dl-title">${esc(d.title || d.release || "Unknown")}</div>
+        <div class="muted dl-sub">${esc([d.artist, d.status, d.timeleft ? "≈" + d.timeleft : "", d.client].filter(Boolean).join(" · "))}</div>
+        ${d.error ? `<div class="dl-err">${esc(d.error)}</div>` : ""}</div>
+      <div class="dl-bar" role="progressbar" aria-valuenow="${esc(Math.round(d.progress || 0))}" aria-valuemin="0" aria-valuemax="100"><span style="width:${Math.max(0, Math.min(100, d.progress || 0))}%"></span></div>
+      <div class="dl-pct muted">${esc(Math.round(d.progress || 0))}%</div>
+    </div>`).join("");
+}
+async function refreshDownloads() {
+  const box = $("lib-dl");
+  if (!box || !box.isConnected) { clearInterval(_libTimer); _libTimer = null; return; }
+  try { box.innerHTML = downloadsHtml((await api("/api/lidarr/queue")).items || []); }
+  catch (e) { box.innerHTML = `<p class="muted msg err">Couldn’t reach Lidarr: ${esc(e.message)}</p>`; }
+}
+
+function libraryStatsText(st) {
+  const s = st.stats || {};
+  const parts = [`${s.albums || 0} albums`, `${s.artists || 0} artists`, `${s.tracks || 0} tracks`];
+  if (st.scan && st.scan.running) parts.push("scanning…");
+  return parts.join(" · ");
+}
+async function waitForScan(onDone) {
+  for (let i = 0; i < 600; i++) {
+    await new Promise((res) => setTimeout(res, 1500));
+    const st = await loadLibraryStatus();
+    if (!st || !(st.scan && st.scan.running)) { onDone(st); return; }
+  }
+}
+
+async function renderLibrary() {
+  const list = $("list");
+  clearInterval(_libTimer); _libTimer = null;
+  list.innerHTML = loadingState("Loading your library…");
+  const st = await loadLibraryStatus();
+  if (!st || !st.enabled) {
+    list.innerHTML = emptyState("music", "Your library is off",
+      "Point Harmony at your music folders — where Lidarr files what it gets — to search and play them everywhere.",
+      { id: "lib-setup", label: "Set up library" });
+    $("lib-setup").onclick = () => goView("accounts");
+    return;
+  }
+  let ov;
+  try { ov = await api("/api/library/browse?order=recent&limit=60"); }
+  catch (e) { list.innerHTML = errorState("Couldn’t load the library", e.message, "lib-retry"); $("lib-retry").onclick = renderLibrary; return; }
+  const albums = ov.albums || [], artists = ov.artists || [];
+  const dl = lidarrEnabled() ? `<section class="detail-sec"><h3>Downloads</h3><div id="lib-dl">${loadingState("Asking Lidarr…")}</div></section>` : "";
+  const warn = (st.missing || []).length
+    ? `<p class="muted msg err">Missing folder${st.missing.length > 1 ? "s" : ""}: ${st.missing.map(esc).join(", ")}</p>` : "";
+  list.innerHTML = `<div class="detail">
+    <div class="sec-head"><span class="muted" id="lib-stats">${esc(libraryStatsText(st))}</span>
+      <button class="act ghost small" id="lib-rescan" type="button">${ICON("sync")} Rescan</button></div>
+    ${warn}
+    ${dl}
+    ${albums.length ? `<section class="detail-sec"><h3>Recently added</h3>
+      <div class="albrows">${albumRowsHtml(albums, { showArtist: true })}</div></section>`
+      : emptyState("music", "No music found yet", st.paths && st.paths.length ? "Rescan once the folders have albums in them." : "Add a music folder in Accounts → Library.")}
+    ${artists.length ? `<section class="detail-sec"><h3>Artists</h3><div class="chips">${artists.map(artistChipHtml).join("")}</div></section>` : ""}
+  </div>`;
+  hydrateArt(list);
+  wireAlbumRows(list);
+  wireArtistChips(list);
+  $("lib-rescan").onclick = async () => {
+    try { await apiPost("/api/library/scan", {}); } catch (e) { toastErr("Couldn’t rescan: " + e.message); return; }
+    $("lib-stats").textContent = "Scanning…";
+    waitForScan(() => { if (state.section === "library" && !state.detail) renderLibrary(); });
+  };
+  if (st.scan && st.scan.running) waitForScan(() => { if (state.section === "library" && !state.detail) renderLibrary(); });
+  if (dl) { refreshDownloads(); _libTimer = setInterval(refreshDownloads, 5000); }
+}
+
 // -- navigation: hash router + floating context menu ------------------------
 
 // Detail pages are addressable so the browser Back button and deep links work:
@@ -442,7 +580,13 @@ function albumMenuItems(a) {
   }
   if (a.artist_ids && a.artist_ids[0])
     items.push({ label: "Go to artist", fn: () => navigateArtist(a.service, a.artist_ids[0]) });
-  items.push(...lidarrMenuItems({ kind: "album", title: a.title, artist: a.artist, mbid: a.mbid }));
+  if (a.localId && a.service !== "local") {
+    const lib = { service: "local", id: a.localId, title: a.title };
+    items.unshift({ label: "Play library copy", fn: () => albumToQueue(lib, "play") },
+                  { label: "Open library copy", fn: () => navigateAlbum("local", a.localId) });
+  }
+  if (a.service !== "local")
+    items.push(...lidarrMenuItems({ kind: "album", title: a.title, artist: a.artist, mbid: a.mbid }));
   return items;
 }
 function openAlbumContextMenu(e, a) { menuAt(e, albumMenuItems(a)); }
@@ -948,6 +1092,7 @@ function setView(view) {
   if (view === "search") { $("view-title").textContent = "Search"; $("search-input").focus(); }
   else if (view === "nowplaying") { $("view-title").textContent = "Now Playing"; renderNowPlaying(); }
   else if (view === "playlists") { $("view-title").textContent = "Playlists"; loadPlaylists(); }
+  else if (view === "library") { $("view-title").textContent = "Library"; renderLibrary(); }
   else if (view === "accounts") { $("view-title").textContent = "Accounts"; renderAccounts(); }
   else if (view === "sync") { $("view-title").textContent = "Sync"; renderSync(); }
   else if (view === "devices") { $("view-title").textContent = "Devices"; renderDevices(); }
@@ -1078,6 +1223,8 @@ async function renderAccounts() {
   try { prefs = await api("/api/preferences"); } catch { /* ignore */ }
   try { instances = (await api("/api/instances")).instances || []; } catch { /* none */ }
   try { lidarr = await api("/api/lidarr"); state.lidarr = lidarr; } catch { /* show form anyway */ }
+  let lib = { enabled: false, paths: [], path_map: [], stats: {}, scan: {} };
+  try { lib = await api("/api/library"); state.library = lib; } catch { /* show form anyway */ }
   // Options (root folders / profiles) only exist once Lidarr is reachable.
   let lopts = null;
   if (lidarr.configured) { try { lopts = await api("/api/lidarr/options"); } catch { /* degrade */ } }
@@ -1096,6 +1243,26 @@ async function renderAccounts() {
                  : `Lidarr is unreachable: ${esc(lidarr.error || "unknown error")}`)
     : "";
   const liStatusCls = lidarr.configured ? (lidarr.ok ? " ok" : " err") : "";
+  const pmText = (lib.path_map || []).map((m) => `${m.remote} => ${m.local}`).join("\n");
+  const libBadge = lib.enabled ? esc(libraryStatsText(lib)) : "off";
+  const libScan = lib.scan || {};
+  const libScanText = libScan.running ? "Scanning…"
+    : libScan.error ? `Last scan failed: ${esc(libScan.error)}`
+    : libScan.finished ? `Last scan: ${libScan.added || 0} added, ${libScan.updated || 0} updated, ${libScan.removed || 0} removed.` : "";
+  const libMissing = (lib.missing || []).length ? ` Missing: ${lib.missing.map(esc).join(", ")}.` : "";
+  // The loop back from Lidarr: its root folders become library folders and an
+  // import webhook keeps the index current. Only offered once Lidarr is reachable.
+  const liLoop = lidarr.configured ? `
+        <details class="field"${lib.enabled ? "" : " open"}><summary class="muted">Library loop — play what Lidarr gets</summary>
+          <p class="muted field">Adds Lidarr’s root folders to this server’s library and registers a
+          webhook in Lidarr, so every album it imports is searchable and playable everywhere moments later.</p>
+          <label class="muted field">Path mappings, if Lidarr sees the files under a different path (one per line: <code>lidarr path =&gt; path on this server</code>)</label>
+          <textarea id="li-pm" rows="2" class="mono" placeholder="/music => /srv/media/music">${esc(pmText)}</textarea>
+          <label class="muted field">Address Lidarr can reach this server at</label>
+          <input id="li-cb" type="text" class="field" value="${esc(location.origin)}" autocomplete="off" />
+          <div class="field-acts"><button class="act" id="li-connect">Connect Lidarr to library</button></div>
+          <p id="li-loop-msg" class="muted msg"></p>
+        </details>` : "";
   const liSelect = (id, label, options) => `<label class="muted field">${esc(label)}</label>
         <select id="${id}" class="field" style="width:100%">
           <option value="">Use Lidarr’s default</option>${options}</select>`;
@@ -1188,6 +1355,23 @@ async function renderAccounts() {
         </label>
         <div class="field-acts"><button class="act" id="li-save">Save</button></div>
         <p id="li-msg" class="muted msg${liStatusCls}">${liStatusText}</p>
+        ${liLoop}
+      </div>
+
+      <div class="card">
+        <h2>Library <span class="badge">${libBadge}</span></h2>
+        <p class="muted">Music folders on this server — searched, browsed and played like any service
+        (here, in the app, and on your speakers). Point it at the folder Lidarr files albums into.</p>
+        <label class="muted field">Music folders (one per line, as paths on this server)</label>
+        <textarea id="lib-paths" rows="2" class="mono" placeholder="/srv/media/music">${esc((lib.paths || []).join("\n"))}</textarea>
+        <label class="field" style="display:flex;gap:.5rem;align-items:center">
+          <input id="lib-enabled" type="checkbox"${lib.enabled ? " checked" : ""} /> <span>Enable the library</span>
+        </label>
+        <div class="field-acts">
+          <button class="act" id="lib-save">Save</button>
+          ${lib.enabled ? `<button class="act ghost" id="lib-scan">Rescan</button>` : ""}
+        </div>
+        <p id="lib-msg" class="muted msg${libMissing ? " err" : ""}">${libScanText}${libMissing}${lib.enabled && !lib.tags ? " Tag reading is off (install mutagen) — names come from folders." : ""}</p>
       </div>
       <p id="acct-msg" class="muted msg"></p>
     </div>`;
@@ -1279,6 +1463,48 @@ async function renderAccounts() {
   };
   if ($("yt-out")) $("yt-out").onclick = async () => { await apiPost("/api/accounts/ytmusic/signout"); after(); };
   if ($("qb-out")) $("qb-out").onclick = async () => { await apiPost("/api/accounts/qobuz/signout"); after(); };
+  const parsePathMap = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+    const i = l.indexOf("=>");
+    return i < 0 ? null : { remote: l.slice(0, i).trim(), local: l.slice(i + 2).trim() };
+  }).filter((m) => m && m.remote && m.local);
+  const setMsg = (id, t, ok) => { const el = $(id); if (!el) return; el.textContent = t; el.className = "muted msg" + (ok === true ? " ok" : ok === "error" ? " err" : ""); };
+  $("lib-save").onclick = async () => {
+    setMsg("lib-msg", "Saving…");
+    const paths = $("lib-paths").value.split("\n").map((l) => l.trim()).filter(Boolean);
+    try {
+      state.library = await apiPost("/api/library/config", { enabled: $("lib-enabled").checked, paths });
+      setMsg("lib-msg", state.library.enabled && paths.length ? "Saved — scanning…" : "Saved.", true);
+      loadAccounts();
+      if (state.library.enabled && paths.length) waitForScan(() => { if (state.section === "accounts" && !state.detail) renderAccounts(); });
+    } catch (e) { setMsg("lib-msg", "Couldn’t save: " + e.message, "error"); }
+  };
+  if ($("lib-scan")) $("lib-scan").onclick = async () => {
+    try { await apiPost("/api/library/scan", {}); setMsg("lib-msg", "Scanning…"); }
+    catch (e) { setMsg("lib-msg", "Couldn’t rescan: " + e.message, "error"); return; }
+    waitForScan(() => { if (state.section === "accounts" && !state.detail) renderAccounts(); });
+  };
+  if ($("li-connect")) $("li-connect").onclick = async () => {
+    setMsg("li-loop-msg", "Connecting…");
+    try {
+      await apiPost("/api/library/config", { path_map: parsePathMap($("li-pm").value) });
+      const r = await apiPost("/api/lidarr/connect-library", { callback_url: $("li-cb").value.trim() });
+      state.library = r.library;
+      const bits = [`Library folders: ${(r.roots || []).join(", ") || "none"}.`,
+        r.tested ? "Lidarr reached this server — imports will appear automatically."
+                 : `Webhook registered, but Lidarr couldn’t reach ${r.webhook_url}${r.test_error ? ` (${r.test_error})` : ""} — check the address.`];
+      if ((r.missing || []).length) bits.push(`Not found on this server: ${r.missing.join(", ")} — add a path mapping.`);
+      setMsg("li-loop-msg", bits.join(" "), r.tested && !(r.missing || []).length ? true : "error");
+      // Reflect the now-enabled library in its card below without a re-render
+      // (which would drop this message).
+      if (r.library) {
+        $("lib-enabled").checked = !!r.library.enabled;
+        $("lib-paths").value = (r.library.paths || []).join("\n");
+        setMsg("lib-msg", "Scanning…");
+        waitForScan((st) => setMsg("lib-msg", st ? `Indexed: ${libraryStatsText(st)}.` : "", true));
+      }
+      loadAccounts();
+    } catch (e) { setMsg("li-loop-msg", "Couldn’t connect: " + e.message, "error"); }
+  };
   if ($("li-save")) $("li-save").onclick = async () => {
     const lm = $("li-msg"); lm.textContent = "Saving…"; lm.className = "muted msg";
     const body = { url: $("li-url").value.trim(), enabled: $("li-enabled").checked };
@@ -1327,8 +1553,8 @@ function albumRowsHtml(albums, opts = {}) {
     const data = `data-svc="${esc(a.service)}" data-id="${esc(a.id || "")}" data-aids="${esc(aids)}" data-title="${esc(a.title || "")}" data-artist="${esc(a.artist || "")}" data-mbid="${esc(a.mbid || "")}"`;
     const more = moreBtn(`More actions for ${a.title || "album"}`);
     if (nav)
-      return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}<span></span>${more}</a>`;
-    return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="badge">credit</span>${more}</div>`;
+      return `<a class="albrow" ${data} href="${routeHref("album", a.service, a.id)}">${inner}<span class="alb-state"></span>${more}</a>`;
+    return `<div class="albrow info" ${data} title="From MusicBrainz credits — not available to play">${inner}<span class="alb-state"><span class="badge">credit</span></span>${more}</div>`;
   }).join("");
 }
 
@@ -1341,6 +1567,7 @@ function wireAlbumRows(scope) {
       title: row.dataset.title || "",
       artist: row.dataset.artist || "",
       mbid: row.dataset.mbid || "",
+      localId: row.dataset.localId || "",
     });
     row.addEventListener("contextmenu", (e) => openAlbumContextMenu(e, a()));
     const more = row.querySelector(".more");
@@ -1474,6 +1701,7 @@ async function renderArtistView(service, id) {
   wireBack();
   hydrateArt(list);
   wireAlbumRows(list);
+  annotateAlbumStates(list);
   wireChips(list);
   // Right-click the artist hero → play/queue the top tracks, "Get with Lidarr".
   const hero = list.querySelector(".detail-hero");
@@ -1515,11 +1743,13 @@ async function renderAlbumView(service, id) {
 
   list.innerHTML = `<div class="detail">
     ${detailHeader(al.title || "Album", bits, al.artwork_url, "Album", tracks.length ? collectionActsHtml("al") : "")}
+    <div id="al-state"></div>
     ${bioHtml(d.bio)}
     <section class="detail-sec">${tracksSec}</section>
   </div>`;
   wireBack();
   hydrateArt(list);
+  if (service !== "local") renderAlbumState($("al-state"), { title: al.title || "", artist: al.artist || "", mbid: al.mbid || "" });
   if (tracks.length) {
     const albumRef = { service, id, title: al.title || "", artist: al.artist || "", mbid: al.mbid || "",
                        artist_ids: ref ? [ref.id] : [] };
@@ -1528,7 +1758,7 @@ async function renderAlbumView(service, id) {
       { label: "Add to queue", fn: () => enqueueTracks(tracks, albumRef.title || "album") },
       { label: "Add all to playlist…", fn: () => openAddMenu($("al-more"), tracks) },
       ...(ref ? [{ label: "Go to artist", fn: () => navigateArtist(ref.service, ref.id) }] : []),
-      ...lidarrMenuItems({ kind: "album", title: albumRef.title, artist: albumRef.artist, mbid: albumRef.mbid }),
+      ...(service !== "local" ? lidarrMenuItems({ kind: "album", title: albumRef.title, artist: albumRef.artist, mbid: albumRef.mbid }) : []),
     ];
     wireCollectionActs("al", () => tracks, items);
     state.queue = tracks; wireTrackRows(list, tracks, { numbered: true }); highlightPlaying();
@@ -1714,6 +1944,7 @@ function renderSmartResults(r, q) {
   list.innerHTML = html;
   hydrateArt(list);
   wireAlbumRows(list);
+  annotateAlbumStates(list);
   wireLidarrArtistTargets(list);
   wireArtistChips(list);
   if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
@@ -2628,6 +2859,7 @@ restorePlayback();   // last queue, shown paused (a device's comes from the serv
 loadAccounts();
 loadDevices();
 loadLidarrStatus();
+loadLibraryStatus();
 if (parseHash()) renderRoute();   // deep link → render the detail page on load
 
 // Progressive web app: install + offline shell.

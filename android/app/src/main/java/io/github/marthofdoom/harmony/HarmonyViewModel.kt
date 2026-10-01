@@ -54,7 +54,7 @@ data class UiState(
     // which bottom tab is showing (VM-held so navigation can switch it)
     val tab: Int = 0,
     // smart search (spec-ordered sections; fires on submit only)
-    val searchService: String = "both",   // both | ytmusic | qobuz
+    val searchService: String = "both",   // both | ytmusic | qobuz | local
     val smart: SmartSearch? = null,
     val smartSearching: Boolean = false,
     // entity-navigation back stack (overlays the tabs when non-empty)

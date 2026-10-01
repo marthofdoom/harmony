@@ -12,6 +12,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -213,6 +214,7 @@ fun EmptyState(
 fun serviceLabel(service: String): String = when (service.lowercase()) {
     "qobuz" -> "Qobuz"
     "ytmusic", "youtube", "youtubemusic", "yt" -> "YouTube Music"
+    "local" -> "Library"
     "spotify" -> "Spotify"
     "tidal" -> "Tidal"
     else -> service.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
@@ -867,8 +869,10 @@ private fun SearchScreen(vm: HarmonyViewModel, state: UiState) {
             IconButton(onClick = { submit() }) { Icon(Icons.Filled.Search, "Search") }
         }
         // Service filter — excluding a provider makes it contribute nothing.
-        Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp)) {
-            val services = listOf("both" to "All", "ytmusic" to "YouTube Music", "qobuz" to "Qobuz")
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState())
+                .padding(horizontal = 16.dp, vertical = 4.dp)) {
+            val services = listOf("both" to "All", "ytmusic" to "YouTube Music", "qobuz" to "Qobuz",
+                "local" to "Library")
             services.forEach { (value, label) ->
                 FilterChip(
                     selected = state.searchService == value,

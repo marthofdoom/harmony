@@ -191,6 +191,11 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
 
     private fun url(path: String) = baseUrl.trimEnd('/') + path
 
+    /** Library artwork comes back as a server path ("/art/<album>.<sig>"); make
+     *  it a URL the image loader + media session can fetch. Remote art is untouched. */
+    private fun absUrl(u: String?): String? =
+        if (u != null && u.startsWith("/")) url(u) else u
+
     private fun get(path: String): String {
         val b = Request.Builder().url(url(path))
         key?.takeIf { it.isNotEmpty() }?.let { b.header("X-Harmony-Key", it) }
@@ -267,7 +272,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         val a = root.getJSONObject("artist")
         val info = ArtistInfo(
             id = a.optString("id"), name = a.optString("name"), service = a.optString("service"),
-            imageUrl = optStr(a, "image_url"), bio = parseBio(a.optJSONObject("bio")),
+            imageUrl = absUrl(optStr(a, "image_url")), bio = parseBio(a.optJSONObject("bio")),
         )
         return ArtistDetail(
             artist = info,
@@ -454,8 +459,15 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             .put("service", t.service).put("id", t.id)
             .put("title", t.title).put("artist", t.artist)
             .put("album", t.album ?: JSONObject.NULL)
-            .put("art_url", t.artworkUrl ?: JSONObject.NULL)
+            .put("art_url", t.artworkUrl?.let { serverRelative(it) } ?: JSONObject.NULL)
             .put("duration_s", t.durationS ?: JSONObject.NULL)
+
+        private val ART_PATH = Regex("^https?://[^/]+(/art/[^/?#]+)$")
+
+        /** Library art back to its server path, so the instance next to a cast
+         *  device re-addresses it for THAT device (the phone's view of the server
+         *  — a tailnet IP, say — may not be reachable from the speaker). */
+        fun serverRelative(u: String): String = ART_PATH.find(u)?.groupValues?.get(1) ?: u
 
         fun tracksJson(ts: List<Track>): JSONArray = JSONArray().apply { ts.forEach { put(trackJson(it)) } }
     }
@@ -499,7 +511,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         title = o.optString("title"), artist = o.optString("artist"),
         album = optStr(o, "album"),
         durationS = optInt(o, "duration_s"),
-        artworkUrl = optStr(o, "artwork_url") ?: optStr(o, "art_url"),
+        artworkUrl = absUrl(optStr(o, "artwork_url") ?: optStr(o, "art_url")),
         trackNumber = optInt(o, "track_number"),
         year = optInt(o, "year"),
         isrc = optStr(o, "isrc"),
@@ -517,7 +529,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         artist = o.optString("artist"),
         year = optInt(o, "year"),
         date = optStr(o, "date"),
-        artworkUrl = optStr(o, "artwork_url"),
+        artworkUrl = absUrl(optStr(o, "artwork_url")),
         trackCount = optInt(o, "track_count"),
     )
 
@@ -531,7 +543,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         return (0 until arr.length()).map { i ->
             val o = arr.getJSONObject(i)
             Playlist(o.optString("service"), o.optString("id"), o.optString("title"),
-                optInt(o, "track_count"), optStr(o, "artwork_url"))
+                optInt(o, "track_count"), absUrl(optStr(o, "artwork_url")))
         }
     }
 

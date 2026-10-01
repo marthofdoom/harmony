@@ -22,6 +22,19 @@ the legend in the [docs index](README.md). Current release: **1.0.4** (pre-1.0 p
   a result) hands the request to a configured Lidarr instance (add + monitor +
   search), matched exactly by MusicBrainz id when Harmony knows it. Harmony
   discovers and serves; Lidarr acquires. Auth-free — no streaming-service creds.
+- **Local library + the Lidarr loop** (server/web, Android) — the server's music
+  folders are the `local` service (`harmony.library`): an incremental SQLite
+  index (mutagen tags, or Lidarr's folder layout without it), search, album/
+  artist pages, Range-aware streaming from disk through the web proxy and the
+  cast relay, and key-free signed artwork URLs (`/art/<album>.<sig>`). *Connect
+  Lidarr to library* adopts Lidarr's root folders (with remote path mappings)
+  and registers a Connect → Webhook, so imports/renames/deletes are indexed as
+  they happen. A Library view shows Lidarr's downloads; albums elsewhere get an
+  *In library* / *↓ %* / *Wanted* badge and "Play library copy". Android renders
+  and plays library tracks (Library search filter; no Lidarr UI). The desktop
+  doesn't build the library provider. *Live Lidarr + device runs still to
+  confirm (built against Lidarr's API; e2e against a generated library and a
+  fake Lidarr).*
 - **Entity navigation** — every artist, album, and track has its own page,
   reachable by clicking a name or right-clicking a row on all three surfaces
   (desktop, web, Android). Artist pages carry a Wikipedia bio, a chronological

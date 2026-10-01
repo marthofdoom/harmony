@@ -196,6 +196,16 @@ class Settings:
     lidarr_root_folder: str = ""
     lidarr_quality_profile_id: int = 0    # 0 => first configured
     lidarr_metadata_profile_id: int = 0   # 0 => first configured
+    # Lidarr's paths as seen from THIS machine, when they differ (Lidarr in a
+    # container / on another host): [{"remote": "/music", "local": "/mnt/media/music"}].
+    # Same idea as the *arr "remote path mappings". Applied to webhook paths and
+    # to Lidarr's root folders when they're adopted as library folders.
+    lidarr_path_map: list[dict[str, str]] = field(default_factory=list)
+
+    # Local library (harmony.library): music folders this instance indexes and
+    # serves as the "local" service — where Lidarr's imports land. Server/web.
+    library_enabled: bool = False
+    library_paths: list[str] = field(default_factory=list)
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its

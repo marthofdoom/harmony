@@ -100,6 +100,11 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         if path == "/healthz":
             self._send_json({"status": "ok", "service": "harmony", "version": __version__})
             return
+        if path.startswith("/art/"):
+            # Library artwork: a signed capability path, deliberately outside the
+            # key gate so <img>, the Android app and cast devices can fetch it.
+            self._handle_art(unquote(path[len("/art/"):]))
+            return
         if path.startswith("/api/") or path.startswith("/stream/"):
             if not self._authorized():
                 self._send_json({"error": "personal key required"}, status=401)
@@ -259,6 +264,35 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     enabled=body.get("enabled"), root_folder=body.get("root_folder"),
                     quality_profile_id=body.get("quality_profile_id"),
                     metadata_profile_id=body.get("metadata_profile_id")))
+            elif parts == ["api", "lidarr", "webhook"]:
+                self._send_json(engine.lidarr_webhook(body))
+            elif parts == ["api", "lidarr", "connect-library"]:
+                base = (body.get("callback_url") or "").strip()
+                if not base:
+                    host = self.headers.get("Host") or ""
+                    base = f"http://{host}" if host else ""
+                try:
+                    self._send_json(engine.lidarr_connect_library(base))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
+            elif parts == ["api", "library", "config"]:
+                paths = body.get("paths")
+                path_map = body.get("path_map")
+                if (paths is not None and not isinstance(paths, list)) or (
+                        path_map is not None and not isinstance(path_map, list)):
+                    self._send_json({"error": "paths and path_map must be lists"}, status=400)
+                    return
+                self._send_json(engine.library_save_config(
+                    enabled=body.get("enabled"), paths=paths, path_map=path_map))
+            elif parts == ["api", "library", "scan"]:
+                paths = body.get("paths")
+                self._send_json(engine.library_scan(paths if isinstance(paths, list) else None))
+            elif parts == ["api", "library", "state"]:
+                albums = body.get("albums")
+                if not isinstance(albums, list):
+                    self._send_json({"error": "albums must be a list"}, status=400)
+                    return
+                self._send_json(engine.album_states(albums[:200]))
             elif parts == ["api", "lidarr", "request"]:
                 kind = (body.get("kind") or "").strip()
                 if kind not in ("album", "artist"):
@@ -309,6 +343,19 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.lidarr_status())
             elif parts == ["api", "lidarr", "options"]:
                 self._send_json(engine.lidarr_options())
+            elif parts == ["api", "lidarr", "queue"]:
+                self._send_json(engine.lidarr_queue())
+            elif parts == ["api", "library"]:
+                self._send_json(engine.library_status())
+            elif parts == ["api", "library", "browse"]:
+                try:
+                    limit = max(1, min(500, int((query.get("limit") or ["60"])[0])))
+                    offset = max(0, int((query.get("offset") or ["0"])[0]))
+                except ValueError:
+                    self._send_json({"error": "limit/offset must be numbers"}, status=400)
+                    return
+                order = (query.get("order") or ["recent"])[0]
+                self._send_json(engine.library_overview(order=order, limit=limit, offset=offset))
             elif parts == ["api", "playlists"]:
                 self._send_json(engine.playlists())
             elif len(parts) == 5 and parts[0:2] == ["api", "playlists"] and parts[4] == "tracks":
@@ -356,6 +403,23 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             log.warning("API error on %s: %s", path, exc)
             self._send_json({"error": str(exc)}, status=502)
 
+    def _handle_art(self, token: str) -> None:
+        try:
+            art = get_engine().library_art(token)
+        except Exception as exc:  # noqa: BLE001
+            log.info("library art failed for %s: %s", token, exc)
+            art = None
+        if art is None:
+            self._send_json({"error": "not found"}, status=404)
+            return
+        data, ctype = art
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Cache-Control", "private, max-age=86400")
+        self.end_headers()
+        self.wfile.write(data)
+
     def _handle_monitor(self) -> None:
         """Stream this machine's live audio output as MP3 (ffmpeg from the
         default sink's monitor). A light client pulls this to play the hub's
@@ -396,6 +460,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
     def _handle_stream(self, token: str) -> None:
         import requests
 
+        from harmony.streamio import is_file_url, open_stream
+
         meta = get_engine().stream_for(token)
         if meta is None:
             self._send_json({"error": "unknown or expired stream token"}, status=404)
@@ -406,6 +472,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             headers = dict(m["headers"])
             if client_range:
                 headers["Range"] = client_range
+            if is_file_url(str(m["url"])):  # a local-library track: serve the file
+                return open_stream(str(m["url"]), headers, mime=str(m.get("mime") or ""))
             return requests.get(m["url"], headers=headers, stream=True, timeout=20)
 
         try:
@@ -447,6 +515,7 @@ def make_server(host: str, port: int) -> ThreadingHTTPServer:
     """Create the HTTP server and start the LAN mesh (advertise + discover)."""
     httpd = ThreadingHTTPServer((host, port), HarmonyHTTPRequestHandler)
     httpd.daemon_threads = True
+    get_engine().set_http_port(httpd.server_address[1])
     get_engine().start_mesh(port, bind_host=host)  # best-effort; skips a loopback bind
     _schedule_credential_adoption()
     return httpd
