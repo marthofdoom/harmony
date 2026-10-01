@@ -46,6 +46,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.6" date="2026-10-01">
+      <description>
+        <p>Play your own music folders anywhere. Point the Harmony server at the
+        folders where your music lives and they become a library you can search,
+        browse and play from the web app, the phone app and your speakers, just
+        like a streaming service.</p>
+        <p>With Lidarr, one click connects the two: albums you get with Lidarr
+        appear in your library moments after they finish downloading. A new
+        Library page shows what Lidarr is downloading, and albums you find on
+        other services show whether they are already in your library, still
+        downloading, or wanted.</p>
+      </description>
+    </release>
     <release version="1.0.5" date="2026-09-25">
       <description>
         <p>Harmony is now a proper music player on every device. Play an album,
