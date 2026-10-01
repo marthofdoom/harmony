@@ -765,3 +765,28 @@ def test_connect_library_saves_path_map_and_scans_once(server, monkeypatch):
     assert len(scans) == 1
     assert Settings.load().lidarr_path_map == [{"remote": "/data/music", "local": str(server.root)}]
     assert _wait_scan(server.engine)["stats"]["tracks"] == 5
+
+
+def test_smart_search_puts_the_library_first() -> None:
+    """With every service searched, owned albums/tracks must lead — not be
+    buried among dozens of streaming results (found on the 1.0.6 emulator run)."""
+    from harmony.models import Album, SearchResults, Service, Track
+    from harmony.web.api import Engine
+
+    class P:
+        def __init__(self, svc: Service, n: int) -> None:
+            self.svc, self.n = svc, n
+
+        def search(self, q, kinds=(), limit=8):
+            return SearchResults(
+                tracks=[Track(id=f"{self.svc.value}{i}", title=f"Sine {i}", service=self.svc)
+                        for i in range(self.n)],
+                albums=[Album(id=f"{self.svc.value}a{i}", title=f"Sine Album {i}", service=self.svc,
+                              year=1990 + i) for i in range(self.n)])
+
+    e = Engine()
+    e._providers = {Service.YTMUSIC: P(Service.YTMUSIC, 8), Service.LOCAL: P(Service.LOCAL, 2)}
+    e._overlay = lambda name: None
+    r = e.search_smart("zzz", service="both")
+    assert [a["service"] for a in r["albums"][:2]] == ["local", "local"]
+    assert [t["service"] for t in r["incidental"]["tracks"][:2]] == ["local", "local"]
