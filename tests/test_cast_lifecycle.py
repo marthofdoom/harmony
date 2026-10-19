@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import types
 from typing import Any
 
@@ -47,13 +48,19 @@ def fake_pc(monkeypatch):
     calls: list[dict] = []
     casts: list[_Cast] = []
 
-    def get(host, tries=None, retry_wait=None, timeout=None):
-        calls.append({"host": host, "tries": tries, "retry_wait": retry_wait, "timeout": timeout})
+    def chromecast(info, tries=None, retry_wait=None, timeout=None):
+        calls.append({"host": info.host, "cast_type": info.cast_type, "tries": tries,
+                      "retry_wait": retry_wait, "timeout": timeout})
         c = _Cast()
         casts.append(c)
         return c
 
-    monkeypatch.setattr(cc, "_pychromecast", lambda: types.SimpleNamespace(get_chromecast_from_host=get))
+    models = types.SimpleNamespace(
+        HostServiceInfo=lambda host, port: (host, port),
+        CastInfo=lambda services, uuid, model, name, host, port, cast_type, mfr: types.SimpleNamespace(
+            services=services, uuid=uuid, host=host, port=port, cast_type=cast_type))
+    monkeypatch.setattr(cc, "_pychromecast",
+                        lambda: types.SimpleNamespace(Chromecast=chromecast, models=models))
     monkeypatch.setattr(cc, "_ensure_reaper", lambda: None)
     return calls, casts
 
@@ -228,11 +235,153 @@ def test_play_to_it_connects_and_stop_disconnects(engine, monkeypatch) -> None:
     assert engine.spy.status_connect[-1] is False     # and passive again
 
 
-def test_direct_cast_is_active_until_stopped(engine) -> None:
+def test_direct_cast_is_a_one_track_queue_and_releases_on_end(engine, monkeypatch) -> None:
+    released: list[str] = []
+    monkeypatch.setattr(cc, "release", released.append)
+    monkeypatch.setattr(engine, "_cast_direct", lambda *a, **k: {"ok": True})
     engine.cast("10.0.0.5", "s", "1")
     assert "10.0.0.5" in engine._active_hosts()
-    engine.device_control("10.0.0.5", "stop")
+    snap = engine._device_queues().snapshot("10.0.0.5")
+    assert len(snap["tracks"]) == 1
+    # the queue's end detection applies: the track finishing releases the device
+    q = engine._device_queues()
+    q.after_status("10.0.0.5", {"state": "playing", "position_s": 10, "duration_s": 100})
+    q._queues["10.0.0.5"].settle_until = 0
+    q.after_status("10.0.0.5", {"state": "playing", "position_s": 10, "duration_s": 100})
+    q.after_status("10.0.0.5", {"state": "playing", "position_s": 99, "duration_s": 100})
+    assert "10.0.0.5" not in engine._active_hosts()
+
+
+def test_direct_cast_error_reaches_the_caller(engine, monkeypatch) -> None:
+    def boom(*a, **k):
+        raise ProviderError("no route")
+
+    monkeypatch.setattr(engine, "_cast_direct", boom)
+    with pytest.raises(ProviderError, match="no route"):
+        engine.cast("10.0.0.5", "s", "1")
     assert engine._active_hosts() == set()
+
+
+def test_stop_to_inactive_cast_never_connects(engine, monkeypatch) -> None:
+    monkeypatch.setattr(cc, "has_connection", lambda h: False)
+    engine.device_control("10.0.0.5", "stop")
+    engine.device_queue_op("10.0.0.5", "stop", {})
+    assert engine.spy.controls == []
+
+
+def test_stop_to_active_cast_reaches_the_device(engine, monkeypatch) -> None:
+    monkeypatch.setattr(cc, "release", lambda h: None)
+    engine._device_queues().op("10.0.0.5", "load", {"tracks": _tracks(2), "start": 0})
+    engine.device_queue_op("10.0.0.5", "stop", {})
+    assert engine.spy.controls == ["stop"]
+
+
+def test_stop_to_inactive_cast_with_leftover_connection_closes_it(engine, monkeypatch) -> None:
+    monkeypatch.setattr(cc, "has_connection", lambda h: True)
+    engine.device_control("10.0.0.5", "stop")
+    assert engine.spy.controls == ["stop"]
+
+
+def test_device_stop_without_connection_is_a_noop(fake_pc) -> None:
+    _, casts = fake_pc
+    cc.ChromecastDevice("10.0.0.5").stop()
+    assert casts == []  # never connected just to stop
+
+
+def test_connect_passes_cast_type_so_no_eureka_fetch(fake_pc) -> None:
+    calls, _ = fake_pc
+    cc._connect("10.0.0.5")
+    cc._connect("10.0.0.6", cast_type="audio")
+    assert [c["cast_type"] for c in calls] == ["cast", "audio"]
+
+
+def test_hosts_connect_independently(fake_pc, monkeypatch) -> None:
+    _, casts = fake_pc
+    gate = threading.Event()
+    entered = threading.Event()
+    orig = _Cast.wait
+
+    def wait(self, timeout=None):
+        if len(casts) == 1:  # the first (dead) host hangs
+            entered.set()
+            gate.wait(5)
+        orig(self, timeout)
+
+    monkeypatch.setattr(_Cast, "wait", wait)
+    t = threading.Thread(target=lambda: cc._connect("dead"), daemon=True)
+    t.start()
+    assert entered.wait(2)
+    cc._connect("alive")  # would deadlock under one global connect lock
+    assert "alive" in cc._CONNECTIONS
+    gate.set()
+    t.join(3)
+
+
+def test_dead_cached_connection_is_evicted(fake_pc) -> None:
+    _, casts = fake_pc
+    cc._connect("h")
+    casts[0].socket_client = types.SimpleNamespace(stop=threading.Event(), is_alive=lambda: True)
+    casts[0].socket_client.stop.set()
+    cc._connect("h")
+    assert len(casts) == 2 and casts[0].disconnected == 1
+
+
+def test_dead_thread_is_evicted(fake_pc) -> None:
+    _, casts = fake_pc
+    cc._connect("h")
+    casts[0].socket_client = types.SimpleNamespace(stop=threading.Event(), is_alive=lambda: False)
+    assert cc.has_connection("h") is False
+
+
+def test_failed_then_connected_retry_succeeds(fake_pc, monkeypatch) -> None:
+    def wait(self, timeout=None):
+        self.listeners[0].new_connection_status(types.SimpleNamespace(status="FAILED"))
+        self.listeners[0].new_connection_status(types.SimpleNamespace(status="CONNECTED"))
+
+    monkeypatch.setattr(_Cast, "wait", wait)
+    assert cc._connect("h") is not None and "h" in cc._CONNECTIONS
+
+
+def test_status_passive_never_connects(fake_pc) -> None:
+    _, casts = fake_pc
+    st = cc.ChromecastDevice("h").status(connect=False)
+    assert st.state == "stopped" and casts == []
+
+
+def test_discovery_uuid_none_is_blank() -> None:
+    import sys
+
+    class CI:
+        uuid = None
+        host = "1.2.3.4"
+        friendly_name = "TV"
+        model_name = None
+        port = 8009
+        cast_type = "cast"
+
+    class Browser:
+        devices = {"a": CI()}
+
+        def __init__(self, *a): ...
+        def start_discovery(self): ...
+        def stop_discovery(self): ...
+
+    zc = types.SimpleNamespace(Zeroconf=lambda: types.SimpleNamespace(close=lambda: None))
+    disc = types.SimpleNamespace(CastBrowser=Browser, SimpleCastListener=lambda: None)
+    sys.modules["zeroconf"] = zc
+    sys.modules["pychromecast.discovery"] = disc
+    try:
+        import pytest as _p
+
+        mp = _p.MonkeyPatch()
+        mp.setattr(cc, "_pychromecast", lambda: object())
+        mp.setattr("time.sleep", lambda s: None)
+        out = cc.discover_cast(timeout=0)
+        mp.undo()
+    finally:
+        sys.modules.pop("zeroconf", None)
+        sys.modules.pop("pychromecast.discovery", None)
+    assert out and out[0].raw["uuid"] == "" and out[0].id == "1.2.3.4"
 
 
 # -- uuid dedupe + stale address ---------------------------------------------
@@ -282,3 +431,66 @@ def test_desktop_state_dedupes_by_uuid_and_updates_host() -> None:
     assert st.settings.known_devices[0]["host"] == "192.168.12.100"
 
 
+
+
+def test_reconcile_never_crosses_kinds_or_drops_a_different_device() -> None:
+    known = [{"host": ".9", "name": "WiiM", "kind": "wiim"},
+             {"host": ".5", "name": "TV", "kind": "cast", "uuid": "U1"}]
+    reconcile_known(known, [{"host": ".9", "kind": "cast", "uuid": "U1"}])
+    wiim = next(k for k in known if k["kind"] == "wiim")
+    tv = next(k for k in known if k["kind"] == "cast")
+    assert len(known) == 2 and "uuid" not in wiim and tv["host"] == ".9"
+
+
+def test_reconcile_dedupe_keeps_the_discovery_confirmed_entry() -> None:
+    known = [{"host": "old", "name": "A", "kind": "cast", "uuid": "U1"},
+             {"host": "new", "name": "B", "kind": "cast", "uuid": "U1"}]
+    reconcile_known(known, [{"host": "new", "kind": "cast", "uuid": "U1"}])
+    assert known == [{"host": "new", "name": "B", "kind": "cast", "uuid": "U1"}]
+
+
+# -- queue: lost devices, next past end, idle pause --------------------------
+
+def test_vanished_device_halts_after_three_poll_failures(monkeypatch) -> None:
+    monkeypatch.setattr(dqm, "POLL_S", 0.01)
+    released: list[str] = []
+    polls = []
+
+    def status(h):
+        polls.append(h)
+        raise ProviderError("timeout")
+
+    qs = DeviceQueues(lambda h, t: {}, status, on_inactive=released.append)
+    qs.op("tv", "load", {"tracks": _tracks(2), "start": 0})
+    for _ in range(200):
+        if released:
+            break
+        threading.Event().wait(0.02)
+    snap = qs.snapshot("tv")
+    assert released == ["tv"] and len(polls) == dqm.MAX_POLL_FAILURES
+    assert snap["playing"] is False and snap["error"] == "Lost the connection to tv — stopped"
+
+
+def test_next_past_end_stops_before_releasing() -> None:
+    order: list[str] = []
+    qs = DeviceQueues(lambda h, t: {}, lambda h: {}, stop=lambda h: order.append("stop"),
+                      on_inactive=lambda h: order.append("release"))
+    qs.op("tv", "load", {"tracks": _tracks(1), "start": 0})
+    qs.op("tv", "next", {})
+    assert order == ["stop", "release"]
+
+
+def test_long_pause_releases_the_device(monkeypatch) -> None:
+    monkeypatch.setattr(dqm, "POLL_S", 0.01)
+    monkeypatch.setattr(dqm, "PAUSE_TIMEOUT_S", 0.05)
+    released: list[str] = []
+    qs = DeviceQueues(lambda h, t: {}, lambda h: {"state": "paused"}, stop=lambda h: None,
+                      on_inactive=released.append)
+    qs.op("tv", "load", {"tracks": _tracks(2), "start": 0})
+    qs.note_control("tv", "pause")
+    for _ in range(200):
+        if released:
+            break
+        threading.Event().wait(0.02)
+    snap = qs.snapshot("tv")
+    assert released == ["tv"] and snap["playing"] is False and snap["state"] == "stopped"

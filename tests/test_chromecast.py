@@ -67,6 +67,7 @@ class _FakeCast:
 def fake_cast(monkeypatch: pytest.MonkeyPatch) -> _FakeCast:
     cast = _FakeCast()
     cc._CONNECTIONS.clear()
+    cc._CONNECTIONS["192.168.1.50"] = cast  # stop() only ever uses a live connection
     monkeypatch.setattr(cc, "_connect", lambda *a, **k: cast)
     return cast
 

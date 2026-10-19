@@ -151,8 +151,6 @@ class Engine:
         self._cred_listeners: list[Any] = []
         self._settings_listeners: list[Any] = []
         self._idle_status: dict[str, tuple[float, dict[str, Any]]] = {}
-        # Cast hosts playing a single directly-cast track (no queue): active too.
-        self._direct_active: set[str] = set()
         try:
             from harmony.playback import chromecast as _cc
 
@@ -2359,12 +2357,19 @@ class Engine:
             return self._peer_call(via, "POST", f"/api/devices/{host}/play",
                                    {"service": service_value, "id": t["id"], "meta": {
                                        **(meta or {}), **({"art_url": t["art_url"]} if t.get("art_url") else {})}})
+        if self._device_kind(host)[0] == "cast":
+            # A one-track queue: the active-output bookkeeping, end detection and
+            # release-on-finish all live in the queue, so a single /play can't
+            # hold a Cast connection forever. Synchronous: errors reach the caller.
+            track = {**(meta or {}), "service": service_value, "id": track_id}
+            snap = self._device_queues().op(host, "load", {
+                "tracks": [track], "start": 0, "sync": True, "repeat": "off", "shuffle": False})
+            if not snap.get("playing") and snap.get("error"):
+                raise ProviderError(str(snap["error"]))
+            return {"ok": True, "host": host}
         if self._queues is not None:
             self._queues.stop(host)
-        result = self._cast_direct(host, service_value, track_id, meta)
-        if self._device_kind(host)[0] == "cast":
-            self._direct_active.add(host)  # explicit play: it's the active output now
-        return result
+        return self._cast_direct(host, service_value, track_id, meta)
 
     def _cast_direct(self, host: str, service_value: str, track_id: str,
                      meta: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2387,16 +2392,24 @@ class Engine:
         return self._caster().cast(host, service_value, track_id, meta, kind=kind, device_info=info)
 
     def device_control(self, host: str, action: str, level: int | None = None,
-                       via: str | None = None) -> dict[str, Any]:
+                       via: str | None = None, *, was_active: bool | None = None) -> dict[str, Any]:
         if via:
             return self._peer_call(via, "POST", f"/api/devices/{host}/{action}",
                                    {"level": level} if level is not None else {})
+        if was_active is None:
+            was_active = host in self._active_hosts()  # before stop() halts the queue
         if action == "stop" and self._queues is not None:
             self._queues.stop(host)
         kind, info = self._device_kind(host)
-        if kind == "cast" and action != "stop" and host not in self._active_hosts():
+        if kind == "cast" and action != "stop" and not was_active:
             # Never wake a Cast device that isn't the active output.
             raise ProviderError(f"{info.get('name') or host} isn't the active output — play to it first")
+        if kind == "cast" and action == "stop" and not was_active:
+            from harmony.playback import chromecast
+
+            if not chromecast.has_connection(host):
+                self._release_device(host)  # not ours to touch: just make sure it's let go
+                return {"ok": True}
         try:
             result = self._caster().control(host, action, level, kind=kind, device_info=info)
         finally:
@@ -2413,14 +2426,16 @@ class Engine:
 
     def _active_hosts(self) -> set[str]:
         """Output hosts that are active now: a running device queue (playing,
-        paused or starting) or a directly-cast track. Harmony talks to a Cast
+        paused or starting; a single /play is a one-track queue). Harmony talks to a Cast
         device only while it is in this set."""
-        queued = self._queues.busy_hosts() if self._queues is not None else set()
-        return queued | set(self._direct_active)
+        return self._queues.busy_hosts() if self._queues is not None else set()
+
+    def is_active_output(self, host: str) -> bool:
+        """True when ``host`` is an active output (a Cast device is only contacted then)."""
+        return host in self._active_hosts()
 
     def _release_device(self, host: str) -> None:
         """``host`` stopped being the active output: drop its Cast connection now."""
-        self._direct_active.discard(host)
         try:
             from harmony.playback import chromecast
 
@@ -2517,10 +2532,11 @@ class Engine:
         if op == "stop":
             # Halting the queue always succeeds; stopping the device is best-effort
             # (an unreachable speaker mustn't leave the queue running).
+            was_active = host in self._active_hosts()
             self._device_queues().stop(host)
             snap = self._device_queues().snapshot(host)
             try:
-                self.device_control(host, "stop")
+                self.device_control(host, "stop", was_active=was_active)
             except Exception as exc:  # noqa: BLE001 - report, don't fail the stop
                 snap["error"] = f"couldn't reach the device to stop it: {exc}"
             return snap

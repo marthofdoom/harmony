@@ -33,7 +33,18 @@ log = logging.getLogger(__name__)
 _CAST_PORT = 8009
 
 _CONNECTIONS: dict[str, Any] = {}  # host -> connected pychromecast.Chromecast
+# _CONN_LOCK only guards the dicts (held for an instant, never across I/O); each
+# host connects under its own lock so one dead device can't stall the others.
 _CONN_LOCK = threading.Lock()
+_HOST_LOCKS: dict[str, threading.Lock] = {}
+
+
+def _host_lock(host: str) -> threading.Lock:
+    with _CONN_LOCK:
+        lock = _HOST_LOCKS.get(host)
+        if lock is None:
+            lock = _HOST_LOCKS[host] = threading.Lock()
+        return lock
 
 # Connections are bounded: a dead address must fail fast (not retry forever),
 # a lost socket is dropped (not reconnected behind our back), and a connection
@@ -101,14 +112,17 @@ def discover_cast(timeout: float = 4.0) -> list[DeviceInfo]:
                 host = _cast_host(ci)
                 if not host:
                     continue
+                raw_uid = getattr(ci, "uuid", None)
+                uid = str(raw_uid) if raw_uid else ""
                 infos.append(
                     DeviceInfo(
-                        id=str(getattr(ci, "uuid", host)),
+                        id=uid or host,
                         name=getattr(ci, "friendly_name", None) or host,
                         host=host,
                         kind="cast",
                         model=getattr(ci, "model_name", None),
-                        raw={"port": getattr(ci, "port", _CAST_PORT), "uuid": str(getattr(ci, "uuid", ""))},
+                        raw={"port": getattr(ci, "port", _CAST_PORT), "uuid": uid,
+                             "cast_type": getattr(ci, "cast_type", None) or "cast"},
                     )
                 )
         finally:
@@ -142,6 +156,38 @@ def _disconnect(cast: Any) -> None:
         pass
 
 
+def _is_dead(cast: Any) -> bool:
+    """True when a cached connection's socket thread has stopped (a LOST/FAILED
+    event can be missed; never hand out a corpse)."""
+    sc = getattr(cast, "socket_client", None)
+    if sc is None:
+        return False
+    stop = getattr(sc, "stop", None)
+    if stop is not None and hasattr(stop, "is_set") and stop.is_set():
+        return True
+    alive = getattr(sc, "is_alive", None)
+    return bool(callable(alive) and not alive())
+
+
+def _peek(host: str) -> Any | None:
+    """The cached live connection for ``host`` (evicting a dead one); never connects."""
+    with _CONN_LOCK:
+        cast = _CONNECTIONS.get(host)
+        if cast is None:
+            return None
+        if not _is_dead(cast):
+            return cast
+        _CONNECTIONS.pop(host, None)
+        _LAST_USED.pop(host, None)
+    _disconnect(cast)
+    return None
+
+
+def has_connection(host: str) -> bool:
+    """True when Harmony currently holds a connection to ``host``."""
+    return _peek(host) is not None
+
+
 class _ConnListener:
     """Drops a connection the moment its socket is lost or fails, instead of
     letting pychromecast reconnect forever in the background."""
@@ -154,30 +200,42 @@ class _ConnListener:
         self.dead = threading.Event()
 
     def new_connection_status(self, status: Any) -> None:
-        if str(getattr(status, "status", "")) not in self._DEAD:
+        name = str(getattr(status, "status", ""))
+        cast = self.cast
+        if name not in self._DEAD:
+            if cast is None and name == "CONNECTED":
+                self.dead.clear()  # a retry succeeded after an earlier FAILED
             return
         self.dead.set()
-        cast = self.cast
         if cast is None:
-            return  # still connecting: _connect sees ``dead`` and gives up
+            return  # still connecting: _connect decides once wait() returns
         log.info("chromecast %s: connection %s — dropped", self.host, status.status)
-        # Non-blocking: a connect in progress holds the lock and waits on this
-        # very thread, so never wait for it here.
-        if _CONN_LOCK.acquire(blocking=False):
-            try:
-                if _CONNECTIONS.get(self.host) is cast:
-                    del _CONNECTIONS[self.host]
-            finally:
-                _CONN_LOCK.release()
+        with _CONN_LOCK:  # held only for an instant, never across a connect
+            if _CONNECTIONS.get(self.host) is cast:
+                del _CONNECTIONS[self.host]
+                _LAST_USED.pop(self.host, None)
         _disconnect(cast)
 
 
+def _make_chromecast(pc: Any, host: str, port: int, uid: Any, model: str | None,
+                     name: str | None, cast_type: str | None) -> Any:
+    """Build a Chromecast with ``cast_type`` already known. Without it
+    pychromecast fetches /setup/eureka_info over HTTPS with a 30 s timeout inside
+    the constructor (measured 38 s against a dead address)."""
+    models = pc.models
+    info = models.CastInfo({models.HostServiceInfo(host, port)}, uid, model, name, host, port,
+                           cast_type or "cast", None)
+    return pc.Chromecast(info, tries=CONNECT_TRIES, retry_wait=CONNECT_RETRY_WAIT_S,
+                         timeout=CONNECT_TIMEOUT_S)
+
+
 def _connect(host: str, port: int = _CAST_PORT, uuid: str | None = None,
-             model: str | None = None, name: str | None = None) -> Any:
+             model: str | None = None, name: str | None = None,
+             cast_type: str | None = None) -> Any:
     """Get a connected Chromecast for ``host``, cached and reused. Bounded: a
-    dead address fails in seconds."""
-    with _CONN_LOCK:
-        cast = _CONNECTIONS.get(host)
+    dead address fails in seconds, and only blocks callers of that same host."""
+    with _host_lock(host):
+        cast = _peek(host)
         if cast is not None:
             return cast  # (callers touch(): a passive poll mustn't count as use)
         pc = _pychromecast()
@@ -193,21 +251,24 @@ def _connect(host: str, port: int = _CAST_PORT, uuid: str | None = None,
                     uid = _uuidmod.UUID(uuid)
                 except ValueError:
                     uid = None
-            cast = pc.get_chromecast_from_host(
-                (host, int(port or _CAST_PORT), uid, model, name),
-                tries=CONNECT_TRIES, retry_wait=CONNECT_RETRY_WAIT_S, timeout=CONNECT_TIMEOUT_S)
+            cast = _make_chromecast(pc, host, int(port or _CAST_PORT), uid, model, name, cast_type)
             listener = _ConnListener(host)
             cast.register_connection_listener(listener)
-            cast.wait(timeout=CONNECT_TIMEOUT_S)
-            if listener.dead.is_set():
+            cast.wait(timeout=CONNECT_TIMEOUT_S)  # raises if no status arrived
+            # A FAILED from an early try is not fatal if a later try connected:
+            # judge by where the connection ended up.
+            sc = getattr(cast, "socket_client", None)
+            connected = getattr(sc, "is_connected", None)
+            if listener.dead.is_set() or (callable(connected) and not connected()):
                 raise ConnectionError("connection failed")
             listener.cast = cast
         except Exception as exc:  # noqa: BLE001
             if cast is not None:
                 _disconnect(cast)
             raise ProviderError(f"couldn't connect to Chromecast at {host}: {exc}") from exc
-        _CONNECTIONS[host] = cast
-        touch(host)
+        with _CONN_LOCK:
+            _CONNECTIONS[host] = cast
+            _LAST_USED[host] = time.monotonic()
         _ensure_reaper()
         return cast
 
@@ -284,11 +345,13 @@ class ChromecastDevice(PlaybackDevice):
         self._port = int(raw.get("port") or _CAST_PORT)
         self._uuid = raw.get("uuid") or None
         self._model = info.model if info else None
+        self._cast_type = raw.get("cast_type") or None
         self._name = info.name if info else host
         self.info = info or DeviceInfo(id=host, name=host, host=host, kind="cast")
 
     def _cast(self, *, use: bool = True) -> Any:
-        cast = _connect(self._host, self._port, self._uuid, self._model, self._name)
+        cast = _connect(self._host, self._port, self._uuid, self._model, self._name,
+                        self._cast_type)
         if use:
             touch(self._host)
         return cast
@@ -323,15 +386,14 @@ class ChromecastDevice(PlaybackDevice):
         """The device's state. ``connect=False`` never opens a connection: a
         cast Harmony isn't connected to (after Stop, or never used) reports
         "stopped" instead, so background polling can't reconnect to it."""
-        if not connect:
-            with _CONN_LOCK:
-                connected = self._host in _CONNECTIONS
-            if not connected:
-                return PlaybackStatus(state="stopped", volume=None, muted=False,
-                                      position_s=None, duration_s=None,
-                                      raw={"connected": False})
+        cast = None if connect else _peek(self._host)  # one read: no check-then-act gap
+        if not connect and cast is None:
+            return PlaybackStatus(state="stopped", volume=None, muted=False,
+                                  position_s=None, duration_s=None,
+                                  raw={"connected": False})
         try:
-            cast = self._cast(use=connect)  # a passive poll never counts as use
+            if cast is None:
+                cast = self._cast()
             # pychromecast only refreshes media_controller.status (and its
             # current_time) when asked; without this the reported position stays
             # frozen at the last event, so the Now Playing progress bar never
@@ -387,12 +449,14 @@ class ChromecastDevice(PlaybackDevice):
         """Stop casting: stop the media, then close the media receiver app so
         the TV/speaker really leaves the cast (only when it's the receiver
         Harmony uses — never some other app the user is running there)."""
+        cast = _peek(self._host)
+        if cast is None:
+            return  # never connect just to stop: nothing of ours is playing there
         try:
             try:
                 self._mc_ready().stop()
             except Exception as exc:  # noqa: BLE001 - quitting the app below still stops it
                 log.debug("chromecast %s: media stop failed: %s", self._host, exc)
-            cast = self._cast()
             if getattr(cast, "app_id", None) == _MEDIA_RECEIVER_APP_ID:
                 cast.quit_app()
         except Exception as exc:  # noqa: BLE001

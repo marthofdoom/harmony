@@ -209,7 +209,7 @@ class DevicesPage(Gtk.Box):
         self.play_pause_button.connect("clicked", self._on_play_pause_clicked)
         self.stop_button.connect("clicked", lambda *_a: self.state.playback_stop()
                                  if self._is_active_output() else
-                                 self._run_device_action(lambda d: d.stop()))
+                                 self._run_device_action(lambda d: d.stop(), ("stop", None)))
         self.next_button.connect("clicked", lambda *_a: self.state.playback_next()
                                  if self._is_active_output() else
                                  self._run_device_action(lambda d: d.next()))
@@ -470,15 +470,9 @@ class DevicesPage(Gtk.Box):
         cast = self._is_cast(device)
 
         def work() -> tuple[Any, Any]:
-            if not cast:
-                return device.info, device.status()
-            try:
-                return device.info, device.status(connect=explicit)
-            finally:
-                if explicit:
-                    from harmony.playback import chromecast
-
-                    chromecast.release(host)
+            # A Cast device is never connected just to be read: Refresh is
+            # passive for it (it reports "not connected" unless it's the output).
+            return device.info, device.status(connect=False) if cast else device.status()
 
         def done(result: tuple[Any, Any]) -> None:
             self.refresh_button.set_sensitive(True)
@@ -500,8 +494,11 @@ class DevicesPage(Gtk.Box):
 
         run_async(work, done, error)
 
-    def _run_device_action(self, action: Any) -> None:
+    def _run_device_action(self, action: Any, cast_action: tuple[str, int | None] | None = None) -> None:
         """Run ``action(device)`` off the main loop, then refresh status from the same call.
+
+        A Cast device is controlled through the engine (``cast_action`` = engine
+        action + level), which refuses unless it's the active output.
 
         Bundling the follow-up ``status()`` into the same worker call (rather
         than a second ``run_async`` round trip) is what satisfies "refresh
@@ -518,14 +515,18 @@ class DevicesPage(Gtk.Box):
         cast = self._is_cast(device)
 
         def work() -> Any:
-            try:
+            if not cast:
                 action(device)
-                return device.status(connect=False) if cast else device.status()
-            finally:
-                if cast:  # an explicit command, not a standing connection
-                    from harmony.playback import chromecast
+                return device.status()
+            from harmony.web.server import get_engine
 
-                    chromecast.release(host)
+            eng = get_engine()
+            if cast_action is None:
+                raise NotSupportedError("a Cast device has no queue controls here")
+            if cast_action[0] != "stop" and not eng.is_active_output(host):
+                raise ProviderError("Not connected — play to it to connect")
+            eng.device_control(host, cast_action[0], cast_action[1])
+            return device.status(connect=False)
 
         def done(status: Any) -> None:
             if self._selected_host != host:
@@ -560,9 +561,9 @@ class DevicesPage(Gtk.Box):
             return
         status = self._last_status
         if status is not None and status.state == "playing":
-            self._run_device_action(lambda d: d.pause())
+            self._run_device_action(lambda d: d.pause(), ("pause", None))
         else:
-            self._run_device_action(lambda d: d.resume())
+            self._run_device_action(lambda d: d.resume(), ("resume", None))
 
     def _on_volume_changed(self, _scale: Gtk.Scale) -> None:
         if self._updating_from_status:
@@ -574,11 +575,11 @@ class DevicesPage(Gtk.Box):
     def _on_volume_debounce_elapsed(self) -> bool:
         self._volume_debounce_id = None
         level = int(self.volume_scale.get_value())
-        self._run_device_action(lambda d, lvl=level: d.set_volume(lvl))
+        self._run_device_action(lambda d, lvl=level: d.set_volume(lvl), ("volume", level))
         return GLib.SOURCE_REMOVE
 
     def _on_mute_toggled(self, switch: Gtk.Switch, _pspec: object) -> None:
         if self._updating_from_status:
             return
         muted = switch.get_active()
-        self._run_device_action(lambda d, m=muted: d.set_muted(m))
+        self._run_device_action(lambda d, m=muted: d.set_muted(m), ("mute", int(muted)))

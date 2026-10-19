@@ -603,7 +603,8 @@ class AppState(GObject.Object):
         # (passive discovery is the only thing that ever changes a saved address).
         from harmony.playback.known import reconcile_known
 
-        seen = [{"host": d.host, "uuid": (getattr(d, "raw", None) or {}).get("uuid")} for d in infos]
+        seen = [{"host": d.host, "kind": getattr(d, "kind", None),
+                 "uuid": (getattr(d, "raw", None) or {}).get("uuid")} for d in infos]
         if reconcile_known(self.settings.known_devices, seen):
             self.settings.save()
         self.emit("devices-changed")

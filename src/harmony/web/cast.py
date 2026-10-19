@@ -113,6 +113,8 @@ class CastController:
             device.stop()
         elif action == "volume":
             device.set_volume(int(level or 0))
+        elif action == "mute":
+            device.set_muted(bool(level))
         elif action == "seek":
             # UPnP AVTransport where the device speaks it (exact); else the
             # backend's own seek (WiiM httpapi, Chromecast media controller).

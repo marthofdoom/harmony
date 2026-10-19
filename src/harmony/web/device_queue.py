@@ -31,6 +31,11 @@ END_EPSILON_S = 2
 # Consecutive tracks that fail to start before the queue gives up (each try is a
 # real connection attempt to the device).
 MAX_START_FAILURES = 3
+# Consecutive status polls that fail before a playing queue is declared lost
+# (the device vanished); each poll of a dead cast costs a full connect attempt.
+MAX_POLL_FAILURES = 3
+# A queue left paused this long gives its device back (resume = Play reloads).
+PAUSE_TIMEOUT_S = 30 * 60.0
 
 
 def _playable(tracks: Any) -> list[dict[str, Any]]:
@@ -224,7 +229,7 @@ class DeviceQueues:
         if start is not None:
             with self._lock:
                 dq.failures = 0  # a user action starts a fresh run of attempts
-            if self._async_start:
+            if self._async_start and not body.get("sync"):
                 with self._lock:  # show it as starting right away
                     dq.q.jump(start)
                     dq.playing = True
@@ -233,13 +238,16 @@ class DeviceQueues:
                                  name=f"harmony-queue-start-{host}").start()
             else:
                 self._start_track(host, start)
-        elif not dq.playing:
-            self._inactive(host)  # e.g. a stop/remove/next-past-end
-        if start is None and stop_device and self._stop is not None:
-            try:
-                self._stop(host)
-            except Exception as exc:  # noqa: BLE001 - the queue is halted either way
-                log.debug("queue: stopping %s failed: %s", host, exc)
+        else:
+            if stop_device and self._stop is not None:
+                # Stop while still connected; releasing first would make the
+                # stop reconnect to the device just to silence it.
+                try:
+                    self._stop(host)
+                except Exception as exc:  # noqa: BLE001 - the queue is halted either way
+                    log.debug("queue: stopping %s failed: %s", host, exc)
+            if not dq.playing:
+                self._inactive(host)  # e.g. a stop/remove/next-past-end
         return self.snapshot(host)
 
     # -- device loop ---------------------------------------------------------
@@ -315,6 +323,8 @@ class DeviceQueues:
         t.start()
 
     def _poll_loop(self, host: str) -> None:
+        failures = 0
+        paused_since: float | None = None
         while True:
             time.sleep(POLL_S)
             with self._lock:
@@ -322,11 +332,44 @@ class DeviceQueues:
                 if dq is None or not dq.playing:
                     self._threads.pop(host, None)
                     return
+                gen = dq.gen
+                if dq.prev_state == "paused":
+                    paused_since = paused_since or time.monotonic()
+                    if time.monotonic() - paused_since >= PAUSE_TIMEOUT_S:
+                        dq.halt()
+                        dq.last_status = {**dq.last_status, "state": "stopped"}
+                        dq.error = None
+                        self._threads.pop(host, None)
+                        expired = True
+                    else:
+                        expired = False
+                else:
+                    paused_since, expired = None, False
+            if expired:
+                log.info("queue: %s paused too long — releasing the device", host)
+                if self._stop is not None:
+                    try:
+                        self._stop(host)
+                    except Exception as exc:  # noqa: BLE001 - released either way
+                        log.debug("queue: stopping idle %s failed: %s", host, exc)
+                self._inactive(host)
+                return
             try:
                 st = self._status(host) or {}
-            except Exception as exc:  # noqa: BLE001 - a missed poll is harmless
-                log.debug("queue poll %s: %s", host, exc)
-                continue
+                failures = 0
+            except Exception as exc:  # noqa: BLE001 - one missed poll is harmless
+                failures += 1
+                log.debug("queue poll %s failed (%d): %s", host, failures, exc)
+                if failures < MAX_POLL_FAILURES:
+                    continue
+                with self._lock:
+                    dq = self._queues.get(host)
+                    if dq is not None and dq.playing and dq.gen == gen:
+                        dq.error = f"Lost the connection to {host} — stopped"
+                        dq.halt()
+                    self._threads.pop(host, None)
+                self._inactive(host)
+                return
             nxt = self.after_status(host, st)
             if nxt is not None:
                 self._start_track(host, nxt)
