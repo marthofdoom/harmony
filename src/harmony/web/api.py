@@ -151,6 +151,14 @@ class Engine:
         self._cred_listeners: list[Any] = []
         self._settings_listeners: list[Any] = []
         self._idle_status: dict[str, tuple[float, dict[str, Any]]] = {}
+        # Cast hosts playing a single directly-cast track (no queue): active too.
+        self._direct_active: set[str] = set()
+        try:
+            from harmony.playback import chromecast as _cc
+
+            _cc.set_busy_provider(self._active_hosts)
+        except Exception:  # noqa: BLE001 - the optional Cast layer must never block startup
+            pass
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
@@ -2202,9 +2210,20 @@ class Engine:
         from a short-lived cache so the page isn't a 3s multicast scan per call.
         """
         from harmony.config import Settings
+        from harmony.playback.known import reconcile_known
 
+        settings = Settings.load()
+        discovered = self._discovered_devices(refresh=refresh)
+        # A saved Cast device follows its uuid to a new DHCP address (passive
+        # mDNS discovery is the only thing that ever updates it), and learns its uuid.
+        if reconcile_known(settings.known_devices, discovered):
+            try:
+                settings.save()
+            except Exception as exc:  # noqa: BLE001 - the list below is still right
+                log.debug("couldn't save updated device addresses: %s", exc)
         by_host: dict[str, dict[str, Any]] = {}
-        for d in Settings.load().known_devices:
+        uuids: set[str] = set()
+        for d in settings.known_devices:
             host = d.get("host")
             if host:
                 by_host[host] = {
@@ -2213,7 +2232,14 @@ class Engine:
                     "kind": d.get("kind", "wiim"),
                     "source": "saved",
                 }
-        for d in self._discovered_devices(refresh=refresh):
+                if d.get("uuid"):
+                    uuids.add(d["uuid"])
+        for d in discovered:
+            uid = d.get("uuid")
+            if uid and uid in uuids:
+                continue  # the same device twice (saved + discovered, or two interfaces)
+            if uid:
+                uuids.add(uid)
             by_host.setdefault(d["host"], d)
         return {"devices": list(by_host.values())}
 
@@ -2335,7 +2361,10 @@ class Engine:
                                        **(meta or {}), **({"art_url": t["art_url"]} if t.get("art_url") else {})}})
         if self._queues is not None:
             self._queues.stop(host)
-        return self._cast_direct(host, service_value, track_id, meta)
+        result = self._cast_direct(host, service_value, track_id, meta)
+        if self._device_kind(host)[0] == "cast":
+            self._direct_active.add(host)  # explicit play: it's the active output now
+        return result
 
     def _cast_direct(self, host: str, service_value: str, track_id: str,
                      meta: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -2365,7 +2394,14 @@ class Engine:
         if action == "stop" and self._queues is not None:
             self._queues.stop(host)
         kind, info = self._device_kind(host)
-        result = self._caster().control(host, action, level, kind=kind, device_info=info)
+        if kind == "cast" and action != "stop" and host not in self._active_hosts():
+            # Never wake a Cast device that isn't the active output.
+            raise ProviderError(f"{info.get('name') or host} isn't the active output — play to it first")
+        try:
+            result = self._caster().control(host, action, level, kind=kind, device_info=info)
+        finally:
+            if action == "stop":
+                self._release_device(host)
         if self._queues is not None:
             if action == "seek":
                 self._queues.note_seek(host, int(level or 0))
@@ -2374,6 +2410,23 @@ class Engine:
         return result
 
     # -- server-owned device queues (auto-advance lives next to the device) --
+
+    def _active_hosts(self) -> set[str]:
+        """Output hosts that are active now: a running device queue (playing,
+        paused or starting) or a directly-cast track. Harmony talks to a Cast
+        device only while it is in this set."""
+        queued = self._queues.busy_hosts() if self._queues is not None else set()
+        return queued | set(self._direct_active)
+
+    def _release_device(self, host: str) -> None:
+        """``host`` stopped being the active output: drop its Cast connection now."""
+        self._direct_active.discard(host)
+        try:
+            from harmony.playback import chromecast
+
+            chromecast.release(host)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.debug("releasing %s failed: %s", host, exc)
 
     def _device_queues(self) -> Any:
         if self._queues is None:
@@ -2396,7 +2449,7 @@ class Engine:
                 return self._caster().control(host, "stop", None, kind=kind, device_info=info)
 
             self._queues = DeviceQueues(play, lambda h: self.device_status(h), stop,
-                                        async_start=True)
+                                        async_start=True, on_inactive=self._release_device)
         return self._queues
 
     def _library_for_peer(self, tracks: list[Any], via: str) -> list[Any]:
@@ -2478,6 +2531,8 @@ class Engine:
         if via:
             return self._peer_call(via, "GET", f"/api/devices/{host}/status", timeout=6)
         kind, info = self._device_kind(host)
+        if kind == "cast" and host not in self._active_hosts():
+            connect = False  # a Cast device that isn't the active output is never contacted
         return self._caster().status(host, kind=kind, device_info=info, connect=connect)
 
     # -- inter-instance audio routing --------------------------------------

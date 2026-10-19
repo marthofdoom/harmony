@@ -218,7 +218,7 @@ class DevicesPage(Gtk.Box):
         outer.append(transport)
 
         self.refresh_button = Gtk.Button(label="Refresh", halign=Gtk.Align.START)
-        self.refresh_button.connect("clicked", lambda *_a: self._refresh_status())
+        self.refresh_button.connect("clicked", lambda *_a: self._refresh_status(explicit=True))
         outer.append(self.refresh_button)
 
         self._set_controls_sensitive(False)
@@ -242,7 +242,8 @@ class DevicesPage(Gtk.Box):
             button = Gtk.Button(icon_name="view-pin-symbolic", valign=Gtk.Align.CENTER,
                                 tooltip_text="Save this device")
             button.connect("clicked", lambda *_a, i=info: self.state.add_device(
-                i.host, i.name, kind=getattr(i, "kind", "wiim")))
+                i.host, i.name, kind=getattr(i, "kind", "wiim"),
+                uuid=(getattr(i, "raw", None) or {}).get("uuid")))
         button.add_css_class("flat")
         row.add_suffix(button)
         return row
@@ -448,7 +449,14 @@ class DevicesPage(Gtk.Box):
         run_async(work, done, error)
         return GLib.SOURCE_CONTINUE
 
-    def _refresh_status(self) -> None:
+    @staticmethod
+    def _is_cast(device: Any) -> bool:
+        return getattr(device, "kind", None) == "cast" or type(device).__name__ == "ChromecastDevice"
+
+    def _refresh_status(self, explicit: bool = False) -> None:
+        """Read the selected device. A Cast device is only contacted by the
+        explicit Refresh button (and then released again unless it is the active
+        output) — merely selecting it never connects."""
         host = self._selected_host
         if host is None:
             return
@@ -459,8 +467,18 @@ class DevicesPage(Gtk.Box):
         # as a freeze rather than as work in progress.
         self.state_row.set_subtitle("Contacting device…")
 
+        cast = self._is_cast(device)
+
         def work() -> tuple[Any, Any]:
-            return device.info, device.status()
+            if not cast:
+                return device.info, device.status()
+            try:
+                return device.info, device.status(connect=explicit)
+            finally:
+                if explicit:
+                    from harmony.playback import chromecast
+
+                    chromecast.release(host)
 
         def done(result: tuple[Any, Any]) -> None:
             self.refresh_button.set_sensitive(True)
@@ -468,6 +486,8 @@ class DevicesPage(Gtk.Box):
                 return  # user picked a different device while this was in flight
             info, status = result
             self._apply_status(status)
+            if cast and (getattr(status, "raw", None) or {}).get("connected") is False:
+                self.state_row.set_subtitle("Not connected — play to it to connect")
             if info.name:
                 self.state.set_device_name(host, info.name)
 
@@ -495,9 +515,17 @@ class DevicesPage(Gtk.Box):
         self._set_controls_sensitive(False)
         self.state_row.set_subtitle("Contacting device…")
 
+        cast = self._is_cast(device)
+
         def work() -> Any:
-            action(device)
-            return device.status()
+            try:
+                action(device)
+                return device.status(connect=False) if cast else device.status()
+            finally:
+                if cast:  # an explicit command, not a standing connection
+                    from harmony.playback import chromecast
+
+                    chromecast.release(host)
 
         def done(status: Any) -> None:
             if self._selected_host != host:

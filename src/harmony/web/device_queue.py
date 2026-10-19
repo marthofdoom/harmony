@@ -28,6 +28,9 @@ POLL_S = 2.0
 # few seconds; ignore end-detection during that window (mirrors the desktop).
 SETTLE_S = 6.0
 END_EPSILON_S = 2
+# Consecutive tracks that fail to start before the queue gives up (each try is a
+# real connection attempt to the device).
+MAX_START_FAILURES = 3
 
 
 def _playable(tracks: Any) -> list[dict[str, Any]]:
@@ -86,8 +89,12 @@ class DeviceQueues:
     def __init__(self, play: Callable[[str, dict[str, Any]], Any],
                  status: Callable[[str], dict[str, Any]],
                  stop: Callable[[str], Any] | None = None,
-                 async_start: bool = False) -> None:
+                 async_start: bool = False,
+                 on_inactive: Callable[[str], Any] | None = None) -> None:
         self._play = play
+        # Called the moment a host's queue stops running (stop, finished, error
+        # halt): the engine drops its device connection there.
+        self._on_inactive = on_inactive
         self._status = status
         self._stop = stop
         # Start tracks on a worker so an HTTP op returns at once (the snapshot
@@ -108,6 +115,19 @@ class DeviceQueues:
             dq = self._queues.get(host)
             if dq:
                 dq.halt()
+
+    def _inactive(self, host: str) -> None:
+        if self._on_inactive is None:
+            return
+        try:
+            self._on_inactive(host)
+        except Exception as exc:  # noqa: BLE001 - best effort
+            log.debug("queue: releasing %s failed: %s", host, exc)
+
+    def busy_hosts(self) -> set[str]:
+        """Hosts whose queue is running (the cast idle reaper leaves these alone)."""
+        with self._lock:
+            return {h for h, dq in self._queues.items() if dq.playing}
 
     def note_control(self, host: str, action: str, level: int | None = None) -> None:
         """Reflect pause/resume/volume in the snapshot now, not at the next poll."""
@@ -202,6 +222,8 @@ class DeviceQueues:
             else:
                 raise ValueError(f"unknown queue op {name!r}")
         if start is not None:
+            with self._lock:
+                dq.failures = 0  # a user action starts a fresh run of attempts
             if self._async_start:
                 with self._lock:  # show it as starting right away
                     dq.q.jump(start)
@@ -211,7 +233,9 @@ class DeviceQueues:
                                  name=f"harmony-queue-start-{host}").start()
             else:
                 self._start_track(host, start)
-        elif stop_device and self._stop is not None:
+        elif not dq.playing:
+            self._inactive(host)  # e.g. a stop/remove/next-past-end
+        if start is None and stop_device and self._stop is not None:
             try:
                 self._stop(host)
             except Exception as exc:  # noqa: BLE001 - the queue is halted either way
@@ -248,9 +272,18 @@ class DeviceQueues:
                 dq.error = str(exc) or exc.__class__.__name__
                 dq.failures += 1
                 nxt = dq.q.following(manual=True)
-                if nxt is None or dq.failures >= len(dq.q.tracks):
+                if dq.failures >= MAX_START_FAILURES:
+                    dq.error = f"Couldn't start {dq.failures} tracks in a row on {host} — stopped"
+                    dq.halt()
+                    stop = True
+                elif nxt is None:
                     dq.halt()  # nothing left that plays — don't spin
-                    return
+                    stop = True
+                else:
+                    stop = False
+            if stop:
+                self._inactive(host)
+                return
             self._start_track(host, nxt)
             return
         with self._lock:
@@ -267,6 +300,7 @@ class DeviceQueues:
                     self._stop(host)
                 except Exception as exc:  # noqa: BLE001 - best effort
                     log.debug("queue: late stop on %s failed: %s", host, exc)
+            self._inactive(host)
             return
         self._ensure_poller(host)
 
@@ -296,6 +330,12 @@ class DeviceQueues:
             nxt = self.after_status(host, st)
             if nxt is not None:
                 self._start_track(host, nxt)
+            else:
+                with self._lock:
+                    dq = self._queues.get(host)
+                    over = dq is None or not dq.playing
+                if over:
+                    self._inactive(host)  # finished / stopped on the device itself
 
     def after_status(self, host: str, st: dict[str, Any]) -> int | None:
         """Record a status reading; return the index to start if the track ended.

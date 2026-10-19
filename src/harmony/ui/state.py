@@ -523,6 +523,7 @@ class AppState(GObject.Object):
                     name=entry.get("name") or host,
                     host=host,
                     kind=entry.get("kind", "wiim"),
+                    raw={"uuid": entry["uuid"]} if entry.get("uuid") else {},
                 )
             )
         return devices
@@ -562,16 +563,18 @@ class AppState(GObject.Object):
         except Exception:  # noqa: BLE001 - a caps read must never break the bar
             return None
 
-    def add_device(self, host: str, name: str | None = None, kind: str = "wiim") -> None:
+    def add_device(self, host: str, name: str | None = None, kind: str = "wiim",
+                   uuid: str | None = None) -> None:
         """Add a device by host, deduped by host. No-op if already known."""
         host = host.strip()
         if not host:
             return
         if any(entry.get("host") == host for entry in self.settings.known_devices):
             return
-        self.settings.known_devices.append(
-            {"host": host, "name": (name or host).strip() or host, "kind": kind or "wiim"}
-        )
+        entry = {"host": host, "name": (name or host).strip() or host, "kind": kind or "wiim"}
+        if uuid:
+            entry["uuid"] = uuid  # a Cast device's stable id: lets its address follow DHCP changes
+        self.settings.known_devices.append(entry)
         self.settings.save()
         self.emit("devices-changed")
 
@@ -581,7 +584,10 @@ class AppState(GObject.Object):
                 return entry
         for d in getattr(self, "_discovered", ()):  # discovered-but-unsaved
             if d.host == host:
-                return {"host": d.host, "name": d.name, "kind": d.kind}
+                entry = {"host": d.host, "name": d.name, "kind": d.kind}
+                if (d.raw or {}).get("uuid"):
+                    entry["uuid"] = d.raw["uuid"]
+                return entry
         return {}
 
     def is_saved_device(self, host: str) -> bool:
@@ -593,13 +599,28 @@ class AppState(GObject.Object):
         playback pickers without a manual add — mirroring the web Devices tab.
         Not persisted; ``add_device`` is how the user pins one."""
         self._discovered = list(infos)
+        # A saved Cast device whose uuid shows up at a new address follows it
+        # (passive discovery is the only thing that ever changes a saved address).
+        from harmony.playback.known import reconcile_known
+
+        seen = [{"host": d.host, "uuid": (getattr(d, "raw", None) or {}).get("uuid")} for d in infos]
+        if reconcile_known(self.settings.known_devices, seen):
+            self.settings.save()
         self.emit("devices-changed")
 
     def all_devices(self) -> list[Any]:
         """Saved devices plus the latest auto-discovered ones (deduped by host)."""
         known = self.known_devices()
         seen = {d.host for d in known}
-        extra = [d for d in getattr(self, "_discovered", ()) if d.host not in seen]
+        uuids = {d.raw["uuid"] for d in known if d.raw.get("uuid")}
+        extra = []
+        for d in getattr(self, "_discovered", ()):
+            uid = (getattr(d, "raw", None) or {}).get("uuid")
+            if d.host in seen or (uid and uid in uuids):
+                continue  # already saved (maybe at an older address) or listed
+            if uid:
+                uuids.add(uid)
+            extra.append(d)
         return [*known, *extra]
 
     def remove_device(self, host: str) -> None:
@@ -643,7 +664,8 @@ class AppState(GObject.Object):
             from harmony.playback import ChromecastDevice
             from harmony.playback.base import DeviceInfo
 
-            info = DeviceInfo(id=host, name=entry.get("name") or host, host=host, kind="cast")
+            info = DeviceInfo(id=host, name=entry.get("name") or host, host=host, kind="cast",
+                              raw={"uuid": entry["uuid"]} if entry.get("uuid") else {})
             return ChromecastDevice(host, info=info)
 
         from harmony.playback import device_from_host
