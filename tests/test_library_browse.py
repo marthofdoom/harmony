@@ -162,3 +162,20 @@ def test_queue_context_travels_with_a_load_and_into_device_snapshots(monkeypatch
                                       "context": {"kind": "genre", "title": "Metal"}})
     assert snap["context"] == {"kind": "genre", "title": "Metal"}
     assert snap["stream"]["quality"]["tier"] == "hires" and snap["stream"]["source"]["instance"] == "server"
+
+
+@pytest.mark.parametrize("order", ["title", "artist", "album", "year", "genre", "duration", "recent", "quality"])
+def test_every_song_sort_works_both_ways(lib: LibraryIndex, order: str) -> None:
+    """Descending used to split the clause inside COALESCE( (a SQL error for
+    Quality) and flip the null-sink instead of the key for Year/Time."""
+    up = [r["id"] for r in lib.songs(order=order)[0]]
+    down = [r["id"] for r in lib.songs(order=order, desc=True)[0]]
+    assert sorted(up) == sorted(down) and len(up) == 3
+
+
+def test_descending_reverses_the_key_not_the_nulls(lib: LibraryIndex) -> None:
+    rates = [r["sample_rate"] for r in lib.songs(order="quality")[0]]
+    assert rates == sorted(rates, reverse=True)          # best first by default
+    assert [r["sample_rate"] for r in lib.songs(order="quality", desc=True)[0]] == sorted(rates)
+    titles = [r["title"] for r in lib.songs(order="title", desc=True)[0]]
+    assert titles == ["Wish", "Nemo", "Hunter"]

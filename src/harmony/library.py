@@ -835,19 +835,23 @@ class LibraryIndex:
                 "GROUP BY genre COLLATE NOCASE ORDER BY name COLLATE NOCASE").fetchall()
         return [_row_dict(r) for r in rows]
 
-    #: Song-list sort orders (the iTunes Songs view's column sorts).
-    _SONG_ORDERS = {
-        "title": "title COLLATE NOCASE",
-        "artist": "artist COLLATE NOCASE, album COLLATE NOCASE, "
-                  "COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
-        "album": "album COLLATE NOCASE, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
-        "year": "year IS NULL, year, album COLLATE NOCASE, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
-        "genre": "genre IS NULL, genre COLLATE NOCASE, artist COLLATE NOCASE, album COLLATE NOCASE",
-        "duration": "duration_s IS NULL, duration_s",
-        "recent": "added_at DESC, album_id, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
-        "quality": "COALESCE(bit_depth, 0) DESC, COALESCE(sample_rate, 0) DESC, "
-                   "COALESCE(bitrate, 0) DESC, title COLLATE NOCASE",
+    _TRACK_TIE = "album COLLATE NOCASE, COALESCE(disc_no, 1), COALESCE(track_no, 9999)"
+    #: Songs-view column sorts: (primary key expression, null-sink expression or "",
+    #: tie-breakers). Descending flips only the primary key — untagged rows still
+    #: sink to the end and ties keep album/track order.
+    _SONG_ORDERS: dict[str, tuple[str, str, str]] = {
+        "title": ("title COLLATE NOCASE", "", "artist COLLATE NOCASE"),
+        "artist": ("artist COLLATE NOCASE", "", _TRACK_TIE),
+        "album": ("album COLLATE NOCASE", "", "COALESCE(disc_no, 1), COALESCE(track_no, 9999)"),
+        "year": ("year", "year IS NULL", _TRACK_TIE),
+        "genre": ("genre COLLATE NOCASE", "genre IS NULL", "artist COLLATE NOCASE, " + _TRACK_TIE),
+        "duration": ("duration_s", "duration_s IS NULL", "title COLLATE NOCASE"),
+        "recent": ("added_at", "", _TRACK_TIE),
+        "quality": ("COALESCE(bit_depth, 0) * 1000000 + COALESCE(sample_rate, 0) * 10 "
+                    "+ COALESCE(bitrate, 0) / 1000.0", "", "title COLLATE NOCASE"),
     }
+    #: Sorts whose natural direction is high→low (newest / best first).
+    _SONG_DESC_FIRST = {"recent", "quality"}
 
     def songs(self, *, order: str = "artist", desc: bool = False, limit: int = 200,
               offset: int = 0, genre: str | None = None, artist_id: str | None = None,
@@ -864,12 +868,9 @@ class LibraryIndex:
             conds.append("album_id = ?")
             args.append(album_id)
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
-        order_sql = self._SONG_ORDERS.get(order, self._SONG_ORDERS["artist"])
-        if desc:
-            # Flip the primary key only; tie-breakers stay natural.
-            first, _, rest = order_sql.partition(",")
-            first = first.replace(" DESC", "") if " DESC" in first else f"{first} DESC"
-            order_sql = first + ("," + rest if rest else "")
+        primary, nulls, tie = self._SONG_ORDERS.get(order, self._SONG_ORDERS["artist"])
+        descending = desc != (order in self._SONG_DESC_FIRST)
+        order_sql = ", ".join(p for p in (nulls, f"{primary} {'DESC' if descending else 'ASC'}", tie) if p)
         with self._lock:
             total = self._conn.execute(f"SELECT COUNT(*) FROM tracks {where}", args).fetchone()[0]
             rows = self._conn.execute(
