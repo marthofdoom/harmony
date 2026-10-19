@@ -161,3 +161,40 @@ def test_pause_refreshes_a_missing_session_first(fake_cast: _FakeCast) -> None:
     fake_cast.media_controller = _SessionlessMediaController()
     ChromecastDevice("192.168.1.50").pause()
     assert fake_cast.media_controller.calls[:2] == ["update_status", "pause"]
+
+
+def test_after_stop_idle_polls_never_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stop must disconnect and STAY disconnected: background status polls
+    (every client polls the selected output) used to reopen the connection."""
+    connects: list[str] = []
+    cast = _FakeCast()
+    cast.app_id = cc._MEDIA_RECEIVER_APP_ID
+    cast.quit_app = lambda timeout=10: None
+
+    def connect(host, *a, **k):
+        connects.append(host)
+        cc._CONNECTIONS[host] = cast
+        return cast
+
+    cc._CONNECTIONS.clear()
+    monkeypatch.setattr(cc, "_connect", connect)
+    dev = ChromecastDevice("192.168.1.50")
+    dev.stop()
+    assert "192.168.1.50" not in cc._CONNECTIONS          # disconnected
+    n = len(connects)
+    for _ in range(5):
+        st = dev.status(connect=False)
+        assert st.state == "stopped" and st.raw == {"connected": False}
+    assert len(connects) == n                              # ...and stays disconnected
+    dev.status()                                           # an explicit refresh may connect
+    assert len(connects) == n + 1
+
+
+def test_engine_idle_queue_poll_is_passive(monkeypatch: pytest.MonkeyPatch) -> None:
+    from harmony.web.api import Engine
+
+    e = Engine()
+    seen: list[bool] = []
+    monkeypatch.setattr(e, "device_status", lambda host, via=None, connect=True: seen.append(connect) or {})
+    e.device_queue("192.168.1.50")
+    assert seen == [False]

@@ -125,8 +125,12 @@ class CastController:
             raise ValueError(f"unknown action {action}")
         return {"ok": True}
 
-    def status(self, host: str, kind: str = "wiim", device_info: dict[str, Any] | None = None) -> dict[str, Any]:
-        st = self._device(host, kind, device_info).status()
+    def status(self, host: str, kind: str = "wiim", device_info: dict[str, Any] | None = None,
+               *, connect: bool = True) -> dict[str, Any]:
+        device = self._device(host, kind, device_info)
+        # A Chromecast keeps a session open while connected; an idle poll must
+        # not (re)open one — Harmony stays disconnected after Stop.
+        st = device.status(connect=connect) if kind == "cast" else device.status()
         return {
             "state": getattr(st, "state", None),
             "position_s": getattr(st, "position_s", None),

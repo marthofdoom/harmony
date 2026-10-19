@@ -48,10 +48,12 @@
   <releases>
     <release version="1.0.9" date="2026-10-19">
       <description>
-        <p>Stopping now really stops casting to a Chromecast or Google TV.
-        Before, Stop could leave the cast playing, especially when it was
+        <p>Stopping now really stops casting to a Chromecast or Google TV —
+        and Harmony disconnects from it and stays disconnected until you
+        play to it again. Before, Stop could leave the cast playing (when
         pressed from a different device than the one that started it, or
-        while the track was still starting.</p>
+        while a track was still starting), and Harmony kept reconnecting to
+        an idle cast device in the background.</p>
       </description>
     </release>
     <release version="1.0.8" date="2026-10-19">

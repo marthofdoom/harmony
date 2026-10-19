@@ -2325,7 +2325,8 @@ class Engine:
             cached = self._idle_status.get(host)
             if cached is None or now - cached[0] > 5:
                 try:
-                    st = self.device_status(host)
+                    # Passive: an idle Chromecast isn't reconnected just to be polled.
+                    st = self.device_status(host, connect=False)
                 except Exception as exc:  # noqa: BLE001 - unreachable is just "no status"
                     log.debug("device %s status unavailable: %s", host, exc)
                     st = {}
@@ -2355,11 +2356,12 @@ class Engine:
             return snap
         return self._device_queues().op(host, op, body)
 
-    def device_status(self, host: str, via: str | None = None) -> dict[str, Any]:
+    def device_status(self, host: str, via: str | None = None, *,
+                      connect: bool = True) -> dict[str, Any]:
         if via:
             return self._peer_call(via, "GET", f"/api/devices/{host}/status", timeout=6)
         kind, info = self._device_kind(host)
-        return self._caster().status(host, kind=kind, device_info=info)
+        return self._caster().status(host, kind=kind, device_info=info, connect=connect)
 
     # -- inter-instance audio routing --------------------------------------
 

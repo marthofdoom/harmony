@@ -430,6 +430,10 @@ class DevicesPage(Gtk.Box):
         self._poll_in_flight = True
 
         def work() -> Any:
+            # The periodic poll is passive for a Chromecast: it never reopens a
+            # connection Stop closed (Refresh still connects on purpose).
+            if getattr(device, "kind", None) == "cast" or type(device).__name__ == "ChromecastDevice":
+                return device.status(connect=False)
             return device.status()
 
         def done(status: Any) -> None:

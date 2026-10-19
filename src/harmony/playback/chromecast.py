@@ -187,7 +187,17 @@ class ChromecastDevice(PlaybackDevice):
             _forget(self._host)
             raise ProviderError(f"Chromecast play failed: {exc}") from exc
 
-    def status(self) -> PlaybackStatus:
+    def status(self, *, connect: bool = True) -> PlaybackStatus:
+        """The device's state. ``connect=False`` never opens a connection: a
+        cast Harmony isn't connected to (after Stop, or never used) reports
+        "stopped" instead, so background polling can't reconnect to it."""
+        if not connect:
+            with _CONN_LOCK:
+                connected = self._host in _CONNECTIONS
+            if not connected:
+                return PlaybackStatus(state="stopped", volume=None, muted=False,
+                                      position_s=None, duration_s=None,
+                                      raw={"connected": False})
         try:
             cast = self._cast()
             # pychromecast only refreshes media_controller.status (and its
