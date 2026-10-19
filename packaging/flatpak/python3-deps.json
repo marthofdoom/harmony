@@ -303,6 +303,20 @@
                     "sha256": "f5ea52b1db0edc3019ec72c9f5354c7e77c2564ecd44f809a6d2f4f518a02e67"
                 }
             ]
+        },
+        {
+            "name": "python3-mutagen",
+            "buildsystem": "simple",
+            "build-commands": [
+                "pip3 install --verbose --exists-action=i --no-index --find-links=\"file://${PWD}\" --prefix=${FLATPAK_DEST} \"mutagen\" --no-build-isolation"
+            ],
+            "sources": [
+                {
+                    "type": "file",
+                    "url": "https://files.pythonhosted.org/packages/47/d8/a29e4e3991765e7ce4ed1f7e4074fe1ba9da03e0048639734de60f9cadb9/mutagen-1.48.1-py3-none-any.whl",
+                    "sha256": "4f077fe87d3fc7fba259aa63d8c026b18382ca6a42ef37c61e16f1b1b5b82fe7"
+                }
+            ]
         }
     ]
 }
