@@ -8,6 +8,7 @@ Shared by the Now Playing bar and the Now Playing page so both say the same thin
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -33,11 +34,19 @@ def playing_from_text(source: dict[str, Any] | None) -> str:
     return f"Playing from {name}" if name else ""
 
 
+def search_query(context: dict[str, Any] | None) -> str:
+    """The query of a search context. Older versions stored the label
+    ("Search “q”" / "Search: q") as the title; strip that."""
+    raw = str((context or {}).get("id") or (context or {}).get("title") or "").strip()
+    m = re.fullmatch(r"Search\s*[“\"](.*)[”\"]", raw) or re.fullmatch(r"Search:\s*(.*)", raw)
+    return (m.group(1) if m else raw).strip()
+
+
 def context_text(context: dict[str, Any] | None) -> str:
     """The album/playlist/artist/list the queue came from, as plain link text."""
     if context and context.get("kind") == "search":
-        title = context.get("title") or ""
-        return f"Search “{title}”" if title else "Search"
+        q = search_query(context)
+        return f"Search “{q}”" if q else "Search"
     return ((context or {}).get("title") or "").strip()
 
 

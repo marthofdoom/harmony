@@ -37,6 +37,8 @@ log = logging.getLogger(__name__)
 
 #: How long a peer's "has a library" probe is trusted.
 _PROBE_TTL_S = 60.0
+#: Rows each library contributes to a merged (multi-library) browse page.
+_MERGE_CAP = 5000
 #: Per-request budget for a peer; a slow/absent peer just contributes nothing.
 _PEER_TIMEOUT_S = 4.0
 
@@ -135,9 +137,15 @@ class FederatedLibraryProvider(MusicProvider):
         return [{"peer": peer, "name": known[peer], "stats": st["stats"]}
                 for peer, st in zip(known, statuses, strict=True) if st]
 
-    def _fan_out(self, fn: Callable[[str], Any]) -> list[tuple[str, Any]]:
-        """Run ``fn(peer)`` on every library peer in parallel; failures drop out."""
-        peers = [p["peer"] for p in self.library_peers()]
+    def _library_peer_ids(self) -> list[str]:
+        """``host:port`` of every peer currently sharing a library."""
+        return [p["peer"] for p in self.library_peers()]
+
+    def _fan_out(self, fn: Callable[[str], Any],
+                 peers: list[str] | None = None) -> list[tuple[str, Any]]:
+        """Run ``fn(peer)`` on every library peer (or ``peers``) in parallel;
+        failures drop out."""
+        peers = self._library_peer_ids() if peers is None else peers
         if not peers:
             return []
 
@@ -287,13 +295,32 @@ class FederatedLibraryProvider(MusicProvider):
         exactly, so paging is right across peers. ``total`` is the true count
         (own + every peer's). Peers too old for the view endpoint contribute
         what they can and are listed in ``outdated_peers``."""
-        want = offset + limit
         raw_artist, artist_peer = split_id(artist_id) if artist_id else (None, None)
-        params = {"view": view, "order": order, "desc": int(desc), "limit": want, "offset": 0,
-                  **({"genre": genre} if genre else {}), **({"artist": raw_artist} if raw_artist else {})}
         own_ok = self.own is not None and artist_peer is None
         peers_ok = artist_id is None or artist_peer is not None
+        # One library involved (the usual case — a client browsing its server's
+        # library, or a server browsing its own): page it directly with SQL
+        # OFFSET, exact and uncapped. Only several libraries need the merge,
+        # where each contributes its first ``offset + limit`` rows (capped).
+        lib_peers = self._library_peer_ids() if peers_ok else []
+        if artist_peer is not None:
+            lib_peers = [p for p in lib_peers if p == artist_peer]
+        own_has = own_ok and bool(self.own.index.stats()["tracks"])
+        single = (own_has and not lib_peers) or (not own_has and len(lib_peers) == 1)
+        if single:
+            src_offset, src_limit, skip = offset, limit, 0
+        else:
+            src_offset, src_limit, skip = 0, min(offset + limit, _MERGE_CAP), offset
+        want = src_limit
+        params = {"view": view, "order": order, "desc": int(desc), "limit": src_limit,
+                  "offset": src_offset,
+                  **({"genre": genre} if genre else {}), **({"artist": raw_artist} if raw_artist else {})}
         outdated: list[str] = []
+
+        def reachable(total: int) -> int:
+            # A merged view can only reach the first _MERGE_CAP rows; say so,
+            # so clients stop asking instead of paging into empty pages.
+            return total if single else min(total, _MERGE_CAP)
 
         def ask(peer: str) -> dict[str, Any]:
             try:
@@ -302,7 +329,8 @@ class FederatedLibraryProvider(MusicProvider):
                 pass
             # An older peer: only its plain browse (albums/artists) is available.
             out: dict[str, Any] = {"_outdated": True}
-            if view in ("albums", "artists") and not genre and not raw_artist:
+            # (Its browse can't page: it only fills the first page.)
+            if view in ("albums", "artists") and not genre and not raw_artist and not src_offset:
                 try:
                     rows = self._get(peer, "/api/library/own/browse",
                                      {"order": order, "limit": min(500, want)}).get(view) or []
@@ -316,7 +344,7 @@ class FederatedLibraryProvider(MusicProvider):
             if not peers_ok:
                 return []
             pages = []
-            for peer, r in self._fan_out(ask):
+            for peer, r in self._fan_out(ask, lib_peers):
                 if artist_peer is not None and peer != artist_peer:
                     continue
                 if r.get("_outdated"):
@@ -332,7 +360,7 @@ class FederatedLibraryProvider(MusicProvider):
                 if r.get("_resort"):
                     rows.sort(key=key)
                 lists.append(rows)
-            return list(heapq.merge(*lists, key=key))[offset:offset + limit]
+            return list(heapq.merge(*lists, key=key))[skip:skip + limit]
 
         def done(page: dict[str, Any]) -> dict[str, Any]:
             return {**page, **({"outdated_peers": outdated} if outdated else {})}
@@ -352,7 +380,7 @@ class FederatedLibraryProvider(MusicProvider):
             return done({"view": view, "genres": items[offset:offset + limit], "total": len(items)})
         if view == "artists":
             own_rows = [{**a, "service": "local"} for a in self.own.list_artists(
-                limit=want, desc=desc, genre=genre)] if own_ok else []
+                limit=want, offset=src_offset, desc=desc, genre=genre)] if own_ok else []
             total = self.own.index.count_artists(genre=genre) if own_ok else 0
             pages = peer_pages()
             total += sum(int(r.get("total") or 0) for _p, r in pages)
@@ -361,23 +389,24 @@ class FederatedLibraryProvider(MusicProvider):
                                            "artwork_url": self._art(peer, a.get("artwork_url")),
                                            "instance": self._known().get(peer, peer)},
                           _artist_key(desc))
-            return done({"view": view, "artists": page, "total": total})
+            return done({"view": view, "artists": page, "total": reachable(total)})
         if view == "albums":
-            own_rows = self.own.list_albums(order=order, desc=desc, limit=want, genre=genre,
-                                            artist_id=raw_artist) if own_ok else []
+            own_rows = self.own.list_albums(order=order, desc=desc, limit=want, offset=src_offset,
+                                            genre=genre, artist_id=raw_artist) if own_ok else []
             total = self.own.index.count_albums(artist_id=raw_artist, genre=genre) if own_ok else 0
             pages = peer_pages()
             total += sum(int(r.get("total") or 0) for _p, r in pages)
-            return done({"view": view, "total": total, "albums": merged(
+            return done({"view": view, "total": reachable(total), "albums": merged(
                 own_rows, pages, "albums", self._album, _album_key(order, desc))})
         if view == "songs":
             own_rows, total = [], 0
             if own_ok:
-                own_rows, total = self.own.list_songs(order=order, desc=desc, limit=want, offset=0,
-                                                      genre=genre, artist_id=raw_artist)
+                own_rows, total = self.own.list_songs(order=order, desc=desc, limit=want,
+                                                      offset=src_offset, genre=genre,
+                                                      artist_id=raw_artist)
             pages = peer_pages()
             total += sum(int(r.get("total") or 0) for _p, r in pages)
-            return done({"view": view, "total": total, "songs": merged(
+            return done({"view": view, "total": reachable(total), "songs": merged(
                 own_rows, pages, "songs", self._track, _song_key(order, desc))})
         raise ValueError(f"unknown library view {view!r}")
 

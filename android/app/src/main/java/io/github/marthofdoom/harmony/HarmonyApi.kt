@@ -194,6 +194,8 @@ data class DeviceSnapshot(
     val durationS: Double?,
     val volume: Int?,
     val context: PlayContext? = null,
+    /** False when the server is too old to report a context at all. */
+    val hasContextKey: Boolean = true,
     val stream: StreamInfo? = null,
 )
 
@@ -582,6 +584,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             durationS = optDouble("duration_s"),
             volume = optDouble("volume")?.toInt(),
             context = PlayContext.fromJson(o.optJSONObject("context")),
+            hasContextKey = o.has("context"),
             stream = StreamInfo.fromJson(o.optJSONObject("stream")),
         )
     }

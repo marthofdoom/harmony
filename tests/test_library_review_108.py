@@ -117,7 +117,8 @@ def fed(tmp_path, idx):
 
     prov = FederatedLibraryProvider(own, lambda: [{"host": "h", "port": 1, "name": "Peer"}], lambda: None)
     prov._get = lambda peer_id, path, params=None, timeout=0: serve(path, params)
-    prov._fan_out = lambda fn: [("h:1", fn("h:1"))]
+    prov._library_peer_ids = lambda: ["h:1"]
+    prov._fan_out = lambda fn, peers=None: [(p, fn(p)) for p in (["h:1"] if peers is None else peers)]
     yield SimpleNamespace(prov=prov, union=LocalLibraryProvider(union, ArtSigner(b"k")),
                           own=idx, peer_idx=peer_idx)
     peer_idx.close()
@@ -257,3 +258,52 @@ def test_stream_info_prefers_the_mesh_instance_name():
     import socket
     assert Engine._stream_info(fake, "local", "t1", SimpleNamespace(quality=None))["source"]["instance"] \
         == socket.gethostname()
+
+
+def test_interrupted_upgrade_rescan_is_redone_next_launch(tmp_path):
+    _v107_db(tmp_path / "old.db")
+    LibraryIndex(tmp_path / "old.db").close()        # upgraded, then "crashed" before rescanning
+    assert LibraryIndex(tmp_path / "old.db").migrated is True
+
+
+def test_rescan_reporting_an_error_keeps_the_flag(tmp_path):
+    _v107_db(tmp_path / "old.db")
+    idx = LibraryIndex(tmp_path / "old.db")
+    fake = SimpleNamespace(library_scan=lambda **kw: {"ok": True, "scan": {"error": "disk gone"}})
+    Engine._rescan_after_migration(fake, idx)
+    assert idx.migrated is True
+    idx.close()
+
+
+def test_a_single_peer_library_pages_directly_with_no_cap():
+    """A desktop browsing its server's library (no library of its own) must reach
+    every row: the page is asked of the peer with the real offset, uncapped."""
+    from harmony.library_federation import FederatedLibraryProvider
+
+    seen = []
+
+    def get(peer, path, params=None, timeout=0):
+        seen.append(dict(params or {}))
+        return {"songs": [], "total": 30_000}
+
+    prov = FederatedLibraryProvider(None, lambda: [{"host": "srv", "port": 8080, "name": "srv"}],
+                                    lambda: None)
+    prov._library_peer_ids = lambda: ["srv:8080"]
+    prov._get = get
+    page = prov.browse_view("songs", order="title", limit=200, offset=12_000)
+    assert seen[-1]["offset"] == 12_000 and seen[-1]["limit"] == 200
+    assert page["total"] == 30_000
+
+
+def test_a_merged_view_reports_only_what_it_can_reach():
+    from harmony.library_federation import _MERGE_CAP, FederatedLibraryProvider
+
+    def get(peer, path, params=None, timeout=0):
+        assert params["offset"] == 0 and params["limit"] <= _MERGE_CAP
+        return {"songs": [], "total": 20_000}
+
+    prov = FederatedLibraryProvider(None, lambda: [], lambda: None)
+    prov._library_peer_ids = lambda: ["a:1", "b:1"]
+    prov._get = get
+    page = prov.browse_view("songs", order="title", limit=200, offset=9_000)
+    assert page["total"] == _MERGE_CAP and page["songs"] == []

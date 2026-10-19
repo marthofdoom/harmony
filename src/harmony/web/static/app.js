@@ -197,7 +197,14 @@ const locationBadge = (t) => `<span class="badge${t.library_id || t.service === 
 // active queue (persisted; sent to devices in queue/load).
 const CTX_KIND = { album: "Album", playlist: "Playlist", artist: "Artist", genre: "Genre", track: "Track" };
 // The collection the queue came from, as a small clickable link label.
-const collText = (c) => (c && c.title ? (c.kind === "search" ? `Search “${c.title}”` : CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
+// A search context's query; older versions stored the label ("Search: q" /
+// "Search “q”") as the title.
+const searchQuery = (c) => {
+  const raw = String((c && (c.id || c.title)) || "").trim();
+  const m = raw.match(/^Search\s*[“"](.*)[”"]$/) || raw.match(/^Search:\s*(.*)$/);
+  return (m ? m[1] : raw).trim();
+};
+const collText = (c) => (c && c.title ? (c.kind === "search" ? `Search “${searchQuery(c)}”` : CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
 function openContext(c) {
   if (!c) return;
   const clear = () => { if (location.hash) history.replaceState(null, "", location.pathname + location.search); };
@@ -210,7 +217,7 @@ function openContext(c) {
   } else if (c.kind === "genre") { libUI.view = "genres"; libUI.genre = c.id || c.title; libUI.genreMode = "songs"; goView("library"); }
   else if (c.kind === "songs") { libUI.view = "songs"; libUI.genre = c.id || null; goView("library"); }
   else if (c.kind === "search") {
-    const q = c.id || String(c.title || "").replace(/^Search:\s*/, "");  // canonical: id == title == query
+    const q = searchQuery(c);  // canonical: id == title == query
     $("search-input").value = q; clear(); doSmartSearch(q);
   }
 }

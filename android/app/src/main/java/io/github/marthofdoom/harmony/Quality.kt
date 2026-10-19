@@ -139,6 +139,16 @@ fun PlayContext.linkLabel(): String = when (kind) {
     "artist" -> "Artist · $title"
     "genre" -> "Genre · $title"
     "songs" -> "Library songs"
-    "search" -> "Search “$title”"
+    "search" -> "Search “${searchQuery()}”"
     else -> title
+}
+
+
+/** A search context's query. Older versions stored the label ("Search: q" /
+ *  "Search “q”") as the title, so strip that. */
+fun PlayContext.searchQuery(): String {
+    val raw = (id ?: title).trim()
+    Regex("^Search\\s*[“\"](.*)[”\"]$").find(raw)?.let { return it.groupValues[1].trim() }
+    Regex("^Search:\\s*(.*)$").find(raw)?.let { return it.groupValues[1].trim() }
+    return raw
 }

@@ -153,3 +153,14 @@ class ClientReviewFixesTest {
         assertTrue(parseOutdatedPeers(JSONObject("{}")).isEmpty())
     }
 }
+
+class LegacySearchContextTest {
+    @org.junit.Test
+    fun legacySearchTitlesAreStripped() {
+        for (t in listOf("Search “nemo”", "Search: nemo", "nemo")) {
+            val c = PlayContext("search", t)
+            org.junit.Assert.assertEquals("nemo", c.searchQuery())
+            org.junit.Assert.assertEquals("Search “nemo”", c.linkLabel())
+        }
+    }
+}

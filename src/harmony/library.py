@@ -571,16 +571,15 @@ class LibraryIndex:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
-        #: True when opening this index added columns (an upgrade): the rows were
-        #: zeroed and need one full re-read. The engine clears it after scanning.
-        self.migrated = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
-            self._migrate()
+            added = self._migrate()
             self._conn.executescript(_SCHEMA)
+            if added:
+                self.set_meta("rescan_pending", "1")
             self._conn.execute("CREATE INDEX IF NOT EXISTS tracks_genre ON tracks(genre)")
             self._conn.commit()
 
@@ -588,12 +587,23 @@ class LibraryIndex:
     _ADDED_COLUMNS = (("genre", "TEXT"), ("codec", "TEXT"), ("sample_rate", "INTEGER"),
                       ("bit_depth", "INTEGER"), ("bitrate", "INTEGER"), ("channels", "INTEGER"))
 
-    def _migrate(self) -> None:
+    @property
+    def migrated(self) -> bool:
+        """True after an upgrade added columns, until one full re-read finishes.
+        Persisted, so a rescan interrupted by a crash or restart is redone."""
+        return self.get_meta("rescan_pending") == "1"
+
+    @migrated.setter
+    def migrated(self, pending: bool) -> None:
+        self.set_meta("rescan_pending", "1" if pending else "0")
+
+    def _migrate(self) -> bool:
         """Add new columns to an older index. Rows indexed before them get their
-        mtime zeroed so the next scan re-reads those files (genre + format)."""
+        mtime zeroed so the next scan re-reads those files (genre + format).
+        Returns whether anything was added."""
         cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tracks)")}
         if not cols:
-            return  # a fresh index: _SCHEMA creates the full table
+            return False  # a fresh index: _SCHEMA creates the full table
         added = False
         for name, kind in self._ADDED_COLUMNS:
             if name not in cols:
@@ -601,7 +611,7 @@ class LibraryIndex:
                 added = True
         if added:
             self._conn.execute("UPDATE tracks SET mtime = 0")
-            self.migrated = True
+        return added
 
     def close(self) -> None:
         with self._lock:

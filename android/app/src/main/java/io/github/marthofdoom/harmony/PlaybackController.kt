@@ -633,7 +633,10 @@ class PlaybackController private constructor(ctx: Context) {
         if (snap.playing && snap.tracks.isNotEmpty()) ownsDeviceQueue = true
         val adoptQueue = snap.tracks.isNotEmpty() && ownsDeviceQueue
         if (adoptQueue) {
-            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat, snap.context)
+            // An older server reports no context at all: keep ours rather than
+            // blanking the link; an explicit null (a new queue without one) clears it.
+            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat,
+                      if (snap.hasContextKey) snap.context else q.context)
         }
         if (!ownsDeviceQueue) {
             // Just the device's volume / idle state; keep our pending queue + position.

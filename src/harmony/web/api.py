@@ -1191,7 +1191,7 @@ class Engine:
     def _rescan_after_migration(self, index: Any) -> None:
         try:
             r = self.library_scan(wait=True)
-            if r.get("ok"):
+            if r.get("ok") and not (r.get("scan") or {}).get("error"):
                 index.migrated = False
         except Exception:  # noqa: BLE001
             log.exception("library: post-upgrade rescan failed")

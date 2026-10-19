@@ -632,10 +632,9 @@ class LibraryPage(Gtk.Box):
                 self._error_page = error_status_page(exc, title="Couldn't load the library")
                 self.stack.add_named(self._error_page, "error")
             else:
-                # Update the error page's description instead of creating a new one
-                error_widget = self._error_page
-                if hasattr(error_widget, "get_subtitle"):
-                    error_widget.set_subtitle(str(exc))
+                # Reuse the page; show this failure's message.
+                if isinstance(self._error_page, Adw.StatusPage):
+                    self._error_page.set_description(str(exc) or type(exc).__name__)
             self.stack.set_visible_child_name("error")
 
         run_async(work, done, failed)

@@ -650,7 +650,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             "songs" -> _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
                 lib = _state.value.lib.copy(section = LibSection.SONGS, focus = null))
             "playlist" -> c.id?.let { openPlaylistFromSearch(Playlist(svc, it, c.title, null, null)) }
-            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.id ?: c.title); smartSearch() }
+            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.searchQuery()); smartSearch() }
             "track" -> c.id?.let { openTrack(svc, it) }
         }
     }
