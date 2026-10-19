@@ -280,7 +280,10 @@ class Settings:
         if not path.exists():
             return cls._fresh()
         try:
-            raw = json.loads(path.read_text("utf-8"))
+            text = path.read_text("utf-8")
+            if not text.strip():
+                return cls._fresh()  # a blank file holds nothing: safe to (re)write
+            raw = json.loads(text)
             if not isinstance(raw, dict):
                 raise ValueError("not a JSON object")
         except (OSError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors

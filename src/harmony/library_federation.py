@@ -160,14 +160,19 @@ class FederatedLibraryProvider(MusicProvider):
     def _request(self, method: str, peer: str, path: str, *, timeout: float,
                  **kw: Any) -> Any:
         """One request to a peer's instance: its preferred address first, the
-        others on a connection error/timeout (an HTTP answer is final)."""
+        others only when it can't be reached at all (a connection error or
+        connect timeout). A read timeout means the server answered the
+        connection and is just slow — another address won't help and would cost
+        another full timeout — and an HTTP answer is final."""
         import requests
 
         last: Exception | None = None
         for addr in self._candidates(peer):
             try:
                 r = requests.request(method, _base(addr) + path, timeout=timeout, **kw)
-            except (requests.ConnectionError, requests.Timeout) as exc:
+            except requests.ReadTimeout:
+                raise
+            except requests.ConnectionError as exc:  # includes ConnectTimeout
                 last = exc
                 continue
             self._remember_good(peer, addr)

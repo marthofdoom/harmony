@@ -465,3 +465,37 @@ def test_unreadable_settings_file_is_never_overwritten(isolated, serve) -> None:
     isolated.write_text("", "utf-8")                       # an empty file holds nothing: saving is fine
     config_module.Settings.load().save()
     assert json.loads(isolated.read_text())["last_page"]
+
+
+def test_a_slow_peer_is_not_retried_on_its_other_addresses(monkeypatch):
+    """A read timeout means the server was reached; trying its other address
+    only doubles the wait (and re-sends the request)."""
+    import pytest
+    import requests
+
+    from harmony.library_federation import FederatedLibraryProvider
+
+    calls = []
+
+    def slow(method, url, **kw):
+        calls.append(url)
+        raise requests.ReadTimeout("slow")
+
+    monkeypatch.setattr(requests, "request", slow)
+    prov = FederatedLibraryProvider(None, lambda: [], lambda: None)
+    monkeypatch.setattr(prov, "_candidates", lambda peer: ["192.168.1.5:8080", "100.64.1.5:8080"])
+    with pytest.raises(requests.ReadTimeout):
+        prov._request("GET", "192.168.1.5:8080", "/x", timeout=1)
+    assert calls == ["http://192.168.1.5:8080/x"]
+
+
+def test_blank_settings_file_is_fresh_not_failed(tmp_path, monkeypatch):
+    import harmony.config as config
+
+    monkeypatch.setattr(config, "settings_path", lambda: tmp_path / "settings.json")
+    (tmp_path / "settings.json").write_text("  \n", "utf-8")
+    s = config.Settings.load()
+    assert not s._load_failed
+    s.last_page = "library"
+    s.save()
+    assert config.Settings.load().last_page == "library"
