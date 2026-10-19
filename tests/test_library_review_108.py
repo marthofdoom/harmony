@@ -252,6 +252,7 @@ def test_old_peer_falls_back_to_browse_and_is_reported(fed):
 def test_stream_info_prefers_the_mesh_instance_name():
     prov = SimpleNamespace(instance_name=lambda tid: None)
     fake = SimpleNamespace(_library_provider=lambda: prov, _mesh=SimpleNamespace(_name="harmony-den-8080"))
+    fake._source_for = lambda svc, iid: Engine._source_for(fake, svc, iid)
     out = Engine._stream_info(fake, "local", "t1", SimpleNamespace(quality=None))
     assert out["source"]["instance"] == "harmony-den-8080"
     fake._mesh = None

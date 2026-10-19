@@ -902,10 +902,15 @@ class Engine:
         elif tracks and tracks[0].artist_ids and tracks[0].artists:
             artist_ref = _artist_ref(service_value, tracks[0].artist_ids[0], tracks[0].artists[0])
 
+        if not album_dict.get("quality"):
+            from harmony.quality import best
+
+            album_dict["quality"] = best([t.quality for t in tracks])
         return {
             "album": album_dict,
             "artist_ref": artist_ref,
             "bio": None,
+            "source": self._source_for(service_value, album_id),
             "tracks": self._annotate_library([track_to_dict(t) for t in tracks]),
         }
 
@@ -1975,27 +1980,32 @@ class Engine:
     def _stream_info(self, service_value: str, track_id: str, source: Any,
                      asked: str | None = None) -> dict[str, Any]:
         """Where a resolved stream comes from + its quality, for "Playing from"."""
+
+        return {"quality": getattr(source, "quality", None),
+                "source": {**self._source_for(service_value, track_id),
+                           "from_library": service_value == "local" and asked not in (None, "local")}}
+
+    def _source_for(self, service_value: str, item_id: str) -> dict[str, Any]:
+        """``{service, label, instance, own}`` for a track/album id: the
+        service's name, and for the Library which instance holds it (a peer's
+        name for ``id@peer``, else this instance's mesh name)."""
         from harmony.models import Service
 
+        try:
+            label = Service(service_value).label
+        except ValueError:
+            label = service_value
         instance = None
         if service_value == "local":
             prov = self._library_provider()
-            instance = prov.instance_name(track_id) if hasattr(prov, "instance_name") else None
+            instance = prov.instance_name(item_id) if hasattr(prov, "instance_name") else None
             if instance is None:
                 import socket
 
                 mesh_name = getattr(self._mesh, "_name", None) if self._mesh is not None else None
                 instance = mesh_name or socket.gethostname()
-        try:
-            label = Service(service_value).label
-        except ValueError:
-            label = service_value
-        return {
-            "quality": getattr(source, "quality", None),
-            "source": {"service": service_value, "label": label, "instance": instance,
-                       "own": service_value == "local" and "@" not in track_id,
-                       "from_library": service_value == "local" and asked not in (None, "local")},
-        }
+        return {"service": service_value, "label": label, "instance": instance,
+                "own": service_value == "local" and "@" not in str(item_id)}
 
     # -- LAN mesh -----------------------------------------------------------
 

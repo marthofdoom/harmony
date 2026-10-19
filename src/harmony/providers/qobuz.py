@@ -24,6 +24,7 @@ from .. import config
 from ..config import CredentialStore, Settings, user_agent
 from ..errors import AuthError, NotSupportedError, ProviderError, RateLimitedError
 from ..models import Album, Artist, Playlist, SearchResults, Service, StreamSource, Track
+from ..quality import describe
 from .base import MusicProvider, _chunked
 
 log = logging.getLogger(__name__)
@@ -452,6 +453,10 @@ class QobuzProvider(MusicProvider):
             date=date or None,
             track_count=raw.get("tracks_count"),
             artwork_url=(raw.get("image") or {}).get("large"),
+            # The best format Qobuz streams this album in (its hi-res ceiling).
+            quality=describe("FLAC", bit_depth=raw.get("maximum_bit_depth"),
+                             sample_rate=raw.get("maximum_sampling_rate"))
+            if raw.get("maximum_bit_depth") else None,
             raw=raw,
         )
 
