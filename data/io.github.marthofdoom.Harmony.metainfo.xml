@@ -46,6 +46,20 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.11" date="2026-10-19">
+      <description>
+        <p>Harmony leaves your Chromecast and Google TV alone unless you're
+        playing to them. It connects when you play to one, lets go the
+        moment playback stops or you switch output, and never contacts an
+        idle device in the background. Before, it kept reconnecting to cast
+        devices it had once used, even a TV that had moved to a new address.</p>
+        <p>A device that turns off mid-song, or a queue whose tracks won't
+        start, now stops after a few tries instead of trying the whole list,
+        and a cast paused for half an hour is released until you press Play.
+        Saved cast devices follow a TV to its new address, so it no longer
+        shows twice.</p>
+      </description>
+    </release>
     <release version="1.0.10" date="2026-10-19">
       <description>
         <p>The desktop app finds your server's library even when your server
