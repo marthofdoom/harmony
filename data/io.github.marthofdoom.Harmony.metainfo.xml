@@ -46,6 +46,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.10" date="2026-10-19">
+      <description>
+        <p>The desktop app finds your server's library even when your server
+        isn't discovered automatically (for example when it runs in a
+        container): add it once under Preferences → Network → Harmony
+        instances, from the Library page, or simply by syncing accounts from
+        it. Each instance shows its version and library size, and the same
+        server reached by several addresses is listed once.</p>
+        <p>Album pages now show where the album plays from and its quality,
+        with quality on each track. The playing bar shows quality once and no
+        longer carries a link to the album.</p>
+      </description>
+    </release>
     <release version="1.0.9" date="2026-10-19">
       <description>
         <p>Stopping now really stops casting to a Chromecast or Google TV —
