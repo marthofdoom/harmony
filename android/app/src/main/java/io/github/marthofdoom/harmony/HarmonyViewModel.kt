@@ -62,6 +62,7 @@ data class LibraryBrowse(
     val section: LibSection = LibSection.ARTISTS,
     val enabled: Boolean? = null,            // null = not loaded yet; false = no library anywhere
     val loading: Boolean = false,
+    val outdatedPeers: List<String> = emptyList(),
     val artists: List<LibArtist> = emptyList(),
     val albums: List<Album> = emptyList(),
     val albumOrder: String = "title",
@@ -75,8 +76,15 @@ data class LibraryBrowse(
     val focus: LibFocus? = null,
 )
 
-/** The display text after "Playing from". */
-val PlayContext.display: String get() = if (kind == "search") "search “$title”" else title
+/** Fold a finished first-page browse load into [l]; lists the user re-sorted meanwhile are kept. */
+fun mergeBrowse(l: LibraryBrowse, songs: LibPage<Track>, artists: LibPage<LibArtist>, albums: LibPage<Album>,
+                genres: LibPage<LibGenre>, keepSongs: Boolean, keepAlbums: Boolean) = l.copy(
+    enabled = true, loading = false, outdatedPeers = songs.outdatedPeers,
+    songs = if (keepSongs) l.songs else songs.items,
+    songsTotal = if (keepSongs) l.songsTotal else songs.total,
+    artists = artists.items,
+    albums = if (keepAlbums) l.albums else albums.items,
+    genres = genres.items)
 
 const val SONGS_PAGE = 200
 
@@ -505,6 +513,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     // -- iTunes-style Library browser -----------------------------------------
 
     private var songGen = 0   // bumps on every songs reset so a stale page is dropped
+    private var albumGen = 0  // bumps on every album sort so a stale response is dropped
+    private var browseGen = 0 // bumps on every full browse (re)load
 
     private fun updLib(f: (LibraryBrowse) -> LibraryBrowse) {
         _state.value = _state.value.copy(lib = f(_state.value.lib))
@@ -515,7 +525,9 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         val client = api ?: return
         val lib = _state.value.lib
         updLib { it.copy(loading = true) }
-        val gen = ++songGen
+        val gen = ++browseGen
+        val songGen0 = songGen
+        val albumGen0 = albumGen
         viewModelScope.launch {
             val res = withContext(Dispatchers.IO) {
                 runCatching {
@@ -533,15 +545,14 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                     return@onSuccess
                 }
                 @Suppress("UNCHECKED_CAST")
-                if (gen == songGen) updLib {
-                    it.copy(enabled = true, loading = false,
-                        songs = (r[0] as LibPage<Track>).items, songsTotal = r[0].total,
-                        artists = (r[1] as LibPage<LibArtist>).items,
-                        albums = (r[2] as LibPage<Album>).items,
-                        genres = (r[3] as LibPage<LibGenre>).items)
+                if (gen == browseGen) updLib {
+                    // A sort tapped while this load was in flight owns that list.
+                    mergeBrowse(it, r[0] as LibPage<Track>, r[1] as LibPage<LibArtist>,
+                        r[2] as LibPage<Album>, r[3] as LibPage<LibGenre>,
+                        keepSongs = songGen != songGen0, keepAlbums = albumGen != albumGen0)
                 }
             }.onFailure {
-                updLib { it.copy(loading = false) }
+                if (gen == browseGen) updLib { it.copy(loading = false) }
                 _state.value = _state.value.copy(message = friendly(it, "Couldn't load your library. Try again."))
             }
         }
@@ -551,10 +562,11 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     fun setAlbumSort(order: String, desc: Boolean) {
         val client = api ?: return
+        val gen = ++albumGen
         updLib { it.copy(albumOrder = order, albumDesc = desc) }
         viewModelScope.launch {
             withContext(Dispatchers.IO) { runCatching { client.libraryAlbums(order, desc) } }
-                .onSuccess { p -> updLib { it.copy(albums = p.items) } }
+                .onSuccess { p -> if (gen == albumGen) updLib { it.copy(albums = p.items) } }
                 .onFailure { _state.value = _state.value.copy(message = friendly(it, "Couldn't sort the albums.")) }
         }
     }
@@ -638,7 +650,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             "songs" -> _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
                 lib = _state.value.lib.copy(section = LibSection.SONGS, focus = null))
             "playlist" -> c.id?.let { openPlaylistFromSearch(Playlist(svc, it, c.title, null, null)) }
-            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.title); smartSearch() }
+            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.id ?: c.title); smartSearch() }
             "track" -> c.id?.let { openTrack(svc, it) }
         }
     }

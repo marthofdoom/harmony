@@ -157,12 +157,19 @@ fun LibraryBrowseContent(vm: HarmonyViewModel, state: UiState) {
         }
         return
     }
+    Column(Modifier.fillMaxSize()) {
+    if (lib.outdatedPeers.isNotEmpty()) Text(
+        "Some libraries need updating: ${lib.outdatedPeers.joinToString(", ")}",
+        Modifier.padding(horizontal = 16.dp, vertical = 4.dp),
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f))
     when (lib.section) {
         LibSection.ARTISTS -> ArtistsList(vm, lib)
         LibSection.ALBUMS -> AlbumsGrid(vm, lib)
         LibSection.SONGS -> SongsList(vm, state)
         LibSection.GENRES -> GenresGrid(vm, lib)
         LibSection.PLAYLISTS -> {}
+    }
     }
 }
 

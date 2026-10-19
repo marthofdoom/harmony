@@ -568,6 +568,7 @@ class LibraryPage(Gtk.Box):
         self._loaded_at = 0.0
         self._ready = False       # a library exists (probe succeeded)
         self._view_loaded: set[str] = set()
+        self._error_page: Gtk.Widget | None = None  # lazily created and reused
 
         self.switcher = SegmentedToggle(
             [("artists", "Artists"), ("albums", "Albums"), ("songs", "Songs"),
@@ -627,7 +628,14 @@ class LibraryPage(Gtk.Box):
 
         def failed(exc: BaseException) -> None:
             log.warning("library probe failed: %s", exc)
-            self.stack.add_named(error_status_page(exc, title="Couldn't load the library"), "error")
+            if self._error_page is None:
+                self._error_page = error_status_page(exc, title="Couldn't load the library")
+                self.stack.add_named(self._error_page, "error")
+            else:
+                # Update the error page's description instead of creating a new one
+                error_widget = self._error_page
+                if hasattr(error_widget, "get_subtitle"):
+                    error_widget.set_subtitle(str(exc))
             self.stack.set_visible_child_name("error")
 
         run_async(work, done, failed)

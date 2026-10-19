@@ -633,7 +633,7 @@ class PlaybackController private constructor(ctx: Context) {
         if (snap.playing && snap.tracks.isNotEmpty()) ownsDeviceQueue = true
         val adoptQueue = snap.tracks.isNotEmpty() && ownsDeviceQueue
         if (adoptQueue) {
-            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat, snap.context ?: q.context)
+            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat, snap.context)
         }
         if (!ownsDeviceQueue) {
             // Just the device's volume / idle state; keep our pending queue + position.

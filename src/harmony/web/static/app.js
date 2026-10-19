@@ -197,7 +197,7 @@ const locationBadge = (t) => `<span class="badge${t.library_id || t.service === 
 // active queue (persisted; sent to devices in queue/load).
 const CTX_KIND = { album: "Album", playlist: "Playlist", artist: "Artist", genre: "Genre", track: "Track" };
 // The collection the queue came from, as a small clickable link label.
-const collText = (c) => (c && c.title ? (CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
+const collText = (c) => (c && c.title ? (c.kind === "search" ? `Search “${c.title}”` : CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
 function openContext(c) {
   if (!c) return;
   const clear = () => { if (location.hash) history.replaceState(null, "", location.pathname + location.search); };
@@ -210,7 +210,7 @@ function openContext(c) {
   } else if (c.kind === "genre") { libUI.view = "genres"; libUI.genre = c.id || c.title; libUI.genreMode = "songs"; goView("library"); }
   else if (c.kind === "songs") { libUI.view = "songs"; libUI.genre = c.id || null; goView("library"); }
   else if (c.kind === "search") {
-    const q = c.id || String(c.title || "").replace(/^Search:\s*/, "");
+    const q = c.id || String(c.title || "").replace(/^Search:\s*/, "");  // canonical: id == title == query
     $("search-input").value = q; clear(); doSmartSearch(q);
   }
 }
@@ -506,7 +506,14 @@ const ALBUM_ORDERS = [["title", "Title"], ["artist", "Artist"], ["year", "Year"]
 async function libFetch(view, params, offset, limit) {
   const q = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
   Object.entries(params || {}).forEach(([k, v]) => { if (v !== "" && v != null && v !== false) q.set(k, v === true ? "1" : String(v)); });
+  const tok0 = ($("lib-body") || {})._tok;
   const r = await api(`/api/library/view?${q}`);
+  const od = $("lib-outdated");
+  if (od && ($("lib-body") || {})._tok === tok0) {   // a stale tab's response must not touch the note
+    const names = Array.isArray(r.outdated_peers) ? r.outdated_peers.filter(Boolean) : [];
+    od.textContent = names.length ? `Some libraries need updating: ${names.join(", ")}` : "";
+    od.hidden = !names.length;
+  }
   return { items: r[view] || [], total: r.total != null ? r.total : (r[view] || []).length };
 }
 
@@ -646,15 +653,18 @@ function renderSongsList(body, { params, ctx, sortable, header }) {
 }
 
 async function showArtistsTab(body) {
+  const tok = body._tok;
+  const stale = () => body._tok !== tok || !body.isConnected;
   body.innerHTML = loadingState("Loading artists…");
   let artists = [];
   try {
     for (let off = 0; off < 20000; off += 1000) {
       const p = await libFetch("artists", {}, off, 1000);
+      if (stale()) return;
       artists = artists.concat(p.items);
       if (artists.length >= p.total || !p.items.length) break;
     }
-  } catch (e) { body.innerHTML = errorState("Couldn’t load artists", e.message, "lib-retry"); $("lib-retry").onclick = showLibBody; return; }
+  } catch (e) { if (stale()) return; body.innerHTML = errorState("Couldn’t load artists", e.message, "lib-retry"); $("lib-retry").onclick = showLibBody; return; }
   if (!artists.length) { body.innerHTML = emptyState("music", "No artists yet", "Rescan once the folders have music in them."); return; }
   const phone = window.matchMedia("(max-width: 720px)").matches;
   if (!phone && !artists.some((a) => a.id === libUI.artist)) libUI.artist = artists[0].id;
@@ -682,7 +692,7 @@ async function showArtistDetail(host, artist, back) {
   try {
     albums = (await libFetch("albums", { artist: artist.id, order: "year" }, 0, 500)).items;
     songs = (await libFetch("songs", { artist: artist.id, order: "album" }, 0, 1000)).items;
-  } catch (e) { host.innerHTML = errorState("Couldn’t load this artist", e.message, "ad-retry"); $("ad-retry").onclick = () => showArtistDetail(host, artist, back); return; }
+  } catch (e) { if (host._tok !== token) return; host.innerHTML = errorState("Couldn’t load this artist", e.message, "ad-retry"); $("ad-retry").onclick = () => showArtistDetail(host, artist, back); return; }
   if (host._tok !== token) return;
   const ctx = { kind: "artist", title: artist.name, service: "local", id: artist.id };
   host.innerHTML = `
@@ -790,6 +800,7 @@ function showLibBody() {
   const body = $("lib-body");
   if (!body) return;
   if (libUI.pager) { libUI.pager.stop(); libUI.pager = null; }
+  body._tok = (body._tok || 0) + 1;
   document.querySelectorAll(".libtabs button").forEach((b) => {
     const on = b.dataset.view === libUI.view;
     b.classList.toggle("on", on); b.setAttribute("aria-selected", String(on));
@@ -824,6 +835,7 @@ async function renderLibrary() {
     ${dl}
     <div class="libtabs" role="tablist" aria-label="Library view">${LIB_VIEWS.map(([k, l]) =>
       `<button type="button" role="tab" data-view="${k}">${l}</button>`).join("")}</div>
+    <p class="muted" id="lib-outdated" hidden style="font-size:.85em;opacity:.75;margin:.25rem 0"></p>
     <div id="lib-body"></div>
   </div>`;
   list.querySelectorAll(".libtabs button").forEach((b) => b.onclick = () => {
@@ -1148,7 +1160,7 @@ function renderTracks(tracks, opts = {}) {
     list.innerHTML = toolbar + empty; wirePlaylistToolbar(); return;
   }
   const context = pl ? { kind: "playlist", title: pl.title, service: pl.service, id: pl.id }
-    : opts.query ? { kind: "search", title: `Search: ${opts.query}`, id: opts.query } : null;
+    : opts.query ? { kind: "search", title: opts.query, id: opts.query } : null;
   const rowOpts = { ...opts, playlistActions: !!pl, context };
   list.innerHTML = toolbar + tracksHtml(tracks, rowOpts);
   state.queue = tracks;
@@ -2333,7 +2345,7 @@ function renderSmartResults(r, q) {
   annotateAlbumStates(list);
   wireLidarrArtistTargets(list);
   wireArtistChips(list);
-  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks, { context: { kind: "search", title: `Search: ${q}`, id: q } }); highlightPlaying(); }
+  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks, { context: { kind: "search", title: q, id: q } }); highlightPlaying(); }
   wirePlaylistCards(list);
 }
 

@@ -65,7 +65,11 @@ class LocalLibraryProvider(MusicProvider):
             artwork_url=self._art(r["album_id"]),
             genre=r.get("genre"), quality=row_quality(r),
             raw={"path": r["path"], "mime": r["mime"], "album_artist": r["album_artist"],
-                 "mb_releasegroup": r["mb_releasegroup"]},
+                 "mb_releasegroup": r["mb_releasegroup"],
+                 # What the Songs-view SQL sorts on, so a peer can merge pages exactly.
+                 "sort": {"added_at": r.get("added_at"), "disc": r.get("disc_no"),
+                          "q": (r.get("bit_depth") or 0) * 1000000 + (r.get("sample_rate") or 0) * 10
+                          + (r.get("bitrate") or 0) / 1000.0}},
         )
 
     def _album(self, r: dict[str, Any]) -> Album:
@@ -119,16 +123,18 @@ class LocalLibraryProvider(MusicProvider):
 
     # -- browse (iTunes-style; not part of the provider contract) ------------
 
-    def list_albums(self, *, order: str = "recent", limit: int = 60, offset: int = 0,
-                    genre: str | None = None, artist_id: str | None = None) -> list[Album]:
+    def list_albums(self, *, order: str = "recent", desc: bool = False, limit: int = 60,
+                    offset: int = 0, genre: str | None = None,
+                    artist_id: str | None = None) -> list[Album]:
         return [self._album(a) for a in self.index.albums(
-            order=order, limit=limit, offset=offset, genre=genre, artist_id=artist_id)]
+            order=order, desc=desc, limit=limit, offset=offset, genre=genre, artist_id=artist_id)]
 
-    def list_artists(self, *, limit: int = 2000, genre: str | None = None) -> list[dict[str, Any]]:
+    def list_artists(self, *, limit: int = 2000, offset: int = 0, desc: bool = False,
+                     genre: str | None = None) -> list[dict[str, Any]]:
         return [{"id": a["id"], "name": a["name"], "album_count": a["album_count"],
                  "track_count": a.get("track_count"),
                  "artwork_url": self._art(a["art_album_id"]) if a.get("art_album_id") else None}
-                for a in self.index.artists(limit=limit, genre=genre)]
+                for a in self.index.artists(limit=limit, offset=offset, desc=desc, genre=genre)]
 
     def list_genres(self) -> list[dict[str, Any]]:
         return [{"name": g["name"], "album_count": g["album_count"], "track_count": g["track_count"],

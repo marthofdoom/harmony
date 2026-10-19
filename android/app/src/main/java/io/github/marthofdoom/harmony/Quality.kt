@@ -96,6 +96,9 @@ data class PlayContext(val kind: String, val title: String, val service: String?
         .apply { service?.let { put("service", it) }; id?.let { put("id", it) } }
 
     companion object {
+        /** Canonical search context: title and id both carry the query. */
+        fun search(q: String) = PlayContext("search", q, id = q)
+
         fun fromJson(o: JSONObject?): PlayContext? {
             if (o == null) return null
             val kind = o.optString("kind").ifEmpty { return null }

@@ -571,6 +571,9 @@ class LibraryIndex:
         if self.path != ":memory:":
             Path(self.path).parent.mkdir(parents=True, exist_ok=True)
         self._lock = threading.RLock()
+        #: True when opening this index added columns (an upgrade): the rows were
+        #: zeroed and need one full re-read. The engine clears it after scanning.
+        self.migrated = False
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         with self._lock:
@@ -598,6 +601,7 @@ class LibraryIndex:
                 added = True
         if added:
             self._conn.execute("UPDATE tracks SET mtime = 0")
+            self.migrated = True
 
     def close(self) -> None:
         with self._lock:
@@ -773,7 +777,19 @@ class LibraryIndex:
                 (album_id,)).fetchone()
         return _row_dict(row) if row else None
 
-    def albums(self, *, artist_id: str | None = None, order: str = "year",
+    #: Albums-view sorts, same scheme as ``_SONG_ORDERS``: (primary key, null-sink,
+    #: tie-breakers). The final ``album_id`` makes every page order total.
+    _ALBUM_ORDERS: dict[str, tuple[str, str, str]] = {
+        "year": ("year", "year IS NULL", "album COLLATE NOCASE, album_id"),
+        "recent": ("added_at", "", "album COLLATE NOCASE, album_id"),
+        "title": ("album COLLATE NOCASE", "", "album_artist COLLATE NOCASE, album_id"),
+        "artist": ("album_artist COLLATE NOCASE", "",
+                   "year IS NULL, year, album COLLATE NOCASE, album_id"),
+    }
+    #: Albums sorts whose natural direction is high→low (newest first).
+    _ALBUM_DESC_FIRST = {"recent"}
+
+    def albums(self, *, artist_id: str | None = None, order: str = "year", desc: bool = False,
                limit: int = 500, offset: int = 0, genre: str | None = None) -> list[dict[str, Any]]:
         conds, args = [], []
         if artist_id:
@@ -783,27 +799,26 @@ class LibraryIndex:
             conds.append("genre = ? COLLATE NOCASE")
             args.append(genre)
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
-        order_sql = {
-            "year": "year IS NULL, year, album COLLATE NOCASE",
-            "recent": "added_at DESC",
-            "title": "album COLLATE NOCASE",
-            "artist": "album_artist COLLATE NOCASE, year IS NULL, year",
-        }.get(order, "year IS NULL, year")
+        primary, nulls, tie = self._ALBUM_ORDERS.get(order, self._ALBUM_ORDERS["year"])
+        descending = desc != (order in self._ALBUM_DESC_FIRST)
+        order_sql = ", ".join(p for p in (nulls, f"{primary} {'DESC' if descending else 'ASC'}", tie) if p)
         with self._lock:
             rows = self._conn.execute(
                 f"{self._ALBUM_SELECT} {where} GROUP BY album_id ORDER BY {order_sql} "
                 "LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
         return [_row_dict(r) for r in rows]
 
-    def artists(self, *, limit: int = 2000, genre: str | None = None) -> list[dict[str, Any]]:
+    def artists(self, *, limit: int = 2000, offset: int = 0, desc: bool = False,
+                genre: str | None = None) -> list[dict[str, Any]]:
         where, args = ("WHERE genre = ? COLLATE NOCASE", [genre]) if genre else ("", [])
         with self._lock:
             rows = self._conn.execute(
                 "SELECT album_artist_id AS id, MIN(album_artist) AS name, "
                 "COUNT(DISTINCT album_id) AS album_count, COUNT(*) AS track_count, "
                 "MAX(mb_artist) AS mb_artist, MIN(album_id) AS art_album_id "
-                f"FROM tracks {where} GROUP BY album_artist_id ORDER BY name COLLATE NOCASE LIMIT ?",
-                (*args, limit)).fetchall()
+                f"FROM tracks {where} GROUP BY album_artist_id "
+                f"ORDER BY name COLLATE NOCASE {'DESC' if desc else 'ASC'}, album_artist_id "
+                "LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
         return [_row_dict(r) for r in rows]
 
     def count_artists(self, *, genre: str | None = None) -> int:
@@ -870,7 +885,8 @@ class LibraryIndex:
         where = ("WHERE " + " AND ".join(conds)) if conds else ""
         primary, nulls, tie = self._SONG_ORDERS.get(order, self._SONG_ORDERS["artist"])
         descending = desc != (order in self._SONG_DESC_FIRST)
-        order_sql = ", ".join(p for p in (nulls, f"{primary} {'DESC' if descending else 'ASC'}", tie) if p)
+        order_sql = ", ".join(p for p in (nulls, f"{primary} {'DESC' if descending else 'ASC'}", tie,
+                                          "id") if p)
         with self._lock:
             total = self._conn.execute(f"SELECT COUNT(*) FROM tracks {where}", args).fetchone()[0]
             rows = self._conn.execute(

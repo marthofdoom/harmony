@@ -115,3 +115,41 @@ class PlayingFromTest {
         }
     }
 }
+
+class ClientReviewFixesTest {
+    private fun t(n: Int) = Track("local", n.toString(), "T$n", "A", null, 100, null)
+
+    @Test fun searchContextIsCanonicalAndLabelled() {
+        val c = PlayContext.search("blue")
+        assertEquals("search", c.kind); assertEquals("blue", c.title); assertEquals("blue", c.id)
+        assertEquals("Search “blue”", c.linkLabel())
+        assertEquals(c, PlayContext.fromJson(JSONObject(c.toJson().toString())))
+        assertEquals("blue", c.id ?: c.title)
+    }
+
+    @Test fun adoptedSnapshotContextIsTakenAsIs() {
+        // adoptSnapshot passes snap.context straight to restore: null clears the old context.
+        val q = PlayQueue(); q.load(listOf(t(1)), 0, context = PlayContext("album", "Old", "local", "a"))
+        q.restore(listOf(t(2)), 0, false, RepeatMode.OFF, null)
+        assertNull(q.context)
+    }
+
+    @Test fun browseMergeKeepsListsSortedMeanwhile() {
+        val base = LibraryBrowse(songs = listOf(t(9)), songsTotal = 1, albums = emptyList())
+        val songs = LibPage(true, listOf(t(1)), 5, listOf("peer-a"))
+        val artists = LibPage(true, listOf(LibArtist("a", "A", 1, 1, null)), 1)
+        val albums = LibPage<Album>(true, emptyList(), 0)
+        val genres = LibPage<LibGenre>(true, emptyList(), 0)
+        val kept = mergeBrowse(base, songs, artists, albums, genres, keepSongs = true, keepAlbums = true)
+        assertEquals(listOf(t(9)), kept.songs)
+        assertEquals(1, kept.artists.size)           // artists/genres still land
+        assertFalse(kept.loading); assertEquals(listOf("peer-a"), kept.outdatedPeers)
+        val fresh = mergeBrowse(base, songs, artists, albums, genres, keepSongs = false, keepAlbums = false)
+        assertEquals(5, fresh.songsTotal)
+    }
+
+    @Test fun outdatedPeersParse() {
+        assertEquals(listOf("x", "y"), parseOutdatedPeers(JSONObject("""{"outdated_peers":["x","","y"]}""")))
+        assertTrue(parseOutdatedPeers(JSONObject("{}")).isEmpty())
+    }
+}

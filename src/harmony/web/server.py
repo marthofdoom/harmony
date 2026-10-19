@@ -370,7 +370,7 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 #   &genre=&artist=&limit=&offset=
                 q1 = {k: (v or [""])[0] for k, v in query.items()}
                 try:
-                    limit = max(1, min(1000, int(q1.get("limit") or 200)))
+                    limit = max(1, min(5000, int(q1.get("limit") or 200)))
                     offset = max(0, int(q1.get("offset") or 0))
                 except ValueError:
                     self._send_json({"error": "limit/offset must be numbers"}, status=400)

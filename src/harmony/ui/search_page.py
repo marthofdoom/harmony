@@ -208,7 +208,7 @@ class SearchPage(Gtk.Box):
         if self._drilled is not None:
             return self._item_context(self._drilled, getattr(self._drilled, "title", ""))
         query = self.search_entry.get_text().strip()
-        return {"kind": "search", "title": f"Search “{query}”" if query else "Search"}
+        return {"kind": "search", "title": query, "id": query}
 
     @staticmethod
     def _item_context(item: Album | Artist | Playlist, label: str) -> dict:

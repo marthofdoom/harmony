@@ -66,7 +66,13 @@ data class LibArtist(val id: String, val name: String, val albumCount: Int, val 
 data class LibGenre(val name: String, val albumCount: Int, val trackCount: Int, val artworkUrl: String?)
 
 /** One page of a Library view; [enabled] false = no library anywhere on the mesh. */
-data class LibPage<T>(val enabled: Boolean, val items: List<T>, val total: Int)
+data class LibPage<T>(val enabled: Boolean, val items: List<T>, val total: Int,
+                      val outdatedPeers: List<String> = emptyList())
+
+fun parseOutdatedPeers(o: JSONObject): List<String> {
+    val a = o.optJSONArray("outdated_peers") ?: return emptyList()
+    return (0 until a.length()).map { a.optString(it) }.filter { it.isNotBlank() }
+}
 
 /** GET /api/resolve: the stream URL plus where it comes from and its quality. */
 data class ResolvedStream(val url: String, val info: StreamInfo?)
@@ -386,7 +392,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             LibArtist(a.optString("id"), a.optString("name"), a.optInt("album_count"),
                 a.optInt("track_count"), absUrl(optStr(a, "artwork_url")))
         }
-        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size), parseOutdatedPeers(o))
     }
 
     fun libraryGenres(limit: Int = 1000, offset: Int = 0): LibPage<LibGenre> {
@@ -397,21 +403,21 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             LibGenre(g.optString("name"), g.optInt("album_count"), g.optInt("track_count"),
                 absUrl(optStr(g, "artwork_url")))
         }
-        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size), parseOutdatedPeers(o))
     }
 
     fun libraryAlbums(order: String, desc: Boolean, genre: String? = null, artist: String? = null,
                       limit: Int = 1000, offset: Int = 0): LibPage<Album> {
         val o = JSONObject(get(viewPath("albums", order, desc, genre, artist, limit, offset)))
         val items = parseAlbums(o.optJSONArray("albums"))
-        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size), parseOutdatedPeers(o))
     }
 
     fun librarySongs(order: String, desc: Boolean, genre: String? = null, artist: String? = null,
                      limit: Int = 200, offset: Int = 0): LibPage<Track> {
         val o = JSONObject(get(viewPath("songs", order, desc, genre, artist, limit, offset)))
         val items = parseTracks(o.optJSONArray("songs"))
-        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size), parseOutdatedPeers(o))
     }
 
     /** Other instances this hub sees on the LAN (for routing between them). */

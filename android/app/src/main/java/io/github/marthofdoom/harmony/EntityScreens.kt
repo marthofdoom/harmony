@@ -597,7 +597,7 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
         if (inc.tracks.isNotEmpty()) {
             item { SectionHeader("Songs") }
             itemsIndexed(inc.tracks) { i, t ->
-                TrackRow(t, onPlay = { vm.playFrom(inc.tracks, i, PlayContext("search", smart.query)) },
+                TrackRow(t, onPlay = { vm.playFrom(inc.tracks, i, PlayContext.search(smart.query)) },
                     playState = state.rowPlay(t),
                     trailing = { TrackRowMenu(vm, state, t) })
             }

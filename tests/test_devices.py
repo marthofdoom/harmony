@@ -629,3 +629,21 @@ def test_context_survives_a_restart(player, monkeypatch, tmp_path) -> None:
     state.queue.context = state.playback.context = None
     state.restore_queue()
     assert state.playback.context == ctx and state.queue.context == ctx
+
+
+def test_local_resolve_failure_clears_quality_and_source(player) -> None:
+    """When a local track fails to resolve, clear quality/source so the bar doesn't
+    show the previous track's metadata."""
+    state, prov, _eng, _t = player
+
+    def boom(track_id, *, max_quality=False):
+        raise RuntimeError("stream unavailable")
+
+    prov.resolve_stream = boom
+    # Start with a track that has quality/source set
+    state.playback.quality = _HIRES
+    state.playback.source = {"service": "ytmusic", "label": "YouTube Music"}
+    state.play_list([_track_n(1)], 0)
+    # Resolution failed, so quality and source should be cleared
+    assert state.playback.quality is None
+    assert state.playback.source is None

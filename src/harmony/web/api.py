@@ -73,6 +73,8 @@ def track_to_dict(t: Any) -> dict[str, Any]:
         **({"genre": t.genre} if getattr(t, "genre", None) else {}),
         **({"quality": t.quality} if getattr(t, "quality", None) else {}),
         **({"library_id": t.raw["library_id"]} if (getattr(t, "raw", None) or {}).get("library_id") else {}),
+        # The library's SQL sort inputs, so a federating peer can merge pages exactly.
+        **({"sort": t.raw["sort"]} if isinstance((getattr(t, "raw", None) or {}).get("sort"), dict) else {}),
     }
 
 
@@ -110,7 +112,10 @@ def album_to_dict(a: Any) -> dict[str, Any]:
             "year": a.year, "date": getattr(a, "date", None),
             "track_count": getattr(a, "track_count", None), "artwork_url": a.artwork_url,
             **({"genre": a.genre} if getattr(a, "genre", None) else {}),
-            **({"quality": a.quality} if getattr(a, "quality", None) else {})}
+            **({"quality": a.quality} if getattr(a, "quality", None) else {}),
+            # Peers sort "recently added" by this (library albums only).
+            **({"added_at": (a.raw or {})["added_at"]}
+               if (getattr(a, "raw", None) or {}).get("added_at") is not None else {})}
 
 
 def artist_to_dict(a: Any) -> dict[str, Any]:
@@ -1176,7 +1181,20 @@ class Engine:
 
                 directory = config.data_dir()
                 self._lib = (LibraryIndex(directory / "library.db"), ArtSigner.for_dir(directory))
+                if self._lib[0].migrated:
+                    # An upgrade added columns and zeroed mtimes: re-read every
+                    # file once so genre/format show up without a manual rescan.
+                    threading.Thread(target=self._rescan_after_migration, args=(self._lib[0],),
+                                     daemon=True, name="harmony-library-migrate").start()
             return self._lib
+
+    def _rescan_after_migration(self, index: Any) -> None:
+        try:
+            r = self.library_scan(wait=True)
+            if r.get("ok"):
+                index.migrated = False
+        except Exception:  # noqa: BLE001
+            log.exception("library: post-upgrade rescan failed")
 
     def set_http_port(self, port: int) -> None:
         self._http_port = int(port)
@@ -1450,11 +1468,11 @@ class Engine:
             items = own.list_genres()
             return {"view": view, "genres": items[offset:offset + limit], "total": len(items)}
         if view == "artists":
-            items = own.list_artists(genre=genre)
-            return {"view": view, "artists": items[offset:offset + limit], "total": len(items)}
+            items = own.list_artists(limit=limit, offset=offset, desc=desc, genre=genre)
+            return {"view": view, "artists": items, "total": own.index.count_artists(genre=genre)}
         if view == "albums":
-            albums = own.list_albums(order=order, limit=limit, offset=offset, genre=genre,
-                                     artist_id=artist_id)
+            albums = own.list_albums(order=order, desc=desc, limit=limit, offset=offset,
+                                     genre=genre, artist_id=artist_id)
             return {"view": view, "albums": [album_to_dict(a) for a in albums],
                     "total": own.index.count_albums(artist_id=artist_id, genre=genre)}
         if view == "songs":
@@ -1949,7 +1967,8 @@ class Engine:
             if instance is None:
                 import socket
 
-                instance = socket.gethostname()
+                mesh_name = getattr(self._mesh, "_name", None) if self._mesh is not None else None
+                instance = mesh_name or socket.gethostname()
         try:
             label = Service(service_value).label
         except ValueError:

@@ -35,6 +35,9 @@ def playing_from_text(source: dict[str, Any] | None) -> str:
 
 def context_text(context: dict[str, Any] | None) -> str:
     """The album/playlist/artist/list the queue came from, as plain link text."""
+    if context and context.get("kind") == "search":
+        title = context.get("title") or ""
+        return f"Search “{title}”" if title else "Search"
     return ((context or {}).get("title") or "").strip()
 
 

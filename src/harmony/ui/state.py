@@ -818,6 +818,9 @@ class AppState(GObject.Object):
 
         def failed(exc: BaseException) -> None:
             if gen == self._play_gen:
+                self.playback.quality = None
+                self.playback.source = None
+                self.emit("playback-changed")
                 self._local_failed(exc)
 
         run_async(work, done, failed)
