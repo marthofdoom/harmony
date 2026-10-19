@@ -337,6 +337,7 @@ class DeviceQueues:
                     paused_since = paused_since or time.monotonic()
                     if time.monotonic() - paused_since >= PAUSE_TIMEOUT_S:
                         dq.halt()
+                        gen = dq.gen  # what a new load would bump past
                         dq.last_status = {**dq.last_status, "state": "stopped"}
                         dq.error = None
                         self._threads.pop(host, None)
@@ -347,6 +348,10 @@ class DeviceQueues:
                     paused_since, expired = None, False
             if expired:
                 log.info("queue: %s paused too long — releasing the device", host)
+                with self._lock:
+                    restarted = dq.gen != gen  # a new load began meanwhile: leave it
+                if restarted:
+                    return
                 if self._stop is not None:
                     try:
                         self._stop(host)

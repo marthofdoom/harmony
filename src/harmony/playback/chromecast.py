@@ -224,7 +224,7 @@ def _make_chromecast(pc: Any, host: str, port: int, uid: Any, model: str | None,
     the constructor (measured 38 s against a dead address)."""
     models = pc.models
     info = models.CastInfo({models.HostServiceInfo(host, port)}, uid, model, name, host, port,
-                           cast_type or "cast", None)
+                           cast_type or ("group" if int(port) != _CAST_PORT else "cast"), None)
     return pc.Chromecast(info, tries=CONNECT_TRIES, retry_wait=CONNECT_RETRY_WAIT_S,
                          timeout=CONNECT_TIMEOUT_S)
 
@@ -258,8 +258,10 @@ def _connect(host: str, port: int = _CAST_PORT, uuid: str | None = None,
             # A FAILED from an early try is not fatal if a later try connected:
             # judge by where the connection ended up.
             sc = getattr(cast, "socket_client", None)
-            connected = getattr(sc, "is_connected", None)
-            if listener.dead.is_set() or (callable(connected) and not connected()):
+            connected = getattr(sc, "is_connected", True)  # a property in pychromecast
+            if callable(connected):
+                connected = connected()
+            if listener.dead.is_set() or not connected:
                 raise ConnectionError("connection failed")
             listener.cast = cast
         except Exception as exc:  # noqa: BLE001

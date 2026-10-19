@@ -2264,7 +2264,8 @@ class Engine:
 
                 found.extend(
                     {"host": d.host, "name": d.name, "kind": d.kind, "source": "discovered",
-                     "port": d.raw.get("port"), "uuid": d.raw.get("uuid")}
+                     "port": d.raw.get("port"), "uuid": d.raw.get("uuid"),
+                     "cast_type": d.raw.get("cast_type")}
                     for d in discover_cast(timeout=4.0)
                 )
             except Exception as exc:  # noqa: BLE001 - Cast dep is optional
