@@ -66,9 +66,17 @@ class AlbumPage(Adw.NavigationPage):
         count = album.get("track_count")
         if count:
             bits.append(f"{count} tracks")
+        src = data.get("source") or {}
+        if src.get("label"):
+            src_str = src["label"]
+            if src.get("instance"):
+                src_str += f" · {src['instance']}"
+            bits.append(src_str)
         subtitle = " · ".join(b for b in bits if b)
+        quality = album.get("quality")
+        badge = quality.get("label") if quality else None
         self._content.append(artwork_header(album.get("artwork_url"), title, subtitle,
-                                            icon="media-optical-symbolic"))
+                                            badge=badge, icon="media-optical-symbolic"))
 
         artist_ref = data.get("artist_ref")
         if artist_ref and artist_ref.get("id"):
@@ -88,8 +96,19 @@ class AlbumPage(Adw.NavigationPage):
 
             key = (Service(album["service"]), str(album["id"]))
         context = {"kind": "album", "title": title, "service": self.service, "id": self.album_id}
+        # Define columns with Quality if any track has quality info
+        columns = None
+        if any(t.get("quality") for t in tracks):
+            def _quality_label(t: Any) -> str:
+                return (t.quality or {}).get("label") or ""
+            columns = [
+                ("Title", lambda t: t.title, True),
+                ("Artist", lambda t: t.artist_name, True),
+                ("Duration", lambda t: t.duration_text, False),
+                ("Quality", _quality_label, False),
+            ]
         self._content.append(tracks_widget(tracks, self.state, self.nav, title="Tracks",
-                                           collection_key=key, context=context))
+                                           collection_key=key, context=context, columns=columns))
         self._stack.set_visible_child_name("content")
 
     def _on_error(self, exc: BaseException) -> None:

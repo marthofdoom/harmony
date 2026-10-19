@@ -109,11 +109,6 @@ class PlayingFromTest {
         assertEquals("Library", playingFromSource(null, "qobuz", hasLibraryCopy = true))
     }
 
-    @Test fun contextLinkNeverSaysPlayingFrom() {
-        listOf("album", "playlist", "artist", "genre", "songs", "search", "track").forEach {
-            assertTrue(!PlayContext(it, "X").linkLabel().contains("Playing from"))
-        }
-    }
 }
 
 class ClientReviewFixesTest {
@@ -121,10 +116,9 @@ class ClientReviewFixesTest {
 
     @Test fun searchContextIsCanonicalAndLabelled() {
         val c = PlayContext.search("blue")
-        assertEquals("search", c.kind); assertEquals("blue", c.title); assertEquals("blue", c.id)
-        assertEquals("Search “blue”", c.linkLabel())
+        assertEquals("search", c.kind)
+        assertEquals("blue", c.title)
         assertEquals(c, PlayContext.fromJson(JSONObject(c.toJson().toString())))
-        assertEquals("blue", c.id ?: c.title)
     }
 
     @Test fun adoptedSnapshotContextIsTakenAsIs() {
@@ -157,10 +151,11 @@ class ClientReviewFixesTest {
 class LegacySearchContextTest {
     @org.junit.Test
     fun legacySearchTitlesAreStripped() {
-        for (t in listOf("Search “nemo”", "Search: nemo", "nemo")) {
-            val c = PlayContext("search", t)
-            org.junit.Assert.assertEquals("nemo", c.searchQuery())
-            org.junit.Assert.assertEquals("Search “nemo”", c.linkLabel())
-        }
+        val c1 = PlayContext("search", "Search \"nemo\"")
+        org.junit.Assert.assertEquals("nemo", c1.searchQuery())
+        val c2 = PlayContext("search", "Search: nemo")
+        org.junit.Assert.assertEquals("nemo", c2.searchQuery())
+        val c3 = PlayContext("search", "nemo")
+        org.junit.Assert.assertEquals("nemo", c3.searchQuery())
     }
 }

@@ -160,7 +160,8 @@ def track_menu_builder(state: Any, navigator: Navigator, anchor_getter: Callable
 def tracks_widget(track_dicts: list[dict[str, Any]], state: Any, navigator: Navigator,
                   *, title: str | None = None,
                   collection_key: tuple[Any, str] | None = None,
-                  context: dict[str, Any] | None = None) -> Gtk.Widget:
+                  context: dict[str, Any] | None = None,
+                  columns: list[tuple[str, Any, bool]] | None = None) -> Gtk.Widget:
     """A titled, naturally-sized track list reusing Search's column view, with
     Play / Shuffle / Play Next / Add to Queue for the whole list above it.
     Double-click plays the list from that row."""
@@ -180,7 +181,8 @@ def tracks_widget(track_dicts: list[dict[str, Any]], state: Any, navigator: Navi
     column_view, store, _sel = build_track_column_view(
         on_row_menu=track_menu_builder(state, navigator, lambda: holder["cv"]), state=state,
         on_play_from=lambda ts, i: play_from_list(state, ts, i, collection_key=collection_key,
-                                         context=context))
+                                         context=context),
+        columns=columns)
     holder["cv"] = column_view
     replace_tracks(store, tracks)
     scroller = Gtk.ScrolledWindow(child=column_view)

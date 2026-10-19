@@ -433,12 +433,9 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 #np-info .np-src, #np-info .sep { flex: none; }
 .q-short { display: none; }
 #np-info .np-stream { flex: 0 1 auto; min-width: 0; overflow: hidden; }
-#np-info .np-stream .qpill { display: block; }
+#np-info .np-stream .qpill:not(.q-short) { display: block; }
 #np-info .np-stream .q-full { display: block; }
-#np-info .np-coll { flex: 0 100 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
 #np-info .qpill { vertical-align: baseline; }
-.ctx-link { color: var(--accent); text-decoration: none; }
-.ctx-link:hover { text-decoration: underline; }
 .np-ctx { margin-top: var(--sp-2); }
 .np-q { margin-top: var(--sp-1); color: var(--muted); font-size: 13px; }
 

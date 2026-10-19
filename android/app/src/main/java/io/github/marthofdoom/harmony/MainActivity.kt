@@ -1185,15 +1185,6 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                             color = MaterialTheme.colorScheme.primary,
                             modifier = Modifier.padding(top = 6.dp))
                     }
-                    val ctx = state.context
-                    if (ctx != null) {
-                        Text(ctx.linkLabel(),
-                            style = MaterialTheme.typography.labelMedium,
-                            maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            color = MaterialTheme.colorScheme.secondary,
-                            modifier = Modifier.padding(top = 2.dp).clip(RoundedCornerShape(4.dp))
-                                .clickable { vm.openContext(ctx) })
-                    }
                     val q = state.stream?.quality ?: pb.track?.quality
                     val line = sourceQualityLine(state.stream, pb.track?.quality, pb.track?.location)
                     if (line != null) {

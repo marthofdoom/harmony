@@ -5,8 +5,6 @@ from __future__ import annotations
 import pytest
 
 from harmony.ui.playing_info import (
-    context_action,
-    context_text,
     playing_from_text,
     quality_text,
     tier_pill,
@@ -36,30 +34,10 @@ def test_quality_line_and_pills() -> None:
     assert tier_pill({"tier": "lossy"}) is None and tier_pill(None) is None
 
 
-def test_context_link_navigates() -> None:
-    calls: list[tuple] = []
-
-    class Nav:
-        def go_to_album(self, s, i): calls.append(("album", s, i))
-        def go_to_artist(self, s, i): calls.append(("artist", s, i))
-        def go_to_track(self, s, i): calls.append(("track", s, i))
-
-    ctx = {"kind": "album", "title": "Blackstar", "service": "ytmusic", "id": "b1"}
-    assert context_text(ctx) == "Blackstar"
-    context_action(ctx, Nav(), None)()
-    context_action({**ctx, "kind": "artist"}, Nav(), None)()
-    pages: list[str] = []
-    context_action({"kind": "songs", "title": "Songs"}, Nav(), pages.append)()
-    assert calls == [("album", "ytmusic", "b1"), ("artist", "ytmusic", "b1")]
-    assert pages == ["library"]
-    assert context_action({"kind": "weird", "title": "x"}, Nav(), pages.append) is None
-    assert context_action(None, Nav(), None) is None
-
-
 gi = pytest.importorskip("gi")
 
 
-def test_info_widget_renders_source_link_quality_and_pill(monkeypatch, tmp_path) -> None:
+def test_info_widget_renders_source_quality_and_pill(monkeypatch, tmp_path) -> None:
     from gi.repository import GObject
 
     from harmony import config as config_module
@@ -71,8 +49,7 @@ def test_info_widget_renders_source_link_quality_and_pill(monkeypatch, tmp_path)
     GObject.Object.__init__(state)
     state.settings = config_module.Settings.load()
     state._init_playback()
-    opened: list[str] = []
-    info = NowPlayingInfo(state, open_page=opened.append)
+    info = NowPlayingInfo(state)
     info.update()
     assert not info.from_row.get_visible() and not info.quality_row.get_visible()
 
@@ -81,11 +58,8 @@ def test_info_widget_renders_source_link_quality_and_pill(monkeypatch, tmp_path)
     pb.context = {"kind": "songs", "title": "Songs"}
     info.update()
     assert info.source.get_label() == "Playing from Library"
-    assert info.link_label.get_label() == "· Songs" and info.link.get_visible()
     assert info.quality.get_label() == "Library · harmony-server · FLAC · 24-bit / 96 kHz"
     assert info.pill.get_visible() and info.pill.get_label() == "Hi-Res"
-    info.link.emit("clicked")
-    assert opened == ["library"]
 
     pb.source, pb.quality = {"service": "qobuz", "label": "Qobuz"}, {**CD}
     info.update()

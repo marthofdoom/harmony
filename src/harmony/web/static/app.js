@@ -204,23 +204,6 @@ const searchQuery = (c) => {
   const m = raw.match(/^Search\s*[“"](.*)[”"]$/) || raw.match(/^Search:\s*(.*)$/);
   return (m ? m[1] : raw).trim();
 };
-const collText = (c) => (c && c.title ? (c.kind === "search" ? `Search “${searchQuery(c)}”` : CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
-function openContext(c) {
-  if (!c) return;
-  const clear = () => { if (location.hash) history.replaceState(null, "", location.pathname + location.search); };
-  if (c.kind === "album" && c.id) navigateAlbum(c.service || "local", c.id);
-  else if (c.kind === "artist" && c.id) navigateArtist(c.service || "local", c.id);
-  else if (c.kind === "track" && c.id) navigateTrack(c.service, c.id);
-  else if (c.kind === "playlist" && c.id) {
-    clear(); state.section = "playlists"; state.detail = false; highlightNav("playlists");
-    openPlaylist(c.service, c.id, c.title);
-  } else if (c.kind === "genre") { libUI.view = "genres"; libUI.genre = c.id || c.title; libUI.genreMode = "songs"; goView("library"); }
-  else if (c.kind === "songs") { libUI.view = "songs"; libUI.genre = c.id || null; goView("library"); }
-  else if (c.kind === "search") {
-    const q = searchQuery(c);  // canonical: id == title == query
-    $("search-input").value = q; clear(); doSmartSearch(q);
-  }
-}
 // The stream behind the current track: {quality, source} from /api/resolve
 // (browser) or the device snapshot's `stream`.
 function currentStream() { return onDevice() ? dev.stream : (br.loaded && br.loaded === pq.current() ? br.info : null); }
@@ -1079,12 +1062,13 @@ function trackRowHtml(t, i, opts = {}) {
   const title = t.id
     ? `<a class="tt" href="${routeHref("track", t.service, t.id)}" title="${esc(t.title)}">${esc(t.title)}</a>`
     : `<span class="tt">${esc(t.title)}</span>`;
+  const quality = t.quality ? qPill(t.quality) : "";
   return `
     <div class="trow${opts.numbered ? " numbered" : ""}${opts.reorder ? " reorder" : ""}" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
       <div class="tlead">${num}<button class="play" type="button" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
       <div class="title">${title}${opts.hideBadge ? "" : locationBadge(t)}</div>
       ${trackArtistCell(t)}
-      <div class="dur">${fmtTime(t.duration_s)}</div>
+      <div class="dur">${quality ? `${quality} ${fmtTime(t.duration_s)}` : fmtTime(t.duration_s)}</div>
       <div class="rowacts">
         ${grip}
         ${opts.queueRow ? "" : `<button class="mini add" type="button" aria-label="Add to playlist">${ICON("add")}</button>`}
@@ -2138,15 +2122,18 @@ async function renderAlbumView(service, id) {
   const artistHtml = ref
     ? `<a class="link" href="${routeHref("artist", ref.service, ref.id)}">${esc(ref.name)}</a>`
     : esc(al.artist || "");
-  const bits = [artistHtml, yr ? esc(String(yr)) : "", al.track_count != null ? esc(nTracks(al.track_count)) : ""]
+  const src = d.source || {};
+  const srcLabel = src.label ? (src.instance ? `${esc(src.label)} · ${esc(src.instance)}` : esc(src.label)) : "";
+  const bits = [artistHtml, yr ? esc(String(yr)) : "", al.track_count != null ? esc(nTracks(al.track_count)) : "", srcLabel]
     .filter(Boolean).join(" · ");
+  const albQuality = al.quality ? qPill(al.quality) : "";
   const tracks = d.tracks || [];
   const tracksSec = tracks.length
-    ? tracksHtml(tracks, { numbered: true, hideBadge: true })
+    ? tracksHtml(tracks, { numbered: true, hideBadge: true, albumQuality: albQuality })
     : emptyState("music", "No tracks", "This album has no playable tracks right now.");
 
   list.innerHTML = `<div class="detail">
-    ${detailHeader(al.title || "Album", bits, al.artwork_url, "Album", tracks.length ? collectionActsHtml("al") : "")}
+    ${detailHeader(al.title || "Album", bits + (albQuality ? ` ${albQuality}` : ""), al.artwork_url, "Album", tracks.length ? collectionActsHtml("al") : "")}
     <div id="al-state"></div>
     ${bioHtml(d.bio)}
     <section class="detail-sec">${tracksSec}</section>
@@ -2576,15 +2563,12 @@ function updateMediaSession(t) {
 function paintStreamInfo() {
   const t = pq.current();
   const p = t ? streamParts(t) : null;
-  const coll = t ? collText(pq.context) : "";
-  const link = coll ? `<a href="#" class="ctx-link" data-ctx>${esc(coll)}</a>` : "";
   const detail = p ? [p.instance, p.quality].filter(Boolean).join(" · ") : "";
   const bar = $("np-info");
   if (bar) {
     const html = p ? `<span class="np-from">Playing from ${esc(p.label)}</span>`
       + (p.instance ? `<span class="np-src"> · ${esc(p.instance)}</span>` : "")
-      + (p.pill ? `<span class="sep"> · </span><span class="np-stream"><span class="q-full">${p.pill}</span>${p.shortPill}</span>` : "")
-      + (link ? `<span class="np-coll"><span class="sep"> · </span>${link}</span>` : "") : "";
+      + (p.pill ? `<span class="sep"> · </span><span class="np-stream"><span class="q-full">${p.pill}</span>${p.shortPill}</span>` : "") : "";
     if (bar.dataset.h !== html) { bar.dataset.h = html; bar.innerHTML = html; }
     bar.title = p ? `Playing from ${p.label}${detail ? " · " + detail : ""}` : "";
   }
@@ -2593,16 +2577,10 @@ function paintStreamInfo() {
     const vh = p ? `Playing from <strong>${esc(p.label)}</strong>${p.instance ? ` · ${esc(p.instance)}` : ""}` : "";
     if (v.dataset.h !== vh) { v.dataset.h = vh; v.innerHTML = vh; }
     const vq = $("np-view-q");
-    const qh = (p ? p.pill : "") + (link ? `${p && p.pill ? " " : ""}${link}` : "");
+    const qh = (p ? p.pill : "");
     if (vq && vq.dataset.h !== qh) { vq.dataset.h = qh; vq.innerHTML = qh; }
   }
 }
-document.addEventListener("click", (e) => {
-  const a = e.target.closest && e.target.closest("a[data-ctx]");
-  if (!a) return;
-  e.preventDefault();
-  openContext(pq.context);
-});
 
 let _barKey = null;
 // Bring the bar, the Now Playing view, row indicators and Media Session in

@@ -132,17 +132,6 @@ fun playingFromSource(stream: StreamInfo?, trackService: String?, hasLibraryCopy
     return trackService?.let { serviceLabel(it) }
 }
 
-/** A small "where in the app" link label for the queue's context (not "Playing from"). */
-fun PlayContext.linkLabel(): String = when (kind) {
-    "album" -> "Album · $title"
-    "playlist" -> "Playlist · $title"
-    "artist" -> "Artist · $title"
-    "genre" -> "Genre · $title"
-    "songs" -> "Library songs"
-    "search" -> "Search “${searchQuery()}”"
-    else -> title
-}
-
 
 /** A search context's query. Older versions stored the label ("Search: q" /
  *  "Search “q”") as the title, so strip that. */

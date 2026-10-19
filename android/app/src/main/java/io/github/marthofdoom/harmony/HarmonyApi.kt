@@ -132,11 +132,19 @@ data class ArtistDetail(
     val chronology: Chronology?,
 )
 
+data class Source(
+    val service: String,
+    val label: String,
+    val instance: String? = null,
+    val own: Boolean = false,
+)
+
 data class AlbumDetail(
     val album: Album,
     val artistRef: ArtistRef?,
     val bio: Bio?,
     val tracks: List<Track>,
+    val source: Source? = null,
 )
 
 data class Performer(val name: String, val mbid: String?, val roles: List<String>)
@@ -336,6 +344,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             artistRef = parseArtistRef(root.optJSONObject("artist_ref")),
             bio = parseBio(root.optJSONObject("bio")),
             tracks = parseTracks(root.optJSONArray("tracks")),
+            source = parseSource(root.optJSONObject("source")),
         )
     }
 
@@ -675,6 +684,18 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         val text = o.optString("text")
         if (text.isEmpty()) return null
         return Bio(text, optStr(o, "url"), optStr(o, "source"))
+    }
+
+    private fun parseSource(o: JSONObject?): Source? {
+        if (o == null) return null
+        val label = o.optString("label", "")
+        if (label.isEmpty()) return null
+        return Source(
+            service = o.optString("service"),
+            label = label,
+            instance = optStr(o, "instance"),
+            own = o.optBoolean("own", false),
+        )
     }
 
     /** MB spans arrive as [[start, end|null], ...]. */

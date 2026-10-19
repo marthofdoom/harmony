@@ -377,11 +377,16 @@ private fun AlbumHeader(d: AlbumDetail, onArtist: () -> Unit) {
         val meta = listOfNotNull(
             album.date ?: album.year?.toString(),
             trackCountLabel(album.trackCount ?: d.tracks.size.takeIf { it > 0 }),
+            d.source?.let { src -> src.label + (src.instance?.let { " · $it" } ?: "") },
         ).joinToString(" · ")
         if (meta.isNotBlank()) {
             Spacer(Modifier.height(2.dp))
             Text(meta, style = MaterialTheme.typography.bodyMedium,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        album.quality?.let { q ->
+            Spacer(Modifier.height(4.dp))
+            HiResChip(q, Modifier)
         }
     }
 }
@@ -412,7 +417,8 @@ private fun NumberedTrackRow(
             // An album's tracks share its service; only flag the ones that will
             // play from the Library instead (like the web album page).
             val sub = listOfNotNull(t.artist.ifBlank { null },
-                t.location.takeIf { t.libraryId != null }).joinToString(" · ")
+                t.location.takeIf { t.libraryId != null },
+                t.quality?.label).joinToString(" · ")
             if (sub.isNotBlank()) {
                 Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
                     style = MaterialTheme.typography.bodySmall,

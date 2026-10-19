@@ -629,32 +629,6 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    /** "Playing from …" tapped: go to what the queue was loaded from. */
-    fun openContext(c: PlayContext) {
-        showNowPlaying(false)
-        val svc = c.service ?: "local"
-        when (c.kind) {
-            "album" -> c.id?.let { openAlbum(svc, it) }
-            "artist" -> c.id?.let {
-                if (svc == "local") {
-                    _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
-                        lib = _state.value.lib.copy(section = LibSection.ARTISTS))
-                    openLibArtist(LibArtist(it, c.title, 0, 0, null))
-                } else openArtist(svc, it)
-            }
-            "genre" -> {
-                _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
-                    lib = _state.value.lib.copy(section = LibSection.GENRES))
-                openLibGenre(LibGenre(c.title, 0, 0, null))
-            }
-            "songs" -> _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
-                lib = _state.value.lib.copy(section = LibSection.SONGS, focus = null))
-            "playlist" -> c.id?.let { openPlaylistFromSearch(Playlist(svc, it, c.title, null, null)) }
-            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.searchQuery()); smartSearch() }
-            "track" -> c.id?.let { openTrack(svc, it) }
-        }
-    }
-
     fun openPlaylist(pl: Playlist) {
         val client = api ?: return
         _state.value = _state.value.copy(openPlaylist = pl, playlistTracks = emptyList(), libraryLoading = true)
