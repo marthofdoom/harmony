@@ -131,6 +131,11 @@ def _connect(host: str, port: int = _CAST_PORT, uuid: str | None = None,
         return cast
 
 
+#: The Default Media Receiver that ``play_media`` launches (pychromecast's
+#: ``APP_MEDIA_RECEIVER``).
+_MEDIA_RECEIVER_APP_ID = "CC1AD845"
+
+
 def _forget(host: str) -> None:
     with _CONN_LOCK:
         cast = _CONNECTIONS.pop(host, None)
@@ -211,15 +216,45 @@ class ChromecastDevice(PlaybackDevice):
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(f"Chromecast status failed: {exc}") from exc
 
+    def _mc_ready(self, timeout: float = 4.0) -> Any:
+        """The media controller, with its session known.
+
+        pychromecast's transport commands need the current media session id;
+        on a connection that didn't start the cast (another process, or a fresh
+        connection after a reconnect) it isn't known yet, and the command is
+        silently dropped ("no session is active") — Stop did nothing and the
+        cast kept playing. Ask the device for its status first."""
+        mc = self._mc()
+        status = getattr(mc, "status", None)
+        if status is None or getattr(status, "media_session_id", None) is None:
+            done = threading.Event()
+            try:
+                mc.update_status(callback_function=lambda *_a: done.set())
+                done.wait(timeout)
+            except Exception as exc:  # noqa: BLE001 - the command below reports the failure
+                log.debug("chromecast %s: status refresh failed: %s", self._host, exc)
+        return mc
+
     def pause(self) -> None:
-        self._mc().pause()
+        self._mc_ready().pause()
 
     def resume(self) -> None:
-        self._mc().play()
+        self._mc_ready().play()
 
     def stop(self) -> None:
+        """Stop casting: stop the media, then close the media receiver app so
+        the TV/speaker really leaves the cast (only when it's the receiver
+        Harmony uses — never some other app the user is running there)."""
         try:
-            self._mc().stop()
+            try:
+                self._mc_ready().stop()
+            except Exception as exc:  # noqa: BLE001 - quitting the app below still stops it
+                log.debug("chromecast %s: media stop failed: %s", self._host, exc)
+            cast = self._cast()
+            if getattr(cast, "app_id", None) == _MEDIA_RECEIVER_APP_ID:
+                cast.quit_app()
+        except Exception as exc:  # noqa: BLE001
+            raise ProviderError(f"Chromecast stop failed: {exc}") from exc
         finally:
             _forget(self._host)
 

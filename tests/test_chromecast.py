@@ -115,3 +115,49 @@ def test_castcontroller_defaults_to_wiim() -> None:
     ctrl = CastController(resolve_source=lambda s, t: None)
     device = ctrl._device("192.168.1.9")  # no kind -> WiiM
     assert device.__class__.__name__ == "WiiMDevice"
+
+
+class _SessionlessMediaController(_FakeMediaController):
+    """Like pychromecast on a connection that didn't start the cast: no session
+    known until update_status() is asked, and stop() is then a silent no-op."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.status = None
+
+    def update_status(self, callback_function=None):
+        self.calls.append("update_status")
+        self.status = type("S", (), {"media_session_id": 7, "player_state": "PLAYING"})()
+        if callback_function:
+            callback_function(True, None)
+
+    def stop(self):
+        if self.status is None:  # what pychromecast does: warn and drop the command
+            return
+        self.calls.append("stop")
+
+
+def test_stop_works_from_a_connection_that_didnt_start_the_cast(fake_cast: _FakeCast) -> None:
+    """The bug: Stop did nothing (no media session known) and the cast kept playing."""
+    fake_cast.media_controller = _SessionlessMediaController()
+    fake_cast.app_id = cc._MEDIA_RECEIVER_APP_ID
+    quits: list[bool] = []
+    fake_cast.quit_app = lambda timeout=10: quits.append(True)
+    ChromecastDevice("192.168.1.50").stop()
+    calls = fake_cast.media_controller.calls
+    assert calls.index("update_status") < calls.index("stop")
+    assert quits == [True]                     # the receiver app is closed: casting ends
+
+
+def test_stop_never_quits_another_app_on_the_tv(fake_cast: _FakeCast) -> None:
+    fake_cast.app_id = "SOME_OTHER_APP"
+    quits: list[bool] = []
+    fake_cast.quit_app = lambda timeout=10: quits.append(True)
+    ChromecastDevice("192.168.1.50").stop()
+    assert quits == []
+
+
+def test_pause_refreshes_a_missing_session_first(fake_cast: _FakeCast) -> None:
+    fake_cast.media_controller = _SessionlessMediaController()
+    ChromecastDevice("192.168.1.50").pause()
+    assert fake_cast.media_controller.calls[:2] == ["update_status", "pause"]

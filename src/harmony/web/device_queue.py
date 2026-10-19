@@ -44,6 +44,7 @@ class DeviceQueue:
         self.last_status: dict[str, Any] = {}
         self.error: str | None = None
         self.stream: dict[str, Any] | None = None  # {quality, source} of what's playing
+        self.gen = 0  # bumped by every start and every halt
         self.failures = 0          # consecutive tracks that failed to start
         # Wall-clock play time of the current track: a Chromecast playing a
         # relayed stream reports a frozen position, so this stands in for it.
@@ -54,6 +55,7 @@ class DeviceQueue:
     def halt(self) -> None:
         self.playing = False
         self.armed = False
+        self.gen += 1  # a track still starting must not resume playback
 
     def snapshot(self) -> dict[str, Any]:
         q = self.q
@@ -224,6 +226,8 @@ class DeviceQueues:
             if dq is None or dq.q.jump(index) is None:
                 return
             track = dq.q.current()
+            dq.gen += 1
+            gen = dq.gen
             dq.playing = True
             dq.armed = False
             dq.error = None
@@ -239,6 +243,8 @@ class DeviceQueues:
         except Exception as exc:  # noqa: BLE001 - surface, then try the next one
             log.warning("queue: couldn't play %s on %s: %s", track.get("title"), host, exc)
             with self._lock:
+                if dq.gen != gen:
+                    return  # stopped or superseded while starting: don't move on
                 dq.error = str(exc) or exc.__class__.__name__
                 dq.failures += 1
                 nxt = dq.q.following(manual=True)
@@ -248,9 +254,20 @@ class DeviceQueues:
             self._start_track(host, nxt)
             return
         with self._lock:
-            dq.failures = 0
-            if isinstance(played, dict) and isinstance(played.get("stream"), dict):
-                dq.stream = played["stream"]
+            halted = dq.gen != gen and not dq.playing
+            if dq.gen == gen:
+                dq.failures = 0
+                if isinstance(played, dict) and isinstance(played.get("stream"), dict):
+                    dq.stream = played["stream"]
+        if halted:
+            # Stop was pressed while the device was still starting this track
+            # (a Chromecast takes seconds): it began anyway — silence it.
+            if self._stop is not None:
+                try:
+                    self._stop(host)
+                except Exception as exc:  # noqa: BLE001 - best effort
+                    log.debug("queue: late stop on %s failed: %s", host, exc)
+            return
         self._ensure_poller(host)
 
     def _ensure_poller(self, host: str) -> None:

@@ -229,3 +229,29 @@ def test_prev_on_a_stopped_queue_steps_back(dqs) -> None:
     queues.op("wiim", "stop", {})
     queues.op("wiim", "prev", {})
     assert played[-1] == ("wiim", "0")
+
+
+def test_stop_while_a_slow_cast_is_starting_silences_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The cast-won't-stop bug: Stop during the seconds a Chromecast takes to
+    start left the track playing once the start finished."""
+    import threading
+
+    started, release = threading.Event(), threading.Event()
+    stopped: list[str] = []
+
+    def slow_play(host, t):
+        started.set()
+        release.wait(5)
+
+    monkeypatch.setattr(dqmod, "SETTLE_S", 0.0)
+    queues = DeviceQueues(slow_play, lambda h: {}, stop=lambda h: stopped.append(h), async_start=True)
+    monkeypatch.setattr(queues, "_ensure_poller", lambda host: None)
+    queues.op("cast", "load", {"tracks": [_t(0), _t(1)], "start": 0})
+    assert started.wait(5)
+    queues.op("cast", "stop", {})
+    release.set()
+    for _ in range(100):
+        if stopped:
+            break
+        time.sleep(0.02)
+    assert stopped == ["cast"] and not queues.snapshot("cast")["playing"]
