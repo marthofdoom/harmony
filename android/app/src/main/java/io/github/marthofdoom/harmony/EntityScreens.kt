@@ -386,8 +386,21 @@ private fun AlbumHeader(d: AlbumDetail, onArtist: () -> Unit) {
         }
         album.quality?.let { q ->
             Spacer(Modifier.height(4.dp))
-            HiResChip(q, Modifier)
+            AlbumQualityChip(q)
         }
+    }
+}
+
+/** The album's quality for every tier: its label, accent-styled only for hi-res. */
+@Composable
+private fun AlbumQualityChip(q: Quality) {
+    if (q.label.isBlank()) return
+    val hi = q.isHiRes
+    Surface(shape = RoundedCornerShape(4.dp),
+        color = if (hi) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+        contentColor = if (hi) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant) {
+        Text(q.label, style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp), maxLines = 1)
     }
 }
 

@@ -79,6 +79,35 @@ def _best_address(addresses: list[str], local_nets: list[ipaddress.IPv4Network])
     return min(addresses, key=lambda a: (_address_rank(a, local_nets), a))
 
 
+def host_rank(host: str, local_nets: list[ipaddress.IPv4Network] | None = None) -> int:
+    """Directness of a peer host for picking among addresses of ONE instance.
+    IP literals use _address_rank; a name resolves unknown, so it ranks between a
+    LAN address and a public/overlay one."""
+    try:
+        ipaddress.ip_address(str(host))
+    except ValueError:
+        return 2
+    return _address_rank(str(host), _local_networks() if local_nets is None else local_nets)
+
+
+def dedupe_instances(insts: list[dict[str, Any]], own_id: str | None = None) -> list[dict[str, Any]]:
+    """One row per Harmony instance. Rows carrying an ``instance_id`` collapse by
+    it (keeping the most direct address, LAN over Tailscale) and our own id is
+    dropped; rows without one (older peers) collapse by host:port."""
+    nets = _local_networks()
+    out: dict[str, dict[str, Any]] = {}
+    for p in insts:
+        iid = p.get("instance_id")
+        if iid and iid == own_id:
+            continue
+        key = f"id:{iid}" if iid else f"{p.get('host')}:{p.get('port')}"
+        cur = out.get(key)
+        if cur is None or (host_rank(p.get("host"), nets), str(p.get("host"))) < \
+                (host_rank(cur.get("host"), nets), str(cur.get("host"))):
+            out[key] = p
+    return list(out.values())
+
+
 def _primary_ipv4() -> str:
     """This host's primary LAN IPv4 (best-effort), for the mDNS advertisement."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -122,8 +151,9 @@ class Mesh:
     nothing). ``peers()`` returns the currently-known other instances.
     """
 
-    def __init__(self, name: str, port: int) -> None:
+    def __init__(self, name: str, port: int, instance_id: str = "") -> None:
         self._name = name
+        self._instance_id = instance_id
         self._port = port
         self._zc: Any | None = None
         self._info: Any | None = None
@@ -148,7 +178,8 @@ class Mesh:
                 self._service_name,
                 addresses=addresses,
                 port=self._port,
-                properties={"name": self._name, "version": __version__},
+                properties={"name": self._name, "version": __version__,
+                            **({"iid": self._instance_id} if self._instance_id else {})},
             )
             self._zc.register_service(self._info)
             self._browser = ServiceBrowser(self._zc, SERVICE_TYPE, _Listener(self))
@@ -198,7 +229,10 @@ class Mesh:
             "host": host,
             "port": info.port,
             "version": props.get("version"),
+            "instance_id": props.get("iid") or None,
         }
+        if self._instance_id and peer["instance_id"] == self._instance_id:
+            return  # our own advertisement under another service name
         with self._lock:
             self._peers[name] = peer
 

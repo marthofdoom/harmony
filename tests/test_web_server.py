@@ -49,7 +49,9 @@ def test_healthz_reports_ok_and_version(base_url: str) -> None:
     assert status == 200
     assert "application/json" in ctype
     payload = json.loads(body)
-    assert payload == {"status": "ok", "service": "harmony", "version": __version__}
+    assert {k: payload[k] for k in ("status", "service", "version")} == {
+        "status": "ok", "service": "harmony", "version": __version__}
+    assert payload["instance_id"] and payload["name"]
 
 
 def test_start_background_serves_and_stops() -> None:

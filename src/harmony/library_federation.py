@@ -95,7 +95,9 @@ class FederatedLibraryProvider(MusicProvider):
         """``{"host:port": name}`` for every instance the mesh knows."""
         out: dict[str, str] = {}
         try:
-            for p in self._peers() or []:
+            from harmony.mesh import dedupe_instances
+
+            for p in dedupe_instances([q for q in self._peers() or [] if isinstance(q, dict)]):
                 if p.get("host") and p.get("port"):
                     out[f"{p['host']}:{p['port']}"] = str(p.get("name") or p["host"])
         except Exception as exc:  # noqa: BLE001 - no mesh means no peers

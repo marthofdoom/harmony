@@ -195,15 +195,6 @@ const locationBadge = (t) => `<span class="badge${t.library_id || t.service === 
 // -- "Playing from" context + stream quality ----------------------------------
 // Every play entry point passes {kind, title, service?, id?}; it lives with the
 // active queue (persisted; sent to devices in queue/load).
-const CTX_KIND = { album: "Album", playlist: "Playlist", artist: "Artist", genre: "Genre", track: "Track" };
-// The collection the queue came from, as a small clickable link label.
-// A search context's query; older versions stored the label ("Search: q" /
-// "Search “q”") as the title.
-const searchQuery = (c) => {
-  const raw = String((c && (c.id || c.title)) || "").trim();
-  const m = raw.match(/^Search\s*[“"](.*)[”"]$/) || raw.match(/^Search:\s*(.*)$/);
-  return (m ? m[1] : raw).trim();
-};
 // The stream behind the current track: {quality, source} from /api/resolve
 // (browser) or the device snapshot's `stream`.
 function currentStream() { return onDevice() ? dev.stream : (br.loaded && br.loaded === pq.current() ? br.info : null); }
@@ -1054,6 +1045,7 @@ function trackArtistCell(t) {
 // Row options:
 //   numbered        album-style track numbers (play button over the number)
 //   reorder         a drag grip (Now Playing queue)
+//   showQuality     a per-track quality pill after the title (album pages)
 //   queueRow        a Now Playing queue row: queue actions only — NEVER playlist ones
 //   playlistActions an editable playlist's rows (remove-from-playlist)
 function trackRowHtml(t, i, opts = {}) {
@@ -1062,13 +1054,13 @@ function trackRowHtml(t, i, opts = {}) {
   const title = t.id
     ? `<a class="tt" href="${routeHref("track", t.service, t.id)}" title="${esc(t.title)}">${esc(t.title)}</a>`
     : `<span class="tt">${esc(t.title)}</span>`;
-  const quality = t.quality ? qPill(t.quality) : "";
+  const quality = opts.showQuality && t.quality ? qPill(t.quality) : "";
   return `
     <div class="trow${opts.numbered ? " numbered" : ""}${opts.reorder ? " reorder" : ""}" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
       <div class="tlead">${num}<button class="play" type="button" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
-      <div class="title">${title}${opts.hideBadge ? "" : locationBadge(t)}</div>
+      <div class="title">${title}${opts.hideBadge ? "" : locationBadge(t)}${quality}</div>
       ${trackArtistCell(t)}
-      <div class="dur">${quality ? `${quality} ${fmtTime(t.duration_s)}` : fmtTime(t.duration_s)}</div>
+      <div class="dur">${fmtTime(t.duration_s)}</div>
       <div class="rowacts">
         ${grip}
         ${opts.queueRow ? "" : `<button class="mini add" type="button" aria-label="Add to playlist">${ICON("add")}</button>`}
@@ -2129,7 +2121,7 @@ async function renderAlbumView(service, id) {
   const albQuality = al.quality ? qPill(al.quality) : "";
   const tracks = d.tracks || [];
   const tracksSec = tracks.length
-    ? tracksHtml(tracks, { numbered: true, hideBadge: true, albumQuality: albQuality })
+    ? tracksHtml(tracks, { numbered: true, hideBadge: true, showQuality: true })
     : emptyState("music", "No tracks", "This album has no playable tracks right now.");
 
   list.innerHTML = `<div class="detail">

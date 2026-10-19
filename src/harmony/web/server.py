@@ -99,7 +99,11 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if path == "/healthz":
-            self._send_json({"status": "ok", "service": "harmony", "version": __version__})
+            try:
+                payload = get_engine().healthz()
+            except Exception:  # noqa: BLE001 - liveness must not depend on settings I/O
+                payload = {"status": "ok", "service": "harmony", "version": __version__}
+            self._send_json(payload)
             return
         if path.startswith("/art/"):
             # Library artwork: a signed capability path, deliberately outside the

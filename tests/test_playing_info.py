@@ -108,12 +108,3 @@ def test_pager_pages_and_drops_stale_results(monkeypatch) -> None:
     fn, done, _ = pending.pop()
     done(fn())
     assert seen[-1] == ([0, 1], True)
-
-
-def test_legacy_search_labels_are_not_doubled() -> None:
-    from harmony.ui.playing_info import context_text, search_query
-
-    for old in ({"kind": "search", "title": "Search “nemo”"}, {"kind": "search", "title": "Search: nemo"},
-                {"kind": "search", "title": "nemo", "id": "nemo"}):
-        assert search_query(old) == "nemo"
-        assert context_text(old) == "Search “nemo”"

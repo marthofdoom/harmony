@@ -118,6 +118,7 @@ class ClientReviewFixesTest {
         val c = PlayContext.search("blue")
         assertEquals("search", c.kind)
         assertEquals("blue", c.title)
+        assertEquals("blue", c.id)
         assertEquals(c, PlayContext.fromJson(JSONObject(c.toJson().toString())))
     }
 
@@ -151,11 +152,8 @@ class ClientReviewFixesTest {
 class LegacySearchContextTest {
     @org.junit.Test
     fun legacySearchTitlesAreStripped() {
-        val c1 = PlayContext("search", "Search \"nemo\"")
-        org.junit.Assert.assertEquals("nemo", c1.searchQuery())
-        val c2 = PlayContext("search", "Search: nemo")
-        org.junit.Assert.assertEquals("nemo", c2.searchQuery())
-        val c3 = PlayContext("search", "nemo")
-        org.junit.Assert.assertEquals("nemo", c3.searchQuery())
+        for (t in listOf("Search \u201cnemo\u201d", "Search \"nemo\"", "Search: nemo", "nemo")) {
+            org.junit.Assert.assertEquals(t, "nemo", PlayContext("search", t).searchQuery())
+        }
     }
 }

@@ -57,10 +57,6 @@ class HarmonyWindow(Adw.ApplicationWindow):
         outer.append(self.split_view)
         self.now_playing_bar = NowPlayingBar(self.state)
         self.now_playing_bar.on_open_now_playing = lambda: self._activate_page("now_playing")
-        self.now_playing_bar.on_open_page = self._activate_page
-        np_page = self._pages.get("now_playing")
-        if hasattr(np_page, "info"):
-            np_page.info.open_page = self._activate_page
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         self.now_playing_bar.bind_property(
             "visible", separator, "visible", GObject.BindingFlags.SYNC_CREATE

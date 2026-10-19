@@ -73,8 +73,7 @@ class NowPlayingBar(Gtk.Box):
         self._artist.add_css_class("caption")
         # "Playing from …" + the stream's source/format (Hi-Res pill); the live
         # local-output readout is its tooltip.
-        self.on_open_page: Any = None
-        self._info = NowPlayingInfo(state, open_page=lambda p: self.on_open_page and self.on_open_page(p))
+        self._info = NowPlayingInfo(state)
         meta.append(self._title)
         meta.append(self._artist)
         meta.append(self._info)

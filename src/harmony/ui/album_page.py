@@ -76,7 +76,7 @@ class AlbumPage(Adw.NavigationPage):
         quality = album.get("quality")
         badge = quality.get("label") if quality else None
         self._content.append(artwork_header(album.get("artwork_url"), title, subtitle,
-                                            badge=badge, icon="media-optical-symbolic"))
+                                            badge=badge, badge_tier=(quality or {}).get("tier"), icon="media-optical-symbolic"))
 
         artist_ref = data.get("artist_ref")
         if artist_ref and artist_ref.get("id"):
@@ -101,12 +101,9 @@ class AlbumPage(Adw.NavigationPage):
         if any(t.get("quality") for t in tracks):
             def _quality_label(t: Any) -> str:
                 return (t.quality or {}).get("label") or ""
-            columns = [
-                ("Title", lambda t: t.title, True),
-                ("Artist", lambda t: t.artist_name, True),
-                ("Duration", lambda t: t.duration_text, False),
-                ("Quality", _quality_label, False),
-            ]
+            from harmony.ui.widgets import _TRACK_COLUMNS
+
+            columns = [*_TRACK_COLUMNS, ("Quality", _quality_label, False)]
         self._content.append(tracks_widget(tracks, self.state, self.nav, title="Tracks",
                                            collection_key=key, context=context, columns=columns))
         self._stack.set_visible_child_name("content")

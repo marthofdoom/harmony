@@ -34,7 +34,8 @@ from harmony.ui.widgets import (  # noqa: E402
 
 
 def artwork_header(image_url: str | None, title: str, subtitle: str,
-                   *, badge: str | None = None, icon: str = "emblem-music-symbolic") -> Gtk.Widget:
+                   *, badge: str | None = None, badge_tier: str | None = None,
+                   icon: str = "emblem-music-symbolic") -> Gtk.Widget:
     box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=18,
                   margin_top=8, margin_bottom=4)
     image = Gtk.Image(pixel_size=128)
@@ -51,9 +52,13 @@ def artwork_header(image_url: str | None, title: str, subtitle: str,
         sub.add_css_class("dim-label")
         text.append(sub)
     if badge:
-        chip = Gtk.Label(label=badge, xalign=0.0)
-        chip.add_css_class("caption")
-        chip.add_css_class("dim-label")
+        from harmony.ui.np_info import install_css
+
+        install_css()
+        chip = Gtk.Label(label=badge, xalign=0.0)   # the bar's tier pill, every tier
+        chip.add_css_class("tier-pill")
+        if badge_tier == "hires":
+            chip.add_css_class("hires")
         chip_row = Gtk.Box()
         chip_row.append(chip)
         text.append(chip_row)

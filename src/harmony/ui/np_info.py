@@ -11,8 +11,6 @@ theme, light or dark, restyles it.
 
 from __future__ import annotations
 
-from collections.abc import Callable
-
 import gi
 
 gi.require_version("Gtk", "4.0")
@@ -60,11 +58,9 @@ class NowPlayingInfo(Gtk.Box):
     The live local-output readout ("Output: …") is the quality line's tooltip,
     and stands in for the line while the stream's format isn't known yet."""
 
-    def __init__(self, state: AppState, *, large: bool = False,
-                 open_page: Callable[[str], None] | None = None) -> None:
+    def __init__(self, state: AppState, *, large: bool = False) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2 if not large else 4)
         self.state = state
-        self.open_page = open_page
         install_css()
         css = "body" if large else "caption"
 

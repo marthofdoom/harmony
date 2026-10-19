@@ -157,6 +157,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .trow .play .ico { width: 1.15rem; height: 1.15rem; }
 .trow .title { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; font-weight: 550; }
 .trow .title .tt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: inherit; text-decoration: none; min-width: 0; }
+.trow .title .qpill { flex: none; }
 .trow .title a.tt:hover { text-decoration: underline; }
 @media (hover: none) { .trow { cursor: pointer; } }
 .link-plain { color: inherit; text-decoration: none; }
@@ -498,7 +499,7 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
                         overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .libgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   #np-info { font-size: 10.5px; }
-  #np-info .np-src, #np-info .np-coll { display: none; }
+  #np-info .np-src { display: none; }
   #np-info .np-stream { flex: none; display: flex; gap: 4px; overflow: visible; }
   #np-info .q-full { display: none !important; }
   #np-info .qpill.q-short { display: block; flex: none; }

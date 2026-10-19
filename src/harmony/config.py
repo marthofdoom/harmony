@@ -8,6 +8,7 @@ writing a password to a world-readable file would be worse than the warning.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -240,21 +241,40 @@ class Settings:
     # arrives. Non-secret; adoption/routing still gate on the personal key.
     known_peers: list[dict[str, Any]] = field(default_factory=list)
 
+    # Stable identity of THIS Harmony instance (uuid4, created on first need), so
+    # peers can tell "same server, another address" from "another server".
+    instance_id: str = ""
+
     _extra: dict[str, Any] = field(default_factory=dict, repr=False)
+    # Field values as last read from / written to disk: the base of save()'s
+    # three-way merge (None for a Settings built by hand).
+    _base: dict[str, Any] | None = field(default=None, repr=False)
+
+    def _snapshot(self) -> dict[str, Any]:
+        return copy.deepcopy({k: getattr(self, k) for k in self.__dataclass_fields__
+                              if not k.startswith("_")})
+
+    @classmethod
+    def _fresh(cls) -> Settings:
+        inst = cls()
+        inst._base = inst._snapshot()
+        return inst
 
     @classmethod
     def load(cls) -> Settings:
         path = settings_path()
         if not path.exists():
-            return cls()
+            return cls._fresh()
         try:
             raw = json.loads(path.read_text("utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             log.warning("Could not read %s (%s); starting from defaults", path, exc)
-            return cls()
+            return cls._fresh()
         known = {f for f in cls.__dataclass_fields__ if not f.startswith("_")}
         extra = {k: v for k, v in raw.items() if k not in known}
-        return cls(**{k: v for k, v in raw.items() if k in known}, _extra=extra)
+        inst = cls(**{k: v for k, v in raw.items() if k in known}, _extra=extra)
+        inst._base = inst._snapshot()
+        return inst
 
     def reload(self) -> None:
         """Re-read the file into THIS object, in place.
@@ -267,14 +287,31 @@ class Settings:
         for name in self.__dataclass_fields__:
             setattr(self, name, getattr(fresh, name))
 
+    def _merge_disk(self) -> None:
+        """Fields this object never changed since it last synced with the file
+        take the file's (newer) value, so a long-lived copy saving its own
+        change (a page switch) can't clobber what another writer — the engine
+        adding a peer — put on disk meanwhile."""
+        if self._base is None:
+            return
+        try:
+            disk = json.loads(settings_path().read_text("utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return
+        for k, base_v in self._base.items():
+            if k in disk and getattr(self, k) == base_v and disk[k] != base_v:
+                setattr(self, k, disk[k])
+
     def save(self) -> None:
         path = settings_path()
         path.parent.mkdir(parents=True, exist_ok=True)
+        self._merge_disk()
         payload = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
         payload.update(self._extra)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
         tmp.replace(path)
+        self._base = self._snapshot()
 
 
 # --------------------------------------------------------------------------

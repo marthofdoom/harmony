@@ -53,7 +53,11 @@ def add_instance(text: str) -> dict[str, Any]:
     host, port = parse_address(text)
     result = _engine().add_peer(host, port)
     if not result.get("ok"):
-        raise RuntimeError(f"Couldn't reach {host}:{port} ({result.get('reason', 'no answer')}).")
+        reason = str(result.get("reason") or "no answer")
+        if reason.startswith("unreachable") or reason == "no answer":
+            raise RuntimeError(f"Couldn't reach {host}:{port} ({reason}).")
+        # "not a Harmony server" / "that's this instance": say exactly that.
+        raise RuntimeError(f"{host}:{port} — {reason}.")
     return result
 
 

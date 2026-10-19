@@ -154,6 +154,8 @@ class Engine:
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
         self._mesh: Any | None = None
+        self._iid: str | None = None
+        self._iid_lock = threading.Lock()
         self._onboard: Any | None = None
         self._audio_router: Any | None = None
         self._devices_cache: tuple[float, list[dict[str, Any]]] | None = None
@@ -2028,13 +2030,41 @@ class Engine:
 
         from harmony.mesh import Mesh
 
-        self._mesh = Mesh(name or f"harmony-{socket.gethostname()}-{port}", port)
+        self._mesh = Mesh(name or f"harmony-{socket.gethostname()}-{port}", port, self.instance_id())
         self._mesh.start()
+
+    def instance_id(self) -> str:
+        """This instance's stable id (uuid4), created and persisted on first need."""
+        from harmony.config import Settings
+
+        with self._iid_lock:
+            if self._iid is None:
+                settings = Settings.load()
+                if not settings.instance_id:
+                    import uuid
+
+                    settings.instance_id = str(uuid.uuid4())
+                    settings.save()
+                self._iid = settings.instance_id
+            return self._iid
+
+    def instance_name(self) -> str:
+        import socket
+
+        mesh_name = getattr(self._mesh, "_name", None) if self._mesh is not None else None
+        return mesh_name or f"harmony-{socket.gethostname()}"
+
+    def healthz(self) -> dict[str, Any]:
+        from harmony import __version__
+
+        return {"status": "ok", "service": "harmony", "version": __version__,
+                "instance_id": self.instance_id(), "name": self.instance_name()}
 
     def instances(self) -> dict[str, Any]:
         """Reachable Harmony instances: mDNS-discovered peers plus manually
         registered ones (Tailscale/routed hosts multicast can't reach)."""
         from harmony.config import Settings
+        from harmony.mesh import dedupe_instances
 
         by_addr: dict[str, dict[str, Any]] = {}
         discovered = self._mesh.peers() if self._mesh is not None else []
@@ -2047,14 +2077,19 @@ class Engine:
             key = f"{host}:{port}"
             if key in by_addr:
                 by_addr[key]["source"] = "both"
+                if p.get("instance_id") and not by_addr[key].get("instance_id"):
+                    by_addr[key]["instance_id"] = p["instance_id"]
             else:
                 by_addr[key] = {
                     "name": p.get("name") or host,
                     "host": host,
                     "port": port,
                     "source": "manual",
+                    "instance_id": p.get("instance_id") or None,
                 }
-        return {"instances": list(by_addr.values())}
+        # The same server can show up twice (its mDNS LAN address and a typed
+        # Tailscale/hostname one): one row per instance id, most direct address.
+        return {"instances": dedupe_instances(list(by_addr.values()), self.instance_id())}
 
     def add_peer(self, host: str, port: int, name: str | None = None) -> dict[str, Any]:
         """Register a peer instance by address, verifying it answers /healthz."""
@@ -2070,14 +2105,33 @@ class Engine:
         if not host:
             return {"ok": False, "reason": "no host"}
         info: dict[str, Any] = {}
+        bare = host[1:-1] if host.startswith("[") and host.endswith("]") else host
+        netloc = f"[{bare}]" if ":" in bare else bare
+        host = bare
         try:
-            resp = requests.get(f"http://{host}:{port}/healthz", timeout=4)
-            info = resp.json() if resp.ok else {}
+            resp = requests.get(f"http://{netloc}:{port}/healthz", timeout=4)
+            ok = resp.ok
+            info = resp.json() if ok else {}
         except Exception as exc:  # noqa: BLE001 - reachability is best-effort
             return {"ok": False, "reason": f"unreachable: {exc}"}
+        if not ok or not isinstance(info, dict) or info.get("service") != "harmony":
+            return {"ok": False, "reason": "not a Harmony server"}
+        iid = info.get("instance_id") or None
+        if iid and iid == self.instance_id():
+            return {"ok": False, "reason": "that's this instance"}
+        from harmony.mesh import host_rank
+
         settings = Settings.load()
         peers = [p for p in settings.known_peers if not (p.get("host") == host and p.get("port") == port)]
-        peers.append({"host": host, "port": port, "name": name or info.get("name") or host})
+        if iid:
+            twins = [p for p in peers if p.get("instance_id") == iid]
+            if any(host_rank(t.get("host")) <= host_rank(host) for t in twins):
+                # Already saved at an equally direct (or better) address.
+                best = twins[0]
+                return {"ok": True, "peer": best, "healthz": info}
+            peers = [p for p in peers if p.get("instance_id") != iid]
+        peers.append({"host": host, "port": port, "name": name or info.get("name") or host,
+                      **({"instance_id": iid} if iid else {})})
         settings.known_peers = peers
         settings.save()
         self._peers_changed()
