@@ -128,6 +128,7 @@ class PlayQueue {
 // on. It survives navigation and changes only through explicit play / queue ops
 // (or, on a device, the server's snapshot) — never as a side effect of browsing.
 const pq = new PlayQueue();
+pq.context = null;   // {kind, title, service?, id?} — where the active queue came from
 
 const state = {
   // The currently DISPLAYED list (search results / album / playlist). Used only
@@ -191,6 +192,50 @@ const serviceLabel = (s) => ({ ytmusic: "YouTube Music", qobuz: "Qobuz", local: 
 const locationLabel = (t) => (t.library_id ? "Library" : serviceLabel(t.service));
 const locationBadge = (t) => `<span class="badge${t.library_id || t.service === "local" ? " lib" : ""}"${
   t.library_id ? ` title="Plays from your library (also on ${esc(serviceLabel(t.service))})"` : ""}>${esc(locationLabel(t))}</span>`;
+// -- "Playing from" context + stream quality ----------------------------------
+// Every play entry point passes {kind, title, service?, id?}; it lives with the
+// active queue (persisted; sent to devices in queue/load).
+const CTX_KIND = { album: "Album", playlist: "Playlist", artist: "Artist", genre: "Genre", track: "Track" };
+// The collection the queue came from, as a small clickable link label.
+const collText = (c) => (c && c.title ? (CTX_KIND[c.kind] ? `${CTX_KIND[c.kind]}: ${c.title}` : c.title) : "");
+function openContext(c) {
+  if (!c) return;
+  const clear = () => { if (location.hash) history.replaceState(null, "", location.pathname + location.search); };
+  if (c.kind === "album" && c.id) navigateAlbum(c.service || "local", c.id);
+  else if (c.kind === "artist" && c.id) navigateArtist(c.service || "local", c.id);
+  else if (c.kind === "track" && c.id) navigateTrack(c.service, c.id);
+  else if (c.kind === "playlist" && c.id) {
+    clear(); state.section = "playlists"; state.detail = false; highlightNav("playlists");
+    openPlaylist(c.service, c.id, c.title);
+  } else if (c.kind === "genre") { libUI.view = "genres"; libUI.genre = c.id || c.title; libUI.genreMode = "songs"; goView("library"); }
+  else if (c.kind === "songs") { libUI.view = "songs"; libUI.genre = c.id || null; goView("library"); }
+  else if (c.kind === "search") {
+    const q = c.id || String(c.title || "").replace(/^Search:\s*/, "");
+    $("search-input").value = q; clear(); doSmartSearch(q);
+  }
+}
+// The stream behind the current track: {quality, source} from /api/resolve
+// (browser) or the device snapshot's `stream`.
+function currentStream() { return onDevice() ? dev.stream : (br.loaded && br.loaded === pq.current() ? br.info : null); }
+function streamParts(t) {
+  const s = currentStream() || {};
+  const q = s.quality || (t && t.quality) || null;
+  const src = s.source || {};
+  const label = src.label || (t ? (t.library_id || t.service === "local" ? "Library" : serviceLabel(t.service)) : "");
+  const instance = label === "Library" ? (src.instance || "") : "";
+  const pill = q && q.label ? `<span class="qpill ${esc(q.tier || "")}">${esc(q.label)}</span>` : "";
+  // Phone-width short form: "FLAC 24/96" (lossless), "AAC 256" (lossy) + a separate Hi-Res pill.
+  let short = "";
+  if (q) {
+    const codec = q.codec || "";
+    const khz = q.sample_rate ? String(Math.round(q.sample_rate / 100) / 10).replace(/\.0$/, "") : "";
+    short = q.lossless && q.bit_depth && khz ? `${codec} ${q.bit_depth}/${khz}` : q.bitrate ? `${codec} ${q.bitrate}` : (codec || "");
+    short = short.trim();
+  }
+  const shortPill = short ? `<span class="qpill q-short ${esc(q.tier === "hires" ? "" : q.tier || "")}">${esc(short)}</span>`
+    + (q.tier === "hires" ? `<span class="qpill hires q-short">Hi-Res</span>` : "") : "";
+  return { label, instance, pill, shortPill, quality: q && q.label ? q.label : "" };
+}
 const nTracks = (n) => (n == null ? "" : `${n} ${n === 1 ? "track" : "tracks"}`);
 const deviceIcon = (d) => (d.host === "browser" ? "computer" : d.kind === "cast" ? "tv" : "speaker");
 const deviceKindLabel = (d) => (d.kind === "cast" ? "Chromecast" : d.kind === "wiim" ? "WiiM" : (d.kind || "device"));
@@ -437,9 +482,329 @@ async function waitForScan(onDone) {
   }
 }
 
+// -- iTunes-style Library browser ---------------------------------------------
+// Artists | Albums | Songs | Genres over GET /api/library/view (merged across
+// every library on the mesh). The last-used tab is remembered in localStorage.
+
+const LIB_VIEWS = [["artists", "Artists"], ["albums", "Albums"], ["songs", "Songs"], ["genres", "Genres"]];
+const LIB_PAGE = 200;
+const lsGet = (k) => { try { return localStorage.getItem(k); } catch { return null; } };
+const lsSet = (k, v) => { try { localStorage.setItem(k, v); } catch { /* ignore */ } };
+const libUI = {
+  view: LIB_VIEWS.some((v) => v[0] === lsGet("harmonyLibView")) ? lsGet("harmonyLibView") : "albums",
+  genre: null,          // drilled into a genre (Genres tab) or filtering Songs by one
+  genreMode: "albums",  // inside a genre: its albums or its songs
+  artist: null,         // selected artist id (Artists tab)
+  albums: { order: "title", desc: false },
+  songs: { order: "artist", desc: false },
+  pager: null,
+};
+const SONG_COLS = [["title", "Title"], ["artist", "Artist"], ["album", "Album"], ["year", "Year"],
+                   ["genre", "Genre"], ["duration", "Time"], ["quality", "Quality"]];
+const ALBUM_ORDERS = [["title", "Title"], ["artist", "Artist"], ["year", "Year"], ["recent", "Recently added"]];
+
+async function libFetch(view, params, offset, limit) {
+  const q = new URLSearchParams({ view, limit: String(limit), offset: String(offset) });
+  Object.entries(params || {}).forEach(([k, v]) => { if (v !== "" && v != null && v !== false) q.set(k, v === true ? "1" : String(v)); });
+  const r = await api(`/api/library/view?${q}`);
+  return { items: r[view] || [], total: r.total != null ? r.total : (r[view] || []).length };
+}
+
+// Infinite scroll over `box`: fetches the next page whenever the sentinel under
+// it nears the viewport of #list. `fetchPage(offset)` → {items, total}.
+function libPager(box, fetchPage, renderChunk) {
+  if (libUI.pager) libUI.pager.stop();
+  const st = { offset: 0, total: null, items: [], busy: false, dead: false };
+  const sentinel = document.createElement("div");
+  sentinel.className = "lib-more";
+  box.after(sentinel);
+  const io = "IntersectionObserver" in window
+    ? new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) st.more(); }, { root: $("list"), rootMargin: "300px" })
+    : null;
+  st.done = () => st.total != null && st.offset >= st.total;
+  st.more = async () => {
+    if (st.busy || st.dead || st.done()) return;
+    st.busy = true;
+    sentinel.innerHTML = loadingState("Loading…");
+    try {
+      const page = await fetchPage(st.offset);
+      if (st.dead) return;
+      st.total = page.total;
+      const start = st.items.length;
+      st.items.push(...page.items);
+      st.offset += page.items.length;
+      if (!page.items.length) st.total = st.offset;
+      renderChunk(page.items, start, st);
+      sentinel.textContent = "";
+    } catch (e) {
+      if (st.dead) return;
+      sentinel.innerHTML = `<p class="muted msg err">Couldn’t load: ${esc(e.message)} <button class="act ghost small" type="button">Retry</button></p>`;
+      sentinel.querySelector("button").onclick = () => st.more();
+      st.busy = false;
+      return;
+    }
+    st.busy = false;
+    if (st.done()) { if (io) io.disconnect(); sentinel.textContent = ""; }
+    else if (io) { io.unobserve(sentinel); io.observe(sentinel); }   // re-check if still in view
+  };
+  st.stop = () => { st.dead = true; if (io) io.disconnect(); sentinel.remove(); };
+  st.empty = () => st.total === 0;
+  libUI.pager = st;
+  if (io) io.observe(sentinel);
+  st.more();
+  return st;
+}
+
+const qPill = (q) => (q && q.label ? `<span class="qpill ${esc(q.tier || "")}" title="${esc(q.label)}">${esc(q.label)}</span>` : "");
+const yearOf = (t) => (t.year != null ? t.year : (t.date ? String(t.date).slice(0, 4) : ""));
+
+function albumCardHtml(a, i) {
+  const hires = a.quality && a.quality.tier === "hires";
+  const sub = [a.artist, yearOf(a)].filter(Boolean).join(" · ");
+  return `<div class="plcard alcard" tabindex="0" role="link" data-i="${i}" title="${esc(a.title)}">
+    <div class="art" data-art="${esc(a.artwork_url || "")}">${ICON("music")}</div>
+    ${hires ? `<span class="qpill hires corner">Hi-Res</span>` : ""}
+    <div class="t">${esc(a.title)}</div>
+    <div class="s">${esc(sub)}</div>
+    ${moreBtn(`More actions for ${a.title || "album"}`)}
+  </div>`;
+}
+function wireAlbumCards(scope, albums) {
+  scope.querySelectorAll(".alcard:not([data-wired])").forEach((card) => {
+    card.dataset.wired = "1";
+    const a = albums[Number(card.dataset.i)];
+    if (!a) return;
+    const open = () => navigateAlbum(a.service || "local", a.id);
+    card.addEventListener("click", (e) => { if (!e.target.closest(".more")) open(); });
+    card.addEventListener("keydown", (e) => { if (e.target === card && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); open(); } });
+    card.addEventListener("contextmenu", (e) => menuAt(e, albumMenuItems(a)));
+    const more = card.querySelector(".more");
+    if (more) more.addEventListener("click", (e) => { e.stopPropagation(); menuAt(e.currentTarget, albumMenuItems(a)); });
+  });
+}
+
+function songRowHtml(t, i) {
+  const title = t.id
+    ? `<a class="tt" href="${routeHref("track", t.service, t.id)}" title="${esc(t.title)}">${esc(t.title)}</a>`
+    : `<span class="tt">${esc(t.title)}</span>`;
+  return `<div class="trow songrow" data-i="${i}" data-svc="${esc(t.service)}" data-tid="${esc(t.id)}">
+    <div class="tlead"><button class="play" type="button" aria-label="Play ${esc(t.title)}">${ICON("play")}</button></div>
+    <div class="title">${title}<span class="msub">${esc([t.artist, t.album].filter(Boolean).join(" · "))}</span></div>
+    ${trackArtistCell(t)}
+    <div class="col-album">${esc(t.album || "")}</div>
+    <div class="col-year">${esc(yearOf(t))}</div>
+    <div class="col-genre">${esc(t.genre || "")}</div>
+    <div class="dur">${fmtTime(t.duration_s)}</div>
+    <div class="col-q">${qPill(t.quality)}</div>
+    <div class="rowacts">${moreBtn(`More actions for ${t.title || "track"}`)}</div>
+  </div>`;
+}
+
+// A songs list (library-wide, a genre, or one artist). Rows play the WHOLE list
+// from the clicked row — the rest of the pages are fetched first if needed.
+function renderSongsList(body, { params, ctx, sortable, header }) {
+  const sort = libUI.songs;
+  body.innerHTML = `${header || ""}
+    <div class="songs${sortable ? "" : " nohead"}">
+      ${sortable ? `<div class="songhead" role="row">
+        <span></span>${SONG_COLS.map(([k, label]) => `<button type="button" class="sh sh-${k}${sort.order === k ? " on" : ""}" data-order="${k}"
+          aria-sort="${sort.order === k ? (sort.desc ? "descending" : "ascending") : "none"}">${label}<span class="arrow">${sort.order === k ? (sort.desc ? "▼" : "▲") : ""}</span></button>`).join("")}
+        <span></span></div>` : ""}
+      <div class="tracks" id="songs-box"></div>
+    </div>`;
+  const box = $("songs-box");
+  const tracks = [];
+  const fetchOrder = sortable ? { order: sort.order, desc: sort.desc } : { order: "album" };
+  const pg = libPager(box, (off) => libFetch("songs", { ...params, ...fetchOrder }, off, LIB_PAGE), (items, start) => {
+    tracks.push(...items);
+    const wrap = document.createElement("div");
+    wrap.style.display = "contents";
+    wrap.innerHTML = items.map((t, k) => songRowHtml(t, start + k)).join("");
+    box.appendChild(wrap);
+    wireTrackRows(wrap, tracks, { onPlay: playFromRow, context: ctx });
+    highlightPlaying();
+    if (pg.total === 0) box.innerHTML = emptyState("music", "No songs", "Nothing matches.");
+  });
+  async function playFromRow(i) {
+    if (!pg.done()) {
+      toast("Loading the whole list…");
+      for (let n = 0; n < 40 && !pg.done() && !pg.dead; n++) {
+        if (pg.busy) { await new Promise((r) => setTimeout(r, 100)); continue; }
+        await pg.more();
+        if (pg.items.length >= 8000) break;
+      }
+    }
+    playFrom(tracks, i, { context: ctx });
+  }
+  state.queue = tracks;
+  body.querySelectorAll(".sh").forEach((b) => b.onclick = () => {
+    const k = b.dataset.order;
+    if (sort.order === k) sort.desc = !sort.desc; else { sort.order = k; sort.desc = false; }
+    showLibBody();
+  });
+  return { tracks, pg };
+}
+
+async function showArtistsTab(body) {
+  body.innerHTML = loadingState("Loading artists…");
+  let artists = [];
+  try {
+    for (let off = 0; off < 20000; off += 1000) {
+      const p = await libFetch("artists", {}, off, 1000);
+      artists = artists.concat(p.items);
+      if (artists.length >= p.total || !p.items.length) break;
+    }
+  } catch (e) { body.innerHTML = errorState("Couldn’t load artists", e.message, "lib-retry"); $("lib-retry").onclick = showLibBody; return; }
+  if (!artists.length) { body.innerHTML = emptyState("music", "No artists yet", "Rescan once the folders have music in them."); return; }
+  const phone = window.matchMedia("(max-width: 720px)").matches;
+  if (!phone && !artists.some((a) => a.id === libUI.artist)) libUI.artist = artists[0].id;
+  if (phone && !artists.some((a) => a.id === libUI.artist)) libUI.artist = null;
+  body.innerHTML = `<div class="artsplit${libUI.artist ? " drilled" : ""}">
+    <div class="artlist" role="listbox" aria-label="Artists">${artists.map((a, i) => `
+      <button type="button" class="artitem${a.id === libUI.artist ? " sel" : ""}" role="option" data-i="${i}">
+        <span class="an">${esc(a.name)}</span><span class="ac muted">${esc(String(a.album_count))} ${a.album_count === 1 ? "album" : "albums"}</span></button>`).join("")}</div>
+    <div class="artdetail" id="artdetail"></div></div>`;
+  const split = body.querySelector(".artsplit");
+  const select = (a) => {
+    libUI.artist = a ? a.id : null;
+    split.classList.toggle("drilled", !!a);
+    body.querySelectorAll(".artitem").forEach((el) => el.classList.toggle("sel", !!a && artists[Number(el.dataset.i)].id === a.id));
+    if (a) showArtistDetail($("artdetail"), a, () => select(null));
+  };
+  body.querySelectorAll(".artitem").forEach((el) => el.onclick = () => select(artists[Number(el.dataset.i)]));
+  if (libUI.artist) select(artists.find((a) => a.id === libUI.artist));
+}
+
+async function showArtistDetail(host, artist, back) {
+  host.innerHTML = loadingState("Loading…");
+  const token = (host._tok = (host._tok || 0) + 1);
+  let albums = [], songs = [];
+  try {
+    albums = (await libFetch("albums", { artist: artist.id, order: "year" }, 0, 500)).items;
+    songs = (await libFetch("songs", { artist: artist.id, order: "album" }, 0, 1000)).items;
+  } catch (e) { host.innerHTML = errorState("Couldn’t load this artist", e.message, "ad-retry"); $("ad-retry").onclick = () => showArtistDetail(host, artist, back); return; }
+  if (host._tok !== token) return;
+  const ctx = { kind: "artist", title: artist.name, service: "local", id: artist.id };
+  host.innerHTML = `
+    <div class="detail-head artback"><button class="backbtn" id="ad-back" type="button" aria-label="Back to artists">${ICON("prev")} Artists</button></div>
+    <h2 class="detail-title">${esc(artist.name)}</h2>
+    <div class="muted">${esc(`${artist.album_count} ${artist.album_count === 1 ? "album" : "albums"} · ${nTracks(artist.track_count)}`)}</div>
+    ${songs.length ? collectionActsHtml("ad") : ""}
+    ${albums.length ? `<h3 class="lib-h">Albums</h3><div class="plgrid libgrid" id="ad-albums">${albums.map(albumCardHtml).join("")}</div>` : ""}
+    ${songs.length ? `<h3 class="lib-h">Songs</h3><div class="songs nohead"><div class="tracks" id="ad-songs">${songs.map(songRowHtml).join("")}</div></div>` : ""}`;
+  $("ad-back").onclick = back;
+  hydrateArt(host);
+  wireAlbumCards(host, albums);
+  if (songs.length) {
+    wireTrackRows($("ad-songs"), songs, { context: ctx });
+    wireCollectionActs("ad", () => songs, () => [
+      { label: "Play next", fn: () => playNextTracks(songs, artist.name) },
+      { label: "Add to queue", fn: () => enqueueTracks(songs, artist.name) },
+      { label: "Go to artist", fn: () => navigateArtist("local", artist.id) },
+    ], ctx);
+    state.queue = songs; highlightPlaying();
+  }
+}
+
+function showAlbumsGrid(body, { params, header }) {
+  const s = libUI.albums;
+  body.innerHTML = `${header || ""}
+    <div class="toolbar-row wrap libtools">
+      <label class="muted" for="alb-sort">Sort by</label>
+      <select id="alb-sort" class="mini-select">${ALBUM_ORDERS.map(([k, l]) => `<option value="${k}"${s.order === k ? " selected" : ""}>${l}</option>`).join("")}</select>
+      <button class="act ghost small" id="alb-dir" type="button" aria-label="Reverse order" title="Reverse order">${s.desc ? "▼ Descending" : "▲ Ascending"}</button>
+    </div>
+    <div class="plgrid libgrid" id="alb-box"></div>`;
+  $("alb-sort").onchange = (e) => { s.order = e.target.value; s.desc = s.order === "recent"; showLibBody(); };
+  $("alb-dir").onclick = () => { s.desc = !s.desc; showLibBody(); };
+  const box = $("alb-box");
+  libPager(box, (off) => libFetch("albums", { ...params, order: s.order, desc: s.desc }, off, 120), (items, start, st) => {
+    const wrap = document.createElement("div");
+    wrap.style.display = "contents";
+    wrap.innerHTML = items.map((a, k) => albumCardHtml(a, start + k)).join("");
+    box.appendChild(wrap);
+    hydrateArt(wrap);
+    wireAlbumCards(wrap, st.items);
+    if (st.total === 0) box.outerHTML = emptyState("music", "No albums", "Nothing matches.");
+  });
+}
+
+function songSortBar() {
+  const sort = libUI.songs;
+  return `<div class="toolbar-row wrap libtools songsort">
+      <label class="muted" for="song-sort">Sort by</label>
+      <select id="song-sort" class="mini-select">${SONG_COLS.map(([k, l]) => `<option value="${k}"${sort.order === k ? " selected" : ""}>${l}</option>`).join("")}</select>
+      <button class="act ghost small" id="song-dir" type="button" aria-label="Reverse order">${sort.desc ? "▼ Descending" : "▲ Ascending"}</button>
+    </div>`;
+}
+function wireSongSort() {
+  const sort = libUI.songs;
+  $("song-sort").onchange = (e) => { sort.order = e.target.value; sort.desc = false; showLibBody(); };
+  $("song-dir").onclick = () => { sort.desc = !sort.desc; showLibBody(); };
+}
+function showSongsTab(body, genre) {
+  const ctx = { kind: "songs", title: genre ? `Songs · ${genre}` : "Songs", service: "local", id: genre || "" };
+  renderSongsList(body, { params: { genre }, ctx, sortable: true, header: songSortBar() });
+  wireSongSort();
+}
+
+async function showGenresTab(body) {
+  if (libUI.genre) {
+    const g = libUI.genre;
+    const header = `<div class="detail-head"><button class="backbtn" id="gn-back" type="button">${ICON("prev")} Genres</button></div>
+      <div class="sec-head"><h3>${esc(g)}</h3>
+        <div class="seg" role="tablist"><button type="button" class="${libUI.genreMode === "albums" ? "on" : ""}" data-mode="albums">Albums</button><button type="button" class="${libUI.genreMode === "songs" ? "on" : ""}" data-mode="songs">Songs</button></div></div>`;
+    const wire = () => {
+      $("gn-back").onclick = () => { libUI.genre = null; showLibBody(); };
+      body.querySelectorAll(".seg button").forEach((b) => b.onclick = () => { libUI.genreMode = b.dataset.mode; showLibBody(); });
+    };
+    if (libUI.genreMode === "songs") {
+      const ctx = { kind: "genre", title: g, service: "local", id: g };
+      renderSongsList(body, { params: { genre: g }, ctx, sortable: true, header: header + songSortBar() });
+      wireSongSort();
+    } else showAlbumsGrid(body, { params: { genre: g }, header });
+    wire();
+    return;
+  }
+  body.innerHTML = `<div class="plgrid libgrid" id="gn-box"></div>`;
+  const box = $("gn-box");
+  libPager(box, (off) => libFetch("genres", {}, off, 300), (items, start, st) => {
+    if (st.total === 0) { box.outerHTML = emptyState("music", "No genres", "Tracks need a genre tag to show up here."); return; }
+    const wrap = document.createElement("div");
+    wrap.style.display = "contents";
+    wrap.innerHTML = items.map((g, k) => `<div class="plcard gncard" tabindex="0" role="link" data-i="${start + k}">
+      <div class="art" data-art="${esc(g.artwork_url || "")}">${ICON("music")}</div>
+      <div class="t">${esc(g.name)}</div>
+      <div class="s">${esc(`${g.album_count} ${g.album_count === 1 ? "album" : "albums"} · ${nTracks(g.track_count)}`)}</div></div>`).join("");
+    box.appendChild(wrap);
+    hydrateArt(wrap);
+    wrap.querySelectorAll(".gncard").forEach((c) => {
+      const open = () => { libUI.genre = st.items[Number(c.dataset.i)].name; libUI.genreMode = "albums"; showLibBody(); };
+      c.onclick = open;
+      c.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } };
+    });
+  });
+}
+
+function showLibBody() {
+  const body = $("lib-body");
+  if (!body) return;
+  if (libUI.pager) { libUI.pager.stop(); libUI.pager = null; }
+  document.querySelectorAll(".libtabs button").forEach((b) => {
+    const on = b.dataset.view === libUI.view;
+    b.classList.toggle("on", on); b.setAttribute("aria-selected", String(on));
+  });
+  if (libUI.view === "artists") showArtistsTab(body);
+  else if (libUI.view === "albums") showAlbumsGrid(body, { params: {} });
+  else if (libUI.view === "songs") showSongsTab(body, libUI.genre);
+  else showGenresTab(body);
+  $("list").scrollTop = 0;
+}
+
 async function renderLibrary() {
   const list = $("list");
   clearInterval(_libTimer); _libTimer = null;
+  if (libUI.pager) { libUI.pager.stop(); libUI.pager = null; }
   list.innerHTML = loadingState("Loading your library…");
   const st = await loadLibraryStatus();
   if (!st || (!st.enabled && !(st.peers || []).length)) {
@@ -449,26 +814,22 @@ async function renderLibrary() {
     $("lib-setup").onclick = () => goView("accounts");
     return;
   }
-  let ov;
-  try { ov = await api("/api/library/browse?order=recent&limit=60"); }
-  catch (e) { list.innerHTML = errorState("Couldn’t load the library", e.message, "lib-retry"); $("lib-retry").onclick = renderLibrary; return; }
-  const albums = ov.albums || [], artists = ov.artists || [];
   const dl = lidarrEnabled() ? `<section class="detail-sec"><h3>Downloads</h3><div id="lib-dl">${loadingState("Asking Lidarr…")}</div></section>` : "";
   const warn = (st.missing || []).length
     ? `<p class="muted msg err">Missing folder${st.missing.length > 1 ? "s" : ""}: ${st.missing.map(esc).join(", ")}</p>` : "";
-  list.innerHTML = `<div class="detail">
+  list.innerHTML = `<div class="libroot">
     <div class="sec-head"><span class="muted" id="lib-stats">${esc(libraryStatsText(st))}</span>
       ${st.enabled ? `<button class="act ghost small" id="lib-rescan" type="button">${ICON("sync")} Rescan</button>` : ""}</div>
     ${warn}
     ${dl}
-    ${albums.length ? `<section class="detail-sec"><h3>Recently added</h3>
-      <div class="albrows">${albumRowsHtml(albums, { showArtist: true })}</div></section>`
-      : emptyState("music", "No music found yet", st.paths && st.paths.length ? "Rescan once the folders have albums in them." : "Add a music folder in Accounts → Library.")}
-    ${artists.length ? `<section class="detail-sec"><h3>Artists</h3><div class="chips">${artists.map(artistChipHtml).join("")}</div></section>` : ""}
+    <div class="libtabs" role="tablist" aria-label="Library view">${LIB_VIEWS.map(([k, l]) =>
+      `<button type="button" role="tab" data-view="${k}">${l}</button>`).join("")}</div>
+    <div id="lib-body"></div>
   </div>`;
-  hydrateArt(list);
-  wireAlbumRows(list);
-  wireArtistChips(list);
+  list.querySelectorAll(".libtabs button").forEach((b) => b.onclick = () => {
+    libUI.view = b.dataset.view; libUI.genre = null; lsSet("harmonyLibView", libUI.view); showLibBody();
+  });
+  showLibBody();
   if ($("lib-rescan")) $("lib-rescan").onclick = async () => {
     try { await apiPost("/api/library/scan", {}); } catch (e) { toastErr("Couldn’t rescan: " + e.message); return; }
     $("lib-stats").textContent = "Scanning…";
@@ -607,7 +968,8 @@ async function artistToQueue(ar, where) {
   try {
     const tracks = ar.tracks || await artistTopTracks(ar.service, ar.id);
     if (!tracks.length) { toastErr("No top tracks to play for this artist."); return; }
-    collectionTo(tracks, where, ar.name ? `${ar.name} top tracks` : "top tracks");
+    collectionTo(tracks, where, ar.name ? `${ar.name} top tracks` : "top tracks",
+      { kind: "artist", title: ar.name || "Artist", service: ar.service, id: ar.id });
   } catch (e) { toastErr("Couldn’t load that artist: " + e.message); }
 }
 function artistMenuItems(ar) {
@@ -628,7 +990,8 @@ async function playlistToQueue(p, where) {
   try {
     const tracks = p.tracks || (await api(`/api/playlists/${encodeURIComponent(p.service)}/${encodeURIComponent(p.id)}/tracks`)).tracks || [];
     if (!tracks.length) { toastErr("That playlist is empty."); return; }
-    collectionTo(tracks, where, p.title || "playlist");
+    collectionTo(tracks, where, p.title || "playlist",
+      { kind: "playlist", title: p.title || "Playlist", service: p.service, id: p.id });
   } catch (e) { toastErr("Couldn’t load that playlist: " + e.message); }
 }
 function playlistMenuItems(p) {
@@ -643,9 +1006,9 @@ function playlistMenuItems(p) {
 }
 
 // One place that turns a whole list into a queue action.
-function collectionTo(tracks, where, label) {
-  if (where === "play") playFrom(tracks, 0);
-  else if (where === "shuffle") playFrom(tracks, null, { shuffle: true });
+function collectionTo(tracks, where, label, context) {
+  if (where === "play") playFrom(tracks, 0, { context });
+  else if (where === "shuffle") playFrom(tracks, null, { shuffle: true, context });
   else if (where === "next") playNextTracks(tracks, label);
   else enqueueTracks(tracks, label);
 }
@@ -658,12 +1021,12 @@ function collectionActsHtml(prefix, opts = {}) {
     <button class="act ghost icon-only" id="${prefix}-more" type="button" aria-label="More actions" aria-haspopup="menu">${ICON("more")}</button>
   </div>`;
 }
-function wireCollectionActs(prefix, getTracks, moreItems) {
+function wireCollectionActs(prefix, getTracks, moreItems, context) {
   const run = async (where) => {
     let tracks;
     try { tracks = await getTracks(); } catch (e) { toastErr(e.message); return; }
     if (!tracks || !tracks.length) { toastErr("Nothing playable here."); return; }
-    collectionTo(tracks, where);
+    collectionTo(tracks, where, undefined, context);
   };
   if ($(`${prefix}-play`)) $(`${prefix}-play`).onclick = () => run("play");
   if ($(`${prefix}-shuffle`)) $(`${prefix}-shuffle`).onclick = () => run("shuffle");
@@ -734,7 +1097,7 @@ function rowIsCurrent(tracks, i, opts) {
 function wireTrackRows(scope, tracks, opts = {}) {
   scope.querySelectorAll(".trow").forEach((row) => {
     const i = Number(row.dataset.i);
-    const start = opts.onPlay ? () => opts.onPlay(i) : () => playFrom(tracks, i);
+    const start = opts.onPlay ? () => opts.onPlay(i) : () => playFrom(tracks, i, { context: opts.context });
     const play = () => (rowIsCurrent(tracks, i, opts) && !isStopped() ? togglePlay() : start());
     const pbtn = row.querySelector(".play");
     if (pbtn) pbtn.addEventListener("click", (e) => { e.stopPropagation(); play(); });
@@ -784,11 +1147,13 @@ function renderTracks(tracks, opts = {}) {
                    opts.query ? "Try a different title or artist." : "Search for a song to get started.");
     list.innerHTML = toolbar + empty; wirePlaylistToolbar(); return;
   }
-  const rowOpts = { ...opts, playlistActions: !!pl };
+  const context = pl ? { kind: "playlist", title: pl.title, service: pl.service, id: pl.id }
+    : opts.query ? { kind: "search", title: `Search: ${opts.query}`, id: opts.query } : null;
+  const rowOpts = { ...opts, playlistActions: !!pl, context };
   list.innerHTML = toolbar + tracksHtml(tracks, rowOpts);
   state.queue = tracks;
   wireTrackRows(list, tracks, rowOpts);
-  if (pl) wireCollectionActs("pl", () => tracks, () => playlistMenuItems({ ...pl, tracks, here: true }));
+  if (pl) wireCollectionActs("pl", () => tracks, () => playlistMenuItems({ ...pl, tracks, here: true }), context);
   wirePlaylistToolbar();
   highlightPlaying();
 }
@@ -981,6 +1346,8 @@ function renderNowPlaying() {
         <div class="detail-kind" id="np-view-kind">Now Playing</div>
         <h2 class="detail-title" id="np-view-title">${title}</h2>
         <div class="detail-sub" id="np-view-artist">${esc(t.artist || "")}</div>
+        <div class="np-ctx" id="np-view-ctx"></div>
+        <div class="np-q" id="np-view-q"></div>
         <div class="npvol" id="np-view-volrow">
           ${ICON("speaker")}<input id="np-view-vol" type="range" min="0" max="100" value="${esc($("np-vol").value)}" aria-label="Device volume" />
         </div>
@@ -1007,6 +1374,7 @@ function renderNowPlaying() {
   $("np-view-vol").addEventListener("input", (e) => setVolume(Number(e.target.value)));
   updateNowPlayingView();
   paintModes();
+  paintStreamInfo();
 }
 
 // Keep an open Now Playing view in step with a track change without rebuilding
@@ -1722,13 +2090,14 @@ async function renderArtistView(service, id) {
   // Right-click the artist hero → play/queue the top tracks, "Get with Lidarr".
   const hero = list.querySelector(".detail-hero");
   if (hero) hero.addEventListener("contextmenu", (e) => menuAt(e, artistMenuItems(artistRef)));
-  wireCollectionActs("ar", () => top, () => artistMenuItems(artistRef));
+  const arCtx = { kind: "artist", title: a.name || "Artist", service, id };
+  wireCollectionActs("ar", () => top, () => artistMenuItems(artistRef), arCtx);
   if (!top.length && $("ar-more")) $("ar-more").onclick = (e) => menuAt(e.currentTarget, artistMenuItems(artistRef));
   wireLidarrArtistTargets(list);
   if (top.length) {
-    state.queue = top; wireTrackRows(list, top); highlightPlaying();
-    $("top-play").onclick = () => playFrom(top, 0);
-    $("top-shuffle").onclick = () => playFrom(top, null, { shuffle: true });
+    state.queue = top; wireTrackRows(list, top, { context: arCtx }); highlightPlaying();
+    $("top-play").onclick = () => playFrom(top, 0, { context: arCtx });
+    $("top-shuffle").onclick = () => playFrom(top, null, { shuffle: true, context: arCtx });
   }
 }
 
@@ -1776,8 +2145,9 @@ async function renderAlbumView(service, id) {
       ...(ref ? [{ label: "Go to artist", fn: () => navigateArtist(ref.service, ref.id) }] : []),
       ...(service !== "local" ? lidarrMenuItems({ kind: "album", title: albumRef.title, artist: albumRef.artist, mbid: albumRef.mbid }) : []),
     ];
-    wireCollectionActs("al", () => tracks, items);
-    state.queue = tracks; wireTrackRows(list, tracks, { numbered: true }); highlightPlaying();
+    const context = { kind: "album", title: al.title || "Album", service, id };
+    wireCollectionActs("al", () => tracks, items, context);
+    state.queue = tracks; wireTrackRows(list, tracks, { numbered: true, context }); highlightPlaying();
   }
 }
 
@@ -1835,7 +2205,7 @@ async function renderTrackView(service, id) {
   wireChips(list);
   wireLidarrArtistTargets(list);
   const tk = { ...t, service: t.service || service, id: t.id || id };
-  $("tk-play").onclick = () => (sameTrack(pq.current(), tk) && !isStopped() ? togglePlay() : playFrom([tk], 0));
+  $("tk-play").onclick = () => (sameTrack(pq.current(), tk) && !isStopped() ? togglePlay() : playFrom([tk], 0, { context: { kind: "track", title: tk.title || "Track", service: tk.service, id: tk.id } }));
   $("tk-next").onclick = () => playNextTracks([tk], tk.title);
   $("tk-queue").onclick = () => enqueueTracks([tk], tk.title);
   $("tk-more").onclick = (e) => menuAt(e.currentTarget,
@@ -1963,7 +2333,7 @@ function renderSmartResults(r, q) {
   annotateAlbumStates(list);
   wireLidarrArtistTargets(list);
   wireArtistChips(list);
-  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks); highlightPlaying(); }
+  if (tracks.length) { state.queue = tracks; wireTrackRows(list, tracks, { context: { kind: "search", title: `Search: ${q}`, id: q } }); highlightPlaying(); }
   wirePlaylistCards(list);
 }
 
@@ -2092,6 +2462,7 @@ const br = {
   stopped: true,   // stopped / finished / never started — Play (re)starts pq.index
   resumePos: 0,    // where Play starts when nothing is loaded (restore / hand-off)
   failures: 0,     // consecutive tracks that failed to start
+  info: null,      // {quality, source} of the loaded stream (from /api/resolve)
 };
 // Device output: the server owns the queue; `pq` mirrors its snapshot.
 const dev = {
@@ -2106,6 +2477,7 @@ const dev = {
   gen: 0, applied: 0, inflight: 0,   // ordering of snapshot responses
   volSetAt: 0,     // user moved the volume recently: don't let a poll yank it back
   holdUntil: 0,    // after a user pause/resume: the server's status lags ~2s, keep ours
+  stream: null,    // the snapshot's {quality, source} for the current track
 };
 
 // A user action that changes device state optimistically: drop any poll that
@@ -2181,6 +2553,38 @@ function updateMediaSession(t) {
   } catch { /* ignore */ }
 }
 
+// "Playing from …" + source/quality line on the bar and the Now Playing view.
+function paintStreamInfo() {
+  const t = pq.current();
+  const p = t ? streamParts(t) : null;
+  const coll = t ? collText(pq.context) : "";
+  const link = coll ? `<a href="#" class="ctx-link" data-ctx>${esc(coll)}</a>` : "";
+  const detail = p ? [p.instance, p.quality].filter(Boolean).join(" · ") : "";
+  const bar = $("np-info");
+  if (bar) {
+    const html = p ? `<span class="np-from">Playing from ${esc(p.label)}</span>`
+      + (p.instance ? `<span class="np-src"> · ${esc(p.instance)}</span>` : "")
+      + (p.pill ? `<span class="sep"> · </span><span class="np-stream"><span class="q-full">${p.pill}</span>${p.shortPill}</span>` : "")
+      + (link ? `<span class="np-coll"><span class="sep"> · </span>${link}</span>` : "") : "";
+    if (bar.dataset.h !== html) { bar.dataset.h = html; bar.innerHTML = html; }
+    bar.title = p ? `Playing from ${p.label}${detail ? " · " + detail : ""}` : "";
+  }
+  const v = $("np-view-ctx");
+  if (v) {
+    const vh = p ? `Playing from <strong>${esc(p.label)}</strong>${p.instance ? ` · ${esc(p.instance)}` : ""}` : "";
+    if (v.dataset.h !== vh) { v.dataset.h = vh; v.innerHTML = vh; }
+    const vq = $("np-view-q");
+    const qh = (p ? p.pill : "") + (link ? `${p && p.pill ? " " : ""}${link}` : "");
+    if (vq && vq.dataset.h !== qh) { vq.dataset.h = qh; vq.innerHTML = qh; }
+  }
+}
+document.addEventListener("click", (e) => {
+  const a = e.target.closest && e.target.closest("a[data-ctx]");
+  if (!a) return;
+  e.preventDefault();
+  openContext(pq.context);
+});
+
 let _barKey = null;
 // Bring the bar, the Now Playing view, row indicators and Media Session in
 // line with pq / the output state. Cheap enough to call after any change.
@@ -2199,6 +2603,7 @@ function paintCurrent() {
     if (key !== _barKey) setArt("");
   }
   _barKey = key;
+  paintStreamInfo();
   updateCastChip();
   updateNowPlayingView();
   paintModes();
@@ -2215,6 +2620,7 @@ function paintAll() { refreshQueueUi(); paintCurrent(); }
 
 function clearAudio() {
   br.loaded = null;
+  br.info = null;
   try { audio.pause(); } catch { /* ignore */ }
   if (audio.getAttribute("src")) {
     audio.removeAttribute("src");
@@ -2248,7 +2654,9 @@ async function playBrowserAt(i, { seek = 0, autoplay = true } = {}) {
   catch (e) { if (gen === br.gen && !onDevice()) trackFailed(t, e.message); return; }
   if (gen !== br.gen || onDevice()) return;      // superseded (newer play / output switch)
   br.loaded = t;
+  br.info = { quality: r.quality || null, source: r.source || null };
   audio.src = `/stream/${r.token}${keyParam()}`;
+  paintStreamInfo();
   if (seek > 0) {
     audio.addEventListener("loadedmetadata", () => {
       if (gen === br.gen) { try { audio.currentTime = seek; } catch { /* ignore */ } }
@@ -2380,6 +2788,8 @@ function applySnapshot(s) {
   }
   pq.shuffle = !!s.shuffle;
   if (REPEAT_MODES.includes(s.repeat)) pq.repeat = s.repeat;
+  if (s.context !== undefined) pq.context = s.context || null;
+  dev.stream = s.stream || null;
   dev.running = running;
   if (!running || Date.now() >= dev.holdUntil) dev.paused = running && /paus/i.test(s.state || "");
   const cur = pq.current();
@@ -2420,6 +2830,7 @@ async function pushQueueToDevice(pos = 0) {
   const snap = await devOp("load", {
     tracks: pq.tracks.map(wireTrack), start: pq.index,
     shuffle: pq.shuffle, repeat: pq.repeat, keep_order: true,
+    ...(pq.context ? { context: pq.context } : {}),
   }, "start playback");
   if (!snap) {                                   // keep the queue ready for another try
     if (sameTgt(tgt)) { dev.pending = "handoff"; dev.pendingPos = pos || 0; dev.running = false; paintCurrent(); }
@@ -2568,6 +2979,7 @@ function playFrom(list, index, opts = {}) {
   });
   if (!keep.length) { toastErr("Nothing playable here."); return; }
   if (opts.shuffle) { pq.shuffle = true; persistPrefs(); }
+  pq.context = opts.context || null;
   const shufflePlay = !!opts.shuffle || index == null;
   if (!shufflePlay && start === null) start = 0;
   if (onDevice()) {
@@ -2577,7 +2989,8 @@ function playFrom(list, index, opts = {}) {
     paintAll();
     // The UNshuffled list: the server applies shuffle itself, and we adopt its order.
     devOp("load", { tracks: keep.map(wireTrack), start: shufflePlay ? null : start,
-                    shuffle: pq.shuffle, repeat: pq.repeat }, "start playback");
+                    shuffle: pq.shuffle, repeat: pq.repeat,
+                    ...(pq.context ? { context: pq.context } : {}) }, "start playback");
     return;
   }
   pq.load(keep, shufflePlay ? null : start);
@@ -2668,7 +3081,8 @@ async function albumToQueue(a, where) {
     const d = await api(`/api/album/${encodeURIComponent(a.service)}/${encodeURIComponent(a.id)}`);
     const tracks = d.tracks || [];
     if (!tracks.length) { toastErr("That album has no playable tracks."); return; }
-    collectionTo(tracks, where === "next" ? "next" : where === "play" || where === "shuffle" ? where : "end", a.title || "album");
+    collectionTo(tracks, where === "next" ? "next" : where === "play" || where === "shuffle" ? where : "end", a.title || "album",
+      { kind: "album", title: a.title || "Album", service: a.service, id: a.id });
   } catch (e) { toastErr("Couldn’t load that album: " + e.message); }
 }
 
@@ -2708,7 +3122,7 @@ function switchOutput(value) {
   stopDevicePoll();
   dev.gen++; dev.applied = dev.gen;       // drop replies meant for the old output
   if (oldRunning) devQueue("stop", {}, from).catch(() => { /* best-effort */ });
-  Object.assign(dev, { running: false, paused: false, pos: 0, dur: 0, sig: "", lastErr: null, pending: null, pendingPos: 0, volSetAt: 0, holdUntil: 0 });
+  Object.assign(dev, { running: false, paused: false, pos: 0, dur: 0, sig: "", lastErr: null, pending: null, pendingPos: 0, volSetAt: 0, holdUntil: 0, stream: null });
   if (!fromDevice) { br.gen++; clearAudio(); br.stopped = true; }
 
   if (onDevice()) {
@@ -2732,7 +3146,7 @@ function switchOutput(value) {
 
 const QKEY = "harmonyQueue";
 const SLIM_KEYS = ["service", "id", "title", "artist", "album", "artwork_url", "art_url", "duration_s",
-                   "artist_ids", "album_id", "track_number"];
+                   "artist_ids", "album_id", "track_number", "quality", "library_id"];
 const slimTrack = (t) => { const o = {}; SLIM_KEYS.forEach((k) => { if (t[k] != null) o[k] = t[k]; }); return o; };
 let _saveT = null;
 function savePlayback() { clearTimeout(_saveT); _saveT = setTimeout(savePlaybackNow, 400); }
@@ -2741,7 +3155,7 @@ function savePlaybackNow() {
   try {
     const orig = pq.original.map((t) => pq.tracks.indexOf(t));
     localStorage.setItem(QKEY, JSON.stringify({
-      v: 1, tracks: pq.tracks.map(slimTrack), index: pq.index,
+      v: 1, tracks: pq.tracks.map(slimTrack), index: pq.index, context: pq.context,
       original: orig.length === pq.tracks.length && orig.every((i) => i >= 0) ? orig : null,
       pos: Math.floor(currentPos() || 0),
       target: onDevice() ? encodeTarget(state.target, state.targetVia) : "browser",
@@ -2764,6 +3178,7 @@ function restorePlayback() {
       const orig = Array.isArray(s.original) && s.original.length === tracks.length
         ? s.original.map((i) => tracks[i]).filter(Boolean) : null;
       pq.original = orig && orig.length === tracks.length ? orig : tracks.slice();
+      pq.context = s.context && typeof s.context === "object" ? s.context : null;
     }
   }
   const pos = s && Number(s.pos) > 0 ? Number(s.pos) : 0;

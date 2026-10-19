@@ -74,7 +74,7 @@ class HarmonyPlayer(private val c: PlaybackController) : SimpleBasePlayer(Looper
                         else t.durationS?.let { it * 1_000_000L } ?: C.TIME_UNSET
             MediaItemData.Builder("$i|${t.service}|${t.id}")
                 .setMediaItem(MediaItem.Builder().setMediaId("${t.service}:${t.id}")
-                    .setMediaMetadata(c.metadataFor(t)).build())
+                    .setMediaMetadata(c.metadataFor(t, if (i == s.index) s.stream else null)).build())
                 .setDurationUs(durUs)
                 .setIsSeekable(true)
                 .build()

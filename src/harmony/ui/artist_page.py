@@ -137,7 +137,10 @@ class ArtistPage(Adw.NavigationPage):
 
         top = data.get("top_tracks") or []
         if top:
-            self._content.append(tracks_widget(top, self.state, self.nav, title="Top tracks"))
+            self._content.append(tracks_widget(
+                top, self.state, self.nav, title="Top tracks",
+                context={"kind": "artist", "title": name, "service": self.service,
+                         "id": self.artist_id}))
 
         self._stack.set_visible_child_name("content")
 

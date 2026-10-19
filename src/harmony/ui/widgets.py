@@ -335,11 +335,20 @@ def _indicator_factory() -> Gtk.SignalListItemFactory:
     return factory
 
 
+def _noop_sorter() -> Gtk.CustomSorter:
+    """A sorter that orders nothing: sorting is done server-side, but the header
+    still needs one to be clickable and to show the sort arrow."""
+    return Gtk.CustomSorter.new(lambda _a, _b, _d: 0, None)
+
+
 def build_track_column_view(
     on_row_menu: Callable[[Track], list[tuple[str, Callable[[], None]]]] | None = None,
     state: object | None = None,
     on_row_activate: Callable[[Track], None] | None = None,
     on_play_from: Callable[[list[Track], int], None] | None = None,
+    columns: list[tuple[str, Callable[[Track], str], bool]] | None = None,
+    sort_keys: dict[str, str] | None = None,
+    on_sort: Callable[[str, bool], None] | None = None,
 ) -> tuple[Gtk.ColumnView, Gio.ListStore, Gtk.MultiSelection]:
     """Build a multi-select ``Gtk.ColumnView`` for track lists.
 
@@ -363,6 +372,11 @@ def build_track_column_view(
     ``on_play_from``, if given, is called with ``(all tracks, row index)`` when
     a row is activated (double-click or Enter) -- play the list from that row.
     ``on_row_activate`` is the single-track variant (the Now Playing queue).
+
+    ``columns`` replaces the default column set (title, getter, expand).
+    ``sort_keys`` maps a column title to a sort key; those headers become
+    clickable and ``on_sort(key, descending)`` is called when the user picks one
+    (the caller re-queries -- the rows themselves are never reordered here).
     """
     store = Gio.ListStore(item_type=TrackObject)
     selection = Gtk.MultiSelection(model=store)
@@ -387,10 +401,22 @@ def build_track_column_view(
         indicator.set_fixed_width(28)
         column_view.append_column(indicator)
         _wire_now_playing_indicator(store, state)
-    for title, getter, expand in _TRACK_COLUMNS:
+    for title, getter, expand in columns or _TRACK_COLUMNS:
         column = Gtk.ColumnViewColumn(title=title, factory=_label_factory(getter, on_row_menu))
         column.set_expand(expand)
+        if sort_keys and title in sort_keys:
+            column.set_sorter(_noop_sorter())
         column_view.append_column(column)
+    if sort_keys and on_sort is not None:
+        sorter = column_view.get_sorter()
+
+        def _sort_changed(*_a: object) -> None:
+            column = sorter.get_primary_sort_column()
+            key = sort_keys.get(column.get_title()) if column is not None else None
+            if key is not None:
+                on_sort(key, sorter.get_primary_sort_order() == Gtk.SortType.DESCENDING)
+
+        sorter.connect("changed", _sort_changed)
     return column_view, store, selection
 
 

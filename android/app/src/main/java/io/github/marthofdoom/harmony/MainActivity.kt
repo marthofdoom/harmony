@@ -407,8 +407,11 @@ private fun ConnectedScreen(vm: HarmonyViewModel, state: UiState) {
 @Composable
 private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
     val open = state.openPlaylist
-    // System back closes an open playlist instead of exiting the app.
+    val focus = state.lib.focus
+    val browsing = open == null && state.lib.section != LibSection.PLAYLISTS
+    // System back closes an open playlist / artist / genre instead of exiting the app.
     BackHandler(enabled = open != null) { vm.closePlaylist() }
+    BackHandler(enabled = open == null && focus != null) { vm.closeLibFocus() }
 
     var showDelete by remember { mutableStateOf(false) }
     if (showDelete && open != null) {
@@ -431,9 +434,11 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
     val owned = open != null && state.playlists.any { it.service == open.service && it.id == open.id }
     Column(Modifier.fillMaxSize()) {
         TopAppBar(
-            title = { Text(open?.title ?: "Library", maxLines = 1, overflow = TextOverflow.Ellipsis) },
+            title = { Text(open?.title ?: focus?.title ?: "Library", maxLines = 1, overflow = TextOverflow.Ellipsis) },
             navigationIcon = {
                 if (open != null) IconButton(onClick = { vm.closePlaylist() }) {
+                    Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
+                } else if (focus != null) IconButton(onClick = { vm.closeLibFocus() }) {
                     Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back")
                 }
             },
@@ -444,11 +449,16 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
                         colors = ButtonDefaults.textButtonColors(
                             contentColor = MaterialTheme.colorScheme.error),
                     ) { Text("Delete") }
-                } else {
-                    TextButton(onClick = { vm.loadLibrary() }) { Text("Refresh") }
+                } else if (focus == null) {
+                    TextButton(onClick = { vm.loadLibrary(); vm.loadLibraryBrowse() }) { Text("Refresh") }
                 }
             },
         )
+        if (open == null && focus == null) LibrarySegmentsHeader(vm, state)
+        if (browsing) {
+            LibraryBrowseContent(vm, state)
+            return@Column
+        }
         if (state.libraryLoading) {
             Box(Modifier.fillMaxWidth().padding(24.dp), contentAlignment = Alignment.Center) {
                 CircularProgressIndicator()
@@ -500,19 +510,20 @@ private fun LibraryScreen(vm: HarmonyViewModel, state: UiState) {
             }
         } else {
             val tracks = state.playlistTracks
+            val plCtx = PlayContext("playlist", open.title, open.service, open.id)
             LazyColumn(Modifier.fillMaxSize()) {
                 if (tracks.isNotEmpty()) {
                     item {
                         ListActionsRow(
-                            onPlay = { vm.playAll(tracks, shuffle = false) },
-                            onShuffle = { vm.playAll(tracks, shuffle = true) },
+                            onPlay = { vm.playAll(tracks, shuffle = false, context = plCtx) },
+                            onShuffle = { vm.playAll(tracks, shuffle = true, context = plCtx) },
                             onPlayNext = { vm.playNext(tracks) },
                             onAddToQueue = { vm.addToQueue(tracks) },
                         )
                     }
                 }
                 itemsIndexed(tracks) { i, t ->
-                    TrackRow(t, onPlay = { vm.playFrom(tracks, i) },
+                    TrackRow(t, onPlay = { vm.playFrom(tracks, i, plCtx) },
                         playState = state.rowPlay(t),
                         trailing = {
                             TrackRowMenu(vm, state, t)
@@ -932,7 +943,9 @@ fun TrackRow(
                 style = MaterialTheme.typography.bodyLarge,
                 color = if (playState != RowPlay.NONE) MaterialTheme.colorScheme.primary
                         else MaterialTheme.colorScheme.onSurface)
-            Text(listOfNotNull(t.artist.ifBlank { null }, t.album, t.location).joinToString(" · "),
+            Text(listOfNotNull(t.artist.ifBlank { null }, t.album,
+                t.location.takeUnless { t.quality != null && it == "Library" }, t.quality?.short)
+                .joinToString(" · "),
                 maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
@@ -1035,13 +1048,19 @@ fun MiniPlayer(vm: HarmonyViewModel, state: UiState, modifier: Modifier = Modifi
                     Text(if (state.playingHere) "Hub audio" else t?.title ?: "",
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodyMedium)
+                    val q = if (state.playingHere) null else state.stream?.quality ?: t?.quality
                     val sub = if (state.playingHere) state.instanceName ?: ""
                               else listOfNotNull(t?.artist?.ifBlank { null },
-                                  state.targetName?.takeIf { state.target != PHONE }?.let { "on $it" })
+                                  state.targetName?.takeIf { state.target != PHONE }?.let { "on $it" },
+                                  q?.short)
                                   .joinToString(" · ")
-                    Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.weight(1f, fill = false))
+                        HiResChip(q, Modifier.padding(start = 6.dp))
+                    }
                 }
                 if (state.buffering) {
                     CircularProgressIndicator(Modifier.size(20.dp).padding(end = 4.dp), strokeWidth = 2.dp)
@@ -1156,6 +1175,38 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                 Text(subtitle, style = MaterialTheme.typography.bodyMedium,
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
+                if (!state.playingHere) {
+                    val from = playingFromSource(state.stream, pb.track?.service,
+                        pb.track?.libraryId != null)
+                    if (from != null) {
+                        Text("Playing from $from",
+                            style = MaterialTheme.typography.labelLarge,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.primary,
+                            modifier = Modifier.padding(top = 6.dp))
+                    }
+                    val ctx = state.context
+                    if (ctx != null) {
+                        Text(ctx.linkLabel(),
+                            style = MaterialTheme.typography.labelMedium,
+                            maxLines = 1, overflow = TextOverflow.Ellipsis,
+                            color = MaterialTheme.colorScheme.secondary,
+                            modifier = Modifier.padding(top = 2.dp).clip(RoundedCornerShape(4.dp))
+                                .clickable { vm.openContext(ctx) })
+                    }
+                    val q = state.stream?.quality ?: pb.track?.quality
+                    val line = sourceQualityLine(state.stream, pb.track?.quality, pb.track?.location)
+                    if (line != null) {
+                        Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.Center) {
+                            Text(line, style = MaterialTheme.typography.bodySmall,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f, fill = false))
+                            HiResChip(q, Modifier.padding(start = 8.dp))
+                        }
+                    }
+                }
                 Spacer(Modifier.height(24.dp))
 
                 val dur = pb.durationMs.coerceAtLeast(0)

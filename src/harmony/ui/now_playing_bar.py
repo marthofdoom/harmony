@@ -20,6 +20,7 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib, Gtk  # noqa: E402
 
 from harmony.tasks import run_async  # noqa: E402
+from harmony.ui.np_info import NowPlayingInfo  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 
 log = logging.getLogger(__name__)
@@ -64,27 +65,28 @@ class NowPlayingBar(Gtk.Box):
         self.append(self._art)
 
         meta = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, valign=Gtk.Align.CENTER)
-        meta.set_size_request(150, -1)
+        meta.set_size_request(240, -1)
         self._title = Gtk.Label(xalign=0.0, ellipsize=3, label="Nothing playing")
         self._title.add_css_class("heading")
         self._artist = Gtk.Label(xalign=0.0, ellipsize=3)
         self._artist.add_css_class("dim-label")
         self._artist.add_css_class("caption")
-        # Live audio-quality readout (bit depth / rate) for local playback, shown
-        # inline rather than hidden in the artwork tooltip.
-        self._quality = Gtk.Label(xalign=0.0, ellipsize=3, visible=False)
-        self._quality.add_css_class("dim-label")
-        self._quality.add_css_class("caption")
+        # "Playing from …" + the stream's source/format (Hi-Res pill); the live
+        # local-output readout is its tooltip.
+        self.on_open_page: Any = None
+        self._info = NowPlayingInfo(state, open_page=lambda p: self.on_open_page and self.on_open_page(p))
         meta.append(self._title)
         meta.append(self._artist)
-        meta.append(self._quality)
+        meta.append(self._info)
         # Clicking the art/title opens the Now Playing page (the full queue).
         self.on_open_now_playing: Any = None
-        opener = Gtk.GestureClick()
-        opener.connect("released", lambda *_a: self.on_open_now_playing and self.on_open_now_playing())
-        meta.add_controller(opener)
-        meta.set_cursor_from_name("pointer")
-        meta.set_tooltip_text("Show Now Playing")
+        # Only the title/artist open Now Playing; the info lines have their own clicks.
+        for w in (self._title, self._artist):
+            opener = Gtk.GestureClick()
+            opener.connect("released", lambda *_a: self.on_open_now_playing and self.on_open_now_playing())
+            w.add_controller(opener)
+            w.set_cursor_from_name("pointer")
+            w.set_tooltip_text("Show Now Playing")
         self.append(meta)
 
         # -- transport ------------------------------------------------------
@@ -283,8 +285,7 @@ class NowPlayingBar(Gtk.Box):
         # a live readout of the highest-quality-stream + bit-perfect work.
         quality = self.state.local_audio_label()
         self._art.set_tooltip_text(f"Output: {quality}" if quality else None)
-        self._quality.set_label(quality or "")
-        self._quality.set_visible(bool(quality))
+        self._info.update()
 
         playing = pb.state in ("playing", "loading")
         self._play.set_icon_name(

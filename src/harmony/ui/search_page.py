@@ -73,6 +73,7 @@ class SearchPage(Gtk.Box):
         # ``_drill_into``/``_show_artist_albums``/`_on_show_artist_top_tracks_clicked``.
         self._showing_artist: Artist | None = None
         self._showing_artist_top_tracks_for: Artist | None = None
+        self._drilled: Album | Playlist | None = None  # the album/playlist whose tracks show
 
         self.append(self._build_controls())
 
@@ -84,7 +85,8 @@ class SearchPage(Gtk.Box):
         )
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
             on_row_menu=self._track_row_actions, state=self.state,
-            on_play_from=lambda ts, i: play_from_list(self.state, ts, i),
+            on_play_from=lambda ts, i: play_from_list(self.state, ts, i,
+                                                       context=self._play_context()),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_action_sensitivity())
         tracks_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
@@ -195,6 +197,24 @@ class SearchPage(Gtk.Box):
         provider = self.state.providers.get(service)
         return {service: provider} if provider else {}
 
+    def _play_context(self) -> dict:
+        """What the track list on screen is: a similar-tracks list, an artist's top
+        tracks, a drilled-into album/playlist, or the search results."""
+        if self._showing_similar_to is not None:
+            return {"kind": "similar", "title": f"Similar to {self._showing_similar_to.title}"}
+        if self._showing_artist_top_tracks_for is not None:
+            return self._item_context(self._showing_artist_top_tracks_for,
+                                      self._showing_artist_top_tracks_for.name)
+        if self._drilled is not None:
+            return self._item_context(self._drilled, getattr(self._drilled, "title", ""))
+        query = self.search_entry.get_text().strip()
+        return {"kind": "search", "title": f"Search “{query}”" if query else "Search"}
+
+    @staticmethod
+    def _item_context(item: Album | Artist | Playlist, label: str) -> dict:
+        kind = "artist" if isinstance(item, Artist) else "album" if isinstance(item, Album) else "playlist"
+        return {"kind": kind, "title": label, "service": item.service.value, "id": item.id}
+
     def _run_search(self, *, immediate: bool = False) -> None:
         query = self.search_entry.get_text().strip()
         self._back_bar.set_visible(False)
@@ -250,6 +270,7 @@ class SearchPage(Gtk.Box):
             return
         kind = _KINDS[self.kind_dropdown.get_selected()]
         if kind == "tracks":
+            self._drilled = None
             replace_tracks(self.track_store, results.tracks)
             self.content_stack.set_visible_child_name("tracks")
         else:
@@ -333,15 +354,16 @@ class SearchPage(Gtk.Box):
             self._restore_search_results()
             self.state.toast("Couldn't load those tracks — check your connection.")
 
-        run_async(work, self._on_drill_done, on_error)
+        run_async(work, lambda tracks: self._on_drill_done(tracks, item), on_error)
 
-    def _on_drill_done(self, tracks: list[Track]) -> None:
+    def _on_drill_done(self, tracks: list[Track], drilled: Album | Playlist | None = None) -> None:
         # Plain album/playlist track drill-down carries no "similar" or
         # "artist top tracks" context; clear both so a stale back bar from an
         # earlier view can't linger into this one.
         self._back_bar.set_visible(False)
         self._showing_similar_to = None
         self._showing_artist_top_tracks_for = None
+        self._drilled = drilled
         replace_tracks(self.track_store, tracks)
         self.content_stack.set_visible_child_name("tracks")
 
@@ -407,6 +429,7 @@ class SearchPage(Gtk.Box):
         def done(tracks: list[Track]) -> None:
             self._showing_artist_top_tracks_for = artist
             self._showing_similar_to = None
+            self._drilled = None
             replace_tracks(self.track_store, tracks)
             label = "Most popular" if artist.service == Service.QOBUZ else "Top songs"
             self._similar_label.set_label(f"{label} · {artist.name}")
@@ -579,6 +602,7 @@ class SearchPage(Gtk.Box):
         def done(similar: list[Track]) -> None:
             self._showing_similar_to = track
             self._showing_artist_top_tracks_for = None
+            self._drilled = None
             replace_tracks(self.track_store, similar)
             self._similar_label.set_label(f"Similar to “{track.title}” by {track.artist_name}")
             self._back_bar.set_visible(True)
@@ -664,7 +688,9 @@ class SearchPage(Gtk.Box):
         if fetch_tracks is not None:
             actions.append((
                 "Play on Device",
-                lambda: play_collection_on_device(anchor, self.state, label=label, fetch_tracks=fetch_tracks),
+                lambda: play_collection_on_device(anchor, self.state, label=label,
+                                                  fetch_tracks=fetch_tracks,
+                                                  context=self._item_context(item, label)),
             ))
             actions.append((
                 "Add to Queue",
@@ -743,6 +769,7 @@ class SearchPage(Gtk.Box):
             return
         kind = _KINDS[self.kind_dropdown.get_selected()]
         if kind == "tracks":
+            self._drilled = None
             replace_tracks(self.track_store, self._last_results.tracks)
             self.content_stack.set_visible_child_name("tracks")
         else:

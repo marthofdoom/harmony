@@ -44,6 +44,7 @@ def play_collection_on_device(
     label: str,
     fetch_tracks: Callable[[], list[Track]],
     collection_key: tuple[Service, str] | None = None,
+    context: dict | None = None,
 ) -> None:
     """Open a device picker; on pick, fetch the collection's tracks and queue them.
 
@@ -68,7 +69,7 @@ def play_collection_on_device(
 
         def _pick(_row: Adw.ActionRow, host: str = info.host, name: str = info.name, pop: Gtk.Popover = popover) -> None:
             pop.popdown()
-            _play_collection(state, label, fetch_tracks, host, name, collection_key)
+            _play_collection(state, label, fetch_tracks, host, name, collection_key, context)
 
         row.connect("activated", _pick)
         listbox.append(row)
@@ -82,12 +83,14 @@ def _play_collection(
     host: str,
     name: str,
     collection_key: tuple[Service, str] | None = None,
+    context: dict | None = None,
 ) -> None:
     def work() -> int:
         tracks = list(fetch_tracks())
         if not tracks:
             return 0
-        state.play_tracks_on_device(tracks, host, collection_key)
+        state.play_tracks_on_device(tracks, host, collection_key,
+                                     context or {"kind": "collection", "title": label})
         return len(tracks)
 
     def done(count: int) -> None:
@@ -118,15 +121,18 @@ def enqueue_collection(
 
 def play_from_list(state: AppState, tracks: list[Track], index: int = 0, *,
                    collection_key: tuple[Service, str] | None = None,
-                   shuffle: bool = False) -> None:
+                   shuffle: bool = False, context: dict | None = None) -> None:
     """Play ``tracks`` from ``index`` as the active queue, on the current output
-    (this computer when nothing is playing) — double-click / Enter / Play."""
-    state.play_list(tracks, index, collection_key=collection_key, shuffle=shuffle)
+    (this computer when nothing is playing) — double-click / Enter / Play.
+    ``context`` ({kind, title, service?, id?}) feeds "Playing from …"."""
+    state.play_list(tracks, index, collection_key=collection_key, shuffle=shuffle,
+                    context=context)
 
 
 def play_track_here(state: AppState, track: Track) -> None:
     """Play one track (a list of one) on the current output."""
-    state.play_list([track])
+    state.play_list([track], context={"kind": "track", "title": track.title,
+                                      "service": track.service.value, "id": track.id})
 
 
 def queue_actions(state: AppState, tracks: Callable[[], list[Track]]) -> list[tuple[str, Callable[[], None]]]:
@@ -139,12 +145,16 @@ def queue_actions(state: AppState, tracks: Callable[[], list[Track]]) -> list[tu
 
 def play_toolbar(state: AppState, get_tracks: Callable[[], list[Track]], *,
                  collection_key: tuple[Service, str] | Callable[[], tuple[Service, str] | None]
-                 | None = None) -> Gtk.Widget:
+                 | None = None,
+                 context: dict | Callable[[], dict | None] | None = None) -> Gtk.Widget:
     """Play · Shuffle · Play Next · Add to Queue for a whole list (album,
     playlist, artist top tracks). Every button acts on the full list.
     ``collection_key`` may be a callable (a page whose collection changes)."""
     def key() -> tuple[Service, str] | None:
         return collection_key() if callable(collection_key) else collection_key
+
+    def ctx() -> dict | None:
+        return context() if callable(context) else context
 
     box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
 
@@ -160,11 +170,12 @@ def play_toolbar(state: AppState, get_tracks: Callable[[], list[Track]], *,
     play = Gtk.Button(css_classes=["suggested-action", "pill"])
     play.set_child(Adw.ButtonContent(icon_name="media-playback-start-symbolic", label="Play"))
     play.connect("clicked", with_tracks(
-        lambda ts: play_from_list(state, ts, 0, collection_key=key())))
+        lambda ts: play_from_list(state, ts, 0, collection_key=key(), context=ctx())))
     shuffle = Gtk.Button(css_classes=["pill"])
     shuffle.set_child(Adw.ButtonContent(icon_name="media-playlist-shuffle-symbolic", label="Shuffle"))
     shuffle.connect("clicked", with_tracks(
-        lambda ts: play_from_list(state, ts, collection_key=key(), shuffle=True)))
+        lambda ts: play_from_list(state, ts, collection_key=key(), shuffle=True,
+                                  context=ctx())))
     nxt = Gtk.Button(icon_name="list-add-symbolic", tooltip_text="Play Next",
                      css_classes=["flat", "circular"])
     nxt.connect("clicked", with_tracks(state.playback_play_next))

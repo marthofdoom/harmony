@@ -174,6 +174,7 @@ class PlaylistsPage(Gtk.Box):
                 lambda: play_collection_on_device(
                     anchor, self.state, label=playlist.title, fetch_tracks=fetch_tracks,
                     collection_key=(playlist.service, playlist.id),
+                    context=self._playlist_context(playlist),
                 ),
             ))
             actions.append((
@@ -244,7 +245,8 @@ class PlaylistsPage(Gtk.Box):
         self.column_view, self.track_store, self.track_selection = build_track_column_view(
             on_row_menu=self._track_row_actions, state=self.state,
             on_play_from=lambda ts, i: play_from_list(self.state, ts, i,
-                                                      collection_key=self._selected_key()),
+                                                      collection_key=self._selected_key(),
+                                                      context=self._selected_context()),
         )
         self.track_selection.connect("selection-changed", lambda *_a: self._update_toolbar_sensitivity())
         self.track_stack.add_named(Gtk.ScrolledWindow(child=self.column_view), "tracks")
@@ -260,7 +262,8 @@ class PlaylistsPage(Gtk.Box):
         # menu instead of six always-visible buttons.
         # Play / Shuffle / Play Next / Add to Queue for the whole playlist.
         bar.pack_start(play_toolbar(self.state, self._loaded_tracks,
-                                    collection_key=self._selected_key))
+                                    collection_key=self._selected_key,
+                                    context=self._selected_context))
 
         self.remove_tracks_button = Gtk.Button(label="Remove Selected")
         self.remove_tracks_button.connect("clicked", self._on_remove_tracks_clicked)
@@ -341,6 +344,14 @@ class PlaylistsPage(Gtk.Box):
 
     def _loaded_tracks(self) -> list[Track]:
         return [self.track_store.get_item(i).track for i in range(self.track_store.get_n_items())]
+
+    @staticmethod
+    def _playlist_context(p: Playlist) -> dict:
+        return {"kind": "playlist", "title": p.title, "service": p.service.value, "id": p.id}
+
+    def _selected_context(self) -> dict | None:
+        p = self._selected_playlist
+        return self._playlist_context(p) if p is not None else None
 
     def _selected_key(self) -> tuple[Service, str] | None:
         p = self._selected_playlist

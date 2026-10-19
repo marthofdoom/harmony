@@ -90,6 +90,7 @@ class FakeState:
         self._playlists: dict[Service, list[Playlist]] = {}
         self.toasts: list[str] = []
         self.play_calls: list[tuple[list[Track], str]] = []
+        self.play_contexts: list[object] = []
         self.emitted: list[tuple] = []
         self.refreshed = False
 
@@ -112,9 +113,11 @@ class FakeState:
         return self._playlists
 
     def play_tracks_on_device(
-        self, tracks: list[Track], host: str, collection_key: object = None
+        self, tracks: list[Track], host: str, collection_key: object = None,
+        context: object = None,
     ) -> None:
         self.play_calls.append((list(tracks), host))
+        self.play_contexts.append(context)
 
 
 def _device(name: str, host: str) -> SimpleNamespace:

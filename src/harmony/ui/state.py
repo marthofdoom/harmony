@@ -51,6 +51,12 @@ class PlaybackState:
     repeat: str = "off"
     has_prev: bool = False
     has_next: bool = False
+    #: What the queue was started from: {kind, title, service?, id?} ("Playing from …").
+    context: dict[str, Any] | None = None
+    #: The playing stream's format (``harmony.quality.describe``).
+    quality: dict[str, Any] | None = None
+    #: Where the audio comes from: {service, label, instance, own, from_library}.
+    source: dict[str, Any] | None = None
 
     def track_key(self) -> tuple[Service, str] | None:
         """``(service, id)`` of the current track, for row-indicator matching."""
@@ -682,8 +688,11 @@ class AppState(GObject.Object):
 
     def play_list(self, tracks: list[Any], index: int = 0, host: str | None = None,
                   collection_key: tuple[Service, str] | None = None,
-                  shuffle: bool = False) -> None:
+                  shuffle: bool = False, context: dict[str, Any] | None = None) -> None:
         """Make ``tracks`` the active queue and play from ``index`` (main loop).
+
+        ``context`` ({kind, title, service?, id?}) is what the list came from, shown
+        as "Playing from …" and carried to devices.
 
         ``shuffle=True`` is one-click shuffle play: turns shuffle on and starts
         at a random track. ``host`` defaults to the current output."""
@@ -694,30 +703,37 @@ class AppState(GObject.Object):
         self._switch_output(host)
         self._resume_at = 0
         self._active_collection = collection_key
+        self.playback.context = context
+        self.playback.quality = self.playback.source = None
         if shuffle:
             self.playback.shuffle = True
         start = None if shuffle else max(0, min(index, len(tracks) - 1))
         if host == LOCAL_HOST:
-            idx = self.queue.load(tracks, start, shuffle=self.playback.shuffle)
+            idx = self.queue.load(tracks, start, shuffle=self.playback.shuffle, context=context)
             if idx is not None:
                 self._start_local(idx)
             return
         # Show it straight away; the device's snapshot replaces this shortly.
-        self.queue.load(tracks, start, shuffle=self.playback.shuffle)
+        self.queue.load(tracks, start, shuffle=self.playback.shuffle, context=context)
         self._mark_now_playing(host, self.queue.current(), state="loading")
         self._remote_op("load", {
             "tracks": [self._track_dict(t) for t in tracks], "start": start,
             "shuffle": self.playback.shuffle, "repeat": self.playback.repeat,
+            "context": context,
         }, error="Couldn't play on that device.")
 
     def play_tracks_on_device(self, tracks: list[Any], device_host: str,
-                              collection_key: tuple[Service, str] | None = None) -> None:
+                              collection_key: tuple[Service, str] | None = None,
+                              context: dict[str, Any] | None = None) -> None:
         """Thread-safe wrapper: play a list on ``device_host`` (from any thread)."""
-        on_main(self.play_list, list(tracks), 0, device_host, collection_key)
+        on_main(lambda: self.play_list(list(tracks), 0, device_host, collection_key,
+                                       context=context))
 
     def play_track_on_device(self, track: Any, device_host: str) -> None:
         """Thread-safe wrapper: play one track on ``device_host`` (from any thread)."""
-        on_main(self.play_list, [track], 0, device_host)
+        on_main(lambda: self.play_list([track], 0, device_host,
+                                       context={"kind": "track", "title": track.title,
+                                                "service": track.service.value, "id": track.id}))
 
     @staticmethod
     def _track_dict(t: Any) -> dict[str, Any]:
@@ -761,6 +777,7 @@ class AppState(GObject.Object):
         gen = self._play_gen
         self._seek_settle_until = 0.0
         self._mark_now_playing(LOCAL_HOST, track, state="loading")
+        # quality/source keep showing until the new stream resolves (no flicker)
         provider = self.provider_for(track.service)
 
         def work() -> Any:
@@ -778,18 +795,21 @@ class AppState(GObject.Object):
                 library = self.provider_for(Service.LOCAL) if lib_id else None
                 if library is not None:
                     try:
-                        return library.resolve_stream(lib_id, max_quality=True)
+                        src = library.resolve_stream(lib_id, max_quality=True)
+                        return (src, *self._stream_info("local", lib_id, src, track.service.value))
                     except Exception as exc:  # noqa: BLE001 - copy gone/peer offline: stream it
                         log.info("library copy unavailable (%s); streaming instead", exc)
                         self._engine()._forget_library_match(track.service.value, track.id)
             if provider is None:
                 raise RuntimeError(f"No provider configured for {track.service.label}")
             # The in-app player decodes locally, so ask for the highest tier.
-            return provider.resolve_stream(track.id, max_quality=True)
+            src = provider.resolve_stream(track.id, max_quality=True)
+            return (src, *self._stream_info(track.service.value, track.id, src, track.service.value))
 
-        def done(source: Any) -> None:
+        def done(resolved: Any) -> None:
             if gen != self._play_gen:
                 return  # superseded by a newer play/skip while resolving
+            source, self.playback.quality, self.playback.source = resolved
             log.info("Local playback: %s (%s)", getattr(source, "label", "?"), source.mime_type)
             self._get_local_player().load_and_play(source.url, dict(source.headers))
             self._local_failures = 0
@@ -801,6 +821,27 @@ class AppState(GObject.Object):
                 self._local_failed(exc)
 
         run_async(work, done, failed)
+
+    def _stream_info(self, service_value: str, track_id: str, source: Any,
+                     asked: str | None = None) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+        """``(quality, source)`` for a resolved stream — the same shape the engine
+        reports for device playback (``Engine._stream_info``)."""
+        instance = None
+        if service_value == "local":
+            library = self.provider_for(Service.LOCAL)
+            instance = library.instance_name(track_id) if hasattr(library, "instance_name") else None
+            if instance is None:
+                import socket
+
+                instance = socket.gethostname()
+        try:
+            label = Service(service_value).label
+        except ValueError:
+            label = service_value
+        return getattr(source, "quality", None), {
+            "service": service_value, "label": label, "instance": instance,
+            "own": service_value == "local" and "@" not in track_id,
+            "from_library": service_value == "local" and asked not in (None, "local")}
 
     def _local_failed(self, exc: BaseException | str) -> None:
         """A local track couldn't play: say so, then move on (never spin forever)."""
@@ -888,6 +929,13 @@ class AppState(GObject.Object):
         self.queue.repeat = snap.get("repeat") or "off"
         pb = self.playback
         pb.shuffle, pb.repeat = self.queue.shuffle, self.queue.repeat
+        ctx = snap.get("context")
+        self.queue.context = pb.context = ctx if isinstance(ctx, dict) else None
+        stream = snap.get("stream")
+        if isinstance(stream, dict):
+            pb.quality, pb.source = stream.get("quality"), stream.get("source")
+        else:
+            pb.quality = pb.source = None
         cur = self.queue.current()
         if cur is not None:
             pb.track = cur
@@ -1102,7 +1150,8 @@ class AppState(GObject.Object):
                 self._remote_op("load", {
                     "tracks": [self._track_dict(t) for t in self.queue.tracks], "start": index,
                     "shuffle": self.playback.shuffle, "repeat": self.playback.repeat,
-                    "keep_order": True}, error="Couldn't play that track.")
+                    "keep_order": True, "context": self.queue.context},
+                    error="Couldn't play that track.")
             return
         self.playback.active_host = LOCAL_HOST
         self._ensure_poller()
@@ -1135,6 +1184,7 @@ class AppState(GObject.Object):
         else:
             start = self.queue.enqueue(tracks, idle=idle)
             if start is not None:
+                self.queue.context = self.playback.context = None
                 self._start_local(start)
             self._refresh_nav()
             self.emit("playback-changed")
@@ -1155,6 +1205,7 @@ class AppState(GObject.Object):
         else:
             start = self.queue.play_next(tracks, idle=idle)
             if start is not None:
+                self.queue.context = self.playback.context = None
                 self._start_local(start)
             self._refresh_nav()
             self.emit("playback-changed")
@@ -1260,7 +1311,7 @@ class AppState(GObject.Object):
         eng = self._engine()
         body = {"tracks": [self._track_dict(t) for t in tracks], "start": index,
                 "shuffle": self.playback.shuffle, "repeat": self.playback.repeat,
-                "keep_order": True,
+                "keep_order": True, "context": self.queue.context,
                 "original": [self._track_dict(t) for t in (self.queue.original or tracks)]}
 
         def work() -> dict[str, Any]:
@@ -1340,6 +1391,7 @@ class AppState(GObject.Object):
             "position_s": pb.position_s or 0, "shuffle": pb.shuffle, "repeat": pb.repeat,
             "collection": [self._active_collection[0].value, self._active_collection[1]]
             if self._active_collection else None,
+            "context": self.queue.context,
             "tracks": [self._track_dict(t) for t in self.queue.tracks],
         }
         try:
@@ -1378,6 +1430,8 @@ class AppState(GObject.Object):
         pb.active_host = data.get("target") or LOCAL_HOST
         pb.track = self.queue.current()
         pb.collection_key = self._active_collection
+        ctx = data.get("context")
+        self.queue.context = pb.context = ctx if isinstance(ctx, dict) else None
         pb.state = "stopped"
         pb.position_s = int(data.get("position_s") or 0)
         pb.duration_s = getattr(pb.track, "duration_s", None)

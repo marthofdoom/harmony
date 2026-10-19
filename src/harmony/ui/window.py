@@ -19,6 +19,7 @@ log = logging.getLogger(__name__)
 # (internal name, display title, symbolic icon)
 _PAGES: list[tuple[str, str, str]] = [
     ("search", "Search", "system-search-symbolic"),
+    ("library", "Library", "folder-music-symbolic"),
     ("now_playing", "Now Playing", "emblem-music-symbolic"),
     ("playlists", "Playlists", "view-list-symbolic"),
     ("sync", "Sync", "emblem-synchronizing-symbolic"),
@@ -56,6 +57,10 @@ class HarmonyWindow(Adw.ApplicationWindow):
         outer.append(self.split_view)
         self.now_playing_bar = NowPlayingBar(self.state)
         self.now_playing_bar.on_open_now_playing = lambda: self._activate_page("now_playing")
+        self.now_playing_bar.on_open_page = self._activate_page
+        np_page = self._pages.get("now_playing")
+        if hasattr(np_page, "info"):
+            np_page.info.open_page = self._activate_page
         separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         self.now_playing_bar.bind_property(
             "visible", separator, "visible", GObject.BindingFlags.SYNC_CREATE
@@ -191,6 +196,10 @@ class HarmonyWindow(Adw.ApplicationWindow):
                 from harmony.ui.search_page import SearchPage
 
                 return SearchPage(self.state)
+            if name == "library":
+                from harmony.ui.library_page import LibraryPage
+
+                return LibraryPage(self.state, self.navigator)
             if name == "now_playing":
                 from harmony.ui.now_playing_page import NowPlayingPage
 

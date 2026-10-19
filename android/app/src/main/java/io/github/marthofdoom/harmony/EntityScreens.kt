@@ -145,7 +145,7 @@ private fun PlayableAlbumRow(vm: HarmonyViewModel, al: Album) {
         onClick = id?.let { { vm.openAlbum(al.service, it) } },
         onAction = id?.let { { action: ListAction ->
             if (action == ListAction.GET_WITH_LIDARR) vm.getWithLidarr("album", al.title, al.artist)
-            else vm.albumAction(al.service, it, action)
+            else vm.albumAction(al.service, it, action, al.title)
         } },
         lidarr = lidarr)
 }
@@ -206,15 +206,17 @@ private fun ArtistScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntr
                 if (d.topTracks.isNotEmpty()) {
                     item { SectionHeader("Top tracks") }
                     item {
+                        val ctx = PlayContext("artist", d.artist.name, d.artist.service, d.artist.id)
                         ListActionsRow(
-                            onPlay = { vm.playAll(d.topTracks, shuffle = false) },
-                            onShuffle = { vm.playAll(d.topTracks, shuffle = true) },
+                            onPlay = { vm.playAll(d.topTracks, shuffle = false, context = ctx) },
+                            onShuffle = { vm.playAll(d.topTracks, shuffle = true, context = ctx) },
                             onPlayNext = { vm.playNext(d.topTracks) },
                             onAddToQueue = { vm.addToQueue(d.topTracks) },
                         )
                     }
                     itemsIndexed(d.topTracks) { i, t ->
-                        TrackRow(t, onPlay = { vm.playFrom(d.topTracks, i) },
+                        TrackRow(t, onPlay = { vm.playFrom(d.topTracks, i,
+                                PlayContext("artist", d.artist.name, d.artist.service, d.artist.id)) },
                             playState = state.rowPlay(t),
                             trailing = { TrackRowMenu(vm, state, t) })
                     }
@@ -327,10 +329,11 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
             else -> LazyColumn(Modifier.fillMaxSize()) {
                 item { AlbumHeader(d, onArtist = { d.artistRef?.let { vm.openArtist(it) } }) }
                 d.bio?.let { bio -> item { BioBlock(bio) } }
+                val ctx = PlayContext("album", d.album.title, d.album.service, d.album.id ?: entry.id)
                 if (d.tracks.isNotEmpty()) item {
                     ListActionsRow(
-                        onPlay = { vm.playAll(d.tracks, shuffle = false) },
-                        onShuffle = { vm.playAll(d.tracks, shuffle = true) },
+                        onPlay = { vm.playAll(d.tracks, shuffle = false, context = ctx) },
+                        onShuffle = { vm.playAll(d.tracks, shuffle = true, context = ctx) },
                         onPlayNext = { vm.playNext(d.tracks) },
                         onAddToQueue = { vm.addToQueue(d.tracks) },
                     )
@@ -343,7 +346,7 @@ private fun AlbumScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
                         t,
                         playState = state.rowPlay(t),
                         onOpen = { vm.openTrack(t.service, t.id) },
-                        onPlay = { vm.playFrom(d.tracks, i) },
+                        onPlay = { vm.playFrom(d.tracks, i, ctx) },
                         menu = { TrackRowMenu(vm, state, t) },
                     )
                 }
@@ -439,7 +442,7 @@ private fun TrackScreen(vm: HarmonyViewModel, state: UiState, entry: DetailEntry
             else -> LazyColumn(Modifier.fillMaxSize()) {
                 item {
                     TrackHeader(d.track,
-                        onPlay = { vm.play(d.track) },
+                        onPlay = { vm.play(d.track, context = PlayContext("track", d.track.title, d.track.service, d.track.id)) },
                         onPlayNext = { vm.playNext(d.track) },
                         onAddToQueue = { vm.addToQueue(d.track) },
                         menu = { AddToPlaylistButton(vm, state, d.track) })
@@ -594,7 +597,7 @@ fun SmartResults(vm: HarmonyViewModel, state: UiState, smart: SmartSearch) {
         if (inc.tracks.isNotEmpty()) {
             item { SectionHeader("Songs") }
             itemsIndexed(inc.tracks) { i, t ->
-                TrackRow(t, onPlay = { vm.playFrom(inc.tracks, i) },
+                TrackRow(t, onPlay = { vm.playFrom(inc.tracks, i, PlayContext("search", smart.query)) },
                     playState = state.rowPlay(t),
                     trailing = { TrackRowMenu(vm, state, t) })
             }

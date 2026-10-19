@@ -75,7 +75,10 @@ class TrackPage(Adw.NavigationPage):
             from harmony.ui.entity_nav import track_from_dict
 
             the_track = track_from_dict(track)
-            self._content.append(play_toolbar(self.state, lambda: [the_track]))
+            self._content.append(play_toolbar(
+                self.state, lambda: [the_track],
+                context={"kind": "track", "title": the_track.title,
+                         "service": self.service, "id": self.track_id}))
 
         # Navigation to the album + performing artists.
         nav_group = Adw.PreferencesGroup(title="Go to")

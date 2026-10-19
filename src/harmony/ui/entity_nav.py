@@ -65,6 +65,8 @@ def track_from_dict(d: dict[str, Any]) -> Track:
         year=d.get("year"),
         track_number=d.get("track_number"),
         artwork_url=d.get("artwork_url"),
+        genre=d.get("genre"),
+        quality=d.get("quality") if isinstance(d.get("quality"), dict) else None,
         raw={"library_id": d["library_id"]} if d.get("library_id") else {},
     )
 
@@ -86,6 +88,8 @@ def album_from_dict(d: dict[str, Any]) -> Album:
         date=d.get("date"),
         track_count=d.get("track_count"),
         artwork_url=d.get("artwork_url"),
+        genre=d.get("genre"),
+        quality=d.get("quality") if isinstance(d.get("quality"), dict) else None,
     )
 
 
@@ -136,7 +140,8 @@ def art_fetch_url(url: str) -> str:
 
 
 def load_artwork_into(
-    image: Gtk.Image, url: str | None, *, fallback_icon: str = "emblem-music-symbolic"
+    image: Gtk.Image, url: str | None, *, fallback_icon: str = "emblem-music-symbolic",
+    still_wanted: Any = None,
 ) -> None:
     """Load ``url`` into ``image`` off the main loop, falling back to an icon.
 
@@ -144,6 +149,9 @@ def load_artwork_into(
     GdkPixbuf decode run on the worker thread (both thread-safe); the
     ``Gdk.Texture`` — a GDK object — is created in the main-thread callback,
     because building it off-thread segfaults GTK.
+
+    ``still_wanted`` (optional ``() -> bool``) lets a recycled cell (a GridView
+    row bound to a different item by the time the fetch lands) drop a stale result.
     """
     if not url:
         image.set_from_icon_name(fallback_icon)
@@ -158,7 +166,9 @@ def load_artwork_into(
         import requests
         from gi.repository import GdkPixbuf
 
-        data = requests.get(art_fetch_url(url), timeout=8).content
+        resp = requests.get(art_fetch_url(url), timeout=8)
+        resp.raise_for_status()  # a missing cover is a 404, not an image
+        data = resp.content
         loader = GdkPixbuf.PixbufLoader()
         loader.write(data)
         loader.close()
@@ -169,7 +179,8 @@ def load_artwork_into(
 
         texture = Gdk.Texture.new_for_pixbuf(pixbuf)
         _ART_CACHE[url] = texture
-        image.set_from_paintable(texture)
+        if still_wanted is None or still_wanted():
+            image.set_from_paintable(texture)
 
     run_async(work, done, lambda exc: log.debug("art load failed for %s: %s", url, exc))
 

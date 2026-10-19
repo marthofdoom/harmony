@@ -21,6 +21,7 @@ from gi.repository import Adw, Gtk  # noqa: E402
 from harmony.ui.collection_actions import add_collection_to_playlist  # noqa: E402
 from harmony.ui.detail_widgets import track_menu_builder  # noqa: E402
 from harmony.ui.entity_nav import Navigator, load_artwork_into  # noqa: E402
+from harmony.ui.np_info import NowPlayingInfo  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
 from harmony.ui.widgets import build_track_column_view, replace_tracks  # noqa: E402
 
@@ -58,6 +59,9 @@ class NowPlayingPage(Gtk.Box):
         self._artist.add_css_class("dim-label")
         art_col.append(self._title)
         art_col.append(self._artist)
+        # "Playing from …" + source/format (Hi-Res pill), larger than the bar's.
+        self.info = NowPlayingInfo(state, large=True)
+        art_col.append(self.info)
 
         # Shuffle + repeat, acting on the active queue (mirrors the Now Playing bar).
         controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, margin_top=6)
@@ -161,6 +165,8 @@ class NowPlayingPage(Gtk.Box):
             if art != self._art_url:
                 self._art_url = art
                 load_artwork_into(self._art, art)
+
+        self.info.update()
 
         # Reflect shuffle/repeat state.
         self._syncing = True

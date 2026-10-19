@@ -557,3 +557,75 @@ def test_engine_reset_notifies_listeners() -> None:
     e._reset_providers()
     e.reset_providers(notify=False)
     assert seen == [1]
+
+
+# -- "Playing from <source>" + quality: context / quality / source propagation ----
+
+_HIRES = {"codec": "FLAC", "bit_depth": 24, "sample_rate": 96000, "bitrate": 2304,
+          "lossless": True, "tier": "hires", "label": "FLAC · 24-bit / 96 kHz · Hi-Res"}
+
+
+class _Library:
+    def __init__(self, instance=None) -> None:
+        self._instance = instance
+
+    def instance_name(self, track_id):
+        return self._instance
+
+    def resolve_stream(self, track_id, *, max_quality=False):
+        return StreamSource(url=f"file:///{track_id}.flac", mime_type="audio/flac",
+                            container="flac", quality=_HIRES)
+
+
+def _local_track(tid="a1") -> Track:
+    return Track(id=tid, title="Song", service=Service.LOCAL, artists=["A"], duration_s=100)
+
+
+def test_play_list_keeps_context_on_queue_and_playback(player) -> None:
+    state, _prov, _eng, _t = player
+    ctx = {"kind": "album", "title": "Blackstar", "service": "ytmusic", "id": "b1"}
+    state.play_list([_track_n(1), _track_n(2)], 0, context=ctx)
+    assert state.playback.context == ctx and state.queue.context == ctx
+    state.playback_next()                       # next track keeps the same context
+    assert state.playback.context == ctx
+
+
+def test_local_playback_sets_source_and_quality_for_a_library_track(player) -> None:
+    state, _prov, _eng, _t = player
+    state.providers[Service.LOCAL] = _Library("harmony-server")
+    state.play_list([_local_track("a1")], 0, context={"kind": "songs", "title": "Songs"})
+    pb = state.playback
+    assert pb.quality == _HIRES
+    assert pb.source["service"] == "local" and pb.source["label"] == "Library"
+    assert pb.source["instance"] == "harmony-server" and pb.source["own"] is True
+    assert pb.source["from_library"] is False
+
+
+def test_local_streaming_track_reports_service_label(player) -> None:
+    state, prov, _eng, _t = player
+    state.play_list([_track_n(1)], 0)
+    assert state.playback.source["label"] == "YouTube Music"
+    assert state.playback.source["instance"] is None
+
+
+def test_device_snapshot_carries_context_and_stream(player) -> None:
+    state, _prov, _eng, _t = player
+    ctx = {"kind": "playlist", "title": "Mix", "service": "qobuz", "id": "p"}
+    state.play_list([_track_n(1)], 0, host="192.168.1.9", context=ctx)
+    snap = state._engine().device_queue("192.168.1.9")
+    assert snap["context"] == ctx                 # the engine queue received it
+    snap = {**snap, "stream": {"quality": _HIRES, "source": {"service": "qobuz", "label": "Qobuz"}}}
+    state._apply_snapshot("192.168.1.9", snap)
+    assert state.playback.context == ctx
+    assert state.playback.quality == _HIRES and state.playback.source["label"] == "Qobuz"
+
+
+def test_context_survives_a_restart(player, monkeypatch, tmp_path) -> None:
+    state, _prov, _eng, _t = player
+    monkeypatch.setattr(AppState, "_queue_file", staticmethod(lambda: tmp_path / "q.json"))
+    ctx = {"kind": "album", "title": "Blackstar", "service": "ytmusic", "id": "b1"}
+    state.play_list([_track_n(1), _track_n(2)], 0, context=ctx)
+    state._save_queue()
+    state.queue.context = state.playback.context = None
+    state.restore_queue()
+    assert state.playback.context == ctx and state.queue.context == ctx

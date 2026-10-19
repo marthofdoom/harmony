@@ -28,6 +28,8 @@ data class Track(
     val isrc: String? = null,
     /** The Library's copy of a streaming track (it plays instead), if any. */
     val libraryId: String? = null,
+    val genre: String? = null,
+    val quality: Quality? = null,
 )
 
 // ── Entity navigation + smart search models (see api-contract) ─────────────
@@ -52,7 +54,22 @@ data class Album(
     val date: String?,
     val artworkUrl: String?,
     val trackCount: Int? = null,
+    val genre: String? = null,
+    val quality: Quality? = null,
 )
+
+/** A Library artist row (GET /api/library/view?view=artists). */
+data class LibArtist(val id: String, val name: String, val albumCount: Int, val trackCount: Int,
+                     val artworkUrl: String?)
+
+/** A Library genre row (view=genres). */
+data class LibGenre(val name: String, val albumCount: Int, val trackCount: Int, val artworkUrl: String?)
+
+/** One page of a Library view; [enabled] false = no library anywhere on the mesh. */
+data class LibPage<T>(val enabled: Boolean, val items: List<T>, val total: Int)
+
+/** GET /api/resolve: the stream URL plus where it comes from and its quality. */
+data class ResolvedStream(val url: String, val info: StreamInfo?)
 
 /** One inclusive span [start, end]; a null end means "to the present". */
 data class Member(
@@ -170,6 +187,8 @@ data class DeviceSnapshot(
     val positionS: Double?,
     val durationS: Double?,
     val volume: Int?,
+    val context: PlayContext? = null,
+    val stream: StreamInfo? = null,
 )
 
 /** POST /api/credentials/adopt — which services were adopted, which were kept
@@ -336,11 +355,63 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
 
     /** Resolve a track to a same-origin stream URL the player can hand to
      *  ExoPlayer (the personal key travels as ?key= so the stream is authorized). */
-    fun streamUrl(track: Track): String {
+    fun streamUrl(track: Track): String = resolveStream(track).url
+
+    /** Like [streamUrl], plus the resolve response's source + quality. */
+    fun resolveStream(track: Track): ResolvedStream {
         val s = URLEncoder.encode(track.service, "UTF-8"); val id = URLEncoder.encode(track.id, "UTF-8")
-        val token = JSONObject(get("/api/resolve?service=$s&id=$id")).getString("token")
+        val o = JSONObject(get("/api/resolve?service=$s&id=$id"))
+        val token = o.getString("token")
         val keyParam = key?.takeIf { it.isNotEmpty() }?.let { "?key=" + URLEncoder.encode(it, "UTF-8") } ?: ""
-        return url("/stream/$token$keyParam")
+        return ResolvedStream(url("/stream/$token$keyParam"), StreamInfo.fromJson(o))
+    }
+
+    // -- Library browser (iTunes-style) ---------------------------------------
+
+    private fun viewPath(view: String, order: String?, desc: Boolean, genre: String?, artist: String?,
+                         limit: Int, offset: Int): String {
+        val sb = StringBuilder("/api/library/view?view=$view&limit=$limit&offset=$offset")
+        if (!order.isNullOrEmpty()) sb.append("&order=").append(enc(order))
+        if (desc) sb.append("&desc=1")
+        if (!genre.isNullOrEmpty()) sb.append("&genre=").append(enc(genre))
+        if (!artist.isNullOrEmpty()) sb.append("&artist=").append(enc(artist))
+        return sb.toString()
+    }
+
+    fun libraryArtists(limit: Int = 1000, offset: Int = 0): LibPage<LibArtist> {
+        val o = JSONObject(get(viewPath("artists", null, false, null, null, limit, offset)))
+        val arr = o.optJSONArray("artists")
+        val items = if (arr == null) emptyList() else (0 until arr.length()).map { i ->
+            val a = arr.getJSONObject(i)
+            LibArtist(a.optString("id"), a.optString("name"), a.optInt("album_count"),
+                a.optInt("track_count"), absUrl(optStr(a, "artwork_url")))
+        }
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+    }
+
+    fun libraryGenres(limit: Int = 1000, offset: Int = 0): LibPage<LibGenre> {
+        val o = JSONObject(get(viewPath("genres", null, false, null, null, limit, offset)))
+        val arr = o.optJSONArray("genres")
+        val items = if (arr == null) emptyList() else (0 until arr.length()).map { i ->
+            val g = arr.getJSONObject(i)
+            LibGenre(g.optString("name"), g.optInt("album_count"), g.optInt("track_count"),
+                absUrl(optStr(g, "artwork_url")))
+        }
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+    }
+
+    fun libraryAlbums(order: String, desc: Boolean, genre: String? = null, artist: String? = null,
+                      limit: Int = 1000, offset: Int = 0): LibPage<Album> {
+        val o = JSONObject(get(viewPath("albums", order, desc, genre, artist, limit, offset)))
+        val items = parseAlbums(o.optJSONArray("albums"))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
+    }
+
+    fun librarySongs(order: String, desc: Boolean, genre: String? = null, artist: String? = null,
+                     limit: Int = 200, offset: Int = 0): LibPage<Track> {
+        val o = JSONObject(get(viewPath("songs", order, desc, genre, artist, limit, offset)))
+        val items = parseTracks(o.optJSONArray("songs"))
+        return LibPage(o.optBoolean("enabled"), items, o.optInt("total", items.size))
     }
 
     /** Other instances this hub sees on the LAN (for routing between them). */
@@ -504,6 +575,8 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             positionS = optDouble("position_s"),
             durationS = optDouble("duration_s"),
             volume = optDouble("volume")?.toInt(),
+            context = PlayContext.fromJson(o.optJSONObject("context")),
+            stream = StreamInfo.fromJson(o.optJSONObject("stream")),
         )
     }
 
@@ -532,6 +605,8 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         year = optInt(o, "year"),
         isrc = optStr(o, "isrc"),
         libraryId = optStr(o, "library_id"),
+        genre = optStr(o, "genre"),
+        quality = Quality.fromJson(o.optJSONObject("quality")),
     )
 
     private fun parseTracks(arr: JSONArray?): List<Track> {
@@ -548,6 +623,8 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
         date = optStr(o, "date"),
         artworkUrl = absUrl(optStr(o, "artwork_url")),
         trackCount = optInt(o, "track_count"),
+        genre = optStr(o, "genre"),
+        quality = Quality.fromJson(o.optJSONObject("quality")),
     )
 
     private fun parseAlbums(arr: JSONArray?): List<Album> {

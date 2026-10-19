@@ -42,6 +42,44 @@ data class Playback(
     val durationMs: Long = 0,
 )
 
+/** The Library tab's segments. */
+enum class LibSection(val label: String) {
+    ARTISTS("Artists"), ALBUMS("Albums"), SONGS("Songs"), GENRES("Genres"), PLAYLISTS("Playlists")
+}
+
+/** An artist or genre opened inside the Library tab (its albums + songs). */
+data class LibFocus(
+    val kind: String,            // "artist" | "genre"
+    val id: String,              // artist id, or the genre name
+    val title: String,
+    val albums: List<Album> = emptyList(),
+    val songs: List<Track> = emptyList(),
+    val loading: Boolean = true,
+)
+
+/** State of the iTunes-style Library browser (merged across the mesh). */
+data class LibraryBrowse(
+    val section: LibSection = LibSection.ARTISTS,
+    val enabled: Boolean? = null,            // null = not loaded yet; false = no library anywhere
+    val loading: Boolean = false,
+    val artists: List<LibArtist> = emptyList(),
+    val albums: List<Album> = emptyList(),
+    val albumOrder: String = "title",
+    val albumDesc: Boolean = false,
+    val genres: List<LibGenre> = emptyList(),
+    val songs: List<Track> = emptyList(),
+    val songsTotal: Int = 0,
+    val songOrder: String = "title",
+    val songDesc: Boolean = false,
+    val songsLoadingMore: Boolean = false,
+    val focus: LibFocus? = null,
+)
+
+/** The display text after "Playing from". */
+val PlayContext.display: String get() = if (kind == "search") "search “$title”" else title
+
+const val SONGS_PAGE = 200
+
 data class UiState(
     val conn: ConnState = ConnState.DISCONNECTED,
     val instanceName: String? = null,
@@ -66,6 +104,10 @@ data class UiState(
     // The ACTIVE PLAY QUEUE (history + current + up next); for a device output
     // this mirrors the server-owned device queue.
     val queue: List<Track> = emptyList(),
+    // What the queue was loaded from + the current stream's source/quality.
+    val context: PlayContext? = null,
+    val stream: StreamInfo? = null,
+    val lib: LibraryBrowse = LibraryBrowse(),
     // Index of the currently-playing track within [queue] (-1 when nothing is queued).
     val activeIndex: Int = -1,
     val shuffle: Boolean = false,
@@ -151,6 +193,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(
                     playback = Playback(ps.current, ps.isPlaying, ps.positionMs, ps.durationMs),
                     queue = ps.queue, activeIndex = ps.index,
+                    context = ps.context, stream = ps.stream,
                     shuffle = ps.shuffle, repeatMode = ps.repeat, buffering = ps.buffering,
                     playingHere = ps.monitoring,
                     target = ps.target, targetVia = ps.targetVia, targetName = ps.targetName,
@@ -219,7 +262,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 val name = _state.value.discovered.firstOrNull { it.baseUrl == baseUrl }?.name ?: baseUrl
                 _state.value = _state.value.copy(conn = ConnState.CONNECTED, instanceName = name,
                     connectingUrl = null)
-                refreshPeers(); loadLibrary(); loadDevices(); loadLidarr()
+                refreshPeers(); loadLibrary(); loadLibraryBrowse(); loadDevices(); loadLidarr()
             }.onFailure {
                 _state.value = _state.value.copy(conn = ConnState.DISCONNECTED, connectingUrl = null,
                     message = friendly(it, "Couldn't connect. Check the address and key, then try again."))
@@ -240,6 +283,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
             peers = emptyList(), routeStatus = null,
             renderers = emptyList(), bridgingTo = null,
             playlists = emptyList(), openPlaylist = null, playlistTracks = emptyList(),
+            lib = LibraryBrowse(),
             devices = emptyList(), syncPlan = null, syncMsg = null,
             accountSyncBusy = false, accountSyncMsg = null)
     }
@@ -342,21 +386,21 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Play [track], loading [queue] (the album/playlist/search list it came from)
      *  as the ACTIVE PLAY QUEUE, keeping the current shuffle mode. */
-    fun play(track: Track, queue: List<Track> = listOf(track)) {
+    fun play(track: Track, queue: List<Track> = listOf(track), context: PlayContext? = null) {
         val idx = queue.indexOfFirst { it.id == track.id && it.service == track.service }
-        playFrom(if (idx < 0) listOf(track) else queue, idx.coerceAtLeast(0))
+        playFrom(if (idx < 0) listOf(track) else queue, idx.coerceAtLeast(0), context)
     }
 
     /** Play [list] starting at [index] (a tapped row), keeping the shuffle mode. */
-    fun playFrom(list: List<Track>, index: Int) {
+    fun playFrom(list: List<Track>, index: Int, context: PlayContext? = null) {
         if (list.isEmpty()) return
-        player.playList(list, index.coerceIn(0, list.size - 1), shuffle = null)
+        player.playList(list, index.coerceIn(0, list.size - 1), shuffle = null, context = context)
     }
 
     /** Play / Shuffle buttons: the whole list in order, or shuffle-play it. */
-    fun playAll(list: List<Track>, shuffle: Boolean) {
+    fun playAll(list: List<Track>, shuffle: Boolean, context: PlayContext? = null) {
         if (list.isEmpty()) return
-        player.playList(list, if (shuffle) null else 0, shuffle = shuffle)
+        player.playList(list, if (shuffle) null else 0, shuffle = shuffle, context = context)
     }
 
     fun next() = player.next()
@@ -406,8 +450,10 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /** Whole-album actions from an album row (search / artist discography). */
-    fun albumAction(service: String, id: String, action: ListAction) =
-        withTracks("Couldn't load that album. Try again.", { it.album(service, id).tracks }) { runListAction(it, action) }
+    fun albumAction(service: String, id: String, action: ListAction, title: String = "") =
+        withTracks("Couldn't load that album. Try again.", { it.album(service, id).tracks }) {
+            runListAction(it, action, PlayContext("album", title.ifBlank { "Album" }, service, id))
+        }
 
     private fun loadLidarr() {
         val client = api ?: return
@@ -431,11 +477,13 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Whole-playlist actions from a playlist row. */
     fun playlistAction(pl: Playlist, action: ListAction) =
-        withTracks("Couldn't load that playlist. Try again.", { it.playlistTracks(pl.service, pl.id) }) { runListAction(it, action) }
+        withTracks("Couldn't load that playlist. Try again.", { it.playlistTracks(pl.service, pl.id) }) {
+            runListAction(it, action, PlayContext("playlist", pl.title, pl.service, pl.id))
+        }
 
-    private fun runListAction(tracks: List<Track>, action: ListAction) = when (action) {
-        ListAction.PLAY -> playAll(tracks, shuffle = false)
-        ListAction.SHUFFLE -> playAll(tracks, shuffle = true)
+    private fun runListAction(tracks: List<Track>, action: ListAction, context: PlayContext?) = when (action) {
+        ListAction.PLAY -> playAll(tracks, shuffle = false, context = context)
+        ListAction.SHUFFLE -> playAll(tracks, shuffle = true, context = context)
         ListAction.PLAY_NEXT -> playNext(tracks)
         ListAction.ADD_TO_QUEUE -> addToQueue(tracks)
         ListAction.GET_WITH_LIDARR -> Unit  // not a track action; see getWithLidarr
@@ -454,6 +502,147 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // -- iTunes-style Library browser -----------------------------------------
+
+    private var songGen = 0   // bumps on every songs reset so a stale page is dropped
+
+    private fun updLib(f: (LibraryBrowse) -> LibraryBrowse) {
+        _state.value = _state.value.copy(lib = f(_state.value.lib))
+    }
+
+    /** First page of every view. Runs once per connection and on Refresh. */
+    fun loadLibraryBrowse() {
+        val client = api ?: return
+        val lib = _state.value.lib
+        updLib { it.copy(loading = true) }
+        val gen = ++songGen
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val songs = client.librarySongs(lib.songOrder, lib.songDesc, limit = SONGS_PAGE)
+                    if (!songs.enabled) return@runCatching null
+                    listOf(songs, client.libraryArtists(), client.libraryAlbums(lib.albumOrder, lib.albumDesc),
+                        client.libraryGenres())
+                }
+            }
+            res.onSuccess { r ->
+                if (r == null) {
+                    // No library anywhere: Playlists is the useful landing segment.
+                    updLib { it.copy(enabled = false, loading = false,
+                        section = if (it.section == LibSection.ARTISTS) LibSection.PLAYLISTS else it.section) }
+                    return@onSuccess
+                }
+                @Suppress("UNCHECKED_CAST")
+                if (gen == songGen) updLib {
+                    it.copy(enabled = true, loading = false,
+                        songs = (r[0] as LibPage<Track>).items, songsTotal = r[0].total,
+                        artists = (r[1] as LibPage<LibArtist>).items,
+                        albums = (r[2] as LibPage<Album>).items,
+                        genres = (r[3] as LibPage<LibGenre>).items)
+                }
+            }.onFailure {
+                updLib { it.copy(loading = false) }
+                _state.value = _state.value.copy(message = friendly(it, "Couldn't load your library. Try again."))
+            }
+        }
+    }
+
+    fun setLibSection(s: LibSection) = updLib { it.copy(section = s, focus = null) }
+
+    fun setAlbumSort(order: String, desc: Boolean) {
+        val client = api ?: return
+        updLib { it.copy(albumOrder = order, albumDesc = desc) }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { client.libraryAlbums(order, desc) } }
+                .onSuccess { p -> updLib { it.copy(albums = p.items) } }
+                .onFailure { _state.value = _state.value.copy(message = friendly(it, "Couldn't sort the albums.")) }
+        }
+    }
+
+    fun setSongSort(order: String, desc: Boolean) {
+        val client = api ?: return
+        val gen = ++songGen
+        updLib { it.copy(songOrder = order, songDesc = desc, songsLoadingMore = false) }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) { runCatching { client.librarySongs(order, desc, limit = SONGS_PAGE) } }
+                .onSuccess { p -> if (gen == songGen) updLib { it.copy(songs = p.items, songsTotal = p.total) } }
+                .onFailure { _state.value = _state.value.copy(message = friendly(it, "Couldn't sort the songs.")) }
+        }
+    }
+
+    /** Page in the next [SONGS_PAGE] songs when the list is scrolled near its end. */
+    fun loadMoreSongs() {
+        val client = api ?: return
+        val lib = _state.value.lib
+        if (lib.songsLoadingMore || lib.songs.size >= lib.songsTotal) return
+        val gen = songGen
+        updLib { it.copy(songsLoadingMore = true) }
+        viewModelScope.launch {
+            withContext(Dispatchers.IO) {
+                runCatching { client.librarySongs(lib.songOrder, lib.songDesc, limit = SONGS_PAGE, offset = lib.songs.size) }
+            }.onSuccess { p ->
+                if (gen == songGen) updLib { it.copy(songs = it.songs + p.items, songsTotal = p.total,
+                    songsLoadingMore = false) }
+            }.onFailure {
+                if (gen == songGen) updLib { it.copy(songsLoadingMore = false) }
+            }
+        }
+    }
+
+    fun openLibArtist(a: LibArtist) = openFocus(LibFocus("artist", a.id, a.name))
+    fun openLibGenre(g: LibGenre) = openFocus(LibFocus("genre", g.name, g.name))
+    fun closeLibFocus() = updLib { it.copy(focus = null) }
+
+    private fun openFocus(f: LibFocus) {
+        val client = api ?: return
+        updLib { it.copy(focus = f) }
+        viewModelScope.launch {
+            val res = withContext(Dispatchers.IO) {
+                runCatching {
+                    val genre = if (f.kind == "genre") f.id else null
+                    val artist = if (f.kind == "artist") f.id else null
+                    val albums = client.libraryAlbums("year", false, genre = genre, artist = artist)
+                    val songs = if (f.kind == "artist") client.librarySongs("album", false, artist = artist, limit = 500)
+                                else null
+                    albums.items to (songs?.items ?: emptyList())
+                }
+            }
+            res.onSuccess { (albums, songs) ->
+                updLib { l -> if (l.focus?.kind == f.kind && l.focus.id == f.id)
+                    l.copy(focus = f.copy(albums = albums, songs = songs, loading = false)) else l }
+            }.onFailure {
+                updLib { l -> if (l.focus?.id == f.id) l.copy(focus = f.copy(loading = false)) else l }
+                _state.value = _state.value.copy(message = friendly(it, "Couldn't open that. Try again."))
+            }
+        }
+    }
+
+    /** "Playing from …" tapped: go to what the queue was loaded from. */
+    fun openContext(c: PlayContext) {
+        showNowPlaying(false)
+        val svc = c.service ?: "local"
+        when (c.kind) {
+            "album" -> c.id?.let { openAlbum(svc, it) }
+            "artist" -> c.id?.let {
+                if (svc == "local") {
+                    _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
+                        lib = _state.value.lib.copy(section = LibSection.ARTISTS))
+                    openLibArtist(LibArtist(it, c.title, 0, 0, null))
+                } else openArtist(svc, it)
+            }
+            "genre" -> {
+                _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
+                    lib = _state.value.lib.copy(section = LibSection.GENRES))
+                openLibGenre(LibGenre(c.title, 0, 0, null))
+            }
+            "songs" -> _state.value = _state.value.copy(tab = 1, detailStack = emptyList(),
+                lib = _state.value.lib.copy(section = LibSection.SONGS, focus = null))
+            "playlist" -> c.id?.let { openPlaylistFromSearch(Playlist(svc, it, c.title, null, null)) }
+            "search" -> { _state.value = _state.value.copy(tab = 0, detailStack = emptyList(), query = c.title); smartSearch() }
+            "track" -> c.id?.let { openTrack(svc, it) }
+        }
+    }
+
     fun openPlaylist(pl: Playlist) {
         val client = api ?: return
         _state.value = _state.value.copy(openPlaylist = pl, playlistTracks = emptyList(), libraryLoading = true)
@@ -467,7 +656,8 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Open a playlist found in search: show it on the Library tab. */
     fun openPlaylistFromSearch(pl: Playlist) {
-        _state.value = _state.value.copy(tab = 1, detailStack = emptyList())
+        _state.value = _state.value.copy(tab = 1, detailStack = emptyList(), nowPlayingOpen = false,
+            lib = _state.value.lib.copy(section = LibSection.PLAYLISTS))
         openPlaylist(pl)
     }
 

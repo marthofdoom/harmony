@@ -28,6 +28,8 @@ class PlayQueue {
     private var original: MutableList<QEntry> = mutableListOf()  // load order, restored when shuffle goes off
     var shuffle: Boolean = false; private set
     var repeat: RepeatMode = RepeatMode.OFF
+    /** What the queue was loaded from ("Playing from …"); enqueue/play-next keep it. */
+    var context: PlayContext? = null
 
     val tracks: List<Track> get() = entries.map { it.track }
     /** Load order (what shuffle-off restores), sent along on a hand-off. */
@@ -48,8 +50,10 @@ class PlayQueue {
 
     /** Replace the queue. [start] null = "shuffle play" (random first track when
      *  shuffle is on). [keepOrder] takes the list as already arranged. */
-    fun load(tracks: List<Track>, start: Int?, shuffle: Boolean? = null, keepOrder: Boolean = false): Int? {
+    fun load(tracks: List<Track>, start: Int?, shuffle: Boolean? = null, keepOrder: Boolean = false,
+             context: PlayContext? = null): Int? {
         if (tracks.isEmpty()) return null
+        this.context = context
         if (shuffle != null) this.shuffle = shuffle
         val list = tracks.map { QEntry(it) }
         original = list.toMutableList()
@@ -70,7 +74,9 @@ class PlayQueue {
     }
 
     /** Restore a persisted/adopted queue verbatim (no reshuffle). */
-    fun restore(tracks: List<Track>, index: Int, shuffle: Boolean, repeat: RepeatMode) {
+    fun restore(tracks: List<Track>, index: Int, shuffle: Boolean, repeat: RepeatMode,
+                context: PlayContext? = null) {
+        this.context = context
         entries = tracks.map { QEntry(it) }.toMutableList()
         original = entries.toMutableList()
         this.index = if (entries.isEmpty()) -1 else index.coerceIn(0, entries.size - 1)
@@ -151,7 +157,7 @@ class PlayQueue {
     }
 
     fun reset() {
-        entries = mutableListOf(); original = mutableListOf(); index = -1
+        entries = mutableListOf(); original = mutableListOf(); index = -1; context = null
     }
 
     fun setShuffle(on: Boolean) {

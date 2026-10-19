@@ -49,6 +49,10 @@ data class PlayerState(
     val devicePaused: Boolean = false,
     // "Play here": the phone is streaming the hub's live audio (not the queue).
     val monitoring: Boolean = false,
+    // "Playing from …" (what the queue was loaded from) and the current stream's
+    // source + quality (null until the track resolves / the device reports it).
+    val context: PlayContext? = null,
+    val stream: StreamInfo? = null,
 ) {
     val current: Track? get() = queue.getOrNull(index)
     val onDevice: Boolean get() = target != PHONE
@@ -143,7 +147,7 @@ class PlaybackController private constructor(ctx: Context) {
 
     /** Replace the queue with [tracks] and play from [start] (null = shuffle-play
      *  from a random track). [shuffle] null keeps the current shuffle mode. */
-    fun playList(tracks: List<Track>, start: Int?, shuffle: Boolean? = null) {
+    fun playList(tracks: List<Track>, start: Int?, shuffle: Boolean? = null, context: PlayContext? = null) {
         if (tracks.isEmpty()) return
         val s = _state.value
         if (s.onDevice) {
@@ -151,11 +155,12 @@ class PlaybackController private constructor(ctx: Context) {
                 .put("start", start ?: JSONObject.NULL)
                 .put("shuffle", shuffle ?: q.shuffle)
                 .put("repeat", q.repeat.wire)
+            context?.let { body.put("context", it.toJson()) }
             deviceOp("load", body, "Couldn't start playback on the device.")
             return
         }
         stopMonitorQuietly()
-        val r = q.load(tracks, start, shuffle) ?: return
+        val r = q.load(tracks, start, shuffle, context = context) ?: return
         startLocal(r)
     }
 
@@ -375,7 +380,7 @@ class PlaybackController private constructor(ctx: Context) {
         pendingStartMs = posMs; phoneEnded = false
         _state.value = old.copy(target = newTarget, targetVia = via, targetName = name,
             isPlaying = false, buffering = false, monitoring = false, positionMs = posMs,
-            deviceVolume = null, devicePaused = false)
+            deviceVolume = null, devicePaused = false, stream = null)
         publish()
 
         // 2) start the new one where the old one was
@@ -459,11 +464,13 @@ class PlaybackController private constructor(ctx: Context) {
         }
         startAutoplay = autoplay
         startJob = scope.launch {
-            val url = withContext(Dispatchers.IO) { runCatching { client.streamUrl(track) } }
-            url.onSuccess { u ->
+            val url = withContext(Dispatchers.IO) { runCatching { client.resolveStream(track) } }
+            url.onSuccess { resolved ->
+                val u = resolved.url
+                publish { it.copy(stream = resolved.info) }
                 exo.setMediaItem(
                     MediaItem.Builder().setUri(u).setMediaId("${track.service}:${track.id}")
-                        .setMediaMetadata(metadataFor(track)).build(),
+                        .setMediaMetadata(metadataFor(track, resolved.info)).build(),
                     startMs)
                 exo.prepare()
                 exo.playWhenReady = autoplay
@@ -475,7 +482,7 @@ class PlaybackController private constructor(ctx: Context) {
         // Stop the previous track right away so the old one doesn't keep playing
         // while the next URL resolves.
         exo.stop()
-        publish { it.copy(positionMs = startMs, durationMs = (track.durationS ?: 0) * 1000L) }
+        publish { it.copy(positionMs = startMs, durationMs = (track.durationS ?: 0) * 1000L, stream = null) }
         refreshPhone()
         startJob?.invokeOnCompletion { scope.launch { refreshPhone() } }
     }
@@ -589,6 +596,7 @@ class PlaybackController private constructor(ctx: Context) {
             .put("start", q.index.coerceAtLeast(0))
             .put("shuffle", q.shuffle).put("repeat", q.repeat.wire)
             .put("keep_order", true)
+            .apply { q.context?.let { put("context", it.toJson()) } }
             .put("original", HarmonyApi.tracksJson(q.originalTracks.ifEmpty { q.tracks }))
         val seq = ++opSeq
         publish { it.copy(isPlaying = true, buffering = true) }
@@ -625,14 +633,14 @@ class PlaybackController private constructor(ctx: Context) {
         if (snap.playing && snap.tracks.isNotEmpty()) ownsDeviceQueue = true
         val adoptQueue = snap.tracks.isNotEmpty() && ownsDeviceQueue
         if (adoptQueue) {
-            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat)
+            q.restore(snap.tracks, snap.index, snap.shuffle, snap.repeat, snap.context ?: q.context)
         }
         if (!ownsDeviceQueue) {
             // Just the device's volume / idle state; keep our pending queue + position.
             deviceDurMs = (q.current()?.track?.durationS ?: 0) * 1000L
             publish { it.copy(isPlaying = false, buffering = false, devicePaused = false,
                 deviceVolume = snap.volume ?: it.deviceVolume, positionMs = pendingStartMs,
-                durationMs = deviceDurMs) }
+                durationMs = deviceDurMs, stream = null) }
             return
         }
         val paused = snap.state == "paused"
@@ -645,7 +653,8 @@ class PlaybackController private constructor(ctx: Context) {
         publish {
             it.copy(isPlaying = playing, buffering = false, devicePaused = paused,
                 deviceVolume = snap.volume ?: it.deviceVolume,
-                positionMs = currentPositionMsFor(playing), durationMs = deviceDurMs)
+                positionMs = currentPositionMsFor(playing), durationMs = deviceDurMs,
+                stream = snap.stream)
         }
     }
 
@@ -678,7 +687,8 @@ class PlaybackController private constructor(ctx: Context) {
     // ── state, persistence, ticker ──────────────────────────────────────────
 
     private fun publish(extra: (PlayerState) -> PlayerState = { it }) {
-        val s = _state.value.copy(queue = q.tracks, index = q.index, shuffle = q.shuffle, repeat = q.repeat)
+        val s = _state.value.copy(queue = q.tracks, index = q.index, shuffle = q.shuffle, repeat = q.repeat,
+            context = q.context)
         _state.value = extra(s)
         refreshPhone()
         saveSoon()
@@ -695,19 +705,20 @@ class PlaybackController private constructor(ctx: Context) {
         prefs.savePlayback(Prefs.SavedPlayback(
             queue = q.tracks, index = q.index, positionMs = currentPositionMs(),
             shuffle = q.shuffle, repeat = q.repeat,
-            target = s.target, targetVia = s.targetVia, targetName = s.targetName))
+            target = s.target, targetVia = s.targetVia, targetName = s.targetName,
+            context = q.context))
     }
 
     private fun restore() {
         val saved = prefs.loadPlayback() ?: return
-        q.restore(saved.queue, saved.index, saved.shuffle, saved.repeat)
+        q.restore(saved.queue, saved.index, saved.shuffle, saved.repeat, saved.context)
         pendingStartMs = saved.positionMs
         devicePosMs = saved.positionMs
         deviceDurMs = (q.current()?.track?.durationS ?: 0) * 1000L
         _state.value = PlayerState(
             queue = q.tracks, index = q.index, shuffle = q.shuffle, repeat = q.repeat,
             target = saved.target, targetVia = saved.targetVia, targetName = saved.targetName,
-            positionMs = saved.positionMs, durationMs = deviceDurMs,
+            positionMs = saved.positionMs, durationMs = deviceDurMs, context = saved.context,
         )
     }
 
@@ -727,8 +738,9 @@ class PlaybackController private constructor(ctx: Context) {
 
     private fun say(msg: String) { _messages.tryEmit(msg) }
 
-    fun metadataFor(t: Track): MediaMetadata = MediaMetadata.Builder()
+    fun metadataFor(t: Track, stream: StreamInfo? = null): MediaMetadata = MediaMetadata.Builder()
         .setTitle(t.title).setArtist(t.artist).setAlbumTitle(t.album)
+        .setSubtitle(sourceQualityLine(stream, t.quality, null))
         .setArtworkUri(t.artworkUrl?.let { Uri.parse(it) })
         .setIsPlayable(true).setIsBrowsable(false)
         .build()
