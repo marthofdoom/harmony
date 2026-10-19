@@ -46,6 +46,21 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.8" date="2026-10-19">
+      <description>
+        <p>Browse your library the way you'd expect. A new Library view on
+        the desktop, the web and the phone lists your music by Artists,
+        Albums, Songs and Genres: sort any column, page through everything,
+        and play any list from any song. It covers every library shared by
+        your Harmony instances.</p>
+        <p>The playing bar and Now Playing now say where the music is
+        playing from — your Library, YouTube Music or Qobuz — and in what
+        quality, such as FLAC 24-bit / 96 kHz with a Hi-Res badge. Libraries
+        upgrade themselves to pick up genres and quality, and the desktop no
+        longer says "Library: not set up" when your library lives on your
+        server.</p>
+      </description>
+    </release>
     <release version="1.0.7" date="2026-10-01">
       <description>
         <p>One library for all your devices. Every Harmony instance now shares
