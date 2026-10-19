@@ -70,6 +70,8 @@ def track_to_dict(t: Any) -> dict[str, Any]:
         "year": getattr(t, "year", None),
         "isrc": getattr(t, "isrc", None),
         "artwork_url": t.artwork_url,
+        **({"genre": t.genre} if getattr(t, "genre", None) else {}),
+        **({"quality": t.quality} if getattr(t, "quality", None) else {}),
         **({"library_id": t.raw["library_id"]} if (getattr(t, "raw", None) or {}).get("library_id") else {}),
     }
 
@@ -86,6 +88,7 @@ def track_from_dict(d: dict[str, Any]) -> Any:
         album_id=d.get("album_id"), duration_s=d.get("duration_s"),
         track_number=d.get("track_number"), year=d.get("year"), isrc=d.get("isrc"),
         artwork_url=d.get("artwork_url") or d.get("art_url"),
+        genre=d.get("genre"), quality=d.get("quality") if isinstance(d.get("quality"), dict) else None,
         raw={"library_id": d["library_id"]} if d.get("library_id") else {},
     )
 
@@ -105,7 +108,9 @@ def album_to_dict(a: Any) -> dict[str, Any]:
     return {"id": a.id, "title": a.title, "service": a.service.value,
             "artist": _artists(a), "artist_ids": list(getattr(a, "artist_ids", []) or []),
             "year": a.year, "date": getattr(a, "date", None),
-            "track_count": getattr(a, "track_count", None), "artwork_url": a.artwork_url}
+            "track_count": getattr(a, "track_count", None), "artwork_url": a.artwork_url,
+            **({"genre": a.genre} if getattr(a, "genre", None) else {}),
+            **({"quality": a.quality} if getattr(a, "quality", None) else {})}
 
 
 def artist_to_dict(a: Any) -> dict[str, Any]:
@@ -124,6 +129,9 @@ def _album_ref(service_value: str, album_id: str, title: str) -> dict[str, Any]:
 def _sort_albums_chrono(albums: list[Any]) -> list[Any]:
     """Chronological ascending; undated albums sink to the end, then by title."""
     return sorted(albums, key=lambda a: (a.year is None, a.year or 0, a.title.lower()))
+
+
+_last_resolved = threading.local()
 
 
 class Engine:
@@ -1412,6 +1420,49 @@ class Engine:
         svc, tid = self._prefer_library(service_value, track_id, meta)
         return tid if svc == "local" and service_value != "local" else None
 
+    @staticmethod
+    def _view_dict(page: dict[str, Any]) -> dict[str, Any]:
+        out = dict(page)
+        if "albums" in out:
+            out["albums"] = [album_to_dict(a) for a in out["albums"]]
+        if "songs" in out:
+            out["songs"] = [track_to_dict(t) for t in out["songs"]]
+        return out
+
+    def library_view(self, view: str, *, order: str = "artist", desc: bool = False,
+                     limit: int = 200, offset: int = 0, genre: str | None = None,
+                     artist_id: str | None = None) -> dict[str, Any]:
+        """iTunes-style Library browser page across every library on the mesh:
+        ``view`` = artists | albums | songs | genres."""
+        prov = self._library_provider()
+        if prov is None or not prov.active():
+            return {"enabled": False, "view": view, view: [], "total": 0}
+        page = prov.browse_view(view, order=order, desc=desc, limit=limit, offset=offset,
+                                genre=genre, artist_id=artist_id)
+        return {"enabled": True, **self._view_dict(page)}
+
+    def library_own_view(self, view: str, *, order: str = "artist", desc: bool = False,
+                         limit: int = 200, offset: int = 0, genre: str | None = None,
+                         artist_id: str | None = None) -> dict[str, Any]:
+        """The same page from this instance's own library only (what peers ask)."""
+        own = self._own_library()
+        if view == "genres":
+            items = own.list_genres()
+            return {"view": view, "genres": items[offset:offset + limit], "total": len(items)}
+        if view == "artists":
+            items = own.list_artists(genre=genre)
+            return {"view": view, "artists": items[offset:offset + limit], "total": len(items)}
+        if view == "albums":
+            albums = own.list_albums(order=order, limit=limit, offset=offset, genre=genre,
+                                     artist_id=artist_id)
+            return {"view": view, "albums": [album_to_dict(a) for a in albums],
+                    "total": own.index.count_albums(artist_id=artist_id, genre=genre)}
+        if view == "songs":
+            songs, total = own.list_songs(order=order, desc=desc, limit=limit, offset=offset,
+                                          genre=genre, artist_id=artist_id)
+            return {"view": view, "songs": [track_to_dict(t) for t in songs], "total": total}
+        raise ValueError(f"unknown library view {view!r}")
+
     def library_overview(self, *, order: str = "recent", limit: int = 60) -> dict[str, Any]:
         """Browse the Library: albums + artists across this instance's library
         and every peer's (own first)."""
@@ -1844,7 +1895,8 @@ class Engine:
         }
         self._prune()
         return {"token": token, "mime": source.mime_type, "label": source.label,
-                "service": service_value, "from_library": service_value == "local" and asked != "local"}
+                "service": service_value, "from_library": service_value == "local" and asked != "local",
+                **self._stream_info(service_value, track_id, source, asked)}
 
     def _resolve_preferring_library(self, service_value: str, track_id: str,
                                     meta: dict[str, Any] | None = None) -> tuple[str, str, Any]:
@@ -1879,7 +1931,35 @@ class Engine:
         if prov is None:
             raise KeyError(service_value)
         with self._plock(service_value):
-            return prov.resolve_stream(track_id, max_quality=True)
+            source = prov.resolve_stream(track_id, max_quality=True)
+        # Remembered per thread so a cast (which resolves inside the caster)
+        # can report what it actually played: the Library copy or the stream.
+        _last_resolved.value = (service_value, track_id, source)
+        return source
+
+    def _stream_info(self, service_value: str, track_id: str, source: Any,
+                     asked: str | None = None) -> dict[str, Any]:
+        """Where a resolved stream comes from + its quality, for "Playing from"."""
+        from harmony.models import Service
+
+        instance = None
+        if service_value == "local":
+            prov = self._library_provider()
+            instance = prov.instance_name(track_id) if hasattr(prov, "instance_name") else None
+            if instance is None:
+                import socket
+
+                instance = socket.gethostname()
+        try:
+            label = Service(service_value).label
+        except ValueError:
+            label = service_value
+        return {
+            "quality": getattr(source, "quality", None),
+            "source": {"service": service_value, "label": label, "instance": instance,
+                       "own": service_value == "local" and "@" not in track_id,
+                       "from_library": service_value == "local" and asked not in (None, "local")},
+        }
 
     # -- LAN mesh -----------------------------------------------------------
 
@@ -2166,9 +2246,16 @@ class Engine:
             from harmony.web.device_queue import DeviceQueues
 
             def play(host: str, t: dict[str, Any]) -> Any:
-                meta = {k: t.get(k) for k in ("title", "artist", "album", "duration_s")}
+                meta = {k: t.get(k) for k in ("title", "artist", "album", "duration_s", "isrc")}
                 meta["art_url"] = t.get("art_url") or t.get("artwork_url")
-                return self._cast_direct(host, str(t["service"]), str(t["id"]), meta)
+                _last_resolved.value = None
+                result = self._cast_direct(host, str(t["service"]), str(t["id"]), meta)
+                last = getattr(_last_resolved, "value", None)
+                if last is not None:
+                    svc, tid, source = last
+                    result = {**(result or {}), "stream": self._stream_info(svc, tid, source,
+                                                                           str(t["service"]))}
+                return result
 
             def stop(host: str) -> Any:
                 kind, info = self._device_kind(host)

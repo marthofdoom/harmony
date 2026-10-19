@@ -265,6 +265,8 @@ class HarmonyWindow(Adw.ApplicationWindow):
     def _update_account_status(self, *_args: object) -> None:
         parts = []
         for service in Service:
+            if service is Service.LOCAL:
+                continue  # the Library isn't a login; filled in below, off the main loop
             provider = self.state.providers.get(service)
             if provider is None:
                 parts.append(f"{service.label}: not set up")
@@ -275,6 +277,26 @@ class HarmonyWindow(Adw.ApplicationWindow):
                 connected = False
             parts.append(f"{service.label}: {'connected' if connected else 'not connected'}")
         self._account_row.set_subtitle(" · ".join(parts))
+        self._update_library_status(parts)
+
+    def _update_library_status(self, parts: list[str]) -> None:
+        """Append the Library's real state: this instance's folders plus every
+        library shared on the mesh (probing peers is network I/O — a worker)."""
+        from harmony.tasks import run_async
+
+        provider = self.state.provider_for(Service.LOCAL)
+        if provider is None:
+            return
+
+        def work() -> str:
+            if not provider.active():
+                return "Library: none found (set one up on your server, same personal key)"
+            return f"Library: {provider.account_name()}"
+
+        def done(text: str) -> None:
+            self._account_row.set_subtitle(" · ".join([*parts, text]))
+
+        run_async(work, done, lambda exc: log.debug("library status failed: %s", exc))
 
     def _on_close_request(self, *_args: object) -> bool:
         self.state.settings.window_width = self.get_width()

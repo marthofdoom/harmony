@@ -706,9 +706,11 @@ class QobuzProvider(MusicProvider):
         # Qobuz reports sampling_rate in kHz (44.1, 96, 192) and bit_depth in
         # bits; ``:g`` drops the trailing ".0" on integer rates.
         bit_depth, sampling_rate = data.get("bit_depth"), data.get("sampling_rate")
-        label = (
-            f"FLAC {bit_depth}/{sampling_rate:g}kHz"
-            if bit_depth and sampling_rate
-            else (mime or None)
-        )
-        return StreamSource(url=url, mime_type=mime, container=container, label=label)
+        from ..quality import codec_for_mime, describe
+
+        quality = describe(codec_for_mime(mime) or ("FLAC" if container == "flac" else "MP3"),
+                           bit_depth=bit_depth, sample_rate=sampling_rate,
+                           bitrate=320 if container == "mp3" else None)
+        label = (quality or {}).get("label") or mime or None
+        return StreamSource(url=url, mime_type=mime, container=container, label=label,
+                            quality=quality)

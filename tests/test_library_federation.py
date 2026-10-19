@@ -158,7 +158,7 @@ def test_client_plays_a_track_from_the_servers_library(server_instance, client_i
     page = _req(c.url + f"/api/album/local/{urllib.parse.quote(once['id'], safe='')}")
     nemo = page["tracks"][2]
     r = _req(c.url + f"/api/resolve?service=local&id={urllib.parse.quote(nemo['id'], safe='')}")
-    assert r["mime"] == "audio/wav" and r["label"].endswith("· server")
+    assert r["mime"] == "audio/wav" and r["source"]["instance"] == "server" and not r["source"]["own"]
     data = s.files["nemo"].read_bytes()
     # The client's own /stream proxies the server's stream (our key forwarded).
     status, headers, body = _req(c.url + f"/stream/{r['token']}", raw=True, headers={"Range": "bytes=10-49"})
@@ -220,6 +220,6 @@ def test_a_peers_library_copy_plays_instead_of_the_stream(server_instance, clien
     row = next(t for t in tracks if t["service"] == "qobuz")
     assert row["library_id"].endswith("@" + server_instance.peer)
     r = _req(client_instance.url + "/api/resolve?service=qobuz&id=q-nemo")
-    assert r["from_library"] and r["label"].endswith("· server")
+    assert r["from_library"] and r["source"]["instance"] == "server"
     _, _, body = _req(client_instance.url + f"/stream/{r['token']}", raw=True)
     assert body == server_instance.files["nemo"].read_bytes()

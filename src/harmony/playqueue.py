@@ -26,6 +26,10 @@ class PlayQueue:
         self.tracks: list[Any] = []
         self.index: int = -1
         self.original: list[Any] = []  # load order, restored when shuffle goes off
+        # What the queue was started from, for "Playing from …" on every client:
+        # {"kind": "album"|"playlist"|"artist"|"genre"|"songs"|"search"|"track"|…,
+        #  "title": str, "service"?: str, "id"?: str}. Opaque here.
+        self.context: dict[str, Any] | None = None
         self.shuffle: bool = False
         self.repeat: str = "off"
 
@@ -59,7 +63,8 @@ class PlayQueue:
     # -- ops (return the index to start, or None) ----------------------------
 
     def load(self, tracks: list[Any], start: int | None = 0, shuffle: bool | None = None,
-             keep_order: bool = False, original: list[Any] | None = None) -> int | None:
+             keep_order: bool = False, original: list[Any] | None = None,
+             context: dict[str, Any] | None = None) -> int | None:
         """Replace the queue with ``tracks``. ``start=None`` means "shuffle
         play": start at a random track (when shuffle is on). ``keep_order``
         takes the list as already arranged (a hand-off to another output keeps
@@ -69,6 +74,7 @@ class PlayQueue:
             return None
         if shuffle is not None:
             self.shuffle = shuffle
+        self.context = context
         # A hand-off of a shuffled queue passes its real (load) order along, so
         # turning shuffle off on the new output still restores the album order.
         self.original = list(original) if original else list(tracks)

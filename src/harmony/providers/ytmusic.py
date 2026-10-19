@@ -180,6 +180,15 @@ def _stream_label(fmt: dict[str, Any]) -> str:
     return f"{codec} {round(abr)}kbps" if abr else f"{codec} (itag {fmt.get('format_id')})"
 
 
+def _stream_quality(fmt: dict[str, Any]) -> dict[str, Any] | None:
+    from ..quality import describe
+
+    prefix = (fmt.get("acodec") or "").split(".")[0]
+    codec = _YT_CODEC_NAMES.get(prefix, prefix or fmt.get("ext") or None)
+    return describe(codec, bitrate=fmt.get("abr"), sample_rate=fmt.get("asr"),
+                    channels=fmt.get("audio_channels"), lossless=False)
+
+
 class YTMusicProvider(MusicProvider):
     service = Service.YTMUSIC
 
@@ -588,6 +597,7 @@ class YTMusicProvider(MusicProvider):
             container=container,
             headers=dict(fmt.get("http_headers") or {}),
             label=_stream_label(fmt),
+            quality=_stream_quality(fmt),
         )
 
 

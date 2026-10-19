@@ -176,6 +176,7 @@ class FederatedLibraryProvider(MusicProvider):
             duration_s=d.get("duration_s"), track_number=d.get("track_number"),
             year=d.get("year"), isrc=d.get("isrc"),
             artwork_url=self._art(peer, d.get("artwork_url")),
+            genre=d.get("genre"), quality=d.get("quality") if isinstance(d.get("quality"), dict) else None,
             raw={"peer": peer},
         )
 
@@ -186,7 +187,9 @@ class FederatedLibraryProvider(MusicProvider):
             artists=[artist] if artist else [],
             artist_ids=[fed_id(a, peer) for a in d.get("artist_ids") or []],
             year=d.get("year"), date=d.get("date"), track_count=d.get("track_count"),
-            artwork_url=self._art(peer, d.get("artwork_url")), raw={"peer": peer},
+            artwork_url=self._art(peer, d.get("artwork_url")),
+            genre=d.get("genre"), quality=d.get("quality") if isinstance(d.get("quality"), dict) else None,
+            raw={"peer": peer},
         )
 
     def _artist(self, peer: str, d: dict[str, Any]) -> Artist:
@@ -265,6 +268,77 @@ class FederatedLibraryProvider(MusicProvider):
             return self._own().get_artist_top_tracks(raw, limit=limit)
         return [self._track(peer, t) for t in self._artist_page(raw, peer).get("top_tracks") or []][:limit]
 
+    # -- iTunes-style browse, merged across every library ------------------------
+
+    def browse_view(self, view: str, *, order: str = "artist", desc: bool = False,
+                    limit: int = 200, offset: int = 0, genre: str | None = None,
+                    artist_id: str | None = None) -> dict[str, Any]:
+        """One page of the Library browser: ``artists`` / ``albums`` / ``songs`` /
+        ``genres``, filtered by genre or artist, sorted, across all libraries.
+
+        Each library contributes its first ``offset + limit`` items; they're
+        merged by the same sort and sliced, so paging is right across peers."""
+        want = offset + limit
+        raw_artist, artist_peer = split_id(artist_id) if artist_id else (None, None)
+        params = {"view": view, "order": order, "desc": int(desc), "limit": want, "offset": 0,
+                  **({"genre": genre} if genre else {}), **({"artist": raw_artist} if raw_artist else {})}
+        own_ok = self.own is not None and artist_peer is None
+        peers_ok = artist_id is None or artist_peer is not None
+
+        def from_peers(path_key: str, convert: Callable[[str, Any], Any]) -> list[Any]:
+            if not peers_ok:
+                return []
+            out: list[Any] = []
+            for peer, r in self._fan_out(lambda p: self._get(p, "/api/library/own/view", params)):
+                if artist_peer is not None and peer != artist_peer:
+                    continue
+                out += [convert(peer, x) for x in r.get(path_key) or []]
+            return out
+
+        if view == "genres":
+            merged: dict[str, dict[str, Any]] = {}
+            rows = (self.own.list_genres() if self.own is not None else []) + from_peers(
+                "genres", lambda peer, g: {**g, "artwork_url": self._art(peer, g.get("artwork_url"))})
+            for g in rows:
+                k = (g.get("name") or "").casefold()
+                cur = merged.setdefault(k, {**g, "album_count": 0, "track_count": 0})
+                cur["album_count"] += g.get("album_count") or 0
+                cur["track_count"] += g.get("track_count") or 0
+            items = sorted(merged.values(), key=lambda g: (g.get("name") or "").casefold())
+            return {"view": view, "genres": items[offset:offset + limit], "total": len(items)}
+        if view == "artists":
+            rows = (self.own.list_artists(genre=genre) if own_ok else []) + from_peers(
+                "artists", lambda peer, a: {**a, "id": fed_id(str(a["id"]), peer),
+                                            "artwork_url": self._art(peer, a.get("artwork_url")),
+                                            "instance": self._known().get(peer, peer)})
+            rows = [{**a, "service": "local"} for a in rows]
+            rows.sort(key=lambda a: (a.get("name") or "").casefold(), reverse=desc)
+            return {"view": view, "artists": rows[offset:offset + limit], "total": len(rows)}
+        if view == "albums":
+            own_albums = (self.own.list_albums(order=order, limit=want, genre=genre,
+                                               artist_id=raw_artist) if own_ok else [])
+            rows = own_albums + from_peers("albums", self._album)
+            rows.sort(key=_album_sort_key(order), reverse=desc)
+            return {"view": view, "albums": rows[offset:offset + limit], "total": len(rows)}
+        if view == "songs":
+            own_songs: list[Track] = []
+            total = 0
+            if own_ok:
+                own_songs, total = self.own.list_songs(order=order, desc=desc, limit=want, offset=0,
+                                                       genre=genre, artist_id=raw_artist)
+            peer_rows: list[Track] = []
+            if peers_ok:
+                for peer, r in self._fan_out(lambda p: self._get(p, "/api/library/own/view", params)):
+                    if artist_peer is not None and peer != artist_peer:
+                        continue
+                    peer_rows += [self._track(peer, t) for t in r.get("songs") or []]
+                    total += int(r.get("total") or 0)
+            rows = own_songs + peer_rows
+            if peer_rows:
+                rows.sort(key=_song_sort_key(order), reverse=desc)
+            return {"view": view, "songs": rows[offset:offset + limit], "total": total}
+        raise ValueError(f"unknown library view {view!r}")
+
     def browse(self, *, order: str = "recent", limit: int = 60) -> tuple[list[Album], list[dict[str, Any]]]:
         """Albums + artists across every library (own first, then each peer's)."""
         albums: list[Album] = []
@@ -312,10 +386,15 @@ class FederatedLibraryProvider(MusicProvider):
             return self._own().resolve_stream(raw, max_quality=max_quality)
         r = self._get(peer, "/api/resolve", {"service": "local", "id": raw}, timeout=10)
         key = self._key()
-        name = self._known().get(peer, peer)
+        q = r.get("quality") if isinstance(r.get("quality"), dict) else None
         return StreamSource(url=f"{_base(peer)}/stream/{r['token']}", mime_type=r.get("mime") or "",
                             headers={"X-Harmony-Key": key} if key else {},
-                            label=f"{r.get('label') or 'Library'} · {name}")
+                            label=r.get("label") or "Library", quality=q)
+
+    def instance_name(self, track_id: str) -> str | None:
+        """The peer's name for a federated id; None for this instance's own."""
+        _raw, peer = split_id(track_id)
+        return self._known().get(peer, peer) if peer else None
 
     # -- no playlists / social on a folder of files ---------------------------------
 
@@ -348,6 +427,29 @@ class FederatedLibraryProvider(MusicProvider):
 
     def liked_tracks(self, *, limit: int = 500) -> list[Track]:
         return []
+
+
+def _album_sort_key(order: str) -> Callable[[Album], Any]:
+    if order == "recent":
+        return lambda a: -float((a.raw or {}).get("added_at") or 0)
+    if order == "title":
+        return lambda a: a.title.casefold()
+    if order == "artist":
+        return lambda a: (a.artist_name.casefold(), a.year is None, a.year or 0)
+    return lambda a: (a.year is None, a.year or 0, a.title.casefold())  # "year"
+
+
+def _song_sort_key(order: str) -> Callable[[Track], Any]:
+    track = lambda t: (t.track_number or 9999)  # noqa: E731
+    return {
+        "title": lambda t: t.title.casefold(),
+        "album": lambda t: ((t.album or "").casefold(), track(t)),
+        "year": lambda t: (t.year is None, t.year or 0, (t.album or "").casefold(), track(t)),
+        "genre": lambda t: ((t.genre or "~").casefold(), t.artist_name.casefold()),
+        "duration": lambda t: t.duration_s or 0,
+        "quality": lambda t: (-((t.quality or {}).get("bit_depth") or 0),
+                              -((t.quality or {}).get("sample_rate") or 0), t.title.casefold()),
+    }.get(order, lambda t: (t.artist_name.casefold(), (t.album or "").casefold(), track(t)))
 
 
 __all__ = ["FederatedLibraryProvider", "fed_id", "split_id"]

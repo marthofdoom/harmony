@@ -20,10 +20,15 @@ from typing import Any
 from ..errors import NotSupportedError, ProviderError
 from ..library import ArtSigner, LibraryIndex
 from ..models import Album, Artist, Playlist, SearchResults, Service, StreamSource, Track
+from ..quality import codec_for_mime, describe
 from .base import MusicProvider
 
-_LABELS = {"audio/flac": "FLAC", "audio/mpeg": "MP3", "audio/mp4": "AAC/ALAC",
-           "audio/aac": "AAC", "audio/ogg": "Ogg", "audio/wav": "WAV", "audio/aiff": "AIFF"}
+
+def row_quality(r: dict[str, Any]) -> dict[str, Any] | None:
+    """The quality dict for a library track (or album aggregate) row."""
+    return describe(r.get("codec") or codec_for_mime(r.get("mime")), bit_depth=r.get("bit_depth"),
+                    sample_rate=r.get("sample_rate"), bitrate=r.get("bitrate"),
+                    channels=r.get("channels"))
 
 
 class LocalLibraryProvider(MusicProvider):
@@ -58,6 +63,7 @@ class LocalLibraryProvider(MusicProvider):
             album=r["album"], album_id=r["album_id"], duration_s=r["duration_s"],
             isrc=r["isrc"], year=r["year"], track_number=r["track_no"],
             artwork_url=self._art(r["album_id"]),
+            genre=r.get("genre"), quality=row_quality(r),
             raw={"path": r["path"], "mime": r["mime"], "album_artist": r["album_artist"],
                  "mb_releasegroup": r["mb_releasegroup"]},
         )
@@ -68,6 +74,7 @@ class LocalLibraryProvider(MusicProvider):
             artists=[r["album_artist"]], artist_ids=[r["album_artist_id"]],
             year=r["year"], date=r["date"], track_count=r["track_count"],
             artwork_url=self._art(r["album_id"]),
+            genre=r.get("genre"), quality=row_quality(r),
             raw={"mb_releasegroup": r.get("mb_releasegroup"), "added_at": r.get("added_at")},
         )
 
@@ -110,14 +117,27 @@ class LocalLibraryProvider(MusicProvider):
     def get_artist_top_tracks(self, artist_id: str, *, limit: int = 20) -> list[Track]:
         return [self._track(r) for r in self.index.artist_tracks(artist_id, limit=limit)]
 
-    def list_albums(self, *, order: str = "recent", limit: int = 60,
-                    offset: int = 0) -> list[Album]:
-        """Browse the library (not part of the provider contract)."""
-        return [self._album(a) for a in self.index.albums(order=order, limit=limit,
-                                                          offset=offset)]
+    # -- browse (iTunes-style; not part of the provider contract) ------------
 
-    def list_artists(self, *, limit: int = 2000) -> list[dict[str, Any]]:
-        return self.index.artists(limit=limit)
+    def list_albums(self, *, order: str = "recent", limit: int = 60, offset: int = 0,
+                    genre: str | None = None, artist_id: str | None = None) -> list[Album]:
+        return [self._album(a) for a in self.index.albums(
+            order=order, limit=limit, offset=offset, genre=genre, artist_id=artist_id)]
+
+    def list_artists(self, *, limit: int = 2000, genre: str | None = None) -> list[dict[str, Any]]:
+        return [{"id": a["id"], "name": a["name"], "album_count": a["album_count"],
+                 "track_count": a.get("track_count"),
+                 "artwork_url": self._art(a["art_album_id"]) if a.get("art_album_id") else None}
+                for a in self.index.artists(limit=limit, genre=genre)]
+
+    def list_genres(self) -> list[dict[str, Any]]:
+        return [{"name": g["name"], "album_count": g["album_count"], "track_count": g["track_count"],
+                 "artwork_url": self._art(g["art_album_id"]) if g.get("art_album_id") else None}
+                for g in self.index.genres()]
+
+    def list_songs(self, **kw: Any) -> tuple[list[Track], int]:
+        rows, total = self.index.songs(**kw)
+        return [self._track(r) for r in rows], total
 
     # -- streaming -----------------------------------------------------------
 
@@ -128,9 +148,10 @@ class LocalLibraryProvider(MusicProvider):
         path = Path(row["path"])
         if not path.is_file():
             raise ProviderError(f"“{row['title']}” is missing from disk (rescan the library).")
+        q = row_quality(row)
         return StreamSource(url=path.as_uri(), mime_type=row["mime"],
                             container=path.suffix.lower().lstrip(".") or None,
-                            label=f"Library · {_LABELS.get(row['mime'], path.suffix.upper()[1:])}")
+                            label=(q or {}).get("label") or path.suffix.upper()[1:], quality=q)
 
     # -- playlists / social: not a thing for a folder of files -----------------
 

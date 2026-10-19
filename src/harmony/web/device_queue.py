@@ -43,6 +43,7 @@ class DeviceQueue:
         self.prev_state = ""
         self.last_status: dict[str, Any] = {}
         self.error: str | None = None
+        self.stream: dict[str, Any] | None = None  # {quality, source} of what's playing
         self.failures = 0          # consecutive tracks that failed to start
         # Wall-clock play time of the current track: a Chromecast playing a
         # relayed stream reports a frozen position, so this stands in for it.
@@ -64,6 +65,10 @@ class DeviceQueue:
             "repeat": q.repeat,
             "playing": self.playing,
             "error": self.error,
+            # "Playing from …" (what the queue was loaded from) and the current
+            # stream's source + quality, so every client shows the same thing.
+            "context": q.context,
+            "stream": self.stream,
             **{k: self.last_status.get(k) for k in ("state", "position_s", "duration_s", "volume")},
         }
 
@@ -158,7 +163,8 @@ class DeviceQueues:
                     original = remapped
                 start = q.load(tracks, None if body.get("start") is None else int(body["start"]),
                                shuffle=None if shuffle is None else bool(shuffle),
-                               keep_order=keep, original=original or None)
+                               keep_order=keep, original=original or None,
+                               context=body["context"] if isinstance(body.get("context"), dict) else None)
             elif name == "jump":
                 start = q.jump(int(body.get("index", -1)))
                 if start is None:
@@ -226,8 +232,10 @@ class DeviceQueues:
             dq.last_status = {}
             dq.raw_pos = None
             dq.prev_state = ""
+        with self._lock:
+            dq.stream = None
         try:
-            self._play(host, track)
+            played = self._play(host, track)
         except Exception as exc:  # noqa: BLE001 - surface, then try the next one
             log.warning("queue: couldn't play %s on %s: %s", track.get("title"), host, exc)
             with self._lock:
@@ -241,6 +249,8 @@ class DeviceQueues:
             return
         with self._lock:
             dq.failures = 0
+            if isinstance(played, dict) and isinstance(played.get("stream"), dict):
+                dq.stream = played["stream"]
         self._ensure_poller(host)
 
     def _ensure_poller(self, host: str) -> None:

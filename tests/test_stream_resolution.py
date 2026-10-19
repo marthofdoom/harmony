@@ -137,7 +137,7 @@ class TestQobuzResolveStream:
         assert source.url == "https://qobuz.example/stream.flac"
         assert source.mime_type == "audio/flac"
         assert source.container == "flac"
-        assert source.label == "FLAC 16/44.1kHz"
+        assert source.label == "FLAC · 16-bit / 44.1 kHz"
         assert source.headers == {}
 
         assert captured["method"] == "GET"
@@ -161,7 +161,7 @@ class TestQobuzResolveStream:
         source = qobuz_provider.resolve_stream("123", max_quality=True)
 
         assert captured["params"]["format_id"] == 27  # FLAC hi-res tier
-        assert source.label == "FLAC 24/96kHz"
+        assert source.label == "FLAC · 24-bit / 96 kHz · Hi-Res"
 
     def test_request_signature_matches_request_sig(
         self, qobuz_provider: QobuzProvider, monkeypatch: pytest.MonkeyPatch
@@ -218,7 +218,7 @@ class TestQobuzResolveStream:
         source = qobuz_provider.resolve_stream("123")
 
         assert source.container == "mp3"
-        assert source.label == "audio/mpeg"  # no bit_depth/sampling_rate -> falls back to mime
+        assert source.label == "MP3 · 320 kbps" and source.quality["tier"] == "lossy"
 
 
 # --------------------------------------------------------------------------

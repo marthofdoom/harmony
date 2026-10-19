@@ -326,7 +326,8 @@ def test_enable_scan_browse_search_album_stream_art(server):
     # Resolve → stream with Range, straight from disk.
     t = page["tracks"][2]
     r = _json(server.url + f"/api/resolve?service=local&id={t['id']}")
-    assert r["mime"] == "audio/wav" and r["label"].startswith("Library")
+    assert r["mime"] == "audio/wav" and r["label"].startswith("WAV")
+    assert r["quality"]["tier"] == "lossless" and r["source"]["service"] == "local" and r["source"]["own"]
     data = server.files["nemo"].read_bytes()
     status, headers, body = _get(server.url + f"/stream/{r['token']}", {"Range": "bytes=0-99"})
     assert status == 206 and body == data[:100]

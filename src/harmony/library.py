@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .quality import codec_for_mime
+
 log = logging.getLogger(__name__)
 
 #: Audio extensions indexed, with the MIME type the stream is served as.
@@ -88,6 +90,12 @@ CREATE TABLE IF NOT EXISTS tracks (
     mb_release      TEXT,
     mb_artist       TEXT,
     mime            TEXT NOT NULL,
+    genre           TEXT,
+    codec           TEXT,
+    sample_rate     INTEGER,
+    bit_depth       INTEGER,
+    bitrate         INTEGER,
+    channels        INTEGER,
     haystack        TEXT NOT NULL,
     added_at        REAL NOT NULL
 );
@@ -182,6 +190,13 @@ class FileTags:
     mb_releasegroup: str | None = None
     mb_release: str | None = None
     mb_artist: str | None = None
+    genre: str | None = None
+    # Audio format (from the decoder headers, not tags).
+    codec: str | None = None
+    sample_rate: int | None = None
+    bit_depth: int | None = None
+    bitrate: int | None = None   # kbps
+    channels: int | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -216,7 +231,7 @@ def _year(date: str) -> int | None:
 _ID3_FRAMES = {
     "title": "TIT2", "artist": "TPE1", "album": "TALB", "albumartist": "TPE2",
     "tracknumber": "TRCK", "discnumber": "TPOS", "date": "TDRC", "originaldate": "TDOR",
-    "year": "TYER", "isrc": "TSRC",
+    "year": "TYER", "isrc": "TSRC", "genre": "TCON",
     "musicbrainz_releasegroupid": "TXXX:MusicBrainz Release Group Id",
     "musicbrainz_albumid": "TXXX:MusicBrainz Album Id",
     "musicbrainz_albumartistid": "TXXX:MusicBrainz Album Artist Id",
@@ -273,11 +288,37 @@ def _mutagen_tags(path: Path) -> FileTags | None:
         mb_artist=get("musicbrainz_albumartistid", "musicbrainz_artistid") or None,
     )
     out.year = _year(out.date or "")
+    out.genre = get("genre") or None
     info = getattr(f, "info", None)
     length = getattr(info, "length", None)
     if length:
         out.duration_s = int(round(length))
+    _read_format(out, f, info)
     return out
+
+
+# mutagen file classes → codec names (MP4 is decided by its own codec field).
+_MUTAGEN_CODECS = {"FLAC": "FLAC", "MP3": "MP3", "EasyMP3": "MP3", "OggVorbis": "Vorbis",
+                   "OggOpus": "Opus", "OggFLAC": "FLAC", "WAVE": "WAV", "AIFF": "AIFF",
+                   "WavPack": "WavPack", "MonkeysAudio": "APE", "ASF": "WMA",
+                   "TrueAudio": "TTA", "DSF": "DSD", "DSDIFF": "DSD"}
+
+
+def _read_format(out: FileTags, f: Any, info: Any) -> None:
+    """Codec, bit depth, sample rate, bitrate and channels from the stream info."""
+    if info is None:
+        return
+    name = type(f).__name__
+    codec = _MUTAGEN_CODECS.get(name)
+    if name in ("MP4", "EasyMP4"):
+        c = str(getattr(info, "codec", "") or "").lower()
+        codec = "ALAC" if c.startswith("alac") else "AAC" if c.startswith("mp4a") else (c.upper() or "AAC")
+    out.codec = codec
+    out.sample_rate = int(getattr(info, "sample_rate", 0) or 0) or None
+    out.bit_depth = int(getattr(info, "bits_per_sample", 0) or 0) or None
+    out.channels = int(getattr(info, "channels", 0) or 0) or None
+    bps = getattr(info, "bitrate", 0) or 0
+    out.bitrate = int(round(bps / 1000)) if bps else None
 
 
 _LEADING_NUM_RE = re.compile(r"^(?:(\d)[-.])?(\d{1,3})\s*[-._ ]\s*(.+)$")
@@ -535,8 +576,28 @@ class LibraryIndex:
         with self._lock:
             if self.path != ":memory:":
                 self._conn.execute("PRAGMA journal_mode=WAL")
+            self._migrate()
             self._conn.executescript(_SCHEMA)
+            self._conn.execute("CREATE INDEX IF NOT EXISTS tracks_genre ON tracks(genre)")
             self._conn.commit()
+
+    #: Columns added after the first release, with their SQL type.
+    _ADDED_COLUMNS = (("genre", "TEXT"), ("codec", "TEXT"), ("sample_rate", "INTEGER"),
+                      ("bit_depth", "INTEGER"), ("bitrate", "INTEGER"), ("channels", "INTEGER"))
+
+    def _migrate(self) -> None:
+        """Add new columns to an older index. Rows indexed before them get their
+        mtime zeroed so the next scan re-reads those files (genre + format)."""
+        cols = {r["name"] for r in self._conn.execute("PRAGMA table_info(tracks)")}
+        if not cols:
+            return  # a fresh index: _SCHEMA creates the full table
+        added = False
+        for name, kind in self._ADDED_COLUMNS:
+            if name not in cols:
+                self._conn.execute(f"ALTER TABLE tracks ADD COLUMN {name} {kind}")
+                added = True
+        if added:
+            self._conn.execute("UPDATE tracks SET mtime = 0")
 
     def close(self) -> None:
         with self._lock:
@@ -565,7 +626,7 @@ class LibraryIndex:
         album = tags.album or path.parent.name or "Unknown Album"
         mime = AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream")
         haystack = " ".join(filter(None, (norm(title), norm(artist), norm(album),
-                                          norm(album_artist))))
+                                          norm(album_artist), norm(tags.genre))))
         row = {
             "id": track_id_for(path), "path": str(path), "size": st.st_size,
             "mtime": st.st_mtime, "title": title, "artist": artist,
@@ -575,7 +636,11 @@ class LibraryIndex:
             "disc_no": tags.disc_no, "year": tags.year, "date": tags.date,
             "duration_s": tags.duration_s, "isrc": (tags.isrc or "").strip().upper() or None,
             "mb_releasegroup": tags.mb_releasegroup, "mb_release": tags.mb_release,
-            "mb_artist": tags.mb_artist, "mime": mime, "haystack": haystack,
+            "mb_artist": tags.mb_artist, "mime": mime,
+            "genre": (tags.genre or "").strip() or None,
+            "codec": tags.codec or codec_for_mime(mime), "sample_rate": tags.sample_rate,
+            "bit_depth": tags.bit_depth, "bitrate": tags.bitrate, "channels": tags.channels,
+            "haystack": haystack,
             "added_at": existing["added_at"] if existing else self._added_at(path),
         }
         cols = ", ".join(row)
@@ -697,7 +762,9 @@ class LibraryIndex:
         "SELECT album_id, MIN(album) AS album, MIN(album_artist) AS album_artist, "
         "MIN(album_artist_id) AS album_artist_id, MAX(year) AS year, MIN(date) AS date, "
         "COUNT(*) AS track_count, MAX(mb_releasegroup) AS mb_releasegroup, "
-        "MIN(path) AS path, MAX(added_at) AS added_at FROM tracks")
+        "MIN(path) AS path, MAX(added_at) AS added_at, MAX(genre) AS genre, "
+        "MAX(bit_depth) AS bit_depth, MAX(sample_rate) AS sample_rate, "
+        "MAX(bitrate) AS bitrate, MAX(codec) AS codec FROM tracks")
 
     def album(self, album_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -707,10 +774,15 @@ class LibraryIndex:
         return _row_dict(row) if row else None
 
     def albums(self, *, artist_id: str | None = None, order: str = "year",
-               limit: int = 500, offset: int = 0) -> list[dict[str, Any]]:
-        where, args = "", []
+               limit: int = 500, offset: int = 0, genre: str | None = None) -> list[dict[str, Any]]:
+        conds, args = [], []
         if artist_id:
-            where, args = "WHERE album_artist_id = ?", [artist_id]
+            conds.append("album_artist_id = ?")
+            args.append(artist_id)
+        if genre:
+            conds.append("genre = ? COLLATE NOCASE")
+            args.append(genre)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
         order_sql = {
             "year": "year IS NULL, year, album COLLATE NOCASE",
             "recent": "added_at DESC",
@@ -723,14 +795,87 @@ class LibraryIndex:
                 "LIMIT ? OFFSET ?", (*args, limit, offset)).fetchall()
         return [_row_dict(r) for r in rows]
 
-    def artists(self, *, limit: int = 2000) -> list[dict[str, Any]]:
+    def artists(self, *, limit: int = 2000, genre: str | None = None) -> list[dict[str, Any]]:
+        where, args = ("WHERE genre = ? COLLATE NOCASE", [genre]) if genre else ("", [])
         with self._lock:
             rows = self._conn.execute(
                 "SELECT album_artist_id AS id, MIN(album_artist) AS name, "
-                "COUNT(DISTINCT album_id) AS album_count, MAX(mb_artist) AS mb_artist "
-                "FROM tracks GROUP BY album_artist_id ORDER BY name COLLATE NOCASE LIMIT ?",
-                (limit,)).fetchall()
+                "COUNT(DISTINCT album_id) AS album_count, COUNT(*) AS track_count, "
+                "MAX(mb_artist) AS mb_artist, MIN(album_id) AS art_album_id "
+                f"FROM tracks {where} GROUP BY album_artist_id ORDER BY name COLLATE NOCASE LIMIT ?",
+                (*args, limit)).fetchall()
         return [_row_dict(r) for r in rows]
+
+    def count_artists(self, *, genre: str | None = None) -> int:
+        where, args = ("WHERE genre = ? COLLATE NOCASE", [genre]) if genre else ("", [])
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT COUNT(DISTINCT album_artist_id) FROM tracks {where}", args).fetchone()[0]
+
+    def count_albums(self, *, artist_id: str | None = None, genre: str | None = None) -> int:
+        conds, args = [], []
+        if artist_id:
+            conds.append("album_artist_id = ?")
+            args.append(artist_id)
+        if genre:
+            conds.append("genre = ? COLLATE NOCASE")
+            args.append(genre)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        with self._lock:
+            return self._conn.execute(
+                f"SELECT COUNT(DISTINCT album_id) FROM tracks {where}", args).fetchone()[0]
+
+    def genres(self) -> list[dict[str, Any]]:
+        """Every genre with its album/track counts (and an album to show as art)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT MIN(genre) AS name, COUNT(DISTINCT album_id) AS album_count, "
+                "COUNT(*) AS track_count, MIN(album_id) AS art_album_id FROM tracks "
+                "WHERE genre IS NOT NULL AND genre != '' "
+                "GROUP BY genre COLLATE NOCASE ORDER BY name COLLATE NOCASE").fetchall()
+        return [_row_dict(r) for r in rows]
+
+    #: Song-list sort orders (the iTunes Songs view's column sorts).
+    _SONG_ORDERS = {
+        "title": "title COLLATE NOCASE",
+        "artist": "artist COLLATE NOCASE, album COLLATE NOCASE, "
+                  "COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
+        "album": "album COLLATE NOCASE, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
+        "year": "year IS NULL, year, album COLLATE NOCASE, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
+        "genre": "genre IS NULL, genre COLLATE NOCASE, artist COLLATE NOCASE, album COLLATE NOCASE",
+        "duration": "duration_s IS NULL, duration_s",
+        "recent": "added_at DESC, album_id, COALESCE(disc_no, 1), COALESCE(track_no, 9999)",
+        "quality": "COALESCE(bit_depth, 0) DESC, COALESCE(sample_rate, 0) DESC, "
+                   "COALESCE(bitrate, 0) DESC, title COLLATE NOCASE",
+    }
+
+    def songs(self, *, order: str = "artist", desc: bool = False, limit: int = 200,
+              offset: int = 0, genre: str | None = None, artist_id: str | None = None,
+              album_id: str | None = None) -> tuple[list[dict[str, Any]], int]:
+        """A page of tracks for the Songs view, plus the total matching count."""
+        conds, args = [], []
+        if genre:
+            conds.append("genre = ? COLLATE NOCASE")
+            args.append(genre)
+        if artist_id:
+            conds.append("(album_artist_id = ? OR artist_id = ?)")
+            args += [artist_id, artist_id]
+        if album_id:
+            conds.append("album_id = ?")
+            args.append(album_id)
+        where = ("WHERE " + " AND ".join(conds)) if conds else ""
+        order_sql = self._SONG_ORDERS.get(order, self._SONG_ORDERS["artist"])
+        if desc:
+            # Flip the primary key only; tie-breakers stay natural.
+            first, _, rest = order_sql.partition(",")
+            first = first.replace(" DESC", "") if " DESC" in first else f"{first} DESC"
+            order_sql = first + ("," + rest if rest else "")
+        with self._lock:
+            total = self._conn.execute(f"SELECT COUNT(*) FROM tracks {where}", args).fetchone()[0]
+            rows = self._conn.execute(
+                f"SELECT * FROM tracks {where} ORDER BY {order_sql} LIMIT ? OFFSET ?",
+                (*args, limit, offset)).fetchall()
+        return [_row_dict(r) for r in rows], total
 
     def artist(self, artist_id: str) -> dict[str, Any] | None:
         with self._lock:

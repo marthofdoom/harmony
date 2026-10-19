@@ -51,6 +51,9 @@ class Album:
     date: str | None = None
     track_count: int | None = None
     artwork_url: str | None = None
+    genre: str | None = None
+    #: Best format among the album's tracks (library albums).
+    quality: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -83,6 +86,9 @@ class Track:
     artwork_url: str | None = None
     explicit: bool = False
     play_count: int | None = None
+    genre: str | None = None
+    #: Known audio format (``harmony.quality.describe``), e.g. a library file's.
+    quality: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict, repr=False)
 
     @property
@@ -130,6 +136,8 @@ class StreamSource:
     container: str | None = None
     headers: dict[str, str] = field(default_factory=dict)
     label: str | None = None
+    #: The stream's format (``harmony.quality.describe``).
+    quality: dict[str, Any] | None = None
 
 
 @dataclass(slots=True)

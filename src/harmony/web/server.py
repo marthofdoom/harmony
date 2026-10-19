@@ -365,6 +365,24 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_json(engine.lidarr_queue())
             elif parts == ["api", "library"]:
                 self._send_json(engine.library_status())
+            elif parts in (["api", "library", "view"], ["api", "library", "own", "view"]):
+                # iTunes-style browser: ?view=artists|albums|songs|genres&order=&desc=1
+                #   &genre=&artist=&limit=&offset=
+                q1 = {k: (v or [""])[0] for k, v in query.items()}
+                try:
+                    limit = max(1, min(1000, int(q1.get("limit") or 200)))
+                    offset = max(0, int(q1.get("offset") or 0))
+                except ValueError:
+                    self._send_json({"error": "limit/offset must be numbers"}, status=400)
+                    return
+                kw = {"order": q1.get("order") or "artist", "desc": q1.get("desc") in ("1", "true"),
+                      "limit": limit, "offset": offset, "genre": q1.get("genre") or None,
+                      "artist_id": q1.get("artist") or None}
+                fn = engine.library_own_view if parts[2] == "own" else engine.library_view
+                try:
+                    self._send_json(fn(q1.get("view") or "albums", **kw))
+                except ValueError as exc:
+                    self._send_json({"error": str(exc)}, status=400)
             elif parts in (["api", "library", "browse"], ["api", "library", "own", "browse"]):
                 try:
                     limit = max(1, min(500, int((query.get("limit") or ["60"])[0])))
