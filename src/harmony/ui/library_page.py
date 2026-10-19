@@ -582,9 +582,7 @@ class LibraryPage(Gtk.Box):
         self.stack = Gtk.Stack(vexpand=True)
         self.append(self.stack)
         self.stack.add_named(loading_status_page("Loading the library…"), "loading")
-        self.stack.add_named(
-            status_page(icon_name="folder-music-symbolic", title="No library found",
-                        description=EMPTY_TEXT), "empty")
+        self.stack.add_named(self._build_empty(), "empty")
         self.views: dict[str, Any] = {
             "artists": ArtistsView(state, navigator, self._on_error),
             "albums": AlbumsView(navigator, self._on_error),
@@ -597,6 +595,46 @@ class LibraryPage(Gtk.Box):
 
         self.connect("map", self._on_map)
         state.connect("providers-changed", lambda *_a: self.refresh(force=True))
+
+    def _build_empty(self) -> Gtk.Widget:
+        """No library yet: the message plus an inline "add your server" entry
+        (mDNS can't cross a container/VPN boundary, so peers are added by hand)."""
+        page = status_page(icon_name="folder-music-symbolic", title="No library found",
+                           description=EMPTY_TEXT)
+        self.add_server_entry = Gtk.Entry(
+            placeholder_text="Add your server (host:port)", width_chars=28,
+            hexpand=True, activates_default=False)
+        self.add_server_button = Gtk.Button(label="Add", css_classes=["suggested-action"])
+        box = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
+        box.append(self.add_server_entry)
+        box.append(self.add_server_button)
+        self.add_server_entry.connect("activate", lambda *_a: self._on_add_server())
+        self.add_server_button.connect("clicked", lambda *_a: self._on_add_server())
+        page.set_child(box)
+        return page
+
+    def _on_add_server(self) -> None:
+        from harmony.ui import instances
+
+        text = self.add_server_entry.get_text()
+        try:
+            instances.parse_address(text)
+        except ValueError as exc:
+            self.state.toast(str(exc))
+            return
+        self.add_server_button.set_sensitive(False)
+
+        def done(result: dict) -> None:
+            self.add_server_button.set_sensitive(True)
+            self.add_server_entry.set_text("")
+            self.state.toast(f"Added {result['peer']['name']}.")
+            self.refresh(force=True)
+
+        def failed(exc: BaseException) -> None:
+            self.add_server_button.set_sensitive(True)
+            self.state.toast(str(exc))
+
+        run_async(lambda: instances.add_instance(text), done, failed)
 
     # -- loading ------------------------------------------------------------
 

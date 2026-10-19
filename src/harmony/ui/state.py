@@ -133,6 +133,8 @@ class AppState(GObject.Object):
         try:
             self._engine().add_credentials_listener(
                 lambda: on_main(self._on_engine_credentials_changed))
+            self._engine().add_settings_listener(
+                lambda: on_main(self._on_engine_settings_changed))
         except Exception:  # noqa: BLE001 - no engine is survivable (tests, partial installs)
             log.debug("engine credentials listener unavailable", exc_info=True)
         self._init_recommender()
@@ -344,6 +346,14 @@ class AppState(GObject.Object):
             self.sync_engine = None
 
     # -- public API ---------------------------------------------------------
+
+    def _on_engine_settings_changed(self) -> None:
+        """The engine saved settings (a peer added, library/Lidarr config): pull
+        them into our copy so our next save() doesn't clobber them, and let
+        pickers / the Library page refresh."""
+        self.settings.reload()
+        self.emit("devices-changed")
+        self.emit("providers-changed")
 
     def _on_engine_credentials_changed(self) -> None:
         self.settings.reload()

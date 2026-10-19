@@ -136,7 +136,102 @@ class PreferencesDialog(Adw.PreferencesDialog):
         run_bg_row.connect("notify::active", lambda r, _p: self._set_run_in_background(r.get_active()))
         group.add(run_bg_row)
         page.add(group)
+        page.add(self._build_instances_group())
         return page
+
+    # -- Harmony instances ------------------------------------------------------
+
+    def _build_instances_group(self) -> Adw.PreferencesGroup:
+        group = Adw.PreferencesGroup(
+            title="Harmony instances",
+            description="Other Harmony servers whose libraries and devices appear here. "
+            "Add one by address when it isn't found automatically (e.g. in a container or "
+            "over a VPN).")
+        self.instances_group = group
+        self._instance_rows: list[Gtk.Widget] = []
+        self.add_instance_row = Adw.EntryRow(title="Add instance (host or host:port)")
+        self.add_instance_button = Gtk.Button(label="Add", valign=Gtk.Align.CENTER,
+                                              css_classes=["suggested-action"])
+        self.add_instance_button.connect("clicked", lambda *_a: self._on_add_instance())
+        self.add_instance_row.connect("entry-activated", lambda *_a: self._on_add_instance())
+        self.add_instance_row.add_suffix(self.add_instance_button)
+        group.add(self.add_instance_row)
+        self._instances_handler = self.state.connect(
+            "devices-changed", lambda *_a: self.refresh_instances())
+        self.connect("closed", lambda *_a: self.state.disconnect(self._instances_handler))
+        self.refresh_instances()
+        return group
+
+    def _on_add_instance(self) -> None:
+        from harmony.ui import instances
+
+        text = self.add_instance_row.get_text()
+        try:
+            instances.parse_address(text)
+        except ValueError as exc:
+            self.state.toast(str(exc))
+            return
+        self.add_instance_button.set_sensitive(False)
+
+        def done(result: dict) -> None:
+            self.add_instance_button.set_sensitive(True)
+            self.add_instance_row.set_text("")
+            self.state.toast(f"Added {result['peer']['name']}.")
+            self.refresh_instances()
+
+        def failed(exc: BaseException) -> None:
+            self.add_instance_button.set_sensitive(True)
+            self.state.toast(str(exc))
+
+        run_async(lambda: instances.add_instance(text), done, failed)
+
+    def refresh_instances(self) -> None:
+        """Re-list saved + discovered instances (probed off the main thread)."""
+        from harmony.ui import instances
+
+        def done(rows: list[dict]) -> None:
+            for w in self._instance_rows:
+                self.instances_group.remove(w)
+            self._instance_rows = []
+            for r in rows:
+                row = self._instance_row(r)
+                self.instances_group.add(row)
+                self._instance_rows.append(row)
+
+        run_async(instances.probe_instances, done,
+                  lambda exc: log.debug("instance probe failed: %s", exc))
+
+    def _instance_row(self, r: dict) -> Adw.ActionRow:
+        from harmony import __version__
+        from harmony.ui import instances
+
+        parts = [f"{r['host']}:{r['port']}"]
+        if not r["reachable"]:
+            parts.append("unreachable")
+        else:
+            if r.get("version"):
+                parts.append(f"v{r['version']}")
+            if r.get("tracks") is not None:
+                parts.append(f"{r['tracks']:,} tracks")
+            else:
+                parts.append("no library")
+            if instances.needs_update(r.get("version"), __version__):
+                parts.append("needs updating")
+        row = Adw.ActionRow(title=GLib.markup_escape_text(str(r["name"])),
+                            subtitle=GLib.markup_escape_text(" · ".join(parts)))
+        if r.get("source") in ("manual", "both"):
+            btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
+                             css_classes=["flat"], tooltip_text="Remove")
+            btn.connect("clicked", lambda *_a, h=r["host"], p=r["port"]: self._remove_instance(h, p))
+            row.add_suffix(btn)
+        return row
+
+    def _remove_instance(self, host: str, port: int) -> None:
+        from harmony.ui import instances
+
+        run_async(lambda: instances.forget_instance(host, port),
+                  lambda _r: self.refresh_instances(),
+                  lambda exc: self.state.toast(f"Couldn't remove: {exc}"))
 
     def _set_run_in_background(self, value: bool) -> None:
         self.settings._extra["run_in_background"] = bool(value)
@@ -426,7 +521,12 @@ class PreferencesDialog(Adw.PreferencesDialog):
 
         def work() -> dict:
             from harmony.web.server import get_engine
-            return get_engine().adopt_from_peer(host, port)
+            result = get_engine().adopt_from_peer(host, port)
+            # It answered and shares our key: remember it as a known instance so
+            # the Library (and Harmony instances list) can reach it next time.
+            from harmony.ui.instances import remember_instance
+            remember_instance(host, port)
+            return result
 
         def done(result: dict) -> None:
             # The pull wrote settings + keyring and reset the engine's providers;

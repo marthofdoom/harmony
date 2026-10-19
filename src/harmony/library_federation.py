@@ -84,6 +84,11 @@ class FederatedLibraryProvider(MusicProvider):
         self._probe: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._probe_lock = threading.Lock()
 
+    def invalidate(self) -> None:
+        """Drop cached peer probes (a peer was added/removed)."""
+        with self._probe_lock:
+            self._probe.clear()
+
     # -- peers -----------------------------------------------------------------
 
     def _known(self) -> dict[str, str]:

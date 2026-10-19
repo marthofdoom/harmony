@@ -149,6 +149,7 @@ class Engine:
         self._cast: Any | None = None
         self._queues: Any | None = None
         self._cred_listeners: list[Any] = []
+        self._settings_listeners: list[Any] = []
         self._idle_status: dict[str, tuple[float, dict[str, Any]]] = {}
         self._db: Any | None = None
         self._plans: dict[str, Any] = {}
@@ -331,6 +332,7 @@ class Engine:
         s.save()
         if key_changed and old_creds:
             CredentialStore().replace_all(old_creds)
+        self._notify_settings_changed()
         # A full instance with a fresh matching key and no accounts of its own
         # pulls credentials from a peer — the "full clients copy creds" model.
         if key_changed and s.personal_key:
@@ -644,6 +646,19 @@ class Engine:
         engine's credentials change — a sync pull, a peer pushing to us, an
         onboarding step. The desktop uses it to rebuild its own providers."""
         self._cred_listeners.append(fn)
+
+    def add_settings_listener(self, fn: Any) -> None:
+        """Call ``fn()`` (from whatever thread wrote them) whenever this engine
+        saves settings a long-lived holder (the desktop's AppState) may also
+        hold a copy of: peers, library/Lidarr config, the personal key."""
+        self._settings_listeners.append(fn)
+
+    def _notify_settings_changed(self) -> None:
+        for fn in list(self._settings_listeners):
+            try:
+                fn()
+            except Exception:  # noqa: BLE001 - a listener must not break the engine
+                log.exception("settings listener failed")
 
     def reset_providers(self, notify: bool = True) -> None:
         self._providers = None  # force a re-warm with freshly-saved credentials
@@ -1136,6 +1151,7 @@ class Engine:
         if api_key:  # only replace the stored key when a fresh one is provided
             CredentialStore().set(LIDARR_API_KEY, api_key.strip())
         self._lidarr_cache.pop("peer", None)  # own Lidarr may now take over from a peer's
+        self._notify_settings_changed()
         return self.lidarr_status()
 
     def lidarr_request(self, kind: str, *, title: str = "", artist: str = "",
@@ -1264,6 +1280,7 @@ class Engine:
                 for m in path_map if str(m.get("remote") or "").strip()]
         s.save()
         self.reset_providers(notify=False)
+        self._notify_settings_changed()
         if paths is not None:
             try:
                 self._library()[0].prune_outside(s.library_paths)
@@ -2053,7 +2070,16 @@ class Engine:
         peers.append({"host": host, "port": port, "name": name or info.get("name") or host})
         settings.known_peers = peers
         settings.save()
+        self._peers_changed()
         return {"ok": True, "peer": peers[-1], "healthz": info}
+
+    def _peers_changed(self) -> None:
+        """The peer set changed: forget cached "this peer has no library"
+        answers so the federated library sees the change at once."""
+        prov = self._libprov
+        if prov is not None:
+            prov.invalidate()
+        self._notify_settings_changed()
 
     def remove_peer(self, host: str, port: int) -> dict[str, Any]:
         from harmony.config import Settings
@@ -2068,6 +2094,7 @@ class Engine:
             p for p in settings.known_peers if not (p.get("host") == host and p.get("port") == port)
         ]
         settings.save()
+        self._peers_changed()
         return {"ok": True, "removed": before - len(settings.known_peers)}
 
     # -- cast to LAN devices ------------------------------------------------
