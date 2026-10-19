@@ -215,10 +215,15 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             elif parts == ["api", "peers", "remove"]:
                 host = (body.get("host") or "").strip()
                 port = body.get("port")
-                if not host or not port:
+                iid = (body.get("instance_id") or "").strip() or None
+                if not iid and (not host or not port):
                     self._send_json({"error": "missing host or port"}, status=400)
                     return
-                self._send_json(engine.remove_peer(host, int(port)))
+                if iid:
+                    self._send_json(engine.remove_peer(host or None, int(port) if port else None,
+                                                       instance_id=iid))
+                else:
+                    self._send_json(engine.remove_peer(host, int(port)))
             elif parts == ["api", "credentials", "adopt"]:
                 host = (body.get("host") or "").strip()
                 port = body.get("port")

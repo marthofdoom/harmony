@@ -16,6 +16,7 @@ import ipaddress
 import logging
 import socket
 import threading
+import time
 from typing import Any
 
 from harmony import __version__
@@ -30,10 +31,29 @@ SERVICE_TYPE = "_harmony._tcp.local."
 _CGNAT = ipaddress.ip_network("100.64.0.0/10")
 
 
+_NETS_TTL_S = 10.0
+_nets_cache: tuple[float, list[ipaddress.IPv4Network]] | None = None
+_nets_lock = threading.Lock()
+
+
 def _local_networks() -> list[ipaddress.IPv4Network]:
     """The IPv4 networks this host is directly attached to (ip/prefix per
     interface). A peer address inside one of these is on a shared subnet — a
-    direct hop — so we prefer it over a VPN/overlay address for the same peer."""
+    direct hop — so we prefer it over a VPN/overlay address for the same peer.
+    Cached for a few seconds: interface enumeration is slow and it's asked per
+    row of every browse (a laptop changing network is picked up within 10 s)."""
+    global _nets_cache
+    now = time.monotonic()
+    with _nets_lock:
+        if _nets_cache is not None and now - _nets_cache[0] < _NETS_TTL_S:
+            return list(_nets_cache[1])
+    nets = _enumerate_local_networks()
+    with _nets_lock:
+        _nets_cache = (now, nets)
+    return list(nets)
+
+
+def _enumerate_local_networks() -> list[ipaddress.IPv4Network]:
     nets: list[ipaddress.IPv4Network] = []
     try:
         import ifaddr
@@ -90,22 +110,66 @@ def host_rank(host: str, local_nets: list[ipaddress.IPv4Network] | None = None) 
     return _address_rank(str(host), _local_networks() if local_nets is None else local_nets)
 
 
-def dedupe_instances(insts: list[dict[str, Any]], own_id: str | None = None) -> list[dict[str, Any]]:
+def dedupe_instances(insts: list[dict[str, Any]], own_id: str | None = None,
+                     own_port: int | None = None) -> list[dict[str, Any]]:
     """One row per Harmony instance. Rows carrying an ``instance_id`` collapse by
-    it (keeping the most direct address, LAN over Tailscale) and our own id is
-    dropped; rows without one (older peers) collapse by host:port."""
+    it (keeping the most direct address, LAN over Tailscale); rows without one
+    (older peers) collapse by host:port. Our own id is dropped -- but only when
+    the row's port is ours too (``own_port``, if given): two instances sharing a
+    copied config share an id, and must not hide each other.
+
+    Each row also carries ``addresses`` (every ``host:port`` the instance is
+    known by, most direct first) and ``saved`` (``[{host, port}]`` the user
+    saved by hand). A collapsed row whose members were partly saved reports
+    ``source: "both"`` so it can still be removed."""
     nets = _local_networks()
-    out: dict[str, dict[str, Any]] = {}
+    groups: dict[str, list[dict[str, Any]]] = {}
     for p in insts:
         iid = p.get("instance_id")
-        if iid and iid == own_id:
+        if iid and iid == own_id and (own_port is None or _int(p.get("port")) == own_port):
             continue
         key = f"id:{iid}" if iid else f"{p.get('host')}:{p.get('port')}"
-        cur = out.get(key)
-        if cur is None or (host_rank(p.get("host"), nets), str(p.get("host"))) < \
-                (host_rank(cur.get("host"), nets), str(cur.get("host"))):
-            out[key] = p
-    return list(out.values())
+        groups.setdefault(key, []).append(p)
+
+    def order(p: dict[str, Any]) -> tuple[int, str, str]:
+        return (host_rank(p.get("host"), nets), str(p.get("host")), str(p.get("port")))
+
+    out: list[dict[str, Any]] = []
+    for members in groups.values():
+        ranked = sorted(members, key=order)
+        row = dict(ranked[0])
+        addrs: list[str] = []
+        for m in ranked:
+            a = f"{m.get('host')}:{m.get('port')}"
+            if a not in addrs:
+                addrs.append(a)
+        saved = [{"host": m.get("host"), "port": m.get("port")}
+                 for m in ranked if m.get("source") in ("manual", "both")]
+        row["addresses"] = addrs
+        row["saved"] = saved
+        if saved:
+            row["source"] = "manual" if all(m.get("source") == "manual" for m in ranked) else "both"
+        out.append(row)
+    return out
+
+
+def _int(v: Any) -> int | None:
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def is_local_address(host: str) -> bool:
+    """Is ``host`` an address (or a name resolving to one) of THIS machine?"""
+    mine = {"127.0.0.1", "::1", "localhost", *_all_ipv4()}
+    host = (host or "").strip().strip("[]")
+    if host in mine:
+        return True
+    try:
+        return socket.gethostbyname(host) in mine or socket.gethostbyname(host).startswith("127.")
+    except OSError:
+        return False
 
 
 def _primary_ipv4() -> str:
@@ -231,7 +295,7 @@ class Mesh:
             "version": props.get("version"),
             "instance_id": props.get("iid") or None,
         }
-        if self._instance_id and peer["instance_id"] == self._instance_id:
+        if self._instance_id and peer["instance_id"] == self._instance_id and info.port == self._port:
             return  # our own advertisement under another service name
         with self._lock:
             self._peers[name] = peer

@@ -69,8 +69,16 @@ def remember_instance(host: str, port: int) -> None:
         pass
 
 
-def forget_instance(host: str, port: int) -> dict[str, Any]:
-    return _engine().remove_peer(host, port)
+def forget_instance(host: str, port: int, instance_id: str | None = None,
+                    saved: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Remove a saved instance: by id when known (all its saved addresses),
+    and by each saved address of the row (saved before ids existed)."""
+    engine = _engine()
+    result = engine.remove_peer(host, port, instance_id=instance_id)
+    for s in saved or []:
+        if s.get("host") and s.get("port") and (s["host"], s["port"]) != (host, port):
+            engine.remove_peer(s["host"], s["port"])
+    return result
 
 
 def version_tuple(v: str | None) -> tuple[int, ...]:
@@ -93,7 +101,8 @@ def _probe_one(inst: dict[str, Any], key: str | None) -> dict[str, Any]:
     host, port = inst.get("host"), inst.get("port")
     base = f"http://{f'[{host}]' if ':' in str(host) else host}:{port}"
     row = {"name": inst.get("name") or host, "host": host, "port": port,
-           "source": inst.get("source", ""), "version": inst.get("version"),
+           "source": inst.get("source", ""), "instance_id": inst.get("instance_id"),
+           "saved": inst.get("saved") or [], "version": inst.get("version"),
            "tracks": None, "reachable": False}
     try:
         r = requests.get(base + "/healthz", timeout=2.5)

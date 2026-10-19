@@ -222,14 +222,15 @@ class PreferencesDialog(Adw.PreferencesDialog):
         if r.get("source") in ("manual", "both"):
             btn = Gtk.Button(icon_name="user-trash-symbolic", valign=Gtk.Align.CENTER,
                              css_classes=["flat"], tooltip_text="Remove")
-            btn.connect("clicked", lambda *_a, h=r["host"], p=r["port"]: self._remove_instance(h, p))
+            btn.connect("clicked", lambda *_a, inst=r: self._remove_instance(inst))
             row.add_suffix(btn)
         return row
 
-    def _remove_instance(self, host: str, port: int) -> None:
+    def _remove_instance(self, r: dict) -> None:
         from harmony.ui import instances
 
-        run_async(lambda: instances.forget_instance(host, port),
+        run_async(lambda: instances.forget_instance(r["host"], r["port"], r.get("instance_id"),
+                                                    r.get("saved")),
                   lambda _r: self.refresh_instances(),
                   lambda exc: self.state.toast(f"Couldn't remove: {exc}"))
 

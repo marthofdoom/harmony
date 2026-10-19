@@ -14,6 +14,7 @@ import logging
 import os
 import re
 import threading
+import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -249,6 +250,18 @@ class Settings:
     # Field values as last read from / written to disk: the base of save()'s
     # three-way merge (None for a Settings built by hand).
     _base: dict[str, Any] | None = field(default=None, repr=False)
+    # Public fields assigned since the last load/save/reload (see __setattr__).
+    _dirty: set[str] = field(default_factory=set, repr=False, compare=False)
+    # The settings file existed but couldn't be parsed when this was loaded:
+    # we run on defaults and must not overwrite the (recoverable) file.
+    _load_failed: bool = field(default=False, repr=False, compare=False)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        object.__setattr__(self, name, value)
+        if not name.startswith("_"):
+            dirty = self.__dict__.get("_dirty")
+            if dirty is not None:
+                dirty.add(name)
 
     def _snapshot(self) -> dict[str, Any]:
         return copy.deepcopy({k: getattr(self, k) for k in self.__dataclass_fields__
@@ -258,6 +271,7 @@ class Settings:
     def _fresh(cls) -> Settings:
         inst = cls()
         inst._base = inst._snapshot()
+        inst._dirty = set()
         return inst
 
     @classmethod
@@ -267,13 +281,18 @@ class Settings:
             return cls._fresh()
         try:
             raw = json.loads(path.read_text("utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
+            if not isinstance(raw, dict):
+                raise ValueError("not a JSON object")
+        except (OSError, ValueError) as exc:  # JSONDecodeError and UnicodeDecodeError are ValueErrors
             log.warning("Could not read %s (%s); starting from defaults", path, exc)
-            return cls._fresh()
+            inst = cls._fresh()
+            inst._load_failed = True
+            return inst
         known = {f for f in cls.__dataclass_fields__ if not f.startswith("_")}
         extra = {k: v for k, v in raw.items() if k not in known}
         inst = cls(**{k: v for k, v in raw.items() if k in known}, _extra=extra)
         inst._base = inst._snapshot()
+        inst._dirty = set()
         return inst
 
     def reload(self) -> None:
@@ -285,33 +304,87 @@ class Settings:
         clobbering the newer values on disk with stale ones."""
         fresh = type(self).load()
         for name in self.__dataclass_fields__:
-            setattr(self, name, getattr(fresh, name))
+            object.__setattr__(self, name, getattr(fresh, name))
+        self._dirty = set()
 
     def _merge_disk(self) -> None:
         """Fields this object never changed since it last synced with the file
         take the file's (newer) value, so a long-lived copy saving its own
         change (a page switch) can't clobber what another writer — the engine
-        adding a peer — put on disk meanwhile."""
+        adding a peer — put on disk meanwhile.
+
+        "Changed" = assigned since the sync (even back to its original value)
+        OR a value that differs from the synced one (in-place edits, e.g.
+        ``known_peers.append``)."""
         if self._base is None:
             return
         try:
             disk = json.loads(settings_path().read_text("utf-8"))
-        except (OSError, json.JSONDecodeError):
+        except (OSError, ValueError):
+            return
+        if not isinstance(disk, dict):
             return
         for k, base_v in self._base.items():
-            if k in disk and getattr(self, k) == base_v and disk[k] != base_v:
-                setattr(self, k, disk[k])
+            if k in self._dirty or getattr(self, k) != base_v:
+                continue
+            if k in disk and disk[k] != base_v:
+                object.__setattr__(self, k, disk[k])  # a merge isn't a user assignment
 
     def save(self) -> None:
         path = settings_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self._merge_disk()
-        payload = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
-        payload.update(self._extra)
-        tmp = path.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
-        tmp.replace(path)
-        self._base = self._snapshot()
+        with _SAVE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if _unreadable(path):
+                _keep_corrupt_copy(path)
+                log.warning("Not saving settings: %s exists but can't be read; "
+                            "leaving it untouched (a copy is kept next to it)", path)
+                return
+            dirty = set(self._dirty)
+            self._merge_disk()
+            payload = {k: v for k, v in asdict(self).items() if not k.startswith("_")}
+            payload.update(self._extra)
+            # A name unique to this process+thread: concurrent saves can't
+            # clobber each other's temp file.
+            tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+            try:
+                tmp.write_text(json.dumps(payload, indent=2, sort_keys=True), "utf-8")
+                tmp.replace(path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            self._base = self._snapshot()
+            self._dirty -= dirty
+
+
+#: Serialises read-merge-write across threads of this process.
+_SAVE_LOCK = threading.Lock()
+
+
+def _unreadable(path: Path) -> bool:
+    """The file exists, isn't empty, and can't be parsed as a JSON object."""
+    try:
+        text = path.read_text("utf-8")
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    if not text.strip():
+        return False  # an empty file (an interrupted write) holds nothing to lose
+    try:
+        return not isinstance(json.loads(text), dict)
+    except ValueError:
+        return True
+
+
+def _keep_corrupt_copy(path: Path) -> None:
+    try:
+        data = path.read_bytes()
+        backup = path.with_name(path.name + ".corrupt")
+        if backup.exists() and backup.read_bytes() != data:
+            backup = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        if not backup.exists():
+            backup.write_bytes(data)
+    except OSError as exc:
+        log.warning("Couldn't keep a copy of the unreadable %s: %s", path, exc)
 
 
 # --------------------------------------------------------------------------

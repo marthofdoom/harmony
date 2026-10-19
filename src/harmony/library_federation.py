@@ -41,6 +41,10 @@ _PROBE_TTL_S = 60.0
 _MERGE_CAP = 5000
 #: Per-request budget for a peer; a slow/absent peer just contributes nothing.
 _PEER_TIMEOUT_S = 4.0
+#: How long the peer list (and the dedupe behind it) is reused within a browse.
+_KNOWN_TTL_S = 2.0
+#: How long the last address that answered stays first in line for its instance.
+_GOOD_ADDR_TTL_S = 300.0
 
 
 class PeerNotFound(ProviderError):
@@ -83,34 +87,98 @@ class FederatedLibraryProvider(MusicProvider):
         self._key = key
         self._probe: dict[str, tuple[float, dict[str, Any] | None]] = {}
         self._probe_lock = threading.Lock()
+        # Memoized dedupe of the mesh's instances: (taken_at, rows).
+        self._insts: tuple[float, list[dict[str, Any]]] | None = None
+        # preferred "host:port" of an instance -> (address that last worked, when)
+        self._good: dict[str, tuple[str, float]] = {}
 
     def invalidate(self) -> None:
-        """Drop cached peer probes (a peer was added/removed)."""
+        """Drop cached peer probes and the instance list (a peer was added/removed)."""
         with self._probe_lock:
             self._probe.clear()
+            self._insts = None
 
     # -- peers -----------------------------------------------------------------
 
-    def _known(self) -> dict[str, str]:
-        """``{"host:port": name}`` for every instance the mesh knows."""
-        out: dict[str, str] = {}
+    def _instances(self) -> list[dict[str, Any]]:
+        """The mesh's instances, one row each (``addresses`` = all its
+        ``host:port``s, most direct first). Memoized for ~2 s so one browse
+        doesn't recompute the dedupe per row."""
+        now = time.monotonic()
+        with self._probe_lock:
+            if self._insts is not None and now - self._insts[0] < _KNOWN_TTL_S:
+                return self._insts[1]
+        rows: list[dict[str, Any]] = []
         try:
             from harmony.mesh import dedupe_instances
 
-            for p in dedupe_instances([q for q in self._peers() or [] if isinstance(q, dict)]):
-                if p.get("host") and p.get("port"):
-                    out[f"{p['host']}:{p['port']}"] = str(p.get("name") or p["host"])
+            rows = [p for p in dedupe_instances([q for q in self._peers() or [] if isinstance(q, dict)])
+                    if p.get("host") and p.get("port")]
         except Exception as exc:  # noqa: BLE001 - no mesh means no peers
             log.debug("library federation: listing peers failed: %s", exc)
-        return out
+        with self._probe_lock:
+            self._insts = (now, rows)
+        return rows
+
+    def _known(self) -> dict[str, str]:
+        """``{"host:port": name}`` for every instance the mesh knows, at its
+        preferred address."""
+        return {f"{p['host']}:{p['port']}": str(p.get("name") or p["host"]) for p in self._instances()}
+
+    def _instance_of(self, peer: str) -> dict[str, Any] | None:
+        """The instance ``peer`` (ANY of its addresses) belongs to."""
+        for p in self._instances():
+            if peer in (p.get("addresses") or [f"{p['host']}:{p['port']}"]):
+                return p
+        return None
+
+    def _candidates(self, peer: str) -> list[str]:
+        """Addresses to try for ``peer``: the one that last worked (for a while),
+        then the instance's other addresses, most direct first."""
+        inst = self._instance_of(peer)
+        if inst is None:
+            return [peer]
+        pref = f"{inst['host']}:{inst['port']}"
+        addrs = list(inst.get("addresses") or [pref])
+        with self._probe_lock:
+            good = self._good.get(pref)
+        if good and time.monotonic() - good[1] < _GOOD_ADDR_TTL_S and good[0] in addrs:
+            addrs.remove(good[0])
+            addrs.insert(0, good[0])
+        return addrs
+
+    def _primary(self, peer: str) -> str:
+        """The address to put in URLs handed to clients (art, streams)."""
+        return self._candidates(peer)[0]
+
+    def _remember_good(self, peer: str, addr: str) -> None:
+        inst = self._instance_of(peer)
+        if inst is not None:
+            with self._probe_lock:
+                self._good[f"{inst['host']}:{inst['port']}"] = (addr, time.monotonic())
+
+    def _request(self, method: str, peer: str, path: str, *, timeout: float,
+                 **kw: Any) -> Any:
+        """One request to a peer's instance: its preferred address first, the
+        others on a connection error/timeout (an HTTP answer is final)."""
+        import requests
+
+        last: Exception | None = None
+        for addr in self._candidates(peer):
+            try:
+                r = requests.request(method, _base(addr) + path, timeout=timeout, **kw)
+            except (requests.ConnectionError, requests.Timeout) as exc:
+                last = exc
+                continue
+            self._remember_good(peer, addr)
+            return r
+        raise ProviderError(f"Library peer {peer} is unreachable ({last}).")
 
     def _get(self, peer: str, path: str, params: dict[str, Any] | None = None,
              timeout: float = _PEER_TIMEOUT_S) -> Any:
-        import requests
-
         key = self._key()
         headers = {"X-Harmony-Key": key} if key else {}
-        r = requests.get(_base(peer) + path, params=params, headers=headers, timeout=timeout)
+        r = self._request("GET", peer, path, params=params, headers=headers, timeout=timeout)
         if r.status_code == 404:
             raise PeerNotFound("That isn't in the peer's library any more.")
         if not r.ok:
@@ -169,7 +237,7 @@ class FederatedLibraryProvider(MusicProvider):
 
     def _route(self, item_id: str) -> tuple[str, str | None]:
         raw, peer = split_id(item_id)
-        if peer is not None and peer not in self._known():
+        if peer is not None and self._instance_of(peer) is None:
             raise ProviderError(f"Library peer {peer} isn't a known instance.")
         return raw, peer
 
@@ -180,10 +248,9 @@ class FederatedLibraryProvider(MusicProvider):
 
     # -- peer JSON → models (ids re-addressed through the peer) -----------------
 
-    @staticmethod
-    def _art(peer: str, url: Any) -> str | None:
+    def _art(self, peer: str, url: Any) -> str | None:
         if isinstance(url, str) and url.startswith("/"):
-            return _base(peer) + url  # /art/ paths are key-free capability URLs
+            return _base(self._primary(peer)) + url  # /art/ paths are key-free capability URLs
         return url or None
 
     def _track(self, peer: str, d: dict[str, Any]) -> Track:
@@ -303,6 +370,10 @@ class FederatedLibraryProvider(MusicProvider):
         (own + every peer's). Peers too old for the view endpoint contribute
         what they can and are listed in ``outdated_peers``."""
         raw_artist, artist_peer = split_id(artist_id) if artist_id else (None, None)
+        if artist_peer is not None:  # an id made via another address of the same instance
+            inst = self._instance_of(artist_peer)
+            if inst is not None:
+                artist_peer = f"{inst['host']}:{inst['port']}"
         own_ok = self.own is not None and artist_peer is None
         peers_ok = artist_id is None or artist_peer is not None
         # One library involved (the usual case — a client browsing its server's
@@ -445,10 +516,8 @@ class FederatedLibraryProvider(MusicProvider):
         want = [{k: items[i].get(k) for k in ("title", "artist", "isrc", "duration_s")} for i in missing]
 
         def ask(peer: str) -> Any:
-            import requests
-
             key = self._key()
-            r = requests.post(_base(peer) + "/api/library/own/match", json={"tracks": want},
+            r = self._request("POST", peer, "/api/library/own/match", json={"tracks": want},
                               headers={"X-Harmony-Key": key} if key else {}, timeout=_PEER_TIMEOUT_S)
             return r.json().get("ids") if r.ok else None
 
@@ -465,14 +534,17 @@ class FederatedLibraryProvider(MusicProvider):
         r = self._get(peer, "/api/resolve", {"service": "local", "id": raw}, timeout=10)
         key = self._key()
         q = r.get("quality") if isinstance(r.get("quality"), dict) else None
-        return StreamSource(url=f"{_base(peer)}/stream/{r['token']}", mime_type=r.get("mime") or "",
+        return StreamSource(url=f"{_base(self._primary(peer))}/stream/{r['token']}", mime_type=r.get("mime") or "",
                             headers={"X-Harmony-Key": key} if key else {},
                             label=r.get("label") or "Library", quality=q)
 
     def instance_name(self, track_id: str) -> str | None:
         """The peer's name for a federated id; None for this instance's own."""
         _raw, peer = split_id(track_id)
-        return self._known().get(peer, peer) if peer else None
+        if not peer:
+            return None
+        inst = self._instance_of(peer)
+        return str(inst.get("name") or inst["host"]) if inst else peer
 
     # -- no playlists / social on a folder of files ---------------------------------
 

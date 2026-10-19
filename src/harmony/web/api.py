@@ -2044,7 +2044,10 @@ class Engine:
                     import uuid
 
                     settings.instance_id = str(uuid.uuid4())
-                    settings.save()
+                    # An unreadable settings file stays untouched (it may be
+                    # recoverable): the id then lives in memory only.
+                    if not settings._load_failed:
+                        settings.save()
                 self._iid = settings.instance_id
             return self._iid
 
@@ -2089,7 +2092,12 @@ class Engine:
                 }
         # The same server can show up twice (its mDNS LAN address and a typed
         # Tailscale/hostname one): one row per instance id, most direct address.
-        return {"instances": dedupe_instances(list(by_addr.values()), self.instance_id())}
+        return {"instances": dedupe_instances(list(by_addr.values()), self.instance_id(),
+                                              own_port=self._own_port())}
+
+    def _own_port(self) -> int | None:
+        port = self._http_port or getattr(self._mesh, "_port", None)
+        return int(port) if port else None
 
     def add_peer(self, host: str, port: int, name: str | None = None) -> dict[str, Any]:
         """Register a peer instance by address, verifying it answers /healthz."""
@@ -2118,7 +2126,14 @@ class Engine:
             return {"ok": False, "reason": "not a Harmony server"}
         iid = info.get("instance_id") or None
         if iid and iid == self.instance_id():
-            return {"ok": False, "reason": "that's this instance"}
+            from harmony.mesh import is_local_address
+
+            own_port = self._own_port()
+            if is_local_address(host) and (own_port is None or port == own_port):
+                return {"ok": False, "reason": "that's this instance"}
+            # Same id, but not us: a copied settings file. Say so; change nothing.
+            return {"ok": False, "reason": "That server has the same instance id as this one — "
+                                           "was its settings copied? Give one a new id"}
         from harmony.mesh import host_rank
 
         settings = Settings.load()
@@ -2145,18 +2160,27 @@ class Engine:
             prov.invalidate()
         self._notify_settings_changed()
 
-    def remove_peer(self, host: str, port: int) -> dict[str, Any]:
+    def remove_peer(self, host: str | None = None, port: int | None = None,
+                    instance_id: str | None = None) -> dict[str, Any]:
+        """Forget a saved peer by address and/or by ``instance_id`` (every saved
+        address of that instance -- one row can stand for several)."""
         from harmony.config import Settings
 
         try:
-            port = int(port)
+            port = int(port) if port is not None else None
         except (TypeError, ValueError):
             return {"ok": False, "reason": "invalid port"}
+        if not instance_id and (not host or port is None):
+            return {"ok": False, "reason": "no host or instance id"}
         settings = Settings.load()
         before = len(settings.known_peers)
-        settings.known_peers = [
-            p for p in settings.known_peers if not (p.get("host") == host and p.get("port") == port)
-        ]
+
+        def doomed(p: dict[str, Any]) -> bool:
+            if host and port is not None and p.get("host") == host and p.get("port") == port:
+                return True
+            return bool(instance_id) and p.get("instance_id") == instance_id
+
+        settings.known_peers = [p for p in settings.known_peers if not doomed(p)]
         settings.save()
         self._peers_changed()
         return {"ok": True, "removed": before - len(settings.known_peers)}
@@ -2388,7 +2412,9 @@ class Engine:
         for t in tracks:
             if isinstance(t, dict) and t.get("service") == "local":
                 raw, owner = split_id(str(t.get("id")))
-                if owner == f"{peer_host}:{peer_port}":
+                target = f"{peer_host}:{peer_port}"
+                inst = self._libprov._instance_of(owner) if owner and self._libprov is not None else None
+                if owner == target or (inst is not None and target in (inst.get("addresses") or [])):
                     out.append({**t, "id": raw})  # the peer's own track: its bare id
                     continue
             if isinstance(t, dict) and t.get("service") == "local" and split_id(str(t.get("id")))[1] is None:
