@@ -46,6 +46,19 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.13" date="2026-10-27">
+      <description>
+        <p>The game source API can now serve lossless FLAC files, about half
+        the size of WAV. Each music type draws from a deeper list of streaming
+        tracks, the same song found on two services is played only once, and
+        Harmony remembers what it played across restarts so songs don't repeat
+        too soon. You can pick exactly which services a profile uses, or
+        exclude a service for the whole server.</p>
+        <p>A bad album or artist in a profile no longer slows down the other
+        profiles, large music types finish loading, and a peek always shows
+        exactly what plays next.</p>
+      </description>
+    </release>
     <release version="1.0.12" date="2026-10-27">
       <description>
         <p>Songs no longer end early on a Chromecast or Google TV: when a
