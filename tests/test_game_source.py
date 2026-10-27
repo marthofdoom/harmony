@@ -8,6 +8,7 @@ whose providers are in-memory, so routing, headers and bytes are the real thing.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import random
@@ -1560,3 +1561,113 @@ def test_flac_and_wav_share_the_lru_cap(env, seed):
     fetch_flac(env, "a2")
     stats = env.game.cache.stats()
     assert stats["files"] == 2 and stats["bytes"] == sum(p.stat().st_size for p in env.game.cache.dir.iterdir())
+
+
+# -- FLAC review follow-ups ---------------------------------------------------------------------------
+
+
+def _stored_profiles(env) -> dict:
+    return json.loads((env.tmp / "settings.json").read_text())["game_profiles"]
+
+
+def test_default_container_is_not_persisted_but_flac_is(env):
+    assert call(env, "PUT", "/api/game/profiles/w", PROFILE)[0] == 200
+    assert call(env, "PUT", "/api/game/profiles/w2", {**PROFILE, "format": {"container": "wav", "bits": 24}})[0] == 200
+    assert call(env, "PUT", "/api/game/profiles/f", {**PROFILE, "format": {"container": "flac"}})[0] == 200
+    stored = _stored_profiles(env)
+    assert "container" not in stored["w"]["format"] and "container" not in stored["w2"]["format"]
+    assert stored["w2"]["format"]["bits"] == 24 and stored["f"]["format"]["container"] == "flac"
+    assert call(env, "GET", "/api/game/profiles/w")[1]["format"]["container"] == "wav"     # GET fills it in
+    assert [p["format"]["container"] for p in call(env, "GET", "/api/game/profiles")[1]["profiles"]] \
+        == ["flac", "wav", "wav"]
+
+
+def test_a_profile_stored_before_containers_loads_as_wav(env, seed):
+    old = {"sources": "library", "types": PROFILE["types"], "format": {"rate": 44100, "bits": 16, "channels": 2},
+           "normalize": False, "trim_silence": False}
+    (env.tmp / "settings.json").write_text(json.dumps({"game_profiles": {"old": old}}))
+    got = call(env, "GET", "/api/game/profiles/old")[1]
+    assert got["format"] == {"rate": 44100, "bits": 16, "channels": 2, "container": "wav"}
+    url = call(env, "POST", "/api/game/next", {"profile": "old", "type": "explore"})[1]["tracks"][0]["audio_url"]
+    assert ".wav?rate=44100" in url
+
+
+@pytest.mark.parametrize("container", ["wav", "flac"])
+def test_get_then_put_round_trips(env, container):
+    call(env, "PUT", "/api/game/profiles/g", {**PROFILE, "format": {"container": container}})
+    got = call(env, "GET", "/api/game/profiles/g")[1]
+    body = {k: v for k, v in got.items() if k != "name"}
+    status, put = call(env, "PUT", "/api/game/profiles/g", body)
+    assert status == 200 and put["format"]["container"] == container and put == got
+
+
+PINNED_WAV_KEY = "f59790d35e0d7e72d4df078ca6af7bdbe25ad35c"
+
+
+def test_wav_cache_key_is_unchanged_from_before_containers(env, seed):
+    # the exact key origin/main's key_of gives for this request (hardcoded, not recomputed)
+    fetch_audio(env, "a1")
+    assert [p.name for p in env.game.cache.dir.glob("*.wav")] == [f"{PINNED_WAV_KEY}.wav"]
+    fetch_flac(env, "a1")
+    (flac,) = env.game.cache.dir.glob("*.flac")
+    assert flac.stem == hashlib.sha256(b"v2|local|a1|48000|16|2|0|0|flac").hexdigest()[:40] != PINNED_WAV_KEY
+
+
+def test_flac_valid_rejects_truncated_and_foreign_files(env, seed):
+    fetch_flac(env, "a1")
+    (good,) = env.game.cache.dir.glob("*.flac")
+    data = good.read_bytes()
+    assert gs.flac_valid(good)
+    for name, blob in (("cut_header", data[:42]), ("cut_meta", data[:80]), ("no_frames", data[:data.index(b"\xff\xf8")]),
+                       ("magic_only", b"fLaC"), ("foreign", b"RIFF" + b"\0" * 400),
+                       ("bad_sync", data[:data.index(b"\xff\xf8")] + b"\0\0" + data[data.index(b"\xff\xf8") + 2:])):
+        f = env.tmp / f"{name}.flac"
+        f.write_bytes(blob)
+        assert not gs.flac_valid(f), name
+    assert not gs.flac_valid(env.tmp / "missing.flac")
+    one = data[:data.index(b"\xff\xf8") + 64]                      # metadata + a (cut) first frame still passes
+    f = env.tmp / "one.flac"
+    f.write_bytes(one)
+    assert gs.flac_valid(f) is (flac_info(data)[3] <= 65535 * 8)   # ...unless STREAMINFO needs more bytes
+
+
+@pytest.mark.parametrize("damage", ["truncate", "foreign"])
+def test_invalid_flac_cache_file_is_rebuilt_not_served(env, seed, damage):
+    _s, _h, good = fetch_flac(env, "a1")
+    (path,) = env.game.cache.dir.glob("*.flac")
+    path.write_bytes(good[:60] if damage == "truncate" else b"definitely not flac" * 20)
+    s, _h, again = fetch_flac(env, "a1")
+    assert s == 200 and again[:4] == b"fLaC" and flac_info(again) == flac_info(good) and len(again) > 1000
+    assert gs.flac_valid(path)
+
+
+@pytest.mark.parametrize("mode", ["fail", "timeout"])
+def test_flac_rewrap_failure_leaves_nothing_behind(env, seed, monkeypatch, mode):
+    real = subprocess.run
+
+    def run(cmd, *a, **kw):
+        if "flac" in cmd:                                  # only the second (re-wrap) ffmpeg step
+            if mode == "timeout":
+                raise subprocess.TimeoutExpired(cmd, 1)
+            return subprocess.CompletedProcess(cmd, 1, b"", b"boom https://cdn.example/x")
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(gs.subprocess, "run", run)
+    status, _h, body = fetch_flac(env, "a1")
+    err = json.loads(body)
+    assert (status, err["code"]) == ((502, "transcode_failed") if mode == "fail" else (504, "transcode_timeout"))
+    assert "cdn.example" not in err["error"]
+    assert list(env.game.cache.dir.iterdir()) == []        # no .flac, no .part, no scratch WAV
+    assert fetch_audio(env, "a1")[0] == 200                # the WAV path is unaffected
+
+
+def test_lru_eviction_removes_a_flac_file(env, seed):
+    env.game.cache._cap = lambda: 100_000
+    env.game.cache.min_evict_age_s = 0
+    fetch_flac(env, "a1")
+    (old,) = env.game.cache.dir.glob("*.flac")
+    time.sleep(0.05)
+    fetch_audio(env, "a2")
+    time.sleep(0.05)
+    fetch_audio(env, "m2")
+    assert not old.exists() and env.game.cache.stats()["files"] == 2

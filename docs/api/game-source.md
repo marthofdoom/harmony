@@ -286,8 +286,8 @@ curl -X POST -H "$K" $H/api/game/next -d '{"profile": "skyrim", "type": "explore
 
 - `type` is the music type that was actually used (`"default"` after a
   fallback); `requested_type` is what you asked for.
-- `quality` is the *source's* format (it can be `null`); the WAV you download is
-  always the format in `audio_url`.
+- `quality` is the *source's* format (it can be `null`); the WAV or FLAC you
+  download is always the format in `audio_url`.
 - `source.from_library` is `true` when a streaming pick was swapped for the
   Library copy.
 - `audio_url` is relative to the server and already carries the profile's
@@ -422,18 +422,22 @@ FLAC downloads roughly half the bytes (a 133 s 44.1 kHz/16-bit stereo track is
 - `bits=16` is a 16-bit FLAC, `bits=24` a 24-bit FLAC (stored in 32-bit sample
   slots only inside ffmpeg; the file's STREAMINFO says 24 bits). Mono and stereo,
   44.1 and 48 kHz.
-- Encoded with ffmpeg's `flac` encoder at compression level 1: nearly as small
+- Encoded with ffmpeg's `flac` encoder (`-fflags +bitexact`, so no version-dependent encoder string) at compression level 1: nearly as small
   as the slowest settings and fast (a 3-minute stereo track encodes in well under
   a second).
-- No metadata: the file is the FLAC `fLaC` marker, a STREAMINFO block with the
-  exact total sample count, and frames.
+- Layout: the `fLaC` marker, a STREAMINFO block with the exact total sample count,
+  a small tag block written by ffmpeg (just its vendor string; no title, artist
+  or other track metadata), a padding block, then the frames. The exact bytes can
+  differ between ffmpeg versions, although the `ETag` is the cache key and does
+  not change with them.
 - `Content-Type: audio/flac`. `Range`/`HEAD` work on the **file as stored**, but
   a byte offset in a FLAC file is not a sample position (frames are variable
   size): **WAV is the only container where byte offsets map to sample frames**.
   Use `Range` on FLAC only to resume or split a download, never to seek.
 - It is cached next to the WAV (a different cache entry, never mixed up with it)
   and shares the same size cap, single-flight, concurrency limits and `202`
-  behaviour.
+  behaviour. While a FLAC is being built it needs roughly 1.5-1.7 times the
+  WAV's size in free cache space (the scratch WAV plus the growing FLAC).
 
 ### Loudness normalisation
 

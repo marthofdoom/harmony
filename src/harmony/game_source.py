@@ -289,15 +289,34 @@ def wav_valid(path: Path) -> bool:
 
 
 def flac_valid(path: Path) -> bool:
-    """Whether ``path`` looks like a complete FLAC written by us (files appear by
-    atomic rename only after ffmpeg exited 0, so a magic + STREAMINFO check suffices)."""
+    """Whether ``path`` is a complete FLAC written by us: the ``fLaC`` marker, a
+    STREAMINFO first block, a clean walk over the metadata blocks to the one flagged
+    last, then a frame sync, and at least as many bytes as STREAMINFO's sample
+    count needs (<= 65535 samples and >= 8 bytes per frame). Files appear only by
+    rename after ffmpeg exited 0, so this catches foreign or truncated files."""
     try:
         size = path.stat().st_size
         with open(path, "rb") as fh:
-            head = fh.read(8)
+            head = fh.read(42)
+            if size <= 42 or head[:4] != b"fLaC" or head[4] & 0x7F != 0 or head[5:8] != b"\x00\x00\x22":
+                return False
+            total = int.from_bytes(head[21:26], "big") & 0xFFFFFFFFF
+            pos, last = 4, head[4] & 0x80
+            while True:
+                fh.seek(pos)
+                block = fh.read(4)
+                if len(block) < 4:
+                    return False
+                last = block[0] & 0x80
+                pos += 4 + int.from_bytes(block[1:4], "big")
+                if last:
+                    break
+            fh.seek(pos)
+            sync = fh.read(2)
     except OSError:
         return False
-    return size > 42 and head[:4] == b"fLaC" and head[4] & 0x7F == 0 and head[5:8] == b"\x00\x00\x22"
+    return (len(sync) == 2 and sync[0] == 0xFF and sync[1] & 0xFE == 0xF8
+            and size - pos >= (-(-total // 65535) * 8 if total else 8))
 
 
 # -- ffmpeg -----------------------------------------------------------------------
@@ -452,7 +471,7 @@ def transcode_to_flac(ffmpeg: str, in_args: list[str], dest: Path, *, rate: int,
         depth = ["-sample_fmt", "s16"] if bits == 16 else ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
         cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "wav",
                "-i", str(scratch), "-vn", "-map_metadata", "-1", "-c:a", "flac",
-               "-compression_level", str(FLAC_LEVEL), *depth, "-f", "flac", str(dest)]
+               "-compression_level", str(FLAC_LEVEL), "-fflags", "+bitexact", *depth, "-f", "flac", str(dest)]
         try:
             proc = subprocess.run(  # noqa: S603 - argv list, our own scratch file
                 cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
@@ -930,6 +949,10 @@ class GameSource:
     def put_profile(self, name: str, body: Any) -> dict[str, Any]:
         validate_name(name)
         profile = validate_profile(body, name)
+        # The default container is not persisted, so a rollback to an older Harmony (which
+        # rejects unknown format keys) still validates every stored profile.
+        stored = {**profile, "format": {k: v for k, v in profile["format"].items()
+                                        if k != "container" or v != "wav"}}
         from harmony.config import Settings
 
         with self._profiles_lock:
@@ -937,7 +960,7 @@ class GameSource:
             profiles = dict(s.game_profiles) if isinstance(s.game_profiles, dict) else {}
             if name not in profiles and len(profiles) >= MAX_PROFILES:
                 raise GameError(400, "too_many_profiles", f"at most {MAX_PROFILES} profiles")
-            own = _size(profile)
+            own = _size(stored)
             if own > MAX_PROFILE_BYTES:
                 raise GameError(413, "profile_too_large",
                                 f"profile is {own} bytes serialised; the limit is {MAX_PROFILE_BYTES}")
@@ -946,7 +969,7 @@ class GameSource:
                 raise GameError(413, "profiles_too_large",
                                 f"all profiles together may take at most {MAX_PROFILES_BYTES} bytes "
                                 f"serialised ({others + own} with this one); delete or shrink some")
-            profiles[name] = profile
+            profiles[name] = stored
             s.game_profiles = profiles  # assignment, so save() merges it
             s.save()
         self._drop_pools(name)
@@ -1305,7 +1328,8 @@ class GameSource:
             except ValueError as exc:
                 raise GameError(400, "bad_format", "wait must be a number of seconds") from exc
         ffmpeg = self._ffmpeg()
-        fmt = f"{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}|{container}"
+        # ``|flac`` only for FLAC: the WAV key stays what it always was (cached files stay valid)
+        fmt = f"{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}" + ("|flac" if container == "flac" else "")
 
         def key_of(svc: str, tid: str) -> str:
             h = hashlib.sha256(f"{_PIPELINE}|{svc}|{tid}|{fmt}".encode()).hexdigest()[:40]
