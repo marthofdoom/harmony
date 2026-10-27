@@ -227,7 +227,8 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   5 consecutive partial builds or 10 minutes (the fetched results are dropped and
   fetched afresh), so one call that keeps failing cannot freeze the rest. After
   5 partial builds in a row whose only failures are permanent ones of single
-  calls (a deleted playlist, HTTP 404; outages, rate limits, 5xx, auth errors and
+  calls (a deleted playlist, HTTP 404, a private playlist's 403, a malformed
+  payload; outages, rate limits, 5xx, auth errors and
   the time budget never count, and never shrink a pool) the failure is treated as permanent: the result is accepted even if smaller, the normal TTL applies
   again and the failing selector is logged as a warning (once per TTL, as long as it stays dead). Until then a
   partial rebuild never makes an existing pool smaller; tracks that arrive late
@@ -239,7 +240,7 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   calls wait their turn behind each search; this is why warm refreshes are done in
   the background and spread out by the long TTL.
 - **Back-off and request rate.** After a rate-limit error, or 3 transient
-  failures in a row (network, timeout, HTTP 5xx, auth; a failure of one call, such as a deleted playlist or a 404, does not count), a service gets no game-source requests for 30 s, doubling to 10 minutes
+  failures in a row (network, timeout, HTTP 5xx/401/408/429, auth, a 403 on a search; a failure of one call, such as a deleted playlist or a 404, does not count), a service gets no game-source requests for 30 s, doubling to 10 minutes
   on each repeat; one success resets it. This covers every search, playlist,
   album and artist call the game source makes. Worst case without failures:
   one build per pool per TTL, and a build is at most ~3 searches per streaming

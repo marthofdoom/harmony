@@ -2488,3 +2488,53 @@ def test_server_errors_and_auth_failures_back_the_service_off_but_a_404_does_not
         for _ in range(gs.BACKOFF_FAILS + 1):
             assert env.game._stream_call("qobuz", boom) is None
         assert ("qobuz" in env.game._bo) is backs_off, exc
+
+
+def test_a_long_partial_period_cannot_leave_the_pool_stuck_at_the_budget(env, monkeypatch):
+    # 4 Qobuz pages are needed (depth 200, page 50) but the budget fits about 2 per build
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 200)}, delay=0.1)
+    _set(game_genre_variants=False, game_stream_search_limit=200)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.15)
+    _put(env)
+    assert 0 < _next(env)["pool_size"] < 200
+    pool = env.game._pools[("g", "explore", "all")]
+    pool.memo_at -= 10000                                          # partial for longer than POOL_TTL_S (an outage)
+    for _ in range(6):
+        pool.expires = 0.0
+        _next(env)
+        _settle(pool)
+        if len(pool.refs) == 200:
+            break
+    assert len(pool.refs) == 200 and abs(_left(pool) - 3600) < 5   # progress resumed, then the full TTL
+
+
+def test_payload_errors_and_403_on_an_exact_selector_are_permanent():
+    from harmony.errors import ProviderError
+
+    assert not gs._transient(ProviderError("Qobuz track payload is missing an id"))
+    assert not gs._transient(ProviderError("Qobuz API error 403 on playlist/get: x"), exact=True)
+    assert gs._transient(ProviderError("Qobuz API error 403 on search: x"))              # a search: maybe a block
+    assert all(gs._transient(ProviderError(f"Qobuz API error {c} on x: y")) for c in (401, 408, 429, 500, 503))
+    assert not gs._transient(ProviderError("Qobuz API error 404 on x: y"))
+
+
+def test_a_locked_playlist_gives_up_without_backing_the_service_off(env):
+    from harmony.errors import ProviderError
+
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 20)})
+    _set(game_genre_variants=False)
+    env.eng.qobuz.playlists["p1"] = _songs(Service.QOBUZ, 100, 110, artist="Other")
+    env.game.put_profile("g", {"sources": "all", "types": {"explore": [
+        {"genre": "rock"}, {"playlist": {"service": "qobuz", "id": "p1"}}]}})
+    assert _next(env)["pool_size"] == 30
+    pool = env.game._pools[("g", "explore", "all")]
+
+    def locked(pid):
+        raise ProviderError("Qobuz API error 403 on playlist/get: forbidden")
+
+    env.eng.qobuz.get_playlist_tracks = locked
+    for _ in range(gs.MAX_PARTIAL_ATTEMPTS):
+        pool.expires = 0.0
+        _next(env)
+        _settle(pool)
+    assert len(pool.refs) == 20 and abs(_left(pool) - 3600) < 5 and env.game._bo.get("qobuz") is None

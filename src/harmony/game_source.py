@@ -789,15 +789,18 @@ def _song_key(title: Any, artist: Any) -> str:
 _SERVICE_RANK = {"local": 0}  # which copy of one song wins: the Library's; between streaming services the first seen
 
 
-def _transient(exc: BaseException) -> bool:
+def _transient(exc: BaseException, exact: bool = False) -> bool:
     """Whether a failed streaming call is the service's / network's fault (and may well pass):
-    rate limits, network, timeouts, auth, HTTP 5xx/401/403/408/429. Anything else (a deleted
-    playlist, a changed page layout, HTTP 404...) is a permanent failure of that call."""
+    rate limits, network, timeouts, auth, HTTP 5xx/401/408/429 (and 403 on a search). Anything
+    else is a permanent failure of that call: a deleted playlist, a changed page layout, HTTP 404,
+    a ProviderError without an HTTP status (a payload of the wrong shape), and 403 on an exact-id
+    selector (``exact``: a private or region-locked playlist)."""
     if isinstance(exc, (RateLimitedError, AuthError, OSError, TimeoutError)) or isinstance(exc.__cause__, OSError):
         return True
     if isinstance(exc, ProviderError):
         m = re.search(r"\b([45]\d\d)\b", str(exc))
-        return m is None or int(m.group(1)) >= 500 or int(m.group(1)) in (401, 403, 408, 429)
+        code = int(m.group(1)) if m else 0
+        return code >= 500 or code in (401, 408, 429) or (code == 403 and not exact)
     return False
 
 
@@ -1308,7 +1311,8 @@ class GameSource:
             log.info("game source: %s call failed: %s", service, exc)
             return None
 
-    def _stream_call(self, service: str, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
+    def _stream_call(self, service: str, fn: Callable[..., Any], *args: Any, _exact: bool = False,
+                     **kw: Any) -> Any:
         """:meth:`_guard` for streaming services plus a back-off: after a rate limit, or
         :data:`BACKOFF_FAILS` transient failures (network, timeout, 5xx, auth) in a row, the service gets
         no game-source requests for 30 s, doubling to 10 min; a success resets it. A failure
@@ -1325,7 +1329,7 @@ class GameSource:
                 result = fn(*args, **kw)
         except Exception as exc:  # noqa: BLE001 - one service failing must not sink the pick
             log.info("game source: %s call failed: %s", service, exc)
-            self._tls.transient = _transient(exc)
+            self._tls.transient = _transient(exc, _exact)
             if not self._tls.transient:
                 return None
             with self._bo_lock:
@@ -1426,7 +1430,8 @@ class GameSource:
             if prov is not None:
                 fn = {"playlist": prov.get_playlist_tracks, "album": prov.get_album_tracks,
                       "artist": lambda i: prov.get_artist_top_tracks(i, limit=ARTIST_TRACKS)}[kind]
-                got = (self._guard if service == "local" else self._stream_call)(service, fn, item_id)
+                got = (self._guard(service, fn, item_id) if service == "local"
+                       else self._stream_call(service, fn, item_id, _exact=True))
                 if got is None and service != "local":
                     ctx.failure(self, f"{kind} {service}:{item_id}")
                 tracks += got or []
@@ -1510,7 +1515,7 @@ class GameSource:
         # freeze the successful ones.
         pool.attempts = 0 if giveup else attempts
         if ctx.partial and not giveup:
-            if pool.memo_fp != fp or not pool.memo:
+            if ctx.memo is not pool.memo:   # a fresh memo (new, or the old one had expired)
                 pool.memo_at = now
             pool.memo, pool.memo_fp = ctx.memo, fp
         else:
