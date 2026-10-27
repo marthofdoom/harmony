@@ -2446,3 +2446,45 @@ def test_a_dead_playlist_does_not_freeze_the_pool_or_back_off_the_service(env, c
     assert env.game._bo.get("qobuz") is None                       # a per-call failure never backs off the service
     msgs = [r.getMessage() for r in caplog.records if "still incomplete" in r.getMessage()]
     assert len(msgs) == 1 and "playlist qobuz:p1" in msgs[0]
+
+
+@pytest.mark.parametrize("make", [lambda: OSError("net down"), lambda: __import__("harmony.errors").errors.RateLimitedError("429"),
+                                  lambda: __import__("harmony.errors").errors.ProviderError("Qobuz API error 503 on x: y"),
+                                  lambda: __import__("harmony.errors").errors.AuthError("signed out")])
+def test_a_service_outage_never_shrinks_a_mixed_pool_or_advances_the_give_up(env, monkeypatch, make):
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 20)},
+                   yt={"rock music": [_trk(f"y{i}", f"Yt {i}", "Y", Service.YTMUSIC) for i in range(20)]})
+    _set(game_genre_variants=False)
+    _put(env)
+    assert _next(env)["pool_size"] == 40
+    pool = env.game._pools[("g", "explore", "all")]
+
+    def down(query, **kw):
+        raise make()
+
+    env.eng.yt.search = down
+    monkeypatch.setattr(gs, "BACKOFF_MIN_S", 0.0)                    # let every build actually call the dead service
+    for _ in range(gs.MAX_PARTIAL_ATTEMPTS + 2):
+        pool.expires = 0.0
+        _next(env)
+        _settle(pool)
+        assert len(pool.refs) == 40 and pool.attempts == 0           # never shrinks, never gives up
+        assert abs(_left(pool) - gs.PARTIAL_POOL_RETRY_S) < 2
+
+
+def test_server_errors_and_auth_failures_back_the_service_off_but_a_404_does_not(env):
+    from harmony.errors import AuthError, ProviderError
+
+    _streaming_env(env, qobuz={})
+    for exc, backs_off in [(ProviderError("YouTube Music: Server returned HTTP 500: x"), True),
+                           (AuthError("token expired"), True),
+                           (ProviderError("Qobuz API error 404 on playlist/get: gone"), False),
+                           (KeyError("x"), False)]:
+        env.game._bo.clear()
+
+        def boom(exc=exc):
+            raise exc
+
+        for _ in range(gs.BACKOFF_FAILS + 1):
+            assert env.game._stream_call("qobuz", boom) is None
+        assert ("qobuz" in env.game._bo) is backs_off, exc

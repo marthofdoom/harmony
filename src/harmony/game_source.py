@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
-from harmony.errors import RateLimitedError
+from harmony.errors import AuthError, ProviderError, RateLimitedError
 from harmony.streamio import file_url_path, is_file_url
 
 log = logging.getLogger(__name__)
@@ -789,6 +789,18 @@ def _song_key(title: Any, artist: Any) -> str:
 _SERVICE_RANK = {"local": 0}  # which copy of one song wins: the Library's; between streaming services the first seen
 
 
+def _transient(exc: BaseException) -> bool:
+    """Whether a failed streaming call is the service's / network's fault (and may well pass):
+    rate limits, network, timeouts, auth, HTTP 5xx/401/403/408/429. Anything else (a deleted
+    playlist, a changed page layout, HTTP 404...) is a permanent failure of that call."""
+    if isinstance(exc, (RateLimitedError, AuthError, OSError, TimeoutError)) or isinstance(exc.__cause__, OSError):
+        return True
+    if isinstance(exc, ProviderError):
+        m = re.search(r"\b([45]\d\d)\b", str(exc))
+        return m is None or int(m.group(1)) >= 500 or int(m.group(1)) in (401, 403, 408, 429)
+    return False
+
+
 def _ref(t: Any) -> dict[str, Any] | None:
     """A ``Track`` (or track dict) as the light candidate record we keep."""
     if isinstance(t, dict):
@@ -1117,7 +1129,16 @@ class _Build:
     memo: dict[tuple, list[Any]] = field(default_factory=dict)
     partial: bool = False
     allowed: frozenset[str] | None = None
-    failed: list[str] = field(default_factory=list)   # what failed (not: what the budget skipped)
+    failed: list[str] = field(default_factory=list)   # permanent per-call failures (deleted playlist...)
+    transient: bool = False                           # budget, back-off, rate limit, network, 5xx, auth
+
+    def failure(self, gsrc: GameSource, what: str) -> None:
+        """Record a failed streaming call (``gsrc._stream_call`` just returned ``None``)."""
+        self.partial = True
+        if getattr(gsrc._tls, "transient", True):
+            self.transient = True
+        else:
+            self.failed.append(what)
 
     def run(self, gsrc: GameSource, memokey: tuple, service: str, call: Callable[[], list[Any]]) -> list[Any]:
         """``call()`` under the provider lock, once per build: a repeat of a key
@@ -1126,12 +1147,11 @@ class _Build:
         if memokey in self.memo:
             return self.memo[memokey]
         if self.deadline is not None and time.monotonic() >= self.deadline:
-            self.partial = True
+            self.partial = self.transient = True
             return []
         got = gsrc._stream_call(service, call)
         if got is None:
-            self.partial = True
-            self.failed.append(" ".join(str(k) for k in memokey))
+            self.failure(gsrc, " ".join(str(k) for k in memokey))
             return []
         self.memo[memokey] = got
         return got
@@ -1290,10 +1310,12 @@ class GameSource:
 
     def _stream_call(self, service: str, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
         """:meth:`_guard` for streaming services plus a back-off: after a rate limit, or
-        :data:`BACKOFF_FAILS` transport failures (network/timeout) in a row, the service gets
+        :data:`BACKOFF_FAILS` transient failures (network, timeout, 5xx, auth) in a row, the service gets
         no game-source requests for 30 s, doubling to 10 min; a success resets it. A failure
         of one call (a deleted playlist, a changed page layout) never backs the service off.
-        ``None`` = failed or backing off."""
+        ``None`` = failed or backing off; ``self._tls.transient`` then says whether the failure
+        may pass (:func:`_transient`) or is permanent for that call."""
+        self._tls.transient = True
         with self._bo_lock:
             st = self._bo.get(service)
             if st and time.monotonic() < st["until"]:
@@ -1303,8 +1325,8 @@ class GameSource:
                 result = fn(*args, **kw)
         except Exception as exc:  # noqa: BLE001 - one service failing must not sink the pick
             log.info("game source: %s call failed: %s", service, exc)
-            transport = isinstance(exc, (OSError, TimeoutError)) or isinstance(exc.__cause__, OSError)
-            if not (transport or isinstance(exc, RateLimitedError)):
+            self._tls.transient = _transient(exc)
+            if not self._tls.transient:
                 return None
             with self._bo_lock:
                 st = self._bo.setdefault(service, {"fails": 0.0, "until": 0.0, "delay": BACKOFF_MIN_S})
@@ -1406,8 +1428,7 @@ class GameSource:
                       "artist": lambda i: prov.get_artist_top_tracks(i, limit=ARTIST_TRACKS)}[kind]
                 got = (self._guard if service == "local" else self._stream_call)(service, fn, item_id)
                 if got is None and service != "local":
-                    ctx.partial = True
-                    ctx.failed.append(f"{kind} {service}:{item_id}")
+                    ctx.failure(self, f"{kind} {service}:{item_id}")
                 tracks += got or []
         return tracks
 
@@ -1466,10 +1487,12 @@ class GameSource:
         """Swap a finished build into ``pool`` (the caller holds ``pool.lock``)."""
         now = time.monotonic()
         same = fp == pool.fingerprint
-        attempts = pool.attempts + 1 if ctx.partial else 0
-        # After MAX_PARTIAL_ATTEMPTS partial builds in a row the failure is treated as
-        # permanent (a deleted playlist...): accept the result and use the normal TTL.
-        giveup = ctx.partial and attempts >= MAX_PARTIAL_ATTEMPTS
+        # Builds whose only failures are permanent per-call ones (a deleted playlist...) count
+        # towards giving up; transient partials (outage, rate limit, back-off, budget) do not.
+        permanent = ctx.partial and not ctx.transient
+        attempts = pool.attempts + 1 if permanent else pool.attempts if ctx.partial else 0
+        # After MAX_PARTIAL_ATTEMPTS of those in a row: accept the result and use the normal TTL.
+        giveup = permanent and attempts >= MAX_PARTIAL_ATTEMPTS
         if giveup:
             log.warning("game source: pool %s still incomplete after %d builds (%s); using it as is",
                         "/".join(key), attempts, ", ".join(ctx.failed) or "time budget")

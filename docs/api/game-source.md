@@ -226,9 +226,10 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   already fetched, so it completes over the next refreshes. That reuse stops after
   5 consecutive partial builds or 10 minutes (the fetched results are dropped and
   fetched afresh), so one call that keeps failing cannot freeze the rest. After
-  5 partial builds in a row the failure is treated as permanent (a deleted
-  playlist, say): the result is accepted even if smaller, the normal TTL applies
-  again and the failing selector is logged once as a warning. Until then a
+  5 partial builds in a row whose only failures are permanent ones of single
+  calls (a deleted playlist, HTTP 404; outages, rate limits, 5xx, auth errors and
+  the time budget never count, and never shrink a pool) the failure is treated as permanent: the result is accepted even if smaller, the normal TTL applies
+  again and the failing selector is logged as a warning (once per TTL, as long as it stays dead). Until then a
   partial rebuild never makes an existing pool smaller; tracks that arrive late
   and were served before the restart are queued behind the current cycle, least
   recently served first (see [no-repeat memory](#no-repeat-memory)).
@@ -237,8 +238,8 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   own YouTube Music / Qobuz calls take), so while a build runs the UI's provider
   calls wait their turn behind each search; this is why warm refreshes are done in
   the background and spread out by the long TTL.
-- **Back-off and request rate.** After a rate-limit error, or 3 network/timeout
-  failures in a row (a failure of one call, such as a deleted playlist, does not count), a service gets no game-source requests for 30 s, doubling to 10 minutes
+- **Back-off and request rate.** After a rate-limit error, or 3 transient
+  failures in a row (network, timeout, HTTP 5xx, auth; a failure of one call, such as a deleted playlist or a 404, does not count), a service gets no game-source requests for 30 s, doubling to 10 minutes
   on each repeat; one success resets it. This covers every search, playlist,
   album and artist call the game source makes. Worst case without failures:
   one build per pool per TTL, and a build is at most ~3 searches per streaming
