@@ -214,6 +214,13 @@ class Settings:
     # Play a song from the Library (this instance's or a peer's) when it's
     # there, even when it was picked from a Qobuz/YouTube Music page.
     library_preferred: bool = True
+    # Game source API (harmony.game_source, docs/api/game-source.md): lets a game
+    # engine use this instance as a proxy music source. ``game_profiles`` maps a
+    # profile name to its validated definition (music types -> selectors,
+    # sources, WAV format); the WAV cache is capped at ``game_cache_max_mb``.
+    game_source_enabled: bool = True
+    game_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
+    game_cache_max_mb: int = 2048
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its

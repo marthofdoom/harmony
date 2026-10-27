@@ -17,7 +17,7 @@ import logging
 import mimetypes
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import ParseResult, parse_qs, unquote, urlparse
 
 from harmony import __version__
 from harmony.errors import ProviderError
@@ -114,7 +114,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             if not self._authorized():
                 self._send_json({"error": "personal key required"}, status=401)
                 return
-            if path == "/api/audio/monitor":
+            if path.startswith("/api/game/"):
+                self._handle_game("GET", parsed)
+            elif path == "/api/audio/monitor":
                 self._handle_monitor()
             elif path.startswith("/api/"):
                 self._handle_api(path, parse_qs(parsed.query))
@@ -137,6 +139,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
             self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        if parsed.path.startswith("/api/game/"):
+            self._handle_game("POST", parsed, body)
             return
         engine = get_engine()
         parts = [unquote(p) for p in parsed.path.strip("/").split("/")]
@@ -332,6 +337,58 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         except Exception as exc:  # noqa: BLE001 - surface as JSON, don't 500-crash
             log.warning("API POST error on %s: %s", parsed.path, exc)
             self._send_json({"error": str(exc)}, status=502)
+
+    # -- game source API (/api/game/*; logic in harmony.game_source) ----------
+
+    def do_HEAD(self) -> None:  # noqa: N802 - stdlib signature
+        parsed = urlparse(self.path)
+        if parsed.path.startswith("/api/game/"):
+            if not self._authorized():
+                self._send_empty(401)
+                return
+            self._handle_game("HEAD", parsed)
+        else:
+            self._send_empty(404)
+
+    def do_PUT(self) -> None:  # noqa: N802 - stdlib signature
+        self._game_with_body("PUT")
+
+    def do_DELETE(self) -> None:  # noqa: N802 - stdlib signature
+        self._game_with_body("DELETE")
+
+    def _send_empty(self, status: int) -> None:
+        self.send_response(status)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _game_with_body(self, method: str) -> None:
+        parsed = urlparse(self.path)
+        if not parsed.path.startswith("/api/game/"):
+            self._send_json({"error": "not found"}, status=404)
+            return
+        if not self._authorized():
+            self._send_json({"error": "personal key required"}, status=401)
+            return
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > 1_000_000:
+            self._send_json({"error": "request body too large", "code": "too_large"}, status=413)
+            self.close_connection = True
+            return
+        raw = self.rfile.read(length) if length else b""
+        try:
+            body = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            self._send_json({"error": "invalid JSON body"}, status=400)
+            return
+        self._handle_game(method, parsed, body)
+
+    def _handle_game(self, method: str, parsed: ParseResult, body: object = None) -> None:
+        from harmony.game_source import send_response
+
+        parts = [unquote(p) for p in parsed.path.strip("/").split("/")]
+        query = parse_qs(parsed.query)
+        resp = get_engine().game_request(method, parts, query, body, self.headers)
+        send_response(self, resp, head=method == "HEAD")
 
     def _handle_api(self, path: str, query: dict[str, list[str]]) -> None:
         engine = get_engine()

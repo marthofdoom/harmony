@@ -28,6 +28,12 @@ This directory is the map. Start with whichever matches what you're doing.
 - [`design/playback.md`](design/playback.md) — device control (shipped) and the
   passive-relay play-to-device design (WiiM, UPnP) rather than in-app decode.
 
+## HTTP API
+
+- [`api/`](api/README.md) — integrating with Harmony over HTTP. Start with the
+  [game source API](api/game-source.md): use Harmony as a music source for a game
+  (Skyrim and friends), no accounts needed.
+
 ## Operations
 
 - [`packaging.md`](packaging.md) — building the Flatpak; where WebKit comes from.

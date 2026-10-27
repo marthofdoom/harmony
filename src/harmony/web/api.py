@@ -2610,3 +2610,12 @@ class Engine:
         cutoff = time.monotonic() - _STREAM_TTL_S
         for token in [k for k, v in self._streams.items() if v["at"] < cutoff]:
             self._streams.pop(token, None)
+
+    # -- game source API (harmony.game_source; docs/api/game-source.md) ---------
+
+    def game_request(self, method: str, parts: list[str], query: dict[str, list[str]],
+                     body: Any, headers: Any) -> Any:
+        """Handle one ``/api/game/*`` request (already key-gated) -> ``GameResponse``."""
+        from harmony.game_source import game_source_for
+
+        return game_source_for(self).handle(method, parts, query, body, headers)

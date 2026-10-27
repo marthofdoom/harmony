@@ -233,6 +233,11 @@ tells you it did. On a headless host you can also inject any credential via a
 The [`docs/`](docs/README.md) directory is the map — architecture, design
 (vision, federation, auth, playback), packaging, roadmap, and decision records.
 
+**HTTP API:** [`docs/api/`](docs/api/README.md) — including the
+[game source API](docs/api/game-source.md), which lets a game engine (e.g. a Skyrim
+music mod) use Harmony as its music source: PCM WAV downloads per music type from
+your Library, Qobuz or — with no accounts at all — YouTube Music.
+
 The short version: providers normalise each service into shared dataclasses,
 `matching` resolves tracks across services, `sync` turns two playlists into a
 reviewable plan before it writes anything, and clients only ever talk to those
