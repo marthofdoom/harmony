@@ -256,9 +256,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 #np-art.fallback { padding: 10px; }
 #np-art { overflow: hidden; }
 #np-art .ico { width: 100%; height: 100%; }
-#np-meta { min-width: 150px; max-width: 460px; }
+#np-meta { min-width: 150px; max-width: 520px; }
 #np-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 #np-artist { color: var(--muted); font-size: 12.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#np-album { color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#np-album:empty { display: none; }
 #np-via { color: var(--accent); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis;
           white-space: nowrap; display: none; align-items: center; gap: 4px; }
 #np-via.show { display: flex; }
@@ -428,17 +430,25 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
 .qpill.lossless { color: var(--success); border-color: var(--success); }
 .qpill.hires { background: var(--accent); border-color: transparent; color: var(--accent-fg); font-weight: 600; }
 .qpill.corner { position: absolute; top: calc(var(--sp-3) + 6px); left: calc(var(--sp-3) + 6px); box-shadow: var(--shadow-1); }
-#np-info { color: var(--muted); font-size: 11.5px; display: flex; min-width: 0; white-space: pre; }
+#np-info { color: var(--muted); font-size: 11.5px; display: flex; align-items: center; gap: 4px;
+           min-width: 0; white-space: pre; }
 #np-info > * { white-space: pre; }
-#np-info .np-from { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
-#np-info .np-src, #np-info .sep { flex: none; }
+#np-info .np-from { flex: 0 100 auto; min-width: 3.5em; overflow: hidden; text-overflow: ellipsis; }
+#np-info .sep { flex: none; }
+#np-info .np-qt { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+#np-info .qpill, #np-info .bp { flex: none; }
 .q-short { display: none; }
-#np-info .np-stream { flex: 0 1 auto; min-width: 0; overflow: hidden; }
-#np-info .np-stream .qpill:not(.q-short) { display: block; }
-#np-info .np-stream .q-full { display: block; }
-#np-info .qpill { vertical-align: baseline; }
-.np-ctx { margin-top: var(--sp-2); }
+#np-info .qpill, .np-ctx .qpill { vertical-align: baseline; font-size: 10.5px; }
+/* Bit-perfect badge: accent when verified, muted outline otherwise. Never colour-only. */
+.bp { display: inline-block; font-size: 10.5px; line-height: 1.5; padding: 0 .4rem; border-radius: var(--r-sm);
+      border: 1px solid var(--border); color: var(--muted); white-space: nowrap; cursor: help; }
+.bp.yes { background: var(--accent); border-color: transparent; color: var(--accent-fg); font-weight: 600; }
+.bp.no { color: var(--fg); }
+.bp.unknown { border-style: dashed; }
+.np-ctx { margin-top: var(--sp-2); display: flex; flex-wrap: wrap; align-items: center; gap: 2px 6px; }
+.np-album:empty { display: none; }
 .np-q { margin-top: var(--sp-1); color: var(--muted); font-size: 13px; }
+.np-q:empty { display: none; }
 
 /* -- library browser -------------------------------------------------------- */
 .libroot { max-width: 1400px; }
@@ -500,9 +510,11 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
   .libgrid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   #np-info { font-size: 10.5px; }
   #np-info .np-src { display: none; }
-  #np-info .np-stream { flex: none; display: flex; gap: 4px; overflow: visible; }
-  #np-info .q-full { display: none !important; }
-  #np-info .qpill.q-short { display: block; flex: none; }
+  #np-info .np-from { flex: none; }
+  #np-info { flex-wrap: wrap; row-gap: 2px; }   /* badges wrap under the quality rather than clip */
+  #np-info .q-full { display: none; }
+  #np-info .q-short { display: inline; }
+  #np-info .np-qt { flex: none; }
   #np-device { max-width: 96px; }
 }
 @media (min-width: 721px) { .songsort { display: none; } }
@@ -533,8 +545,8 @@ svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; 
      prev, play, next, repeat, stop) on row 2, seek full-width on row 3 */
   #nowplaying { flex-wrap: wrap; gap: .3rem .6rem; padding: var(--sp-2) var(--sp-3); }
   #np-art { width: 40px; height: 40px; }
-  #np-meta { display: block; flex: 1 1 0; min-width: 0; max-width: none; }
-  #np-device { order: 2; max-width: 128px; }
+  #np-meta { display: block; flex: 1 1 0; min-width: 0; max-width: none; overflow: hidden; }
+  #np-device { order: 2; max-width: 110px; }
   #np-transport { order: 3; flex-basis: 100%; justify-content: space-evenly; }
   #np-transport button { width: 2.75rem; height: 2.75rem; }
   #np-seekwrap { order: 4; flex-basis: 100%; }

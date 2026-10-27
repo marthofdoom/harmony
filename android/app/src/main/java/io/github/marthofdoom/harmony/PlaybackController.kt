@@ -9,8 +9,13 @@ import androidx.media3.common.C
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
 import androidx.media3.common.PlaybackException
+import androidx.annotation.OptIn
 import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.DefaultRenderersFactory
 import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.analytics.AnalyticsListener
+import androidx.media3.exoplayer.audio.AudioSink
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -53,6 +58,8 @@ data class PlayerState(
     // source + quality (null until the track resolves / the device reports it).
     val context: PlayContext? = null,
     val stream: StreamInfo? = null,
+    // Phone output only: where the audio is routed and the bit-perfect mixer state.
+    val phoneOutput: PhoneOutput? = null,
 ) {
     val current: Track? get() = queue.getOrNull(index)
     val onDevice: Boolean get() = target != PHONE
@@ -106,7 +113,15 @@ class PlaybackController private constructor(ctx: Context) {
     private var ownsDeviceQueue = false   // we loaded (or adopted a running) device queue
     private var lastDeviceError: String? = null
 
-    val exo: ExoPlayer = ExoPlayer.Builder(app)
+    /** Bit-perfect USB output for the phone (Android 14+); also the route the indicator reports. */
+    private val bitPerfect = PhoneBitPerfect(app)
+
+    // Bit-perfect needs the decoded PCM to reach the mixer untouched: no float
+    // conversion, no offload, no software volume (the player's volume stays 1.0;
+    // volume is the device's).
+    @OptIn(UnstableApi::class)
+    val exo: ExoPlayer = ExoPlayer.Builder(app,
+            DefaultRenderersFactory(app).setEnableAudioFloatOutput(false))
         .setAudioAttributes(
             AudioAttributes.Builder().setUsage(C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
@@ -114,6 +129,15 @@ class PlaybackController private constructor(ctx: Context) {
         .setHandleAudioBecomingNoisy(true)
         .setWakeMode(C.WAKE_MODE_NETWORK)
         .build().apply {
+            volume = 1f
+            addAnalyticsListener(object : AnalyticsListener {
+                @OptIn(UnstableApi::class)
+                override fun onAudioTrackInitialized(eventTime: AnalyticsListener.EventTime,
+                                                     audioTrackConfig: AudioSink.AudioTrackConfig) {
+                    bitPerfect.onAudioTrack(audioTrackConfig.sampleRate, audioTrackConfig.encoding,
+                        Integer.bitCount(audioTrackConfig.channelConfig))
+                }
+            })
             addListener(object : Player.Listener {
                 override fun onEvents(player: Player, events: Player.Events) = refreshPhone()
                 override fun onIsPlayingChanged(isPlaying: Boolean) {
@@ -141,6 +165,8 @@ class PlaybackController private constructor(ctx: Context) {
     init {
         restore()
         startTicker()
+        bitPerfect.start()
+        scope.launch { bitPerfect.output.collect { out -> _state.value = _state.value.copy(phoneOutput = out) } }
     }
 
     // ── public controls (output-agnostic) ───────────────────────────────────
@@ -201,6 +227,7 @@ class PlaybackController private constructor(ctx: Context) {
         startJob?.cancel(); startAutoplay = false
         pendingStartMs = 0; phoneEnded = false; halted = true
         exo.stop()
+        bitPerfect.release()
         publish { it.copy(positionMs = 0) }
     }
 
@@ -373,6 +400,7 @@ class PlaybackController private constructor(ctx: Context) {
         } else {
             startJob?.cancel(); startAutoplay = false
             if (old.monitoring) { exo.stop(); exo.clearMediaItems() } else exo.stop()
+            bitPerfect.release()
         }
         deviceRunning = false; deviceHasQueue = false; ownsDeviceQueue = false; lastDeviceError = null
         devicePosMs = posMs; devicePosAt = SystemClock.elapsedRealtime()
@@ -403,6 +431,7 @@ class PlaybackController private constructor(ctx: Context) {
             pendingStartMs = exo.currentPosition
         }
         startJob?.cancel(); startAutoplay = false
+        bitPerfect.release()
         exo.setMediaItem(MediaItem.Builder().setUri(url)
             .setMediaMetadata(MediaMetadata.Builder().setTitle("Hub audio").build()).build())
         exo.prepare(); exo.play()
@@ -433,6 +462,7 @@ class PlaybackController private constructor(ctx: Context) {
             startJob?.cancel(); startAutoplay = false
             stopMonitorQuietly()
             exo.stop()
+            bitPerfect.release()
         }
         pollJob?.cancel(); pollJob = null
         api = null
@@ -467,10 +497,14 @@ class PlaybackController private constructor(ctx: Context) {
             val url = withContext(Dispatchers.IO) { runCatching { client.resolveStream(track) } }
             url.onSuccess { resolved ->
                 val u = resolved.url
-                publish { it.copy(stream = resolved.info) }
+                // The server's "output" describes a network device; the phone's own is computed here.
+                val info = resolved.info?.copy(output = null)
+                publish { it.copy(stream = info) }
+                // Set the USB mixer for this track's rate before the AudioTrack is opened.
+                bitPerfect.onTrack(info?.quality ?: track.quality)
                 exo.setMediaItem(
                     MediaItem.Builder().setUri(u).setMediaId("${track.service}:${track.id}")
-                        .setMediaMetadata(metadataFor(track, resolved.info)).build(),
+                        .setMediaMetadata(metadataFor(track, info, null)).build(),
                     startMs)
                 exo.prepare()
                 exo.playWhenReady = autoplay
@@ -492,6 +526,7 @@ class PlaybackController private constructor(ctx: Context) {
         val nxt = q.advance(manual = false)
         if (nxt == null) {
             phoneEnded = true
+            bitPerfect.release()
             refreshPhone()
             return
         }
@@ -510,6 +545,7 @@ class PlaybackController private constructor(ctx: Context) {
             failures = 0; halted = true
             startAutoplay = false
             exo.stop()
+            bitPerfect.release()
             say(if (q.size > 1) "Couldn't play the queue — no track would start." else "Couldn't play that track.")
             refreshPhone()
             return
@@ -741,9 +777,12 @@ class PlaybackController private constructor(ctx: Context) {
 
     private fun say(msg: String) { _messages.tryEmit(msg) }
 
-    fun metadataFor(t: Track, stream: StreamInfo? = null): MediaMetadata = MediaMetadata.Builder()
+    /** Session metadata: title / artist / album, and a subtitle of the source line
+     *  ("Library · harmony-server · FLAC · 24-bit / 96 kHz") plus the bit-perfect state. */
+    fun metadataFor(t: Track, stream: StreamInfo? = null, indicator: OutputIndicator? = null): MediaMetadata = MediaMetadata.Builder()
         .setTitle(t.title).setArtist(t.artist).setAlbumTitle(t.album)
-        .setSubtitle(sourceQualityLine(stream, t.quality, null))
+        .setSubtitle(listOfNotNull(sourceLine(stream, t.quality, null, indicator, compact = true),
+            indicator?.badge).joinToString(" · ").ifEmpty { null })
         .setArtworkUri(t.artworkUrl?.let { Uri.parse(it) })
         .setIsPlayable(true).setIsBrowsable(false)
         .build()

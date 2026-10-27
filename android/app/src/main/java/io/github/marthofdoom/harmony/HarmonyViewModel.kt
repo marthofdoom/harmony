@@ -115,6 +115,8 @@ data class UiState(
     // What the queue was loaded from + the current stream's source/quality.
     val context: PlayContext? = null,
     val stream: StreamInfo? = null,
+    // Bit-perfect state of the current output (null when nothing is playing / hub audio).
+    val indicator: OutputIndicator? = null,
     val lib: LibraryBrowse = LibraryBrowse(),
     // Index of the currently-playing track within [queue] (-1 when nothing is queued).
     val activeIndex: Int = -1,
@@ -201,7 +203,7 @@ class HarmonyViewModel(app: Application) : AndroidViewModel(app) {
                 _state.value = _state.value.copy(
                     playback = Playback(ps.current, ps.isPlaying, ps.positionMs, ps.durationMs),
                     queue = ps.queue, activeIndex = ps.index,
-                    context = ps.context, stream = ps.stream,
+                    context = ps.context, stream = ps.stream, indicator = outputIndicator(ps),
                     shuffle = ps.shuffle, repeatMode = ps.repeat, buffering = ps.buffering,
                     playingHere = ps.monitoring,
                     target = ps.target, targetVia = ps.targetVia, targetName = ps.targetName,

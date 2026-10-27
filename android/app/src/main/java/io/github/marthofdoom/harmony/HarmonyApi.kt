@@ -594,7 +594,7 @@ class HarmonyApi(var baseUrl: String, var key: String?) {
             volume = optDouble("volume")?.toInt(),
             context = PlayContext.fromJson(o.optJSONObject("context")),
             hasContextKey = o.has("context"),
-            stream = StreamInfo.fromJson(o.optJSONObject("stream")),
+            stream = StreamInfo.fromJson(o.optJSONObject("stream"), o.optJSONObject("output")),
         )
     }
 

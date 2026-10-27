@@ -85,30 +85,15 @@ class PlayContextQualityTest {
         val s = StreamInfo.fromJson(o)!!
         assertEquals("harmony-server", s.source!!.instance)
         assertEquals("Library · harmony-server · FLAC · 24-bit / 96 kHz",
-            sourceQualityLine(s, null, null))
+            sourceLine(s, null, null, null))
         assertNull(StreamInfo.fromJson(JSONObject("""{"token":"x"}""")))
     }
 
     @Test fun lineFallsBackToTheTrackWhenNoStreamInfo() {
         val q = Quality.fromJson(JSONObject(hires))
-        assertEquals("Library · FLAC · 24-bit / 96 kHz", sourceQualityLine(null, q, "Library"))
-        assertNull(sourceQualityLine(null, null, null))
+        assertEquals("Library · FLAC · 24-bit / 96 kHz", sourceLine(null, q, "Library", null))
+        assertNull(sourceLine(null, null, null, null))
     }
-}
-
-class PlayingFromTest {
-    private fun stream(svc: String, label: String?) =
-        StreamInfo(null, SourceInfo(svc, label, "harmony-server", true, false))
-
-    @Test fun playingFromNamesTheSourceNotTheCollection() {
-        assertEquals("Library", playingFromSource(stream("local", "Library"), "local"))
-        assertEquals("Library", playingFromSource(stream("local", "local"), "local"))
-        assertEquals("Qobuz", playingFromSource(stream("qobuz", "Qobuz"), "qobuz"))
-        assertEquals("YouTube Music", playingFromSource(stream("ytmusic", "YouTube Music"), "ytmusic"))
-        assertEquals("Qobuz", playingFromSource(null, "qobuz"))
-        assertEquals("Library", playingFromSource(null, "qobuz", hasLibraryCopy = true))
-    }
-
 }
 
 class ClientReviewFixesTest {

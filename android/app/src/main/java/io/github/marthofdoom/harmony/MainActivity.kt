@@ -1048,18 +1048,28 @@ fun MiniPlayer(vm: HarmonyViewModel, state: UiState, modifier: Modifier = Modifi
                     Text(if (state.playingHere) "Hub audio" else t?.title ?: "",
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.bodyMedium)
-                    val q = if (state.playingHere) null else state.stream?.quality ?: t?.quality
+                    val onDev = state.target != PHONE
+                    // artist · album (· "on <device>")
                     val sub = if (state.playingHere) state.instanceName ?: ""
-                              else listOfNotNull(t?.artist?.ifBlank { null },
-                                  state.targetName?.takeIf { state.target != PHONE }?.let { "on $it" },
-                                  q?.short)
+                              else listOfNotNull(t?.artist?.ifBlank { null }, t?.album?.ifBlank { null },
+                                  state.targetName?.takeIf { onDev }?.let { "on $it" })
                                   .joinToString(" · ")
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.weight(1f, fill = false))
-                        HiResChip(q, Modifier.padding(start = 6.dp))
+                    Text(sub, maxLines = 1, overflow = TextOverflow.Ellipsis,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    if (!state.playingHere) {
+                        val ind = state.indicator
+                        // "Library · FLAC 24/96" + tier + bit-perfect; chips never truncate.
+                        // (the "→ output" side lives on Now Playing; the badge carries the verdict here)
+                        val line = sourceLine(state.stream, t?.quality, t?.location, null, compact = true)
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Text(line ?: "", maxLines = 1, overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.weight(1f, fill = false))
+                            // (no tier chip here: "FLAC 24/96" already says it, and the badge must stay visible)
+                            BitPerfectBadge(ind, Modifier.padding(start = 4.dp))
+                        }
                     }
                 }
                 if (state.buffering) {
@@ -1176,25 +1186,31 @@ private fun NowPlayingScreen(vm: HarmonyViewModel, state: UiState) {
                     maxLines = 1, overflow = TextOverflow.Ellipsis,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
                 if (!state.playingHere) {
-                    val from = playingFromSource(state.stream, pb.track?.service,
-                        pb.track?.libraryId != null)
-                    if (from != null) {
-                        Text("Playing from $from",
-                            style = MaterialTheme.typography.labelLarge,
+                    // Line 3: album (plain text). Line 4: source · instance · quality + tier + bit-perfect.
+                    pb.track?.album?.ifBlank { null }?.let {
+                        Text(it, style = MaterialTheme.typography.bodyMedium,
                             maxLines = 1, overflow = TextOverflow.Ellipsis,
-                            color = MaterialTheme.colorScheme.primary,
-                            modifier = Modifier.padding(top = 6.dp))
+                            color = MaterialTheme.colorScheme.onSurfaceVariant)
                     }
+                    val ind = state.indicator
                     val q = state.stream?.quality ?: pb.track?.quality
-                    val line = sourceQualityLine(state.stream, pb.track?.quality, pb.track?.location)
-                    if (line != null) {
-                        Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically,
+                    val line = sourceLine(state.stream, pb.track?.quality, pb.track?.location, ind,
+                        shortQuality = true)
+                    if (line != null || ind != null) {
+                        Row(Modifier.padding(top = 6.dp), verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.Center) {
-                            Text(line, style = MaterialTheme.typography.bodySmall,
-                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                            Text(line ?: "", style = MaterialTheme.typography.bodySmall,
+                                maxLines = 1, overflow = TextOverflow.Ellipsis,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 modifier = Modifier.weight(1f, fill = false))
-                            HiResChip(q, Modifier.padding(start = 8.dp))
+                            TierChip(q, Modifier.padding(start = 6.dp))
+                            BitPerfectBadge(ind, Modifier.padding(start = 6.dp))
+                        }
+                        ind?.detail?.let {
+                            Text(it, style = MaterialTheme.typography.labelSmall,
+                                maxLines = 2, overflow = TextOverflow.Ellipsis,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.padding(top = 2.dp))
                         }
                     }
                 }

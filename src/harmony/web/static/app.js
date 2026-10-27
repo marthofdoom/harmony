@@ -195,27 +195,119 @@ const locationBadge = (t) => `<span class="badge${t.library_id || t.service === 
 // -- "Playing from" context + stream quality ----------------------------------
 // Every play entry point passes {kind, title, service?, id?}; it lives with the
 // active queue (persisted; sent to devices in queue/load).
-// The stream behind the current track: {quality, source} from /api/resolve
-// (browser) or the device snapshot's `stream`.
+// The stream behind the current track: {quality, source, output} from /api/resolve
+// (browser) or the device snapshot's `stream`/`output`.
 function currentStream() { return onDevice() ? dev.stream : (br.loaded && br.loaded === pq.current() ? br.info : null); }
+
+// A quality dict's label without its trailing tier ("FLAC · 24-bit / 96 kHz · Hi-Res" -> "FLAC · 24-bit / 96 kHz").
+const qPlainLabel = (q) => (q && q.label ? String(q.label).replace(/\s*·?\s*Hi-Res$/i, "").trim() : "");
+const khzText = (hz) => String(Math.round(hz / 100) / 10).replace(/\.0$/, "");
+// Phone-width short form: "FLAC 24/96" (lossless), "AAC 256" (lossy).
+function qShort(q) {
+  if (!q) return "";
+  const codec = q.codec || "";
+  const khz = q.sample_rate ? khzText(q.sample_rate) : "";
+  const s = q.lossless && q.bit_depth && khz ? `${codec} ${q.bit_depth}/${khz}` : q.bitrate ? `${codec} ${q.bitrate}` : (codec || "");
+  return s.trim();
+}
+// Tier pill beside the quality text: Hi-Res / Lossless; nothing for lossy.
+const tierLabel = (q) => (!q ? "" : q.tier === "hires" ? "Hi-Res" : (q.tier === "lossless" || q.lossless) ? "Lossless" : "");
+
+// What the bytes sent to the output actually are, and whether that is bit-perfect.
+// Browser: never bit-perfect — the page can't pick the sound card's rate, so the
+// browser resamples to the AudioContext rate (probed lazily, no audio goes through it).
+let _browserRate = null;
+function browserSampleRate() {
+  if (_browserRate !== null) return _browserRate;
+  let rate = 0;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (AC) {
+      const ctx = new AC();
+      rate = Math.round(ctx.sampleRate) || 0;
+      try { const c = ctx.close(); if (c && c.catch) c.catch(() => {}); } catch (_e) { /* ignore */ }
+    }
+  } catch (_e) { rate = 0; }
+  _browserRate = rate;
+  return rate;
+}
+try {
+  if (navigator.mediaDevices && navigator.mediaDevices.addEventListener) {
+    navigator.mediaDevices.addEventListener("devicechange", () => { _browserRate = null; });
+  }
+} catch (_e) { /* ignore */ }
+
+// -> {quality, state: "yes"|"no"|"unknown", reason, label} or null (no stream to describe).
+function outputInfo() {
+  const t = pq.current();
+  if (!t) return null;
+  const s = currentStream();
+  if (!onDevice()) {
+    if (!s) return null;
+    const rate = browserSampleRate();
+    const reason = rate ? `browser resamples to ${rate} Hz` : "browser mixes and resamples the audio";
+    return { quality: rate ? { sample_rate: rate } : null, state: "no", reason, label: `Not bit-perfect — ${reason}` };
+  }
+  const o = dev.output || (s && s.output) || null;
+  if (!s && !o) return null;
+  if (!o) return { quality: null, state: "unknown", reason: "", label: "" };
+  const state = o.bit_perfect === true ? "yes" : o.bit_perfect === false ? "no" : "unknown";
+  return { quality: o.quality || null, state, reason: o.reason || "", label: o.label || "" };
+}
+const outputDiffers = (src, out) => {
+  if (!out) return false;
+  if (!src) return true;
+  return ["codec", "bit_depth", "sample_rate", "bitrate"].some((k) => out[k] != null && out[k] !== src[k]);
+};
+// "24/96" when the codec is unchanged, "48 kHz" for a bare rate, else the short form.
+function outShort(out, src) {
+  if (!out) return "";
+  if (!out.codec && !out.bit_depth && out.sample_rate) return `${khzText(out.sample_rate)} kHz`;
+  const full = qShort(out);
+  return src && out.codec && out.codec === src.codec && out.lossless && out.bit_depth ? full.slice(out.codec.length).trim() : full;
+}
+function outFull(out, src) {
+  if (!out) return "";
+  if (!out.codec && !out.bit_depth && out.sample_rate) return `${out.sample_rate} Hz`;
+  let l = qPlainLabel(out);
+  if (l && src && out.codec && out.codec === src.codec) l = l.replace(new RegExp("^" + out.codec + "\\s*·\\s*", "i"), "");
+  return l || outShort(out, src);
+}
+function bpBadge(o) {
+  if (!o) return "";
+  const text = o.state === "yes" ? "Bit-perfect" : o.state === "no" ? "Not bit-perfect" : "Unknown";
+  return `<span class="bp ${o.state}" title="${esc(bpText(o))}">${text}</span>`;
+}
+// The badge's full sentence (tooltip on the bar, visible text on Now Playing).
+function bpText(o) {
+  if (!o) return "";
+  if (o.state === "yes") return o.label || "Bit-perfect";
+  if (o.state === "no") {
+    if (o.label && /not bit-perfect/i.test(o.label)) return o.label;
+    if (o.label) return `Not bit-perfect — ${o.reason ? o.reason + " (" + o.label + ")" : o.label}`;
+    return `Not bit-perfect${o.reason ? " — " + o.reason : ""}`;
+  }
+  return o.label || "Bit-perfect status unknown";
+}
+
 function streamParts(t) {
   const s = currentStream() || {};
   const q = s.quality || (t && t.quality) || null;
   const src = s.source || {};
   const label = src.label || (t ? (t.library_id || t.service === "local" ? "Library" : serviceLabel(t.service)) : "");
   const instance = label === "Library" ? (src.instance || "") : "";
-  const pill = q && q.label ? `<span class="qpill ${esc(q.tier || "")}">${esc(q.label)}</span>` : "";
-  // Phone-width short form: "FLAC 24/96" (lossless), "AAC 256" (lossy) + a separate Hi-Res pill.
-  let short = "";
-  if (q) {
-    const codec = q.codec || "";
-    const khz = q.sample_rate ? String(Math.round(q.sample_rate / 100) / 10).replace(/\.0$/, "") : "";
-    short = q.lossless && q.bit_depth && khz ? `${codec} ${q.bit_depth}/${khz}` : q.bitrate ? `${codec} ${q.bitrate}` : (codec || "");
-    short = short.trim();
-  }
-  const shortPill = short ? `<span class="qpill q-short ${esc(q.tier === "hires" ? "" : q.tier || "")}">${esc(short)}</span>`
-    + (q.tier === "hires" ? `<span class="qpill hires q-short">Hi-Res</span>` : "") : "";
-  return { label, instance, pill, shortPill, quality: q && q.label ? q.label : "" };
+  const o = outputInfo();
+  const diff = o && outputDiffers(q, o.quality);
+  const tier = tierLabel(q);
+  const tierPill = tier ? `<span class="qpill ${esc(q.tier === "hires" ? "hires" : "lossless")}">${tier}</span>` : "";
+  const full = qPlainLabel(q), short = qShort(q);
+  const arrowFull = diff ? ` → ${esc(outFull(o.quality, q))}` : "";
+  const arrowShort = diff ? ` → ${esc(outShort(o.quality, q))}` : "";
+  return {
+    label, instance, tierPill, badge: bpBadge(o), output: o,
+    qFull: full ? esc(full) + arrowFull : "", qShort: short ? esc(short) + arrowShort : "",
+    quality: full,
+  };
 }
 const nTracks = (n) => (n == null ? "" : `${n} ${n === 1 ? "track" : "tracks"}`);
 const deviceIcon = (d) => (d.host === "browser" ? "computer" : d.kind === "cast" ? "tv" : "speaker");
@@ -1341,6 +1433,7 @@ function renderNowPlaying() {
         <div class="detail-kind" id="np-view-kind">Now Playing</div>
         <h2 class="detail-title" id="np-view-title">${title}</h2>
         <div class="detail-sub" id="np-view-artist">${esc(t.artist || "")}</div>
+        <div class="detail-sub np-album" id="np-view-album">${esc(t.album || "")}</div>
         <div class="np-ctx" id="np-view-ctx"></div>
         <div class="np-q" id="np-view-q"></div>
         <div class="npvol" id="np-view-volrow">
@@ -1390,6 +1483,8 @@ function updateNowPlayingView() {
     const titleEl = $("np-view-title"), artistEl = $("np-view-artist"), artEl = $("np-view-art");
     if (titleEl) titleEl.innerHTML = t.id ? `<a class="link-plain" href="${routeHref("track", t.service, t.id)}">${esc(t.title || "")}</a>` : esc(t.title || "");
     if (artistEl) artistEl.textContent = t.artist || "";
+    const albumEl = $("np-view-album");
+    if (albumEl) albumEl.textContent = t.album || "";
     if (artEl) { artEl.classList.add("fallback"); artEl.innerHTML = ICON("music"); artEl.dataset.art = artOf(t); hydrateArt(artEl.parentElement); }
   }
   highlightPlaying();
@@ -2476,6 +2571,7 @@ const dev = {
   volSetAt: 0,     // user moved the volume recently: don't let a poll yank it back
   holdUntil: 0,    // after a user pause/resume: the server's status lags ~2s, keep ours
   stream: null,    // the snapshot's {quality, source} for the current track
+  output: null,    // the snapshot's {quality, bit_perfect, reason, label}: what the device is fed
 };
 
 // A user action that changes device state optimistically: drop any poll that
@@ -2551,25 +2647,32 @@ function updateMediaSession(t) {
   } catch { /* ignore */ }
 }
 
-// "Playing from …" + source/quality line on the bar and the Now Playing view.
+// Line 4 on the bar and the Now Playing view: "<Library|Qobuz|YouTube Music>
+// [· instance] · <quality> [tier] [bit-perfect badge]" (no "Playing from" prefix). Source quality, then the
+// output quality when it differs ("FLAC 24/192 → 24/96").
 function paintStreamInfo() {
   const t = pq.current();
   const p = t ? streamParts(t) : null;
-  const detail = p ? [p.instance, p.quality].filter(Boolean).join(" · ") : "";
+  const detail = p ? [p.instance, p.qFull.replace(/&amp;/g, "&")].filter(Boolean).join(" · ") : "";
   const bar = $("np-info");
   if (bar) {
-    const html = p ? `<span class="np-from">Playing from ${esc(p.label)}</span>`
-      + (p.instance ? `<span class="np-src"> · ${esc(p.instance)}</span>` : "")
-      + (p.pill ? `<span class="sep"> · </span><span class="np-stream"><span class="q-full">${p.pill}</span>${p.shortPill}</span>` : "") : "";
+    let html = "";
+    if (p) {
+      html = `<span class="np-from">${esc(p.label)}`
+        + (p.instance ? `<span class="np-src"> · ${esc(p.instance)}</span>` : "") + `</span>`
+        + (p.qFull ? `<span class="sep">·</span><span class="np-qt"><span class="q-full">${p.qFull}</span><span class="q-short">${p.qShort}</span></span>` : "")
+        + p.tierPill + p.badge;
+    }
     if (bar.dataset.h !== html) { bar.dataset.h = html; bar.innerHTML = html; }
-    bar.title = p ? `Playing from ${p.label}${detail ? " · " + detail : ""}` : "";
+    bar.title = p ? `${p.label}${detail ? " · " + detail : ""}${p.output ? " — " + bpText(p.output) : ""}` : "";
   }
   const v = $("np-view-ctx");
   if (v) {
-    const vh = p ? `Playing from <strong>${esc(p.label)}</strong>${p.instance ? ` · ${esc(p.instance)}` : ""}` : "";
+    const vh = p ? `<span class="np-from"><strong>${esc(p.label)}</strong>${p.instance ? ` · ${esc(p.instance)}` : ""}</span>`
+      + (p.qFull ? `<span class="sep">·</span><span class="np-qt">${p.qFull}</span>` : "") + p.tierPill + p.badge : "";
     if (v.dataset.h !== vh) { v.dataset.h = vh; v.innerHTML = vh; }
     const vq = $("np-view-q");
-    const qh = (p ? p.pill : "");
+    const qh = p && p.output ? esc(bpText(p.output)) : "";
     if (vq && vq.dataset.h !== qh) { vq.dataset.h = qh; vq.innerHTML = qh; }
   }
 }
@@ -2583,11 +2686,13 @@ function paintCurrent() {
   if (t) {
     $("np-title").textContent = t.title || "";
     $("np-artist").textContent = t.artist || "";
+    $("np-album").textContent = t.album || "";
     $("nowplaying").classList.remove("empty");
     if (key !== _barKey) { setArt(artOf(t)); updateMediaSession(t); }
   } else {
     $("np-title").textContent = "Nothing playing";
     $("np-artist").textContent = "";
+    $("np-album").textContent = "";
     $("nowplaying").classList.add("empty");
     if (key !== _barKey) setArt("");
   }
@@ -2643,7 +2748,7 @@ async function playBrowserAt(i, { seek = 0, autoplay = true } = {}) {
   catch (e) { if (gen === br.gen && !onDevice()) trackFailed(t, e.message); return; }
   if (gen !== br.gen || onDevice()) return;      // superseded (newer play / output switch)
   br.loaded = t;
-  br.info = { quality: r.quality || null, source: r.source || null };
+  br.info = { quality: r.quality || null, source: r.source || null, output: r.output || null };
   audio.src = `/stream/${r.token}${keyParam()}`;
   paintStreamInfo();
   if (seek > 0) {
@@ -2779,6 +2884,7 @@ function applySnapshot(s) {
   if (REPEAT_MODES.includes(s.repeat)) pq.repeat = s.repeat;
   if (s.context !== undefined) pq.context = s.context || null;
   dev.stream = s.stream || null;
+  dev.output = s.output || (s.stream && s.stream.output) || null;
   dev.running = running;
   if (!running || Date.now() >= dev.holdUntil) dev.paused = running && /paus/i.test(s.state || "");
   const cur = pq.current();

@@ -1,5 +1,6 @@
 package io.github.marthofdoom.harmony
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
@@ -60,6 +61,37 @@ fun HiResChip(q: Quality?, modifier: Modifier = Modifier) {
     Surface(shape = RoundedCornerShape(4.dp), color = MaterialTheme.colorScheme.primaryContainer,
         contentColor = MaterialTheme.colorScheme.onPrimaryContainer, modifier = modifier) {
         Text("Hi-Res", style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), maxLines = 1)
+    }
+}
+
+/** The tier chip beside a quality: "Hi-Res" or "Lossless"; nothing for lossy. */
+@Composable
+fun TierChip(q: Quality?, modifier: Modifier = Modifier) {
+    if (q == null) return
+    if (q.isHiRes) { HiResChip(q, modifier); return }
+    if (!q.lossless && q.tier != "lossless") return
+    Surface(shape = RoundedCornerShape(4.dp), color = MaterialTheme.colorScheme.secondaryContainer,
+        contentColor = MaterialTheme.colorScheme.onSecondaryContainer, modifier = modifier) {
+        Text("Lossless", style = MaterialTheme.typography.labelSmall,
+            modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), maxLines = 1)
+    }
+}
+
+/** The bit-perfect badge: filled primary when verified, outlined for "not", dashed-muted
+ *  (outlineVariant + onSurfaceVariant) when unknown. Text always says which — never colour alone. */
+@Composable
+fun BitPerfectBadge(ind: OutputIndicator?, modifier: Modifier = Modifier) {
+    if (ind == null) return
+    val cs = MaterialTheme.colorScheme
+    val (bg, fg, border) = when (ind.state) {
+        BpState.YES -> Triple(cs.primary, cs.onPrimary, null)
+        BpState.NO -> Triple(cs.surface, cs.onSurface, cs.outline)
+        BpState.UNKNOWN -> Triple(cs.surface, cs.onSurfaceVariant, cs.outlineVariant)
+    }
+    Surface(shape = RoundedCornerShape(4.dp), color = bg, contentColor = fg,
+        border = border?.let { BorderStroke(1.dp, it) }, modifier = modifier) {
+        Text(ind.badge, style = MaterialTheme.typography.labelSmall,
             modifier = Modifier.padding(horizontal = 5.dp, vertical = 1.dp), maxLines = 1)
     }
 }

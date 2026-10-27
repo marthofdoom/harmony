@@ -76,15 +76,39 @@ data class SourceInfo(
     }
 }
 
-/** The current stream's source + quality: /api/resolve on the phone, the queue
- *  snapshot's "stream" on a device. */
-data class StreamInfo(val quality: Quality?, val source: SourceInfo?) {
+/** What a network output is actually fed, and whether that is bit-perfect
+ *  (the server's "output" in GET /api/resolve and the device-queue snapshot).
+ *  [bitPerfect] null means the server could not tell. */
+data class OutputInfo(
+    val quality: Quality?,
+    val bitPerfect: Boolean?,
+    val reason: String?,
+    val label: String?,
+) {
     companion object {
-        fun fromJson(o: JSONObject?): StreamInfo? {
+        /** Parse the server's output dict; null when absent. */
+        fun fromJson(o: JSONObject?): OutputInfo? {
             if (o == null) return null
-            val q = Quality.fromJson(o.optJSONObject("quality"))
-            val s = SourceInfo.fromJson(o.optJSONObject("source"))
-            return if (q == null && s == null) null else StreamInfo(q, s)
+            fun str(k: String): String? = if (o.isNull(k)) null else o.optString(k).ifEmpty { null }
+            return OutputInfo(
+                Quality.fromJson(o.optJSONObject("quality")),
+                if (o.isNull("bit_perfect") || !o.has("bit_perfect")) null else o.optBoolean("bit_perfect"),
+                str("reason"), str("label"))
+        }
+    }
+}
+
+/** The current stream's source + quality (+ the output it ends up as): /api/resolve
+ *  on the phone, the queue snapshot's "stream" + "output" on a device. */
+data class StreamInfo(val quality: Quality?, val source: SourceInfo?, val output: OutputInfo? = null) {
+    companion object {
+        /** [o] is the stream/resolve object; [outputFallback] (the snapshot's top-level
+         *  "output") is used when the stream object carries none. */
+        fun fromJson(o: JSONObject?, outputFallback: JSONObject? = null): StreamInfo? {
+            val q = Quality.fromJson(o?.optJSONObject("quality"))
+            val s = SourceInfo.fromJson(o?.optJSONObject("source"))
+            val out = OutputInfo.fromJson(o?.optJSONObject("output") ?: outputFallback)
+            return if (q == null && s == null && out == null) null else StreamInfo(q, s, out)
         }
     }
 }
@@ -109,29 +133,6 @@ data class PlayContext(val kind: String, val title: String, val service: String?
         }
     }
 }
-
-/** The "Library · harmony-server · FLAC · 24-bit / 96 kHz" line for Now Playing.
- *  [fallbackSource] is used when the stream's source is not known yet. */
-fun sourceQualityLine(stream: StreamInfo?, trackQuality: Quality?, fallbackSource: String?): String? {
-    val src = stream?.source
-    val sourceLabel = src?.label?.let { if (it.equals("local", true)) "Library" else it }
-        ?: src?.service?.let { serviceLabel(it) } ?: fallbackSource
-    val instance = src?.instance?.takeIf { src.service == "local" }
-    val q = stream?.quality ?: trackQuality
-    val parts = listOfNotNull(sourceLabel, instance, q?.plainLabel)
-    return parts.joinToString(" · ").ifEmpty { null }
-}
-
-/** The source named after "Playing from": Library / YouTube Music / Qobuz. */
-fun playingFromSource(stream: StreamInfo?, trackService: String?, hasLibraryCopy: Boolean = false): String? {
-    val src = stream?.source
-    val raw = src?.label ?: src?.service
-    if (raw != null) return if (raw.equals("local", true) || raw.equals("library", true)) "Library"
-        else if (src?.label != null) src.label else serviceLabel(raw)
-    if (hasLibraryCopy) return "Library"
-    return trackService?.let { serviceLabel(it) }
-}
-
 
 /** A search context's query. Older versions stored the label ("Search: q" /
  *  "Search “q”") as the title, so strip that. */
