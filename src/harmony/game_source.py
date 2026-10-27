@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlsplit
 
+from harmony.errors import RateLimitedError
 from harmony.streamio import file_url_path, is_file_url
 
 log = logging.getLogger(__name__)
@@ -56,6 +57,9 @@ log = logging.getLogger(__name__)
 # -- limits / constants -----------------------------------------------------------
 
 SOURCES = ("library", "all")
+#: ``sources`` may also be a comma-separated subset of these (canonical order), e.g. "library,ytmusic".
+SOURCE_NAMES = ("library", "ytmusic", "qobuz")
+_SOURCE_SERVICE = {"library": "local", "ytmusic": "ytmusic", "qobuz": "qobuz"}
 #: What a request/profile that sets no ``sources`` means: every ACTIVE source (the
 #: Library when there is one, YouTube Music always, Qobuz only when signed in; an
 #: unusable one is skipped silently). ``"library"`` must be asked for.
@@ -95,8 +99,17 @@ MAX_PROFILES = 32
 MAX_PROFILE_BYTES = 32 * 1024         # one serialised profile
 MAX_PROFILES_BYTES = 256 * 1024       # all stored profiles together
 
-POOL_TTL_S = 600.0            # candidate list refresh interval
+POOL_TTL_S = 600.0            # candidate list refresh interval (library-only pools; also the memo lifetime)
+DEFAULT_STREAM_POOL_TTL_S = 3600.0   # ... for pools with streaming selectors (setting game_stream_pool_ttl_s)
+MIN_STREAM_POOL_TTL_S = 600.0
+MAX_STREAM_POOL_TTL_S = 86400.0
 EMPTY_POOL_RETRY_S = 3.0      # an empty candidate list (Library mid-scan...) is retried this soon
+STREAM_EMPTY_RETRY_S = 30.0   # ... an empty STREAMING list this soon (every try is a web request)
+MAX_PARTIAL_ATTEMPTS = 5      # consecutive partial builds before the fetched-results memo is dropped
+BACKOFF_MIN_S = 30.0          # per-service back-off after a rate limit / BACKOFF_FAILS failures in a row
+BACKOFF_MAX_S = 600.0
+BACKOFF_FAILS = 3
+HISTORY_WARN_S = 600.0        # a history write failure is logged at most this often
 GENRE_CAP = 1000              # library songs pulled for a genre selector
 LIB_SEARCH_LIMIT = 50
 ARTIST_TRACKS = 100
@@ -207,6 +220,23 @@ def validate_selectors(value: Any, path: str) -> dict[str, Any] | list[dict[str,
     return validate_selector(value, path)
 
 
+def normalize_sources(value: Any, path: str) -> str:
+    """``"all"``, ``"library"`` or a comma-separated subset of library/ytmusic/qobuz,
+    returned in canonical order without duplicates (``"qobuz, library,library"`` ->
+    ``"library,qobuz"``)."""
+    if value in SOURCES:
+        return value
+    if not isinstance(value, str):
+        raise _bad(path, 'must be "all", "library" or a comma-separated list of '
+                   f"{', '.join(SOURCE_NAMES)}")
+    names = [n.strip().lower() for n in value.split(",")]
+    bad = [n for n in names if n not in SOURCE_NAMES]
+    if bad:
+        raise _bad(path, f"unknown source {', '.join(repr(n) for n in bad)}; use \"all\", \"library\" or "
+                   f"a comma-separated list of {', '.join(SOURCE_NAMES)}")
+    return ",".join(n for n in SOURCE_NAMES if n in names)
+
+
 def _int_choice(value: Any, choices: tuple[int, ...], path: str) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value not in choices:
         raise _bad(path, f"must be one of {', '.join(map(str, choices))}")
@@ -239,9 +269,7 @@ def validate_profile(data: Any, name: str | None = None) -> dict[str, Any]:
         raise _bad("profile", f"unknown key(s): {', '.join(sorted(map(str, extra)))}")
     if "name" in data and data["name"] != name:
         raise _bad("name", "does not match the profile name in the URL")
-    sources = data.get("sources", DEFAULT_SOURCES)
-    if sources not in SOURCES:
-        raise _bad("sources", 'must be "library" or "all"')
+    sources = normalize_sources(data.get("sources", DEFAULT_SOURCES), "sources")
     types = data.get("types")
     if not isinstance(types, dict) or not 1 <= len(types) <= MAX_TYPES:
         raise _bad("types", f"must be an object mapping 1-{MAX_TYPES} music types to selectors")
@@ -758,7 +786,7 @@ def _song_key(title: Any, artist: Any) -> str:
     return f"{t}|{a}" if t and a else ""
 
 
-_SERVICE_RANK = {"local": 0, "qobuz": 1, "ytmusic": 2}  # which copy of one song wins
+_SERVICE_RANK = {"local": 0}  # which copy of one song wins: the Library's; between streaming services the first seen
 
 
 def _ref(t: Any) -> dict[str, Any] | None:
@@ -811,27 +839,31 @@ class Bag:
     def sync(self, keys: list[tuple[str, str]], served: list[tuple[str, str]] | None = None) -> None:
         """Adopt a (possibly changed) candidate set without restarting the cycle.
 
-        A fresh bag (``served`` = persisted keys, oldest first) starts from the candidates
-        minus the most recently served ones, as many as leave at least ``max(10, size // 4)``
-        in play, and never opens with one of the last few served."""
+        ``served`` is the persisted memory, oldest first. A fresh bag starts with the
+        never-served candidates shuffled, followed by every served one, least recently
+        served first (one full least-recently-served cycle), and never opens with one
+        of the last few served. Later, a newcomer that was served before (a pool that
+        completes after a partial build) joins after the current cycle in the same
+        least-recently-served order; only a truly unseen one is spliced in at random."""
         old = set(self.members)
         new = set(keys)
         self.members = list(dict.fromkeys(keys))
+        history = list(dict.fromkeys([*(served or ()), *self.recent]))   # oldest first
+        rank = {k: i for i, k in enumerate(history)}
         if not old:
-            seen = [k for k in served or () if k in new]
+            seen = [k for k in history if k in new]
             self.recent.extend(seen[-RECENT_MAX:])
-            skip = min(len(seen), max(0, len(self.members) - max(10, len(self.members) // 4)))
-            out = set(seen[len(seen) - skip:]) if skip else set()
-            cycle = self.rng.sample([k for k in self.members if k not in out],
-                                    len(self.members) - len(out))
+            fresh = [k for k in self.members if k not in rank]
+            cycle = self.rng.sample(fresh, len(fresh)) + seen
             self._avoid_first(cycle, seen)
             self.queue = collections.deque(cycle)
             return
         kept = [k for k in self.queue if k in new]
+        later = sorted((k for k in self.members if k not in old and k in rank), key=rank.__getitem__)
         for k in self.members:
-            if k not in old:  # newcomers go to a random spot in what's left
+            if k not in old and k not in rank:  # unseen newcomers go to a random spot in what's left
                 kept.insert(self.rng.randint(0, len(kept)), k)
-        self.queue = collections.deque(kept)
+        self.queue = collections.deque(kept + later)
 
     def _fill(self, n: int) -> None:
         while len(self.queue) < n and self.members:
@@ -894,13 +926,17 @@ class TrackPool:
     def __init__(self, rng: random.Random | None = None) -> None:
         self.lock = threading.Lock()
         self.fingerprint = ""
-        self.built = 0.0
         self.refs: dict[tuple[str, str], dict[str, Any]] = {}
         self.bag = Bag(rng)
         # Streaming results of a budget-truncated build, keyed by request, so the next
         # refresh spends its budget on what is still missing (see GameSource._collect).
         self.memo: dict[tuple, list[Any]] = {}
         self.memo_fp = ""
+        self.memo_at = 0.0
+        self.attempts = 0                 # consecutive partial builds
+        self.expires = 0.0                # monotonic time the candidate list is next refreshed
+        self.refreshing = False           # a background refresh is running (single flight)
+        self.worker: threading.Thread | None = None
 
 
 class History:
@@ -917,6 +953,7 @@ class History:
         self._lock = threading.Lock()
         self._pools: dict[str, dict[str, Any]] | None = None   # loaded lazily
         self._dirty = False
+        self._warned = -HISTORY_WARN_S
 
     def _load(self) -> dict[str, dict[str, Any]]:
         if self._pools is not None:
@@ -938,8 +975,8 @@ class History:
                     t = ent.get("t")
                     pools[pkey] = {"fp": ent["fp"], "served": served,
                                    "t": t if isinstance(t, (int, float)) else 0.0}
-        except (OSError, ValueError):
-            pools = {}   # missing / corrupt: start fresh
+        except Exception:  # noqa: BLE001 - missing / corrupt / absurdly nested (RecursionError): start fresh
+            pools = {}
         self._pools = pools
         return pools
 
@@ -982,7 +1019,7 @@ class History:
         with self._lock:
             pools = self._load()
             gone = [p for p in pools if p.split("/")[0] == profile
-                    and (ttype is None or p.split("/")[1] == ttype)]
+                    and (ttype is None or p.split("/")[1].casefold() == ttype.casefold())]
             for p in gone:
                 del pools[p]
             if gone:
@@ -1000,12 +1037,19 @@ class History:
             try:
                 path = self._path()
                 path.parent.mkdir(parents=True, exist_ok=True)
-                tmp = path.with_name(path.name + ".tmp")
-                tmp.write_text(json.dumps(payload, separators=(",", ":")), "utf-8")
-                os.replace(tmp, path)
+                tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+                try:
+                    tmp.write_text(json.dumps(payload, separators=(",", ":")), "utf-8")
+                    os.replace(tmp, path)
+                except BaseException:
+                    with contextlib.suppress(OSError):
+                        tmp.unlink()
+                    raise
                 self._dirty = False
             except OSError as exc:
-                log.warning("game source: cannot write %s: %s", HISTORY_FILE, exc)
+                if time.monotonic() - self._warned >= HISTORY_WARN_S:
+                    self._warned = time.monotonic()
+                    log.warning("game source: cannot write %s: %s", HISTORY_FILE, exc)
 
 
 # -- the router ---------------------------------------------------------------------
@@ -1072,9 +1116,10 @@ class _Build:
     deadline: float | None = None
     memo: dict[tuple, list[Any]] = field(default_factory=dict)
     partial: bool = False
+    allowed: frozenset[str] | None = None
 
     def run(self, gsrc: GameSource, memokey: tuple, service: str, call: Callable[[], list[Any]]) -> list[Any]:
-        """``call()`` under the provider lock, once per build family: a repeat of a key
+        """``call()`` under the provider lock, once per build: a repeat of a key
         reuses its result; past the deadline or on a failure nothing is fetched / kept
         and the build is marked ``partial``."""
         if memokey in self.memo:
@@ -1082,7 +1127,7 @@ class _Build:
         if self.deadline is not None and time.monotonic() >= self.deadline:
             self.partial = True
             return []
-        got = gsrc._guard(service, call)
+        got = gsrc._stream_call(service, call)
         if got is None:
             self.partial = True
             return []
@@ -1116,6 +1161,8 @@ class GameSource:
         self._meta: collections.OrderedDict[tuple[str, str], dict[str, Any]] = collections.OrderedDict()
         self._meta_lock = threading.Lock()
         self._bad_lock = threading.Lock()
+        self._bo_lock = threading.Lock()
+        self._bo: dict[str, dict[str, float]] = {}   # per-service back-off state
         self._bad: collections.OrderedDict[tuple[str, str], float] = collections.OrderedDict()
         self._now: dict[str, Any] | None = None
         self._history: collections.deque[dict[str, Any]] = collections.deque(maxlen=HISTORY_MAX)
@@ -1215,7 +1262,8 @@ class GameSource:
 
     def _drop_pools(self, name: str, ttype: str | None = None) -> None:
         with self._pools_lock:
-            for k in [k for k in self._pools if k[0] == name and (ttype is None or k[1] == ttype)]:
+            for k in [k for k in self._pools if k[0] == name
+                      and (ttype is None or k[1].casefold() == ttype.casefold())]:
                 del self._pools[k]
 
     def forget_history(self, name: str, ttype: str | None = None) -> dict[str, Any]:
@@ -1223,8 +1271,8 @@ class GameSource:
         validate_name(name)
         if ttype is not None and not TYPE_RE.match(ttype):
             raise GameError(400, "bad_request", '"type" must be a music type name such as "explore"')
+        self._drop_pools(name, ttype)   # the live bags start over too (first, so nothing re-records)
         cleared = self._hist.forget(name, ttype)
-        self._drop_pools(name, ttype)   # the live bags start over too
         return {"ok": True, "profile": name, "type": ttype, "cleared": cleared}
 
     # -- candidate collection ------------------------------------------------------
@@ -1237,6 +1285,43 @@ class GameSource:
         except Exception as exc:  # noqa: BLE001 - one service failing must not sink the pick
             log.info("game source: %s call failed: %s", service, exc)
             return None
+
+    def _stream_call(self, service: str, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
+        """:meth:`_guard` for streaming services plus a back-off: after a rate limit, or
+        :data:`BACKOFF_FAILS` failures in a row, the service gets no game-source requests
+        for 30 s, doubling to 10 min; a success resets it. ``None`` = failed or backing off."""
+        with self._bo_lock:
+            st = self._bo.get(service)
+            if st and time.monotonic() < st["until"]:
+                return None
+        try:
+            with self.engine._plock(service):
+                result = fn(*args, **kw)
+        except Exception as exc:  # noqa: BLE001 - one service failing must not sink the pick
+            log.info("game source: %s call failed: %s", service, exc)
+            with self._bo_lock:
+                st = self._bo.setdefault(service, {"fails": 0.0, "until": 0.0, "delay": BACKOFF_MIN_S})
+                st["fails"] += 1
+                if isinstance(exc, RateLimitedError) or st["fails"] >= BACKOFF_FAILS:
+                    st["until"] = time.monotonic() + st["delay"]
+                    st["delay"] = min(st["delay"] * 2, BACKOFF_MAX_S)
+                    st["fails"] = 0.0
+                    log.info("game source: backing off %s", service)
+            return None
+        with self._bo_lock:
+            self._bo.pop(service, None)
+        return result
+
+    def _excluded(self) -> set[str]:
+        raw = getattr(self._cfg(), "game_excluded_services", None)
+        names = {str(n).strip().lower() for n in raw} if isinstance(raw, (list, tuple, set)) else set()
+        return {_SOURCE_SERVICE.get(n, n) for n in names}
+
+    def _services(self, sources: str) -> frozenset[str]:
+        """The services a ``sources`` value allows, less the server-wide exclusions."""
+        base = set(_SOURCE_SERVICE.values()) if sources == "all" else \
+            {_SOURCE_SERVICE[n] for n in sources.split(",")}
+        return frozenset(base - self._excluded())
 
     def _streaming(self) -> list[tuple[str, Any]]:
         """Streaming providers usable right now: signed in, or public-catalogue
@@ -1270,73 +1355,75 @@ class GameSource:
                 break
         return out
 
-    def _collect_one(self, sel: dict[str, Any], sources: str, ctx: _Build) -> list[Any]:
+    def _collect_one(self, sel: dict[str, Any], allowed: frozenset[str], ctx: _Build) -> list[Any]:
         (kind, arg), = sel.items()
-        lib = self._library()
+        lib = self._library() if "local" in allowed else None
+        streaming = [(svc, prov) for svc, prov in self._streaming() if svc in allowed]
         tracks: list[Any] = []
         if kind == "genre":
             if lib is not None:
                 page = self._guard("local", lib.browse_view, "songs", genre=arg, limit=GENRE_CAP,
                                    order="artist")
                 tracks += (page or {}).get("songs") or []
-            if sources == "all":
-                streaming = self._streaming()
-                # "<genre> music" finds the genre's songs; a few variants widen the net
-                queries = [(f"{arg} music", ctx.depth)]
-                if ctx.variants:
-                    queries += [(q, max(MIN_STREAM_DEPTH, ctx.depth // 2))
-                                for q in (f"best {arg} songs", f"{arg} playlist")]
-                for query, depth in queries:
-                    for svc, prov in streaming:
-                        tracks += self._stream_search(ctx, svc, prov, query, depth)
-                if ctx.variants:  # YouTube Music's Moods & Genres playlists named like the genre
-                    for svc, prov in streaming:
-                        mood = getattr(prov, "genre_playlist_tracks", None)
-                        if mood is not None:
-                            tracks += ctx.run(self, (svc, "mood", arg), svc, lambda m=mood: list(
-                                m(arg, playlists=MOOD_PLAYLISTS, per_playlist=MOOD_TRACKS)))
+            # "<genre> music" finds the genre's songs; a few variants widen the net
+            queries = [(f"{arg} music", ctx.depth)]
+            if ctx.variants:
+                queries += [(q, max(MIN_STREAM_DEPTH, ctx.depth // 2))
+                            for q in (f"best {arg} songs", f"{arg} playlist")]
+            for query, depth in queries:
+                for svc, prov in streaming:
+                    tracks += self._stream_search(ctx, svc, prov, query, depth)
+            if ctx.variants:  # YouTube Music's Moods & Genres playlists named like the genre
+                for svc, prov in streaming:
+                    mood = getattr(prov, "genre_playlist_tracks", None)
+                    if mood is not None:
+                        tracks += ctx.run(self, (svc, "mood", arg), svc, lambda m=mood: list(
+                            m(arg, playlists=MOOD_PLAYLISTS, per_playlist=MOOD_TRACKS)))
         elif kind == "query":
             if lib is not None:
                 r = self._guard("local", lib.search, arg, kinds=("tracks",), limit=LIB_SEARCH_LIMIT)
                 tracks += list(getattr(r, "tracks", None) or [])
-            if sources == "all":
-                for svc, prov in self._streaming():
-                    tracks += self._stream_search(ctx, svc, prov, arg, ctx.depth)
+            for svc, prov in streaming:
+                tracks += self._stream_search(ctx, svc, prov, arg, ctx.depth)
         else:  # playlist / album / artist: an exact service + id
             service, item_id = arg["service"], arg["id"]
             if service == "local":
                 prov = lib
-            elif sources == "all":
-                prov = dict(self._streaming()).get(service)
+            elif service in allowed:
+                prov = dict(streaming).get(service)
             else:
-                log.info("game source: sources=library skips %s selector for %s", kind, service)
+                log.info("game source: sources=%s skips %s selector for %s", ",".join(sorted(allowed)), kind, service)
                 prov = None
             if prov is not None:
                 fn = {"playlist": prov.get_playlist_tracks, "album": prov.get_album_tracks,
                       "artist": lambda i: prov.get_artist_top_tracks(i, limit=ARTIST_TRACKS)}[kind]
-                tracks += self._guard(service, fn, item_id) or []
+                got = (self._guard if service == "local" else self._stream_call)(service, fn, item_id)
+                if got is None and service != "local":
+                    ctx.partial = True
+                tracks += got or []
         return tracks
 
     def _collect(self, selectors: list[dict[str, Any]], sources: str,
                  ctx: _Build | None = None) -> dict[tuple[str, str], dict[str, Any]]:
         ctx = ctx or _Build(depth=self._stream_depth(), variants=False)
+        allowed = ctx.allowed if ctx.allowed is not None else self._services(sources)
         by_song: dict[str, dict[str, Any]] = {}
         order: list[dict[str, Any]] = []
         for sel in selectors:
-            for t in self._collect_one(sel, sources, ctx):
+            for t in self._collect_one(sel, allowed, ctx):
                 ref = _ref(t)
-                if ref is None or (sources == "library" and ref["service"] != "local"):
+                if ref is None or ref["service"] not in allowed:
                     continue
                 dur = ref["duration_s"]
                 if ref["service"] != "local" and isinstance(dur, (int, float)) and dur \
                         and not STREAM_MIN_S <= dur <= STREAM_MAX_S:
                     continue
                 # One song once, even if the Library and a service (or two query variants)
-                # both have it: Library > Qobuz > YouTube Music, so a "repeat" can't hide as a twin.
+                # both have it: the Library copy wins, else the first seen, so a "repeat" can't hide as a twin.
                 song = _song_key(ref["title"], ref["artist"])
                 if song and song in by_song:
                     kept = by_song[song]
-                    if _SERVICE_RANK.get(ref["service"], 9) < _SERVICE_RANK.get(kept["service"], 9):
+                    if _SERVICE_RANK.get(ref["service"], 1) < _SERVICE_RANK.get(kept["service"], 1):
                         kept.update(ref)
                     continue
                 if song:
@@ -1344,37 +1431,111 @@ class GameSource:
                 order.append(ref)
         return {(r["service"], r["id"]): r for r in order}
 
+    def _stream_pool_ttl(self) -> float:
+        try:
+            n = float(getattr(self._cfg(), "game_stream_pool_ttl_s", DEFAULT_STREAM_POOL_TTL_S))
+        except (TypeError, ValueError):
+            n = DEFAULT_STREAM_POOL_TTL_S
+        return min(MAX_STREAM_POOL_TTL_S, max(MIN_STREAM_POOL_TTL_S, n))
+
+    @staticmethod
+    def _has_streaming(selectors: list[dict[str, Any]], allowed: frozenset[str]) -> bool:
+        stream = allowed - {"local"}
+        for sel in selectors:
+            (kind, arg), = sel.items()
+            if stream and (kind in ("genre", "query") or arg["service"] in stream):
+                return True
+        return False
+
+    def _new_build(self, pool: TrackPool, fp: str, allowed: frozenset[str]) -> _Build:
+        fresh = pool.memo_fp == fp and time.monotonic() - pool.memo_at <= POOL_TTL_S
+        return _Build(depth=self._stream_depth(),
+                      variants=bool(getattr(self._cfg(), "game_genre_variants", True)),
+                      memo=pool.memo if fresh else {}, allowed=allowed)
+
+    def _apply(self, pool: TrackPool, key: tuple[str, str, str], fp: str,
+               refs: dict[tuple[str, str], dict[str, Any]], ctx: _Build, ttl: float, streaming: bool) -> None:
+        """Swap a finished build into ``pool`` (the caller holds ``pool.lock``)."""
+        now = time.monotonic()
+        same = fp == pool.fingerprint
+        # A partial rebuild never shrinks a pool we already have.
+        if refs and ctx.partial and same and len(refs) < len(pool.refs):
+            refs = {}
+        got = bool(refs)
+        if refs or not same:
+            pool.refs = refs
+            pool.bag.sync(list(refs), self._hist.served("/".join(key), fp))
+            pool.fingerprint = fp
+        # The memo of fetched results lives across consecutive partial builds (so each
+        # one finishes what the last could not), but not forever: it is dropped after
+        # MAX_PARTIAL_ATTEMPTS builds or POOL_TTL_S, so a call that keeps failing cannot
+        # freeze the successful ones.
+        pool.attempts = pool.attempts + 1 if ctx.partial else 0
+        if ctx.partial and pool.attempts < MAX_PARTIAL_ATTEMPTS:
+            if pool.memo_fp != fp or not pool.memo:
+                pool.memo_at = now
+            pool.memo, pool.memo_fp = ctx.memo, fp
+        else:
+            pool.memo, pool.memo_fp, pool.attempts = {}, "", 0
+        # An empty refresh of an unchanged selector keeps the old pool (a service blip
+        # must not silence the game's music). Retries: a partial list after a minute,
+        # an empty STREAMING list after 30 s, an empty library list (mid-scan) after a few seconds.
+        if ctx.partial:
+            retry = PARTIAL_POOL_RETRY_S
+        elif not got:
+            retry = STREAM_EMPTY_RETRY_S if streaming else EMPTY_POOL_RETRY_S
+        else:
+            retry = ttl
+        pool.expires = now + retry
+
+    def _refresh_async(self, pool: TrackPool, key: tuple[str, str, str], fp: str,
+                       selectors: list[dict[str, Any]], sources: str, ttl: float,
+                       allowed: frozenset[str]) -> None:
+        """Rebuild an already-populated streaming pool in ONE daemon thread (the caller holds
+        ``pool.lock``); ``next`` keeps serving the old candidates meanwhile."""
+        if pool.refreshing:
+            return
+        pool.refreshing = True
+        ctx = self._new_build(pool, fp, allowed)
+
+        def run() -> None:
+            try:
+                ctx.deadline = time.monotonic() + STREAM_BUDGET_S
+                refs = self._collect(selectors, sources, ctx)
+                with pool.lock:
+                    if pool.fingerprint == fp:
+                        self._apply(pool, key, fp, refs, ctx, ttl, True)
+            except Exception as exc:  # noqa: BLE001 - never leave the pool without a retry
+                log.warning("game source: background pool refresh failed: %s", exc)
+                with pool.lock:
+                    pool.expires = time.monotonic() + PARTIAL_POOL_RETRY_S
+            finally:
+                with pool.lock:
+                    pool.refreshing = False
+
+        pool.worker = threading.Thread(target=run, daemon=True, name="game-pool-refresh")
+        pool.worker.start()
+
     def _pool(self, name: str, ttype: str, sources: str, selectors: list[dict[str, Any]]) -> TrackPool:
         key = (name, ttype, sources)
         with self._pools_lock:
             pool = self._pools.get(key)
             if pool is None:
                 pool = self._pools[key] = TrackPool(self.rng_factory())
-        fp = hashlib.sha256(json.dumps([selectors, sources], sort_keys=True).encode()).hexdigest()
+        allowed = self._services(sources)
+        fp = hashlib.sha256(json.dumps([selectors, sources, sorted(allowed)], sort_keys=True).encode()).hexdigest()
+        streaming = self._has_streaming(selectors, allowed)
+        ttl = self._stream_pool_ttl() if streaming else POOL_TTL_S
         with pool.lock:
-            stale = fp != pool.fingerprint or time.monotonic() - pool.built > POOL_TTL_S
-            if stale:
-                ctx = _Build(depth=self._stream_depth(), variants=bool(
-                    getattr(self._cfg(), "game_genre_variants", True)),
-                    deadline=time.monotonic() + STREAM_BUDGET_S,
-                    memo=pool.memo if pool.memo_fp == fp else {})
-                refs = self._collect(selectors, sources, ctx)
-                # A budget-truncated (or partly failed) rebuild never shrinks a pool we already have.
-                if refs and ctx.partial and fp == pool.fingerprint and len(refs) < len(pool.refs):
-                    refs = {}
-                if refs or fp != pool.fingerprint:
-                    pool.refs = refs
-                    pool.bag.sync(list(refs), self._hist.served("/".join(key), fp))
-                    pool.fingerprint = fp
-                pool.memo, pool.memo_fp = (ctx.memo, fp) if ctx.partial else ({}, "")
-                # An empty refresh of an unchanged selector keeps the old pool
-                # (a service blip must not silence the game's music).
-                # (An empty list -- Library mid-scan, a service blip -- is retried after
-                # a few seconds rather than being cached for the full TTL; a partial one
-                # after a minute, finishing from what the failed attempt already fetched.)
-                now = time.monotonic()
-                pool.built = (now - POOL_TTL_S + EMPTY_POOL_RETRY_S if not refs else
-                              now - POOL_TTL_S + PARTIAL_POOL_RETRY_S if ctx.partial else now)
+            same = fp == pool.fingerprint
+            if same and time.monotonic() < pool.expires:
+                return pool
+            if same and streaming and pool.refs:   # stale-while-revalidate
+                self._refresh_async(pool, key, fp, selectors, sources, ttl, allowed)
+                return pool
+            ctx = self._new_build(pool, fp, allowed)   # a cold build (or a library pool) is synchronous
+            ctx.deadline = time.monotonic() + STREAM_BUDGET_S
+            self._apply(pool, key, fp, self._collect(selectors, sources, ctx), ctx, ttl, streaming)
         return pool
 
     # -- next ---------------------------------------------------------------------
@@ -1446,7 +1607,7 @@ class GameSource:
         """Candidate records -> API tracks (streaming ones swapped for the
         Library's copy when the engine has one, per the library-preferred setting)."""
         swap: dict[int, Any] = {}
-        if sources == "all" and self.engine._library_preferred():
+        if "local" in self._services(sources) and self.engine._library_preferred():
             todo = [i for i, r in enumerate(refs) if r["service"] != "local" and r["title"]]
             if todo:
                 try:
@@ -1498,9 +1659,10 @@ class GameSource:
         if "container" in body:  # the request overrides the profile's format.container
             container = _container_arg(body["container"])
             profile = {**profile, "format": {**profile["format"], "container": container}}
-        sources = body.get("sources", profile["sources"])
-        if sources not in SOURCES:
-            raise GameError(400, "bad_request", '"sources" must be "library" or "all"')
+        try:
+            sources = normalize_sources(body.get("sources", profile["sources"]), "sources")
+        except GameError as exc:
+            raise GameError(400, "bad_request", exc.message) from exc
         ttype = self._resolve_type(profile, requested)
         selectors = selectors_of(profile["types"][ttype])
         pool = self._pool(name, ttype, sources, selectors)
@@ -1512,8 +1674,9 @@ class GameSource:
                                   [(r["service"], r["id"]) for r in refs])
         self._hist.flush()
         if not refs:
-            hint = (" (sources=library: is the Library enabled and does it hold matching music?)"
-                    if sources == "library" else "")
+            hint = (f" (sources={sources}: is the Library enabled and does it hold matching music?)"
+                    if sources == "library" else f" (sources={sources}; services excluded or signed out are skipped)"
+                    if sources != "all" else "")
             raise GameError(404, "no_tracks", f"no playable tracks for type {ttype!r}{hint}")
         return {"profile": name, "type": ttype, "requested_type": requested, "sources": sources,
                 "peek": peek, "pool_size": size, "tracks": self._publish(refs, sources, profile)}
@@ -1557,7 +1720,22 @@ class GameSource:
                 "history": [{k: h.get(k) for k in ("profile", "type", "service", "id", "title",
                                                    "artist", "started_at")}
                             for h in list(self._history)[:20]],
-                "profiles": sorted(self._stored())}
+                "profiles": sorted(self._stored()),
+                "services": self._usable_services(),
+                "excluded_services": sorted(n for n in SOURCE_NAMES if _SOURCE_SERVICE[n] in self._excluded())}
+
+    def _usable_services(self) -> dict[str, bool]:
+        """Which sources a ``sources`` of "all" would use right now."""
+        excluded = self._excluded()
+        out = {"library": False, "ytmusic": False, "qobuz": False}
+        lib = self._library() if "local" not in excluded else None
+        if lib is not None:
+            page = self._guard("local", lib.browse_view, "songs", limit=1)
+            out["library"] = bool((page or {}).get("total") or (page or {}).get("songs"))
+        live = {svc for svc, _p in self._streaming()}
+        out["ytmusic"] = "ytmusic" in live and "ytmusic" not in excluded
+        out["qobuz"] = "qobuz" in live and "qobuz" not in excluded
+        return out
 
     # -- audio --------------------------------------------------------------------------
 

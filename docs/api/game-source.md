@@ -95,16 +95,26 @@ K='X-Harmony-Key: my-personal-key'   # omit -H "$K" if no key is set
 
 ## Concepts
 
-### Sources: `all` (default) or `library`
+### Sources: `all` (default), `library` or a list
 
 **`sources` defaults to every active source** (`all`); pass `sources=library`
-to stay in your Library. Every request can be addressed to one of two source
-sets:
+to stay in your Library, or a comma-separated subset of `library`, `ytmusic`,
+`qobuz` such as `"library,ytmusic"` (no Qobuz). Every request can be addressed to
+one of these source sets:
 
 | `sources` | Where tracks come from |
 |-----------|------------------------|
 | `library` | **Only the Library**: this instance's own music folders plus every key-matching federated peer's Library. No streaming service is contacted. |
 | `all` (default) | Every **active** source: the Library (if there is one), YouTube Music (**signed in or not**: its public catalogue works with no account) and Qobuz (only when signed in). A source that is not usable (no Library, Qobuz signed out) is skipped silently. A streaming track the Library also has is replaced by the Library copy (the same *library preferred* matching the apps use, `library_preferred` setting), and a song the Library and a service both list appears once. |
+
+| `library,ytmusic`, `ytmusic`, `qobuz,ytmusic`... | Exactly the named services (still skipped silently when unusable). The names are normalised to the order `library,ytmusic,qobuz` without duplicates and are case-insensitive, so `"Qobuz, library,library"` is `"library,qobuz"`. An unknown name, an empty entry or `all` inside a list is a `400` naming the path (`sources: unknown source 'spotify'; ...`). Pools, the bag and the [no-repeat memory](#no-repeat-memory) are keyed by the normalised value. |
+
+**Excluding a service server-wide.** The `game_excluded_services` setting (a list
+of `"library"`, `"ytmusic"`, `"qobuz"`, default empty) removes services from
+`all` and from every list, whatever the client asks for (a Qobuz account that
+only serves 30 s previews: exclude `qobuz` once on the server). Changing it
+rebuilds the affected pools. `GET /api/game/status` reports what is usable
+right now.
 
 The value comes from the request's `sources` field if given, else the
 profile's `sources`, else `"all"`. (Profiles saved while the default was
@@ -136,7 +146,7 @@ one mod list) wants to hear. Profiles live in Harmony's settings
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `sources` | `"library"` \| `"all"` | `"all"` | Default source set for this profile: every active source, or only the Library. |
+| `sources` | `"library"` \| `"all"` \| list | `"all"` | Default [source set](#sources-all-default-library-or-a-list) for this profile: every active source, only the Library, or e.g. `"library,ytmusic"`. |
 | `types` | object | required, 1-64 entries | Music type name -> [selector](#selectors). Names are 1-64 characters of letters, digits, `_`, `-`, `.` (starting with a letter or digit). |
 | `format.rate` | `44100` \| `48000` | `48000` | WAV sample rate (Hz). |
 | `format.bits` | `16` \| `24` | `16` | Bits per sample. |
@@ -175,15 +185,27 @@ the apps and `/api/search` return. With `sources=library`, a selector that names
 a streaming service contributes nothing (it is skipped, not an error); if a type
 ends up with no tracks at all, `next` answers `404 no_tracks`.
 
-Candidate lists are cached in memory for 10 minutes (and rebuilt immediately
-when the profile is edited), so a busy game does not search on every request.
-An **empty** list (the Library is still being scanned, a service blipped) is
-only cached for about 3 seconds, so music appears as soon as the scan finishes.
+Candidate lists are cached in memory (and rebuilt immediately when the profile
+is edited), so a busy game does not search on every request. A list with only
+Library selectors is refreshed every 10 minutes; one with **streaming** selectors
+every `game_stream_pool_ttl_s` seconds (default 3600, clamped 600-86400), and that
+refresh is **stale-while-revalidate**: `next` keeps serving the existing
+candidates immediately while ONE background thread per pool rebuilds the list and
+swaps it in (the bag keeps its cycle; see [the bag](#the-bag)). Only a **cold**
+build (nothing cached yet: first request after a start, a profile edit or a
+changed `sources`/exclusion) is synchronous. An **empty** Library list (still
+being scanned) is retried after about 3 seconds; an empty streaming list after 30
+seconds.
+
+**Timeouts for clients.** A cold streaming build can make `next` take **10-12
+seconds** (the 8 s request budget plus the call in flight), so give `next` a timeout of
+**at least 30 seconds** (later calls answer in milliseconds). To avoid a long
+first wait, call `next` with `"peek": true` for each music type at game start.
 
 ### Candidate depth
 
 A streaming search used to give about 25 tracks per service. For `genre` and
-`query` selectors with `sources=all` Harmony now asks for
+`query` selectors that include streaming services Harmony now asks for
 `game_stream_search_limit` tracks (default 100, clamped to 10-300) per query:
 
 - **YouTube Music**: one search with that `limit` (ytmusicapi follows the result
@@ -200,14 +222,31 @@ A streaming search used to give about 25 tracks per service. For `genre` and
 - **Time budget**: a candidate build spends at most about 8 seconds on streaming
   requests (a request already running is not interrupted). If the budget runs
   out or a service call fails, the pool is built from what arrived and rebuilt
-  after **about 60 seconds** (not 10 minutes), reusing the results already
-  fetched, so it completes over the next refreshes. A partial rebuild never
-  makes an existing pool smaller.
-- Requests are sequential and go through the same per-service locks as before; no
-  extra concurrency.
+  after exactly **60 seconds** (instead of the normal TTL), reusing the results
+  already fetched, so it completes over the next refreshes. That reuse stops after
+  5 consecutive partial builds or 10 minutes (the fetched results are dropped and
+  fetched afresh), so one call that keeps failing cannot freeze the rest. A
+  partial rebuild never makes an existing pool smaller; tracks that arrive late
+  and were served before the restart are queued behind the current cycle, least
+  recently served first (see [no-repeat memory](#no-repeat-memory)).
+- Requests are sequential (never parallel) within a build. **Be aware:** every
+  streaming call holds the engine-wide provider lock (the same lock the app's
+  own YouTube Music / Qobuz calls take), so while a build runs the UI's provider
+  calls wait their turn behind each search; this is why warm refreshes are done in
+  the background and spread out by the long TTL.
+- **Back-off and request rate.** After a rate-limit error, or 3 failures in a
+  row, a service gets no game-source requests for 30 s, doubling to 10 minutes
+  on each repeat; one success resets it. This covers every search, playlist,
+  album and artist call the game source makes. Worst case without failures:
+  one build per pool per TTL, and a build is at most ~3 searches per streaming
+  service (genre: primary, 2 variants; Qobuz in pages of 50), plus the mood
+  lookup (2 browse requests + up to 3 playlist requests) on YouTube Music, each
+  YouTube search being several continuation requests. With the defaults that is
+  well under 100 YouTube requests per genre type per hour; a partly failing
+  build is retried every 60 s but gated by the back-off.
 
 **One song once.** Within a candidate list, tracks with the same normalised
-(artist, title) collapse to one, preferring **Library > Qobuz > YouTube Music**.
+(artist, title) collapse to one, preferring the **Library** copy; between two streaming services the one seen first is kept.
 Normalisation is conservative: case, punctuation and spacing are ignored, and
 only pure noise tags are dropped: `(Official Video)`, `[Official Audio]`,
 `(Remastered)` / `- 2011 Remaster`, `(feat. X)` / `ft. X`, and a YouTube
@@ -222,7 +261,9 @@ candidate track is served once, in random order, before any repeats; when the
 bag is empty it is reshuffled, and the first track of the new cycle is never
 the last one of the previous cycle (when there is more than one track). A type
 with a single playable track simply repeats it. The cycle is
-[remembered across restarts](#no-repeat-memory).
+[remembered across restarts](#no-repeat-memory). When a refresh adds candidates,
+unseen ones are shuffled into the rest of the cycle, ones served before wait
+behind it.
 
 The first track of a reshuffled cycle is also never one of the last
 `min(50, pool_size / 2)` tracks served.
@@ -238,18 +279,19 @@ oldest first, written atomically after every consuming `next`. Bounds: the last
 first). A missing, unreadable or corrupt file is ignored (start fresh); a file that
 cannot be written is only logged.
 
-When a pool is (re)built, for example after a restart, its bag starts from the
-candidates **minus the most recently served ones**, as many as leave at least
-`max(10, pool_size / 4)` candidates in play; when everything was served, that
-keeps the *oldest* quarter and replays those first (so a restart mid-way through
-a big pool does not replay what you just heard, even after the first full pass).
-`"peek": true` never writes memory.
+When a pool is built cold, for example after a restart, its first cycle is the
+never-served candidates (shuffled) followed by **every served one, least
+recently served first**, so nothing you just heard comes back before everything
+else has played (no floor; also true after the first full pass through a big
+pool). A track that arrives later (a pool completed after a partial build) is
+queued the same way if it was served before. `"peek": true` never writes memory.
 
 Editing the selectors (or `sources`) of a music type resets that type's memory
 (the fingerprint changes); editing other types or the format keeps it.
 **Reset it** by `DELETE /api/game/profiles/<name>` (clears the profile's
 memory), by `DELETE /api/game/history?profile=<name>[&type=<type>]`
-(`{"ok": true, "cleared": <pools>}`; also restarts the live bags), by deleting the
+(`{"ok": true, "cleared": <pools>}`; `type` is matched case-insensitively; also
+restarts the live bags), by deleting the
 file, or by setting `game_history_enabled` to `false` (no memory is read or
 written).
 
@@ -326,7 +368,7 @@ Pick the next track(s) for a music type.
 |-------|----------|---------|
 | `profile` | yes | Profile name. |
 | `type` | yes | Music type (falls back to the profile's `default`). |
-| `sources` | no | `"library"` or `"all"`; overrides the profile's (default `"all"`, every active source). |
+| `sources` | no | `"library"`, `"all"` or a comma-separated list such as `"library,ytmusic"`; overrides the profile's (default `"all"`, every active source). The response echoes the normalised value. |
 | `count` | no | 1-10 (default 1): how many tracks to return **and consume**. |
 | `peek` | no | `true` returns the next `count` tracks **without consuming** them (default `false`). |
 | `container` | no | `"wav"` or `"flac"`; overrides the profile's `format.container` (default `"wav"`). It only decides the extension of `audio_url`. |
@@ -437,7 +479,9 @@ curl -H "$K" $H/api/game/status
                   "title": "Slow Fog", "age_s": 12.4, "...": "..."},
   "history": [{"profile": "skyrim", "type": "explore", "service": "local", "id": "87fbeaab3e0ef480",
                "title": "Slow Fog", "artist": "Ambient Artist", "started_at": 1793079882.0}],
-  "profiles": ["skyrim"]
+  "profiles": ["skyrim"],
+  "services": {"library": true, "ytmusic": true, "qobuz": false},
+  "excluded_services": ["qobuz"]
 }
 ```
 
@@ -447,7 +491,10 @@ server can produce (`.wav` and `.flac` downloads, the `container` option of
 `next`; a server without the field only does WAV, so a client should treat a
 missing `containers` as `["wav"]`), `cache` is the audio cache (`bytes` of finished
 files, `in_progress_bytes` of half-written ones, `cap` in bytes),
-`history` the last 20 `playing` records.
+`history` the last 20 `playing` records. `services` says which sources `sources: "all"`
+would use right now: the Library when it is enabled and non-empty, YouTube Music
+always, Qobuz only when signed in; a service in `excluded_services` (setting
+`game_excluded_services`) is always `false`.
 
 ## WAV format
 
@@ -641,6 +688,8 @@ In Harmony's `settings.json` (managed by the server; edit with the server stoppe
 | `game_stream_search_limit` | `100` | Tracks fetched per streaming query for `genre`/`query` selectors (clamped 10-300; [details](#candidate-depth)). |
 | `game_genre_variants` | `true` | Extra `genre` query variants and YouTube Music mood playlists. |
 | `game_history_enabled` | `true` | Persist the [no-repeat memory](#no-repeat-memory) (`game-history.json`). |
+| `game_stream_pool_ttl_s` | `3600` | Seconds before a candidate list with streaming selectors is refreshed in the background (clamped 600-86400; Library-only lists: 600). |
+| `game_excluded_services` | `[]` | Services removed from `all` and from every `sources` list: any of `"library"`, `"ytmusic"`, `"qobuz"`. |
 
 ffmpeg is required: the `.deb` depends on it, and the Flatpak's GNOME runtime
 ships `/usr/bin/ffmpeg` (verified: 7.1 with `loudnorm`, `silenceremove`, and the

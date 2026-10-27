@@ -8,6 +8,7 @@ before the user has signed in.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -502,12 +503,18 @@ class YTMusicProvider(MusicProvider):
         self, genre: str, *, playlists: int = 3, per_playlist: int = 50
     ) -> list[Track]:
         """Tracks of the "Moods & Genres" playlists whose category title is ``genre``
-        (case-insensitive). Both browse calls are public (no sign-in)."""
-        want = genre.strip().casefold()
+        (case, hyphen and spacing ignored). Both browse calls are public (no sign-in).
+        ``[]`` when no category matches; a changed page layout makes ytmusicapi raise
+        (KeyError...), which the game source counts as a failed call."""
+
+        def fold(text: str) -> str:  # case, hyphens and spacing don't matter ("hip hop" == "Hip-Hop")
+            return " ".join(re.sub(r"[\W_]+", " ", text.casefold()).split())
+
+        want = fold(genre)
         params = None
         for section in self._call(self._yt.get_mood_categories).values():
             for cat in section:
-                if (cat.get("title") or "").strip().casefold() == want:
+                if want and fold(cat.get("title") or "") == want:
                     params = cat.get("params")
                     break
             if params:

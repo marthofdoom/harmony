@@ -227,6 +227,12 @@ class Settings:
     game_stream_search_limit: int = 100
     game_genre_variants: bool = True
     game_history_enabled: bool = True
+    # Seconds a candidate list with streaming selectors is kept before a background
+    # refresh (clamped 600-86400 when read); library-only lists refresh every 600 s.
+    game_stream_pool_ttl_s: int = 3600
+    # Services removed from the game source's ``sources`` ("all" and lists):
+    # any of "library", "ytmusic", "qobuz".
+    game_excluded_services: list[str] = field(default_factory=list)
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its
