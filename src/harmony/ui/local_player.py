@@ -106,6 +106,9 @@ class LocalPlayer:
         # lags this (async state changes, buffering); status() reports the intent.
         self._intent = "stopped"
         self._buffering = False
+        # True from a load that started PAUSED until the pipeline first plays: its
+        # sink was prerolled but never started (see _to_null).
+        self._never_played = False
         self._headers: dict[str, str] = {}
         self._sink: object | None = None
         self._logged_format = False
@@ -149,6 +152,7 @@ class LocalPlayer:
         log.warning("local player error: %s", err)
         self._intent = "stopped"
         self._buffering = False
+        self._never_played = False  # an errored pipeline has no live sink to protect
         self._playbin.set_state(Gst.State.NULL)
         if self._on_error is not None:
             self._on_error(str(err))
@@ -225,8 +229,9 @@ class LocalPlayer:
         self._headers = dict(headers or {})
         self._logged_format = False
         self._buffering = False
-        self._playbin.set_state(Gst.State.NULL)
+        self._to_null()
         self._playbin.set_property("uri", url)
+        self._never_played = paused
         self._intent = "paused" if paused else "playing"
         self._playbin.set_state(Gst.State.PAUSED if paused else Gst.State.PLAYING)
 
@@ -236,15 +241,38 @@ class LocalPlayer:
 
     def resume(self) -> None:
         self._intent = "playing"
+        self._never_played = False
         # Mid-buffering the pipeline is held in PAUSED on purpose; the buffering
         # handler starts it when the queue is full.
         if not self._buffering:
             self._playbin.set_state(Gst.State.PLAYING)
 
+    def _to_null(self) -> None:
+        """Tear the pipeline down to NULL.
+
+        A pipewiresink that was prerolled in PAUSED but never started (a track
+        loaded paused, e.g. Pause pressed while it resolved) blocks forever when
+        taken back down to READY/NULL -- freezing the whole UI on Stop / next
+        track. Starting it first (muted, so nothing is heard) lets it shut down."""
+        pb = self._playbin
+        if self._never_played:
+            self._never_played = False
+            _ret, current, _pending = pb.get_state(0)
+            if current == Gst.State.PAUSED:
+                pb.set_property("mute", True)
+                try:
+                    pb.set_state(Gst.State.PLAYING)
+                    pb.get_state(Gst.SECOND // 2)
+                    pb.set_state(Gst.State.NULL)
+                finally:
+                    pb.set_property("mute", False)
+                return
+        pb.set_state(Gst.State.NULL)
+
     def stop(self) -> None:
         self._intent = "stopped"
         self._buffering = False
-        self._playbin.set_state(Gst.State.NULL)
+        self._to_null()
 
     def seek(self, position_s: int) -> bool:
         """Seek to ``position_s``. Returns False when GStreamer refuses (e.g. a

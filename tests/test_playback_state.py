@@ -100,6 +100,7 @@ def player() -> LocalPlayer:
     p._on_change = None
     p._intent = "stopped"
     p._buffering = False
+    p._never_played = False
     p._headers = {}
     p._sink = None
     p._logged_format = False
@@ -138,6 +139,31 @@ def test_load_paused_starts_paused(player: LocalPlayer) -> None:
     player.load_and_play("u", paused=True)
     assert player._playbin.calls[-1] == Gst.State.PAUSED
     assert player.status().state == "paused"
+
+
+def test_stopping_a_never_started_paused_load_starts_it_muted_first(player: LocalPlayer) -> None:
+    """A track loaded paused (Pause pressed during its resolve) leaves pipewiresink
+    prerolled but never started; taking that down to NULL deadlocks the main
+    thread (Stop froze the UI). It is started muted first, then shut down."""
+    player.load_and_play("u", paused=True)
+    player._playbin.current = Gst.State.PAUSED  # prerolled
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+    assert player._playbin.props["mute"] is False  # never left muted
+    # a pipeline that did play (or was resumed) goes straight down
+    player.load_and_play("u")
+    player._playbin.current = Gst.State.PLAYING
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.NULL]
+    player.load_and_play("u", paused=True)
+    player.resume()
+    player._playbin.current = Gst.State.PLAYING
+    player._playbin.calls.clear()
+    player.pause()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PAUSED, Gst.State.NULL]
 
 
 def test_buffering_holds_pipeline_but_keeps_intent(player: LocalPlayer) -> None:
@@ -366,7 +392,8 @@ def test_start_local_goes_loading_then_player_decides(state: AppState, monkeypat
                         )
     state.queue.load([_track(1)], 0)
     state._start_local(0)
-    assert fake.calls == [("load", "http://x/t1", False)]
+    # the previous pipeline is silenced when the resolve begins, then the new one loads
+    assert fake.calls == ["stop", ("load", "http://x/t1", False)]
     assert state._local_resolving is False
     assert state.playback.state == "loading"
     state._poll_tick = 0
@@ -396,6 +423,62 @@ def test_pause_while_resolving_starts_paused(state: AppState, monkeypatch) -> No
     assert state.playback.state == "paused"
 
 
+def _slow_resolve(state: AppState, monkeypatch, fake: FakeLocal) -> dict:
+    captured: dict = {}
+    monkeypatch.setattr(state_mod, "run_async",
+                        lambda work, done=None, failed=None, *a, **k: captured.update(
+                            work=work, done=done))
+    state._local_player = fake
+    state.providers = {Service.YTMUSIC: _Prov()}
+    monkeypatch.setattr(state, "_engine", lambda: (_ for _ in ()).throw(RuntimeError("no")))
+    state.queue.load([_track(1), _track(2)], 0)
+    return captured
+
+
+def test_transport_while_resolving_never_touches_the_old_pipeline(state: AppState, monkeypatch) -> None:
+    """Play A, Stop, then pause/play while B resolves: the player still holds A's
+    URI, so pausing/resuming it used to preroll and play A."""
+    fake = FakeLocal("stopped")  # A was stopped (NULL pipeline, A's URI)
+    captured = _slow_resolve(state, monkeypatch, fake)
+    state._start_local(0)
+    assert state._local_resolving is True
+    n = len(fake.calls)
+    state.playback_toggle_pause()  # pause
+    state.playback_toggle_pause()  # play
+    state.playback_toggle_pause()  # pause again
+    assert fake.calls[n:] == []  # the old pipeline was not paused/resumed/prerolled
+    assert fake.state == "stopped"
+    assert state.playback.state == "paused"
+    captured["done"](captured["work"]())
+    assert fake.calls[-1] == ("load", "http://x/t1", True)  # last intent: paused
+
+
+def test_next_while_playing_silences_the_old_track_during_the_resolve(state: AppState, monkeypatch) -> None:
+    """Next while A plays: A must not keep playing (or be resumed by Play) while B resolves."""
+    fake = FakeLocal("playing")
+    captured = _slow_resolve(state, monkeypatch, fake)
+    state._start_local(1)
+    assert fake.calls == ["stop"] and fake.state == "stopped"
+    state.playback_toggle_pause()   # pause during the resolve
+    state.playback_toggle_pause()   # and play again
+    assert fake.calls == ["stop"] and fake.state == "stopped"
+    captured["done"](captured["work"]())
+    assert fake.calls[-1] == ("load", "http://x/t2", False)
+
+
+def test_new_track_and_output_switch_clear_the_transport_intent(state: AppState, monkeypatch) -> None:
+    _device(state, "playing")
+    monkeypatch.setattr(state, "_remote_control", lambda *a, **k: None)
+    state.playback_toggle_pause()
+    assert state._transport_intent == "paused"
+    state._mark_now_playing("wiim-1", _track(2), state="loading")
+    assert state._transport_intent is None
+    state._note_transport("stopped")
+    monkeypatch.setattr(state, "_halt_output", lambda *a, **k: None)
+    state._switch_output(LOCAL_HOST)
+    assert state._transport_intent is None
+
+
 # -- devices ---------------------------------------------------------------------
 
 
@@ -412,9 +495,18 @@ def _device(state: AppState, pb_state: str) -> None:
     pb.active_host, pb.track, pb.state = "wiim-1", state.queue.current(), pb_state
 
 
-def test_snapshot_playing_false_but_device_playing_is_playing(state: AppState) -> None:
+def test_device_playing_something_else_is_not_shown_as_harmony_playing(state: AppState) -> None:
+    """Harmony's queue is idle but the WiiM is playing Spotify Connect / AirPlay:
+    showing "playing" would enable Pause/Stop that then drive the other app."""
     _device(state, "stopped")
     state._apply_snapshot("wiim-1", _snap(state, playing=False, st="playing"))
+    assert state.playback.state == "stopped"
+    assert state.can_stop() is False
+
+
+def test_running_queue_on_a_playing_device_is_playing(state: AppState) -> None:
+    _device(state, "stopped")
+    state._apply_snapshot("wiim-1", _snap(state, playing=True, st="playing"))
     assert state.playback.state == "playing"
     assert state.can_stop() is True
 

@@ -191,6 +191,9 @@ def _stream_quality(fmt: dict[str, Any]) -> dict[str, Any] | None:
 
 class YTMusicProvider(MusicProvider):
     service = Service.YTMUSIC
+    #: ``resolve_stream`` runs its own yt-dlp and uses none of this provider's
+    #: client/session state, so callers needn't serialise it with other calls.
+    resolve_is_self_contained = True
 
     def __init__(self, settings: Settings, credentials: CredentialStore) -> None:
         self._settings = settings

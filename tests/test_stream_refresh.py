@@ -26,3 +26,31 @@ def test_refresh_stream_reresolves_provider_url(monkeypatch: pytest.MonkeyPatch)
 
 def test_refresh_stream_unknown_token_is_none() -> None:
     assert Engine().refresh_stream("nope") is None
+
+
+def test_a_self_contained_resolve_does_not_hold_the_engine_lock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """YouTube's yt-dlp extraction takes seconds and uses none of the provider's
+    session state: it must not stall every other provider call (or the relay's
+    mid-song re-resolve) behind the engine-wide lock. Other services still serialise."""
+    e = Engine()
+    seen: dict[str, bool] = {}
+
+    class Prov:
+        def __init__(self, free: bool) -> None:
+            self.resolve_is_self_contained = free
+
+        def resolve_stream(self, track_id: str, max_quality: bool = False) -> _Src:
+            seen[track_id] = e._lock.locked()
+            return _Src("https://cdn/" + track_id)
+
+    provs = {"ytmusic": Prov(True), "qobuz": Prov(False)}
+    monkeypatch.setattr(e, "_provider", lambda sv: provs[sv])
+    e._resolve_source("ytmusic", "yt")
+    e._resolve_source("qobuz", "qb")
+    assert seen == {"yt": False, "qb": True}
+
+
+def test_ytmusic_provider_declares_its_resolve_self_contained() -> None:
+    from harmony.providers.ytmusic import YTMusicProvider
+
+    assert YTMusicProvider.resolve_is_self_contained is True

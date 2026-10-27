@@ -8,10 +8,12 @@ device; the multi-track queue + auto-advance on top of this is
 from __future__ import annotations
 
 import logging
+import re
 import threading
 import time
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import parse_qs, urlsplit
 
 from harmony.streamio import is_file_url
 
@@ -19,28 +21,83 @@ log = logging.getLogger(__name__)
 
 # A resolved provider URL (Qobuz signed URL, googlevideo) is only good for a
 # while, but a cast device fetches the track in Range chunks across the whole
-# song (and again on every seek). Re-resolve once the URL is this old so a late
-# chunk doesn't hit an expired link and end the track early.
+# song (and again on every seek). When the URL doesn't say when it expires,
+# re-resolve once it is this old so a late chunk doesn't hit an expired link and
+# end the track early. (A 403/410 from the CDN is the backstop either way.)
 SOURCE_STALE_S = 150.0
+# When the URL *does* carry its expiry, renew this long before it (or a quarter
+# of its remaining life, if that is shorter).
+REFRESH_MARGIN_S = 60.0
+# After a failed re-resolve, leave the provider alone this long: otherwise every
+# chunk request the device makes retries a full (slow) extraction.
+FAIL_BACKOFF_S = 20.0
+
+_EXPIRY_QUERY_KEYS = ("expire", "etsp", "Expires")
+_EXPIRY_PATH = re.compile(r"/expire/(\d+)(?:/|$)")
+
+
+def url_expiry_epoch(url: str) -> float | None:
+    """When a signed URL stops working (epoch seconds), read from the URL itself:
+    googlevideo's ``expire=`` (query or ``/expire/N/`` path form), Qobuz's
+    ``etsp=``, or a CDN-style ``Expires=``. None when the URL doesn't say."""
+    try:
+        parts = urlsplit(url)
+        query = parse_qs(parts.query)
+    except ValueError:
+        return None
+    candidates: list[str] = []
+    for key in _EXPIRY_QUERY_KEYS:
+        candidates += query.get(key, [])
+    m = _EXPIRY_PATH.search(parts.path)
+    if m:
+        candidates.append(m.group(1))
+    for raw in candidates:
+        try:
+            value = float(raw)
+        except ValueError:
+            continue
+        if 1e9 < value < 4e9:  # a plausible epoch in seconds, not a ttl or ms value
+            return value
+    return None
 
 
 class _FreshSource:
-    """A resolved stream that re-resolves itself once it is stale.
+    """A resolved stream that re-resolves itself shortly before it expires.
 
     ``get()`` is the relay's per-request resolver; ``refresh()`` forces a new
     resolve (the relay calls it when the upstream says the URL expired).
-    Library files (``file://``) never expire and are never re-resolved."""
+    The URL's own expiry decides when it is stale (a googlevideo URL lives hours,
+    so it is *not* re-extracted every couple of minutes); only a URL that doesn't
+    carry one falls back to ``SOURCE_STALE_S``. Library files (``file://``) never
+    expire and are never re-resolved. A failed re-resolve backs off instead of
+    being retried by every chunk request."""
 
     def __init__(self, resolve: Callable[[], Any], source: Any) -> None:
         self._resolve = resolve
+        self._lock = threading.Lock()
+        self._retry_at = 0.0
+        self._set(source)
+
+    def _set(self, source: Any) -> None:
         self._source = source
         self._at = time.monotonic()
-        self._lock = threading.Lock()
+        exp = None if is_file_url(source.url) else url_expiry_epoch(source.url)
+        life = None if exp is None else exp - time.time()
+        # Monotonic deadline for the *known* expiry; an already-past or absent
+        # one means "unknown" (age-based), so an odd value can't cause a refresh loop.
+        self._expiry: float | None = (self._at + life) if life is not None and life > 0 else None
+
+    def _stale(self) -> bool:
+        now = time.monotonic()
+        if self._expiry is not None:
+            margin = min(REFRESH_MARGIN_S, 0.25 * (self._expiry - self._at))
+            return now >= self._expiry - margin
+        return now - self._at > SOURCE_STALE_S
 
     def get(self) -> Any:
         with self._lock:
-            if (not is_file_url(self._source.url)
-                    and time.monotonic() - self._at > SOURCE_STALE_S):
+            if (not is_file_url(self._source.url) and self._stale()
+                    and time.monotonic() >= self._retry_at):
                 self._renew()
             return self._source
 
@@ -51,12 +108,13 @@ class _FreshSource:
 
     def _renew(self, strict: bool = False) -> None:
         try:
-            self._source = self._resolve()
-            self._at = time.monotonic()
+            self._set(self._resolve())
+            self._retry_at = 0.0
         except Exception as exc:  # noqa: BLE001
+            self._retry_at = time.monotonic() + FAIL_BACKOFF_S
             if strict:
                 raise
-            # Keep serving the old URL (it may still work); retry next request.
+            # Keep serving the old URL (it may still work); retry after a pause.
             log.warning("cast: re-resolving a stale stream failed: %s", exc)
 
 

@@ -348,12 +348,25 @@ class _EndWatch:
 
     def __init__(self, seed: bool = False) -> None:
         self.ended = seed
+        # The media session that was current when the latch was last reset (a new
+        # load). pychromecast re-fires its listeners on every status message,
+        # including empty updates and GET_STATUS replies that re-report the cached
+        # IDLE/FINISHED of the *previous* session; those must not re-arm the latch.
+        self.ignore_session: Any = None
+
+    def reset(self, session_id: Any) -> None:
+        """A new load starts: forget the finish and ignore ``session_id``'s."""
+        self.ended = False
+        self.ignore_session = session_id
 
     def new_media_status(self, status: Any) -> None:
         state = getattr(status, "player_state", None)
         if state == "IDLE":
             if getattr(status, "idle_reason", None) == "FINISHED":
-                self.ended = True
+                stale = (self.ignore_session is not None
+                         and getattr(status, "media_session_id", None) == self.ignore_session)
+                if not stale:
+                    self.ended = True
         elif state in ("PLAYING", "BUFFERING", "PAUSED", "LOADING"):
             self.ended = False
 
@@ -412,8 +425,9 @@ class ChromecastDevice(PlaybackDevice):
         if watch is not None:
             # A new load: forget the previous track's "finished" (the controller
             # still holds its stale status, which is why status() reads the latch
-            # and not the controller's own idle_reason).
-            watch.ended = False
+            # and not the controller's own idle_reason). A late status for the old
+            # media session must not re-arm it, so remember that session's id.
+            watch.reset(getattr(getattr(mc, "status", None), "media_session_id", None))
         # MusicTrackMediaMetadata (type 3) → the device's now-playing card shows
         # title/artist/album + cover art.
         metadata: dict[str, Any] = {"metadataType": 3}

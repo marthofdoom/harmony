@@ -76,12 +76,92 @@ def test_buffering_and_idle_without_a_finish_is_not_an_end(dqs) -> None:
     assert not dqs.snapshot("cast")["playing"]
 
 
-def test_receiver_error_halts_with_a_visible_error(dqs) -> None:
+def test_receiver_error_skips_to_the_next_track(dqs) -> None:
     dqs.op("cast", "load", {"tracks": [_t(0, 180), _t(1)], "start": 0})
+    dqs.after_status("cast", _cast_st("playing", 60, 180))
+    assert dqs.after_status("cast", _cast_st("stopped", 60, 180, reason="ERROR")) == 1
+    assert dqs.snapshot("cast")["playing"]  # the queue goes on
+
+
+def test_receiver_error_on_the_last_track_halts_with_a_visible_error(dqs) -> None:
+    dqs.op("cast", "load", {"tracks": [_t(0, 180)], "start": 0})
     dqs.after_status("cast", _cast_st("playing", 60, 180))
     assert dqs.after_status("cast", _cast_st("stopped", 60, 180, reason="ERROR")) is None
     snap = dqs.snapshot("cast")
     assert not snap["playing"] and "couldn't play" in snap["error"]
+
+
+def test_three_receiver_errors_in_a_row_halt_the_queue(dqs) -> None:
+    dqs.op("cast", "load", {"tracks": [_t(i) for i in range(6)], "start": 0})
+    err = _cast_st("stopped", None, None, reason="ERROR")
+    assert dqs.after_status("cast", err) == 1
+    dqs._queues["cast"].q.jump(1)
+    assert dqs.after_status("cast", err) == 2
+    dqs._queues["cast"].q.jump(2)
+    assert dqs.after_status("cast", err) is None  # the third
+    snap = dqs.snapshot("cast")
+    assert not snap["playing"] and "3 tracks in a row" in snap["error"]
+
+
+def test_a_track_that_plays_to_its_end_resets_the_error_run(dqs) -> None:
+    dqs.op("cast", "load", {"tracks": [_t(i) for i in range(8)], "start": 0})
+    err = _cast_st("stopped", None, None, reason="ERROR")
+    done = _cast_st("stopped", None, None, ended=True, reason="FINISHED")
+    for i in range(2):
+        assert dqs.after_status("cast", err) == i + 1
+        dqs._queues["cast"].q.jump(i + 1)
+    assert dqs.after_status("cast", done) == 3  # natural end: the run is over
+    dqs._queues["cast"].q.jump(3)
+    assert dqs.after_status("cast", err) == 4
+    dqs._queues["cast"].q.jump(4)
+    assert dqs.after_status("cast", err) == 5  # still not three in a row
+    assert dqs.snapshot("cast")["playing"]
+
+
+def test_error_wins_over_a_stale_finished_latch(dqs) -> None:
+    """A failed LOAD with the previous track's FINISHED still latched is an
+    error, not a finish: it counts toward the halt, not as a clean end."""
+    dqs.op("cast", "load", {"tracks": [_t(i) for i in range(5)], "start": 0})
+    st = _cast_st("stopped", None, None, ended=True, reason="ERROR")
+    for i in range(2):
+        assert dqs.after_status("cast", st) == i + 1
+        dqs._queues["cast"].q.jump(i + 1)
+    assert dqs.after_status("cast", st) is None
+    assert "3 tracks in a row" in dqs.snapshot("cast")["error"]
+
+
+def test_queue_loop_skips_errors_and_releases_the_device_on_the_final_halt(monkeypatch) -> None:
+    played: list[str] = []
+    inactive: list[str] = []
+    monkeypatch.setattr(dqmod, "POLL_S", 0.01)
+    monkeypatch.setattr(dqmod, "SETTLE_S", 0.0)
+    err = _cast_st("stopped", None, None, reason="ERROR")
+    queues = DeviceQueues(lambda h, t: played.append(t["id"]), lambda h: dict(err),
+                          on_inactive=inactive.append)
+    queues.op("cast", "load", {"tracks": [_t(i) for i in range(6)], "start": 0})
+    for _ in range(200):
+        if inactive:
+            break
+        time.sleep(0.02)
+    assert played == ["0", "1", "2"]  # three tries, then it gave up
+    assert inactive == ["cast"]
+    snap = queues.snapshot("cast")
+    assert not snap["playing"] and "3 tracks in a row" in snap["error"]
+
+
+def test_settle_window_starts_after_the_track_is_on_the_device(monkeypatch) -> None:
+    """A slow resolve + LOAD must not eat the settle window: the transitional
+    IDLE a LOAD produces arrives after play returns."""
+    monkeypatch.setattr(dqmod, "SETTLE_S", 5.0)
+
+    def slow_play(host, track):
+        time.sleep(0.3)
+
+    queues = DeviceQueues(slow_play, lambda h: {})
+    monkeypatch.setattr(queues, "_ensure_poller", lambda host: None)
+    queues.op("cast", "load", {"tracks": [_t(0)], "start": 0})
+    left = queues._queues["cast"].settle_until - time.monotonic()
+    assert left > 4.9  # would be ~4.7 if the window began before the 0.3 s start
 
 
 def test_wiim_without_a_natural_end_report_still_advances(dqs) -> None:
@@ -105,8 +185,9 @@ def test_wiim_ignores_the_metadata_duration_for_near_end(dqs) -> None:
 
 
 class _Status:
-    def __init__(self, state: str, reason=None, t: float = 0) -> None:
+    def __init__(self, state: str, reason=None, t: float = 0, session=None) -> None:
         self.player_state, self.idle_reason = state, reason
+        self.media_session_id = session
         self.current_time, self.duration, self.title = t, 200, "Song"
 
 
@@ -208,3 +289,22 @@ def test_queue_loop_advances_on_the_devices_natural_end(monkeypatch: pytest.Monk
         time.sleep(0.02)
     assert played[:2] == ["0", "1"]
     queues.stop("cast")
+
+
+def test_a_late_status_for_the_old_session_does_not_rearm_the_finish(cast: _Cast) -> None:
+    """pychromecast re-fires its listeners with the cached IDLE/FINISHED (empty
+    updates, a GET_STATUS reply) after play_url reset the latch; that old session's
+    finish must not end the NEW track."""
+    dev = ChromecastDevice("10.0.0.9")
+    mc = cast.media_controller
+    dev.play_url("http://relay/1", title="One")
+    mc.push(_Status("PLAYING", t=5, session=11))
+    mc.push(_Status("IDLE", "FINISHED", session=11))
+    assert dev.status().raw["ended"] is True
+    dev.play_url("http://relay/2", title="Two")  # LOAD sent; session 12 not reported yet
+    assert dev.status().raw["ended"] is False
+    mc.push(_Status("IDLE", "FINISHED", session=11))  # the stale reply lands late
+    assert dev.status().raw["ended"] is False
+    mc.push(_Status("PLAYING", t=1, session=12))
+    mc.push(_Status("IDLE", "FINISHED", session=12))  # the new track's own end counts
+    assert dev.status().raw["ended"] is True

@@ -129,6 +129,14 @@ def _range_start(upstream: requests.Response) -> int | None:
     return None
 
 
+def _range_total(upstream: requests.Response) -> int | None:
+    """Total length of the resource per a 206's ``Content-Range`` (None for ``*``)."""
+    header = upstream.headers.get("Content-Range", "")
+    if header.startswith("bytes ") and "/" in header:
+        return _int_or_none(header.rsplit("/", 1)[1])
+    return None
+
+
 def _read_chunks(stream: IO[bytes], size: int = _CHUNK_SIZE) -> Iterator[bytes]:
     while True:
         chunk = stream.read(size)
@@ -366,7 +374,8 @@ class _Handler(BaseHTTPRequestHandler):
                     self._reply_icy(upstream, source, entry, send_body=send_body)
                 else:
                     self._reply(upstream, source, send_body=send_body,
-                                reopen=lambda rng: self._reopen(entry, source, rng, token))
+                                reopen=lambda rng, total: self._reopen(entry, source, rng, token,
+                                                                       total))
             except (BrokenPipeError, ConnectionResetError):
                 # Device seeked or stopped mid-stream; nothing to do.
                 pass
@@ -430,14 +439,21 @@ class _Handler(BaseHTTPRequestHandler):
         return upstream, source
 
     def _reopen(self, entry: _Entry, source: StreamSource, range_header: str,
-                token: str) -> requests.Response | None:
+                token: str, total: int | None = None) -> requests.Response | None:
         """Re-fetch the rest of a body that died mid-stream (no reply is sent).
 
-        Tries the current URL, then a freshly resolved one; only a 206 that
-        honours the range is usable."""
-        attempts: list[Callable[[], StreamSource]] = [lambda: source]
+        Tries the entry's own resolver first (for a cast that is the self-
+        refreshing source, so a URL that expired meanwhile is already renewed),
+        then a forced refresh. Only a 206 that continues *exactly* where the
+        dead body stopped is usable: its ``Content-Range`` must start at the
+        requested offset and, when known, describe a resource of the original
+        total length -- a re-resolve can hand back a different file (another
+        quality tier), and splicing that onto the bytes already sent would be
+        audible garbage."""
+        attempts: list[Callable[[], StreamSource]] = [entry.resolver]
         if entry.refresh is not None and not is_file_url(source.url):
             attempts.append(entry.refresh)
+        want_start = _int_or_none(range_header.partition("=")[2].split("-", 1)[0])
         for get_source in attempts:
             try:
                 upstream = self._fetch(get_source(), range_header)
@@ -445,7 +461,13 @@ class _Handler(BaseHTTPRequestHandler):
                 log.debug("relay: resume fetch failed for token %s: %s", token, exc)
                 continue
             if upstream.status_code == 206:
-                return upstream
+                got_total = _range_total(upstream)
+                if _range_start(upstream) == want_start and (
+                        total is None or got_total is None or got_total == total):
+                    return upstream
+                log.warning("relay: resume for token %s is not a continuation "
+                            "(start %s want %s, total %s want %s); not splicing",
+                            token, _range_start(upstream), want_start, got_total, total)
             upstream.close()
         return None
 
@@ -564,7 +586,7 @@ class _Handler(BaseHTTPRequestHandler):
                 remaining -= len(view)
 
     def _reply(self, upstream: requests.Response, source: StreamSource, *, send_body: bool,
-               reopen: Callable[[str], requests.Response | None] | None = None) -> None:
+               reopen: Callable[[str, int | None], requests.Response | None] | None = None) -> None:
         status = upstream.status_code if upstream.status_code in (200, 206) else 200
         self.send_response(status)
         self.send_header("Content-Type", source.mime_type or upstream.headers.get("Content-Type", "application/octet-stream"))
@@ -589,34 +611,51 @@ class _Handler(BaseHTTPRequestHandler):
 
         expected = _int_or_none(upstream.headers.get("Content-Length"))
         start = _range_start(upstream) if status == 206 else 0
+        # Total size of the resource, so a resumed body can be checked to be the
+        # same file: a 206 declares it; a plain 200's length is the whole thing.
+        total = _range_total(upstream) if status == 206 else expected
         sent = 0
         resumes = 0
-        while True:
-            try:
-                for chunk in upstream.iter_content(_CHUNK_SIZE):
-                    if chunk:
+        resumed: requests.Response | None = None  # the latest reopened body (ours to close)
+        try:
+            while True:
+                try:
+                    for chunk in upstream.iter_content(_CHUNK_SIZE):
+                        if not chunk:
+                            continue
+                        if expected is not None:
+                            # Never write past the declared Content-Length: the
+                            # device frames the body by it, and extra bytes would
+                            # be read as the start of its next response.
+                            room = expected - sent
+                            if room <= 0:
+                                break
+                            chunk = chunk[:room]
                         self.wfile.write(chunk)
                         sent += len(chunk)
-            except (BrokenPipeError, ConnectionResetError):
-                raise
-            except Exception as exc:  # noqa: BLE001 - upstream dropped the body mid-stream
-                log.warning("relay: upstream body broke after %d bytes: %s", sent, exc)
-            if expected is None or start is None or sent >= expected:
-                return
-            # The body ended short of its Content-Length (a CDN dropping a long
-            # connection). The device frames by length, so a short body makes it
-            # give up on the track: fetch the remainder by byte offset instead.
-            if reopen is None or resumes >= _MAX_RESUMES:
-                self.close_connection = True
-                return
-            resumes += 1
-            upstream.close()
-            nxt = reopen(f"bytes={start + sent}-{start + expected - 1}")
-            if nxt is None:
-                self.close_connection = True
-                return
-            log.info("relay: resumed a truncated body at byte %d (%d/%d)", start + sent, resumes, _MAX_RESUMES)
-            upstream = nxt
+                except (BrokenPipeError, ConnectionResetError):
+                    raise
+                except Exception as exc:  # noqa: BLE001 - upstream dropped the body mid-stream
+                    log.warning("relay: upstream body broke after %d bytes: %s", sent, exc)
+                if expected is None or start is None or sent >= expected:
+                    return
+                # The body ended short of its Content-Length (a CDN dropping a long
+                # connection). The device frames by length, so a short body makes it
+                # give up on the track: fetch the remainder by byte offset instead.
+                if reopen is None or resumes >= _MAX_RESUMES:
+                    self.close_connection = True
+                    return
+                resumes += 1
+                upstream.close()
+                nxt = reopen(f"bytes={start + sent}-{start + expected - 1}", total)
+                if nxt is None:
+                    self.close_connection = True
+                    return
+                log.info("relay: resumed a truncated body at byte %d (%d/%d)", start + sent, resumes, _MAX_RESUMES)
+                upstream = resumed = nxt
+        finally:
+            if resumed is not None:
+                resumed.close()
 
     def _token_from_path(self) -> str | None:
         path = urlsplit(self.path).path

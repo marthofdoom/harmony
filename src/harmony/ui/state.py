@@ -798,6 +798,7 @@ class AppState(GObject.Object):
         if old and old != host:
             self._halt_output(old)
             self.queue = self._fresh_queue()
+        self._transport_intent = None  # an old output's press says nothing about the new one
         self.playback.active_host = host
         self._ensure_poller()
 
@@ -828,6 +829,11 @@ class AppState(GObject.Object):
         self._seek_settle_until = 0.0
         self._local_resolving = True
         self._pause_after_resolve = False
+        # The player still holds the previous track (or, after Stop / the end of
+        # the queue, a NULL pipeline with its old URI). Silence it now: while the
+        # new stream resolves nothing may pause/resume/preroll that old URI, or
+        # the old song plays under a "loading" bar.
+        self._stop_local_player()
         self._mark_now_playing(LOCAL_HOST, track, state="loading")
         # quality/source keep showing until the new stream resolves (no flicker)
         provider = self.provider_for(track.service)
@@ -1016,10 +1022,9 @@ class AppState(GObject.Object):
         observed: str | None
         if snap.get("playing"):
             observed = "paused" if state == "paused" else "playing"
-        elif state == "playing":
-            # The queue isn't running but the device itself is playing: it IS
-            # playing, so show it (and let Stop work) rather than "stopped".
-            observed = "playing"
+        # (A device that is "playing" while Harmony's queue is NOT running is
+        # playing something else -- Spotify Connect, AirPlay -- so it is never
+        # promoted to "playing" here: Pause/Stop would drive the other app.)
         elif pb.state == "loading" and state not in ("stopped", "idle"):
             observed = None  # still starting; keep "loading"
         else:
@@ -1092,6 +1097,9 @@ class AppState(GObject.Object):
         if track is None:
             return
         self._now_playing[host] = (track.title, track.artist_name)
+        # A new track starts from "loading": a Pause/Stop pressed on the previous
+        # one must not outrank what the device reports for this one.
+        self._transport_intent = None
         pb = self.playback
         pb.active_host = host
         pb.track = track
@@ -1194,9 +1202,12 @@ class AppState(GObject.Object):
         self.emit("playback-changed")
         if host == LOCAL_HOST:
             if self._local_resolving:
-                self._pause_after_resolve = pausing  # honoured when the stream loads
-                if self._local_player is None:
-                    return
+                # The new stream isn't loaded yet and the old pipeline was
+                # stopped when the resolve began: touching the player here would
+                # resume/preroll the PREVIOUS track's URI. Record the intent only;
+                # it is honoured when the stream loads.
+                self._pause_after_resolve = pausing
+                return
             player = self._get_local_player()
             (player.pause if pausing else player.resume)()
             return

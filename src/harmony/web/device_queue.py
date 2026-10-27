@@ -56,6 +56,9 @@ class DeviceQueue:
         self.stream: dict[str, Any] | None = None  # {quality, source} of what's playing
         self.gen = 0  # bumped by every start and every halt
         self.failures = 0          # consecutive tracks that failed to start
+        # Consecutive tracks the *receiver* gave up on after starting them
+        # (idle_reason ERROR); a natural end or a user action resets it.
+        self.error_streak = 0
         # Wall-clock play time of the current track: a Chromecast playing a
         # relayed stream reports a frozen position, so this stands in for it.
         self.clock = 0.0
@@ -231,6 +234,7 @@ class DeviceQueues:
         if start is not None:
             with self._lock:
                 dq.failures = 0  # a user action starts a fresh run of attempts
+                dq.error_streak = 0
             if self._async_start and not body.get("sync"):
                 with self._lock:  # show it as starting right away
                     dq.q.jump(start)
@@ -300,6 +304,10 @@ class DeviceQueues:
             halted = dq.gen != gen and not dq.playing
             if dq.gen == gen:
                 dq.failures = 0
+                # The settle window starts when the device has the track (after
+                # the resolve + LOAD, which can take seconds), not when we began:
+                # the transitional IDLE a LOAD produces lands after this point.
+                dq.settle_until = time.monotonic() + SETTLE_S
                 if isinstance(played, dict) and isinstance(played.get("stream"), dict):
                     dq.stream = played["stream"]
         if halted:
@@ -435,15 +443,30 @@ class DeviceQueues:
             if has_dur and not near_end and state == "playing":
                 dq.armed = True
             ended = False
+            if st.get("idle_reason") == "ERROR" and state in ("stopped", "idle"):
+                # The receiver gave up on the stream (a stalled/refused relay
+                # fetch, a failed LOAD). Checked before a latched "finished": an
+                # error is never a natural end. Skip to the next track, but give
+                # up after MAX_START_FAILURES in a row so a dead stream or
+                # device can't churn through the whole queue.
+                dq.armed = False
+                title = (dq.q.current() or {}).get("title") or "the track"
+                dq.error_streak += 1
+                log.warning("queue: %s errored on %s (%d in a row)", host, title, dq.error_streak)
+                nxt = dq.q.following(manual=True)
+                if dq.error_streak >= MAX_START_FAILURES:
+                    dq.error = (f"{host} couldn't play {dq.error_streak} tracks in a row "
+                                "— stopped")
+                    dq.halt()
+                    return None
+                dq.error = f"{host} couldn't play {title}"
+                if nxt is None:
+                    dq.halt()  # nothing left that plays
+                    return None
+                return nxt
             if dev_ended:
                 dq.armed = False
                 ended = True
-            elif st.get("idle_reason") == "ERROR" and state in ("stopped", "idle"):
-                # The receiver gave up on the stream (a stalled/refused relay
-                # fetch): say so, rather than sit "playing" a silent device.
-                dq.error = f"{host} couldn't play {(dq.q.current() or {}).get('title') or 'the track'}"
-                dq.halt()
-                return None
             elif near_end and dq.armed:
                 dq.armed = False
                 ended = True
@@ -460,6 +483,7 @@ class DeviceQueues:
                 ended = True
             if not ended:
                 return None
+            dq.error_streak = 0  # it played to its end: a run of errors is over
             nxt = dq.q.following()
             if nxt is None:
                 dq.halt()

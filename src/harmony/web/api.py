@@ -9,6 +9,7 @@ real concurrency.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 import secrets
 import threading
@@ -1978,7 +1979,13 @@ class Engine:
         prov = self._provider(service_value)
         if prov is None:
             raise KeyError(service_value)
-        with self._plock(service_value):
+        # A provider whose resolve is self-contained (YouTube: a fresh yt-dlp run
+        # that touches none of the provider's session state) skips the engine-wide
+        # lock: that extraction takes seconds and would otherwise stall every UI
+        # provider call -- and the relay thread asking for a mid-song re-resolve.
+        lock = (contextlib.nullcontext() if getattr(prov, "resolve_is_self_contained", False)
+                else self._plock(service_value))
+        with lock:
             source = prov.resolve_stream(track_id, max_quality=True)
         # Remembered per thread so a cast (which resolves inside the caster)
         # can report what it actually played: the Library copy or the stream.
