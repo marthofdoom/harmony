@@ -106,9 +106,10 @@ class LocalPlayer:
         # lags this (async state changes, buffering); status() reports the intent.
         self._intent = "stopped"
         self._buffering = False
-        # True from a load that started PAUSED until the pipeline first plays: its
-        # sink was prerolled but never started (see _to_null).
-        self._never_played = False
+        # True once the pipeline has really reached PLAYING since the last load.
+        # A pipeline that prerolled (PAUSED) but never got there has a sink that
+        # was never started, and tearing that down hangs (see _to_null).
+        self._started = False
         self._headers: dict[str, str] = {}
         self._sink: object | None = None
         self._logged_format = False
@@ -152,8 +153,9 @@ class LocalPlayer:
         log.warning("local player error: %s", err)
         self._intent = "stopped"
         self._buffering = False
-        self._never_played = False  # an errored pipeline has no live sink to protect
-        self._playbin.set_state(Gst.State.NULL)
+        # An errored pipeline can still be prerolled-but-never-started (e.g. a
+        # stream loaded paused whose server then dropped): same teardown rule.
+        self._to_null()
         if self._on_error is not None:
             self._on_error(str(err))
 
@@ -165,6 +167,8 @@ class LocalPlayer:
             return
         self._notify()
         _old, new, _pending = msg.parse_state_changed()
+        if new == Gst.State.PLAYING:
+            self._started = True
         if new != Gst.State.PLAYING or self._logged_format:
             return
         info = self.audio_info()
@@ -190,6 +194,7 @@ class LocalPlayer:
         self._buffering = percent < 100
         if self._intent == "playing":
             if self._buffering and not was:
+                self._note_started()
                 self._playbin.set_state(Gst.State.PAUSED)
             elif was and not self._buffering:
                 self._playbin.set_state(Gst.State.PLAYING)
@@ -231,43 +236,55 @@ class LocalPlayer:
         self._buffering = False
         self._to_null()
         self._playbin.set_property("uri", url)
-        self._never_played = paused
         self._intent = "paused" if paused else "playing"
         self._playbin.set_state(Gst.State.PAUSED if paused else Gst.State.PLAYING)
 
     def pause(self) -> None:
         self._intent = "paused"
+        self._note_started()
         self._playbin.set_state(Gst.State.PAUSED)
 
     def resume(self) -> None:
         self._intent = "playing"
-        self._never_played = False
         # Mid-buffering the pipeline is held in PAUSED on purpose; the buffering
         # handler starts it when the queue is full.
         if not self._buffering:
             self._playbin.set_state(Gst.State.PLAYING)
 
+    def _note_started(self) -> None:
+        """Record that the pipeline is PLAYING *now*. The bus message that sets
+        ``_started`` is dispatched on the main loop, so a pause/stop that follows
+        a play before the loop ran would otherwise not know the sink had started."""
+        if self._playbin.get_state(0)[1] == Gst.State.PLAYING:
+            self._started = True
+
     def _to_null(self) -> None:
         """Tear the pipeline down to NULL.
 
-        A pipewiresink that was prerolled in PAUSED but never started (a track
-        loaded paused, e.g. Pause pressed while it resolved) blocks forever when
-        taken back down to READY/NULL -- freezing the whole UI on Stop / next
-        track. Starting it first (muted, so nothing is heard) lets it shut down."""
+        A pipewiresink that prerolled in PAUSED but was never started blocks
+        forever when taken back down to READY/NULL, freezing the whole UI on
+        Stop / next track. That is any pipeline that never reached PLAYING since
+        its load: a track loaded paused, pause pressed while it was still
+        prerolling, a buffering hold before the first play, or an errored stream
+        (a dropped connection). Starting it first (muted, so nothing is heard,
+        and waiting at most half a second) lets it shut down."""
         pb = self._playbin
-        if self._never_played:
-            self._never_played = False
-            _ret, current, _pending = pb.get_state(0)
-            if current == Gst.State.PAUSED:
-                pb.set_property("mute", True)
-                try:
-                    pb.set_state(Gst.State.PLAYING)
-                    pb.get_state(Gst.SECOND // 2)
-                    pb.set_state(Gst.State.NULL)
-                finally:
-                    pb.set_property("mute", False)
-                return
-        pb.set_state(Gst.State.NULL)
+        self._note_started()
+        needs_start = False
+        if not self._started:
+            _ret, current, pending = pb.get_state(0)
+            needs_start = current == Gst.State.PAUSED or pending == Gst.State.PAUSED
+        if needs_start:
+            pb.set_property("mute", True)
+            try:
+                pb.set_state(Gst.State.PLAYING)
+                pb.get_state(Gst.SECOND // 2)
+                pb.set_state(Gst.State.NULL)
+            finally:
+                pb.set_property("mute", False)
+        else:
+            pb.set_state(Gst.State.NULL)
+        self._started = False
 
     def stop(self) -> None:
         self._intent = "stopped"

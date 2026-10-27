@@ -100,7 +100,7 @@ def player() -> LocalPlayer:
     p._on_change = None
     p._intent = "stopped"
     p._buffering = False
-    p._never_played = False
+    p._started = False
     p._headers = {}
     p._sink = None
     p._logged_format = False
@@ -164,6 +164,172 @@ def test_stopping_a_never_started_paused_load_starts_it_muted_first(player: Loca
     player.pause()
     player.stop()
     assert player._playbin.calls == [Gst.State.PAUSED, Gst.State.NULL]
+
+
+class _StateMsg:
+    """A ``state-changed`` bus message from the playbin itself."""
+
+    def __init__(self, src, new) -> None:
+        self.src, self._new = src, new
+
+    def parse_state_changed(self):
+        return Gst.State.NULL, self._new, Gst.State.VOID_PENDING
+
+
+def _reached(player: LocalPlayer, st) -> None:
+    """The pipeline arrives at ``st`` and the bus message is dispatched."""
+    pb = player._playbin
+    pb.current, pb.pending = st, Gst.State.VOID_PENDING
+    player._handle_state_changed(None, _StateMsg(pb, st))
+
+
+def test_pause_before_the_first_play_still_starts_muted_before_stop(player: LocalPlayer) -> None:
+    """Not only a paused *load*: play, then pause while it is still prerolling,
+    leaves the sink prerolled but never started (the reviewer's hang)."""
+    player.load_and_play("u")  # PLAYING requested
+    player.pause()  # ...before it got there: PAUSED requested
+    player._playbin.arrive()  # prerolled in PAUSED, never PLAYING
+    assert player._playbin.current == Gst.State.PAUSED
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+    assert player._playbin.props["mute"] is False
+
+
+def test_pause_during_preroll_then_next_track_starts_muted_before_teardown(
+        player: LocalPlayer) -> None:
+    player.load_and_play("u")
+    player.pause()  # current is still READY/NULL, PAUSED pending
+    player._playbin.calls.clear()
+    player.load_and_play("next")  # tears the first one down
+    assert player._playbin.calls[:2] == [Gst.State.PLAYING, Gst.State.NULL]
+    assert player._playbin.calls[-1] == Gst.State.PLAYING  # then the new track
+    assert player._playbin.props["mute"] is False
+
+
+def test_buffering_hold_before_the_first_play_starts_muted_before_stop(
+        player: LocalPlayer) -> None:
+    player.load_and_play("u")
+    player._handle_buffering(None, FakeBuffering(10))  # held in PAUSED, never played
+    player._playbin.arrive()
+    assert player._playbin.current == Gst.State.PAUSED
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+
+
+def test_a_pipeline_that_really_played_goes_straight_down(player: LocalPlayer) -> None:
+    player.load_and_play("u")
+    _reached(player, Gst.State.PLAYING)
+    assert player._started
+    player.pause()
+    player._playbin.arrive()
+    player._handle_buffering(None, FakeBuffering(10))
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.NULL]  # PAUSED now, but it did play
+    assert not player._started
+
+
+def test_a_play_not_yet_reported_on_the_bus_still_counts_as_started(player: LocalPlayer) -> None:
+    """The state-changed message is dispatched on the main loop; pausing right
+    after a play (before it ran) must not make the later stop think it never played."""
+    player.load_and_play("u")
+    player._playbin.arrive()
+    player._playbin.current = Gst.State.PLAYING  # reached PLAYING, message not yet handled
+    assert not player._started
+    player.pause()
+    player._playbin.current = Gst.State.PAUSED
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.NULL]
+
+
+def test_resume_does_not_claim_the_pipeline_started(player: LocalPlayer) -> None:
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+    player.resume()  # PLAYING requested, not reached yet
+    player.pause()
+    player._playbin.arrive()
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+
+
+def test_started_is_reset_by_each_load(player: LocalPlayer) -> None:
+    player.load_and_play("u")
+    _reached(player, Gst.State.PLAYING)
+    player.load_and_play("v", paused=True)
+    assert not player._started
+    player._playbin.arrive()
+    player._playbin.calls.clear()
+    player.stop()
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+
+
+def test_error_on_a_prerolled_never_started_pipeline_starts_muted_before_null(
+        player: LocalPlayer) -> None:
+    """A stream loaded paused whose server then drops ("Server does not support
+    seeking"): the error handler's teardown used to hang the main thread."""
+    errors: list[str] = []
+    player._on_error = errors.append
+
+    class Msg:
+        def parse_error(self):
+            return "boom", ""
+
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+    player._playbin.calls.clear()
+    player._handle_error(None, Msg())
+    assert player._playbin.calls == [Gst.State.PLAYING, Gst.State.NULL]
+    assert player._playbin.props["mute"] is False
+    assert errors == ["boom"]  # on_error still fires
+    assert player.status().state == "stopped"
+
+
+def test_error_on_a_pipeline_that_played_goes_straight_to_null(player: LocalPlayer) -> None:
+    class Msg:
+        def parse_error(self):
+            return "boom", ""
+
+    player.load_and_play("u")
+    _reached(player, Gst.State.PLAYING)
+    player._playbin.calls.clear()
+    player._handle_error(None, Msg())
+    assert player._playbin.calls == [Gst.State.NULL]
+
+
+def test_mute_is_restored_even_if_the_muted_start_raises(player: LocalPlayer) -> None:
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+
+    def boom(_t):
+        raise RuntimeError("get_state exploded")
+
+    real = player._playbin.get_state
+    calls = {"n": 0}
+
+    def flaky(t):
+        calls["n"] += 1
+        if t != 0:  # the bounded wait inside the muted start
+            boom(t)
+        return real(t)
+
+    player._playbin.get_state = flaky
+    with pytest.raises(RuntimeError):
+        player.stop()
+    assert player._playbin.props["mute"] is False
+
+
+def test_muted_start_waits_at_most_half_a_second(player: LocalPlayer) -> None:
+    waits: list[int] = []
+    real = player._playbin.get_state
+    player._playbin.get_state = lambda t: (waits.append(t), real(t))[1]
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+    player.stop()
+    assert max(waits) <= Gst.SECOND // 2
 
 
 def test_buffering_holds_pipeline_but_keeps_intent(player: LocalPlayer) -> None:

@@ -217,7 +217,8 @@ class _MC:
 class _Cast:
     def __init__(self) -> None:
         self.media_controller = _MC()
-        self.status = type("S", (), {"volume_level": 0.5, "volume_muted": False})()
+        self.status = type("S", (), {"volume_level": 0.5, "volume_muted": False,
+                                     "session_id": "app-A", "transport_id": "tr-A"})()
 
 
 @pytest.fixture
@@ -307,4 +308,78 @@ def test_a_late_status_for_the_old_session_does_not_rearm_the_finish(cast: _Cast
     assert dev.status().raw["ended"] is False
     mc.push(_Status("PLAYING", t=1, session=12))
     mc.push(_Status("IDLE", "FINISHED", session=12))  # the new track's own end counts
+    assert dev.status().raw["ended"] is True
+
+
+def test_skip_message_survives_the_next_start_until_a_natural_end_or_user_action(dqs) -> None:
+    """"<host> couldn't play <title>" is set by after_status() and must still be
+    visible after the poll loop has started the next track (it used to be wiped
+    by _start_track before any snapshot saw it)."""
+    dqs.op("cast", "load", {"tracks": [_t(0), _t(1), _t(2)], "start": 0, "sync": True})
+    nxt = dqs.after_status("cast", _cast_st("stopped", None, None, reason="ERROR"))
+    assert nxt == 1
+    assert dqs.snapshot("cast")["error"] == "cast couldn't play T0"
+    dqs._start_track("cast", nxt, keep_error=True)  # what the poll loop does next
+    snap = dqs.snapshot("cast")
+    assert snap["error"] == "cast couldn't play T0"
+    assert snap["playing"] and snap["current"]["id"] == "1"
+    # a natural end of the next track clears it...
+    assert dqs.after_status("cast", _cast_st("stopped", None, None, ended=True,
+                                             reason="FINISHED")) == 2
+    assert dqs.snapshot("cast")["error"] is None
+
+
+def test_skip_message_is_cleared_by_a_user_action(dqs) -> None:
+    dqs.op("cast", "load", {"tracks": [_t(0), _t(1), _t(2)], "start": 0, "sync": True})
+    nxt = dqs.after_status("cast", _cast_st("stopped", None, None, reason="ERROR"))
+    dqs._start_track("cast", nxt, keep_error=True)
+    assert dqs.snapshot("cast")["error"]
+    dqs.op("cast", "jump", {"index": 2, "sync": True})
+    assert dqs.snapshot("cast")["error"] is None
+
+
+def test_skip_message_survives_a_failed_start_that_skips_ahead(dqs, monkeypatch) -> None:
+    plays: list[str] = []
+
+    def play(_host, track):
+        plays.append(track["id"])
+        if track["id"] == "1":
+            raise RuntimeError("boom")
+
+    queues = DeviceQueues(play, lambda h: {})
+    monkeypatch.setattr(queues, "_ensure_poller", lambda host: None)
+    queues.op("cast", "load", {"tracks": [_t(0), _t(1), _t(2)], "start": 1, "sync": True})
+    assert plays == ["1", "2"]  # track 1 failed, 2 started
+    assert queues.snapshot("cast")["error"] == "boom"
+
+
+def test_a_relaunched_receiver_app_with_colliding_session_ids_still_ends_the_track(
+        cast: _Cast) -> None:
+    """Media session ids restart from 1 when the receiver app is relaunched on the
+    same connection. The stale-session ignore is tied to the receiver app instance,
+    so the new app's FINISHED for an id that collides with the old one is honoured
+    (it used to be swallowed, hanging the queue on a finished track)."""
+    dev = ChromecastDevice("10.0.0.9")
+    mc = cast.media_controller
+    dev.play_url("http://relay/1", title="One")
+    mc.push(_Status("PLAYING", t=5, session=3))
+    mc.push(_Status("IDLE", "FINISHED", session=3))
+    dev.play_url("http://relay/2", title="Two")  # ignores session 3 *of app A*
+    mc.push(_Status("IDLE", "FINISHED", session=3))  # a stale replay from app A
+    assert dev.status().raw["ended"] is False
+    # the receiver app is relaunched: new app session, media ids restart (3 again)
+    cast.status.session_id, cast.status.transport_id = "app-B", "tr-B"
+    mc.push(_Status("PLAYING", t=1, session=3))
+    mc.push(_Status("IDLE", "FINISHED", session=3))
+    assert dev.status().raw["ended"] is True
+
+
+def test_relaunch_before_the_replay_does_not_ignore_a_colliding_finish(cast: _Cast) -> None:
+    dev = ChromecastDevice("10.0.0.9")
+    mc = cast.media_controller
+    dev.play_url("http://relay/1", title="One")
+    mc.push(_Status("IDLE", "FINISHED", session=1))
+    dev.play_url("http://relay/2", title="Two")
+    cast.status.session_id = "app-B"  # relaunched before any status arrived
+    mc.push(_Status("IDLE", "FINISHED", session=1))  # the new app's own session 1 ends
     assert dev.status().raw["ended"] is True

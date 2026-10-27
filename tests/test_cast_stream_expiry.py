@@ -400,8 +400,15 @@ def test_failed_re_resolves_back_off_instead_of_retrying_every_request(monkeypat
     for _ in range(5):  # five chunk requests while the provider is failing
         assert fresh.get() is src
     assert len(calls) == 1
-    # ... but the CDN's own 403 still forces an attempt, and a success clears the back-off
+    # the CDN's own 403/410 honours the same back-off: no forced resolve per chunk
+    for _ in range(5):
+        with pytest.raises(RuntimeError, match="backing off"):
+            fresh.refresh()
+    assert len(calls) == 1
+    # ... but once the window has passed a refresh is allowed again, and a
+    # success clears the back-off
     ok = StreamSource(url="http://cdn/y", mime_type="audio/flac")
     fresh._resolve = lambda: ok
+    fresh._retry_at = time.monotonic() - 1
     assert fresh.refresh() is ok
     assert fresh._retry_at == 0.0

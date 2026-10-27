@@ -346,18 +346,36 @@ class _EndWatch:
     the next status message that lacks one, so a poll can miss it. Listening
     to every status message keeps the fact until the next load or playback."""
 
-    def __init__(self, seed: bool = False) -> None:
+    def __init__(self, seed: bool = False,
+                 receiver: Callable[[], Any] | None = None) -> None:
         self.ended = seed
+        # Identity of the receiver app instance the connection is talking to
+        # (its session id + transport id). Media session ids restart from 1 when
+        # the receiver app is relaunched on the same connection, so an id alone
+        # could match a brand-new session's FINISHED; the ignore is therefore
+        # tied to the app instance it was recorded in.
+        self._receiver = receiver
+        self.ignore_receiver: Any = None
         # The media session that was current when the latch was last reset (a new
         # load). pychromecast re-fires its listeners on every status message,
         # including empty updates and GET_STATUS replies that re-report the cached
         # IDLE/FINISHED of the *previous* session; those must not re-arm the latch.
         self.ignore_session: Any = None
 
+    def _receiver_id(self) -> Any:
+        if self._receiver is None:
+            return None
+        try:
+            return self._receiver()
+        except Exception:  # noqa: BLE001 - identity is best effort
+            return None
+
     def reset(self, session_id: Any) -> None:
-        """A new load starts: forget the finish and ignore ``session_id``'s."""
+        """A new load starts: forget the finish and ignore ``session_id``'s (as
+        reported by the receiver app instance that is current right now)."""
         self.ended = False
         self.ignore_session = session_id
+        self.ignore_receiver = self._receiver_id()
 
     def new_media_status(self, status: Any) -> None:
         state = getattr(status, "player_state", None)
@@ -365,6 +383,11 @@ class _EndWatch:
             if getattr(status, "idle_reason", None) == "FINISHED":
                 stale = (self.ignore_session is not None
                          and getattr(status, "media_session_id", None) == self.ignore_session)
+                if stale and self.ignore_receiver is not None:
+                    # A relaunched receiver app is a new session even if its
+                    # media ids collide with the old one's.
+                    now = self._receiver_id()
+                    stale = now is None or now == self.ignore_receiver
                 if not stale:
                     self.ended = True
         elif state in ("PLAYING", "BUFFERING", "PAUSED", "LOADING"):
@@ -383,8 +406,14 @@ def _end_watch(cast: Any) -> _EndWatch | None:
         return None
     live = getattr(mc, "status", None)
     # A connection opened after the track already finished still reports it.
+    def receiver() -> Any:
+        status = getattr(cast, "status", None)
+        ids = (getattr(status, "session_id", None), getattr(status, "transport_id", None))
+        return ids if any(ids) else None
+
     watch = _EndWatch(seed=(getattr(live, "player_state", None) == "IDLE"
-                            and getattr(live, "idle_reason", None) == "FINISHED"))
+                            and getattr(live, "idle_reason", None) == "FINISHED"),
+                      receiver=receiver)
     try:
         register(watch)
         cast._harmony_end_watch = watch

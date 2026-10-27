@@ -102,7 +102,14 @@ class _FreshSource:
             return self._source
 
     def refresh(self) -> Any:
+        """Force a re-resolve (the CDN said 403/410). Honours the failure
+        back-off like ``get()``: with a dead provider every chunk request would
+        otherwise run a slow forced resolve under the lock. Inside the window it
+        raises (the relay answers 502) without calling the resolver; once the
+        window has passed a refresh is allowed again."""
         with self._lock:
+            if time.monotonic() < self._retry_at:
+                raise RuntimeError("stream re-resolve is backing off after a failure")
             self._renew(strict=True)
             return self._source
 

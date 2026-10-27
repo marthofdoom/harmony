@@ -258,7 +258,11 @@ class DeviceQueues:
 
     # -- device loop ---------------------------------------------------------
 
-    def _start_track(self, host: str, index: int) -> None:
+    def _start_track(self, host: str, index: int, keep_error: bool = False) -> None:
+        """Start queue entry ``index`` on ``host``. ``keep_error`` is for the
+        automatic skip-ahead after a failure: the "couldn't play <title>" note it
+        left stays visible through the next start instead of being wiped before
+        any client polled it. A user-initiated start always clears it."""
         with self._lock:
             dq = self._queues.get(host)
             if dq is None or dq.q.jump(index) is None:
@@ -268,7 +272,8 @@ class DeviceQueues:
             gen = dq.gen
             dq.playing = True
             dq.armed = False
-            dq.error = None
+            if not keep_error:
+                dq.error = None
             dq.settle_until = time.monotonic() + SETTLE_S
             dq.clock, dq.clock_at = 0.0, time.monotonic()
             dq.last_status = {}
@@ -298,7 +303,7 @@ class DeviceQueues:
             if stop:
                 self._inactive(host)
                 return
-            self._start_track(host, nxt)
+            self._start_track(host, nxt, keep_error=True)
             return
         with self._lock:
             halted = dq.gen != gen and not dq.playing
@@ -387,7 +392,9 @@ class DeviceQueues:
                 return
             nxt = self.after_status(host, st)
             if nxt is not None:
-                self._start_track(host, nxt)
+                # Poll-driven (a natural end or an errored track): never a user
+                # action, so a skip note set by after_status() must survive it.
+                self._start_track(host, nxt, keep_error=True)
             else:
                 with self._lock:
                     dq = self._queues.get(host)
@@ -484,6 +491,7 @@ class DeviceQueues:
             if not ended:
                 return None
             dq.error_streak = 0  # it played to its end: a run of errors is over
+            dq.error = None  # ...and so is any "couldn't play" note about earlier ones
             nxt = dq.q.following()
             if nxt is None:
                 dq.halt()
