@@ -4,13 +4,13 @@ A game (e.g. a Skyrim SKSE plugin) asks Harmony for "a track for the *combat*
 music type", downloads it as plain PCM WAV and plays it with its own audio
 engine. Harmony does the picking (profiles + shuffled "bags"), the sourcing
 (Library, Qobuz, YouTube Music through the engine's providers) and the
-transcoding (ffmpeg -> exact-length RIFF/WAVE, cached). The HTTP surface is
+transcoding (ffmpeg -> exact-length RIFF/WAVE or lossless FLAC, cached). The HTTP surface is
 documented in ``docs/api/game-source.md``; this module is the whole
 implementation, kept gi-free and independent of the HTTP framework:
 
 * :func:`validate_profile` / :func:`validate_name` -- strict profile schema.
 * :class:`TrackPool` -- candidate tracks for a (profile, type) + the bag.
-* :class:`AudioCache` -- bounded, single-flight ffmpeg transcode + LRU WAV cache.
+* :class:`AudioCache` -- bounded, single-flight ffmpeg transcode + LRU WAV/FLAC cache.
 * :class:`GameSource` -- the request router the web server delegates to
   (:meth:`GameSource.handle`) returning a :class:`GameResponse`;
   :func:`send_response` writes one to a ``BaseHTTPRequestHandler``.
@@ -72,7 +72,12 @@ BAD_TTL_S = 1800.0            # an unresolvable (region/age-blocked...) track is
 RATES = (44100, 48000)
 BITS = (16, 24)
 CHANNELS = (1, 2)
-DEFAULT_FORMAT = {"rate": 48000, "bits": 16, "channels": 2}
+#: Audio file formats: ``wav`` (canonical PCM, byte offsets map to sample frames) and
+#: ``flac`` (the same PCM, losslessly compressed; the sources are lossy already, so
+#: there is deliberately no lossy container).
+CONTAINERS = ("wav", "flac")
+DEFAULT_FORMAT = {"rate": 48000, "bits": 16, "channels": 2, "container": "wav"}
+FLAC_LEVEL = 1                # ffmpeg -compression_level: ~5% bigger than 5, same encode speed
 
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 TYPE_RE = NAME_RE
@@ -195,6 +200,12 @@ def _int_choice(value: Any, choices: tuple[int, ...], path: str) -> int:
     return value
 
 
+def _container(value: Any, path: str) -> str:
+    if not isinstance(value, str) or value not in CONTAINERS:
+        raise _bad(path, 'must be "wav" or "flac"')
+    return value
+
+
 def _flag(value: Any, path: str) -> bool:
     if not isinstance(value, bool):
         raise _bad(path, "must be true or false")
@@ -236,6 +247,7 @@ def validate_profile(data: Any, name: str | None = None) -> dict[str, Any]:
         "rate": _int_choice(fmt_in.get("rate", 48000), RATES, "format.rate"),
         "bits": _int_choice(fmt_in.get("bits", 16), BITS, "format.bits"),
         "channels": _int_choice(fmt_in.get("channels", 2), CHANNELS, "format.channels"),
+        "container": _container(fmt_in.get("container", "wav"), "format.container"),
     }
     return {
         "sources": sources, "types": out_types, "format": fmt,
@@ -274,6 +286,18 @@ def wav_valid(path: Path) -> bool:
     riff, = struct.unpack("<I", head[4:8])
     data, = struct.unpack("<I", head[40:44])
     return data > 0 and riff + 8 == size and 44 + data + data % 2 == size
+
+
+def flac_valid(path: Path) -> bool:
+    """Whether ``path`` looks like a complete FLAC written by us (files appear by
+    atomic rename only after ffmpeg exited 0, so a magic + STREAMINFO check suffices)."""
+    try:
+        size = path.stat().st_size
+        with open(path, "rb") as fh:
+            head = fh.read(8)
+    except OSError:
+        return False
+    return size > 42 and head[:4] == b"fLaC" and head[4] & 0x7F == 0 and head[5:8] == b"\x00\x00\x22"
 
 
 # -- ffmpeg -----------------------------------------------------------------------
@@ -414,6 +438,38 @@ def transcode_to_wav(ffmpeg: str, in_args: list[str], dest: Path, *, rate: int, 
     return data_len
 
 
+def transcode_to_flac(ffmpeg: str, in_args: list[str], dest: Path, *, rate: int, bits: int,
+                      channels: int, normalize: bool, trim: bool) -> int:
+    """Like :func:`transcode_to_wav` but ``dest`` ends up a lossless FLAC (returns the
+    PCM byte count). The canonical WAV is produced first -- one pipeline, so the
+    normalisation, trim, dither and depth rules cannot drift between containers --
+    and then only re-wrapped losslessly; the scratch WAV is removed again."""
+    scratch = dest.with_name(dest.name + ".wav.part")
+    try:
+        data_len = transcode_to_wav(ffmpeg, in_args, scratch, rate=rate, bits=bits,
+                                    channels=channels, normalize=normalize, trim=trim)
+        # ffmpeg decodes 24-bit PCM as s32; bits_per_raw_sample keeps the FLAC 24-bit.
+        depth = ["-sample_fmt", "s16"] if bits == 16 else ["-sample_fmt", "s32", "-bits_per_raw_sample", "24"]
+        cmd = [ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-y", "-f", "wav",
+               "-i", str(scratch), "-vn", "-map_metadata", "-1", "-c:a", "flac",
+               "-compression_level", str(FLAC_LEVEL), *depth, "-f", "flac", str(dest)]
+        try:
+            proc = subprocess.run(  # noqa: S603 - argv list, our own scratch file
+                cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+                timeout=TRANSCODE_TIMEOUT_S, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise GameError(504, "transcode_timeout", "ffmpeg took too long") from exc
+        if proc.returncode != 0:
+            tail = _scrub(proc.stderr.decode("utf-8", "replace").strip()[-300:])
+            raise GameError(502, "transcode_failed", f"ffmpeg failed (rc={proc.returncode}): {tail}")
+        with open(dest, "rb") as fh:
+            os.fsync(fh.fileno())
+        return data_len
+    finally:
+        with contextlib.suppress(OSError):
+            scratch.unlink()
+
+
 # -- audio cache --------------------------------------------------------------------
 
 
@@ -425,7 +481,7 @@ class _Job:
 
 
 class AudioCache:
-    """Finished WAVs on disk (LRU by mtime, size-capped) + single-flight builds.
+    """Finished WAV/FLAC files on disk (LRU by mtime, size-capped) + single-flight builds.
 
     ``get(key, build, wait_s)``: a hit returns the path at once; a miss starts
     ``build(tmp_path)`` on a worker thread (so a client giving up never kills a
@@ -465,7 +521,8 @@ class AudioCache:
         self._sweep_parts()
 
     def path_for(self, key: str) -> Path:
-        return self.dir / f"{key}.wav"
+        """A key is a hash (a WAV, ``<key>.wav``) or ``<hash>.flac`` (a FLAC, stored as is)."""
+        return self.dir / (key if key.endswith(".flac") else f"{key}.wav")
 
     def _sweep_parts(self) -> None:
         """Remove half-written temp files left by a crashed run."""
@@ -483,8 +540,11 @@ class AudioCache:
                 out.append((p, st.st_mtime, st.st_size))
         return out
 
+    def _finished(self) -> list[tuple[Path, float, int]]:
+        return self._sizes("*.wav") + self._sizes("*.flac")
+
     def stats(self) -> dict[str, int]:
-        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        wavs, parts = self._finished(), self._sizes("*.part")
         return {"bytes": sum(s for _p, _m, s in wavs), "files": len(wavs),
                 "in_progress_bytes": sum(s for _p, _m, s in parts), "cap": int(self._cap())}
 
@@ -512,7 +572,7 @@ class AudioCache:
         p = self.path_for(key)
         if not p.exists():
             return None
-        if not wav_valid(p):
+        if not (flac_valid(p) if p.suffix == ".flac" else wav_valid(p)):
             log.warning("game-audio: discarding invalid cache file %s", p.name)
             with contextlib.suppress(OSError):
                 p.unlink()
@@ -522,7 +582,7 @@ class AudioCache:
         return p
 
     def get(self, key: str, build: Callable[[Path], str | None], wait_s: float) -> Path | None:
-        """The cached WAV for ``key`` (pinned: the caller must :meth:`unpin` it
+        """The cached file for ``key`` (pinned: the caller must :meth:`unpin` it
         once it has finished serving), or ``None`` while it is still being built."""
         with self._lock:
             hit = self._hit(key)
@@ -560,11 +620,11 @@ class AudioCache:
     def _check_room(self) -> None:
         """Refuse a new build while the cache (finished files + in-progress
         ``.part`` files) is over its cap and nothing more can be evicted."""
-        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        wavs, parts = self._finished(), self._sizes("*.part")
         if sum(s for _p, _m, s in wavs) + sum(s for _p, _m, s in parts) <= self._effective_cap(wavs):
             return
         self._evict(extra=sum(s for _p, _m, s in parts))
-        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        wavs, parts = self._finished(), self._sizes("*.part")
         if sum(s for _p, _m, s in wavs) + sum(s for _p, _m, s in parts) > self._effective_cap(wavs):
             raise GameError(503, "cache_full",
                             "the game audio cache is full of files in use or made moments ago and cannot "
@@ -610,7 +670,7 @@ class AudioCache:
         ``extra`` bytes of in-progress work) is under the cap. Pinned, just-used
         and ``keep`` entries are spared."""
         with self._lock:
-            wavs = self._sizes("*.wav")
+            wavs = self._finished()
             cap = self._effective_cap(wavs)
             total = sum(s for _p, _m, s in wavs) + extra
             now = time.time()
@@ -751,7 +811,7 @@ class GameResponse:
     status: int = 200
     body: Any = None                      # JSON-serialisable
     headers: dict[str, str] = field(default_factory=dict)
-    file: Path | None = None              # served (a byte range of) as audio/wav
+    file: Path | None = None              # served (a byte range of); Content-Type is in ``headers``
     start: int = 0
     length: int = 0
     #: Called once the response has been written (or dropped): unpins the cache file.
@@ -1081,7 +1141,8 @@ class GameSource:
 
     def _audio_url(self, service: str, item_id: str, profile: dict[str, Any]) -> str:
         f = profile["format"]
-        return (f"/api/game/audio/{service}/{quote(item_id, safe='')}.wav?rate={f['rate']}"
+        ext = f.get("container", "wav")
+        return (f"/api/game/audio/{service}/{quote(item_id, safe='')}.{ext}?rate={f['rate']}"
                 f"&bits={f['bits']}&channels={f['channels']}"
                 f"&normalize={int(profile['normalize'])}&trim={int(profile['trim_silence'])}")
 
@@ -1124,7 +1185,7 @@ class GameSource:
     def next_tracks(self, body: Any) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise GameError(400, "bad_request", "body must be a JSON object")
-        unknown = set(body) - {"profile", "type", "sources", "count", "peek"}
+        unknown = set(body) - {"profile", "type", "sources", "count", "peek", "container"}
         if unknown:
             raise GameError(400, "bad_request", f"unknown key(s): {', '.join(sorted(map(str, unknown)))}")
         name = validate_name(body.get("profile"))
@@ -1138,6 +1199,9 @@ class GameSource:
         if not isinstance(peek, bool):
             raise GameError(400, "bad_request", '"peek" must be true or false')
         profile = self.get_profile(name)
+        if "container" in body:  # the request overrides the profile's format.container
+            container = _container_arg(body["container"])
+            profile = {**profile, "format": {**profile["format"], "container": container}}
         sources = body.get("sources", profile["sources"])
         if sources not in SOURCES:
             raise GameError(400, "bad_request", '"sources" must be "library" or "all"')
@@ -1188,7 +1252,7 @@ class GameSource:
         return {**now, "age_s": round(age, 1)}
 
     def status(self) -> dict[str, Any]:
-        return {"enabled": self.enabled(), "ffmpeg": bool(self._ffmpeg()),
+        return {"enabled": self.enabled(), "ffmpeg": bool(self._ffmpeg()), "containers": list(CONTAINERS),
                 "cache": self.cache.stats(), "now_playing": self._now_view(),
                 "history": [{k: h.get(k) for k in ("profile", "type", "service", "id", "title",
                                                    "artist", "started_at")}
@@ -1229,9 +1293,10 @@ class GameSource:
 
     def audio(self, service: str, filename: str, query: Mapping[str, list[str]],
               range_header: str | None) -> GameResponse:
-        if not filename.endswith(".wav"):
-            raise GameError(404, "not_found", "audio is served as <id>.wav")
-        service, item_id = _check_track_ref(service, filename[:-4])
+        container = next((c for c in CONTAINERS if filename.endswith(f".{c}")), None)
+        if container is None:
+            raise GameError(404, "not_found", "audio is served as <id>.wav or <id>.flac")
+        service, item_id = _check_track_ref(service, filename[: -len(container) - 1])
         rate, bits, channels, normalize, trim = self._parse_format(query)
         wait = self.wait_s
         if query.get("wait"):
@@ -1240,10 +1305,11 @@ class GameSource:
             except ValueError as exc:
                 raise GameError(400, "bad_format", "wait must be a number of seconds") from exc
         ffmpeg = self._ffmpeg()
-        fmt = f"{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}"
+        fmt = f"{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}|{container}"
 
         def key_of(svc: str, tid: str) -> str:
-            return hashlib.sha256(f"{_PIPELINE}|{svc}|{tid}|{fmt}".encode()).hexdigest()[:40]
+            h = hashlib.sha256(f"{_PIPELINE}|{svc}|{tid}|{fmt}".encode()).hexdigest()[:40]
+            return h + ".flac" if container == "flac" else h
 
         # The cache is keyed by the source that will actually be transcoded, not by
         # the id asked for: asking for a streaming id whose Library copy is known
@@ -1265,8 +1331,9 @@ class GameSource:
             except Exception as exc:  # noqa: BLE001
                 self._mark_bad(service, item_id)  # next() stops offering it for a while
                 raise GameError(502, "source_unavailable", _scrub(f"could not resolve the track: {exc}")) from exc
-            transcode_to_wav(ffmpeg, ffmpeg_input_args(source.url, source.headers), tmp, rate=rate,
-                             bits=bits, channels=channels, normalize=normalize, trim=trim)
+            (transcode_to_flac if container == "flac" else transcode_to_wav)(
+                ffmpeg, ffmpeg_input_args(source.url, source.headers), tmp, rate=rate,
+                bits=bits, channels=channels, normalize=normalize, trim=trim)
             return key_of(svc, tid)  # stored under what was really used
 
         path: Path | None = None
@@ -1286,7 +1353,7 @@ class GameSource:
             raise GameError(503, "cache_busy", "the audio cache entry vanished; retry shortly",
                             retry_after=RETRY_AFTER_S)
         release = lambda p=path: self.cache.unpin(p)  # noqa: E731
-        headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes", "ETag": f'"{path.stem}"',
+        headers = {"Content-Type": f"audio/{container}", "Accept-Ranges": "bytes", "ETag": f'"{path.stem}"',
                    "Cache-Control": "private, max-age=3600"}
         rng = parse_range(range_header, size)
         if rng == "bad":
@@ -1371,6 +1438,12 @@ class GameSource:
                 return resp
             raise GameError(405, "method_not_allowed", "use GET or HEAD")
         raise GameError(404, "not_found", "unknown game API route")
+
+
+def _container_arg(value: Any) -> str:
+    if not isinstance(value, str) or value not in CONTAINERS:
+        raise GameError(400, "bad_request", '"container" must be "wav" or "flac"')
+    return value
 
 
 def _size(value: Any) -> int:

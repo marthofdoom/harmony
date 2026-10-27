@@ -234,7 +234,7 @@ def seed(env, audio_files):
 def test_profile_defaults_filled_in():
     p = gs.validate_profile({"types": {"explore": {"genre": "Ambient"}}})
     assert p == {"sources": "all", "types": {"explore": {"genre": "Ambient"}},
-                 "format": {"rate": 48000, "bits": 16, "channels": 2},
+                 "format": {"rate": 48000, "bits": 16, "channels": 2, "container": "wav"},
                  "normalize": False, "trim_silence": False}
 
 
@@ -257,6 +257,9 @@ def test_profile_accepts_every_selector_and_unions():
     {"types": {"a": {"genre": "x"}}, "format": {"channels": 6}},
     {"types": {"a": {"genre": "x"}}, "format": {"rate": True}},
     {"types": {"a": {"genre": "x"}}, "format": {"codec": "mp3"}},
+    {"types": {"a": {"genre": "x"}}, "format": {"container": "mp3"}},
+    {"types": {"a": {"genre": "x"}}, "format": {"container": "FLAC"}},
+    {"types": {"a": {"genre": "x"}}, "format": {"container": True}},
     {"types": {"a": {"genre": "x"}}, "normalize": "yes"},
     {"types": {"a": {"genre": "x"}}, "trim_silence": 1},
     {"types": {"bad name": {"genre": "x"}}},
@@ -1422,3 +1425,138 @@ def test_library_only_must_be_asked_for(env, seed):
     assert used == "all" and ("ytmusic", "yAAAAAAAAAA") in seen
     # the bags are separate per scope: asking for library did not disturb the "all" pool
     assert _ids_over_cycles(env, "g")[1] == "all"
+
+
+# -- FLAC container -----------------------------------------------------------------------------------
+
+
+def fetch_flac(env, tid, service="local", q="rate=48000&bits=16&channels=2", **kw):
+    return call(env, "GET", f"/api/game/audio/{service}/{tid}.flac?{q}", raw=True, **kw)
+
+
+def flac_info(data: bytes):
+    """(rate, channels, bits, total samples) from the mandatory first STREAMINFO block."""
+    assert data[:4] == b"fLaC" and data[4] & 0x7F == 0 and data[5:8] == b"\x00\x00\x22"
+    bits64 = int.from_bytes(data[18:26], "big")  # 20 rate | 3 channels-1 | 5 bits-1 | 36 samples
+    return bits64 >> 44, ((bits64 >> 41) & 7) + 1, ((bits64 >> 36) & 31) + 1, bits64 & ((1 << 36) - 1)
+
+
+def decode(path: Path, fmt: str) -> bytes:
+    return subprocess.run(["ffmpeg", "-v", "error", "-i", str(path), "-f", fmt, "-"],
+                          check=True, capture_output=True).stdout
+
+
+def test_flac_profile_and_next_container_selection(env, seed):
+    assert gs.validate_profile({"types": {"a": {"genre": "x"}},
+                                "format": {"container": "flac"}})["format"]["container"] == "flac"
+    call(env, "PUT", "/api/game/profiles/g", PROFILE)
+    assert call(env, "GET", "/api/game/profiles/g")[1]["format"]["container"] == "wav"
+    nxt = {"profile": "g", "type": "explore", "peek": True}
+    assert ".wav?" in call(env, "POST", "/api/game/next", nxt)[1]["tracks"][0]["audio_url"]   # default
+    url = call(env, "POST", "/api/game/next", {**nxt, "container": "flac"})[1]["tracks"][0]["audio_url"]
+    assert url.startswith("/api/game/audio/local/") and ".flac?rate=48000&bits=16&channels=2" in url
+    call(env, "PUT", "/api/game/profiles/f", {**PROFILE, "format": {"container": "flac"}})
+    nxt = {"profile": "f", "type": "explore", "peek": True}
+    assert ".flac?" in call(env, "POST", "/api/game/next", nxt)[1]["tracks"][0]["audio_url"]  # profile
+    assert ".wav?" in call(env, "POST", "/api/game/next", {**nxt, "container": "wav"})[1]["tracks"][0]["audio_url"]
+    assert ".flac?" in call(env, "POST", "/api/game/next", nxt)[1]["tracks"][0]["audio_url"]  # not sticky
+
+
+@pytest.mark.parametrize("bad", ["mp3", "FLAC", "", None, 1, True, ["flac"]])
+def test_next_rejects_a_bad_container(env, seed, bad):
+    call(env, "PUT", "/api/game/profiles/g", PROFILE)
+    status, body = call(env, "POST", "/api/game/next", {"profile": "g", "type": "explore", "container": bad})
+    assert status == 400 and body["code"] == "bad_request" and "container" in body["error"]
+
+
+def test_put_profile_rejects_a_bad_container_naming_the_path(env):
+    status, body = call(env, "PUT", "/api/game/profiles/g", {**PROFILE, "format": {"container": "ogg"}})
+    assert status == 400 and body["code"] == "invalid_profile" and "format.container" in body["error"]
+
+
+def test_status_lists_the_containers(env):
+    assert call(env, "GET", "/api/game/status")[1]["containers"] == ["wav", "flac"]
+
+
+def test_audio_route_accepts_wav_and_flac_only(env, seed):
+    for name in ("a1.mp3", "a1.flac.wav.x", "a1", "a1.FLAC"):
+        assert call(env, "GET", f"/api/game/audio/local/{name}", raw=True)[0] == 404, name
+    assert call(env, "GET", "/api/game/audio/local/.flac", raw=True)[0] == 400       # empty id
+    assert call(env, "GET", "/api/game/audio/local/..%2Fx.flac", raw=True)[0] == 400
+    assert call(env, "GET", "/api/game/audio/spotify/a1.flac", raw=True)[0] == 400
+    for q in ("rate=96000", "bits=32", "channels=3", "normalize=maybe", "trim=2", "wait=x"):
+        assert fetch_flac(env, "a1", q=q)[0] == 400, q
+
+
+def test_flac_key_never_collides_with_wav(env, seed):
+    assert fetch_audio(env, "a1")[0] == 200 and fetch_flac(env, "a1")[0] == 200
+    cache = env.game.cache.dir
+    (wav,), (flac,) = list(cache.glob("*.wav")), list(cache.glob("*.flac"))
+    assert wav.stem != flac.stem and flac.name.endswith(".flac") and len(flac.stem) == 40
+    assert gs.wav_valid(wav) and gs.flac_valid(flac) and not gs.flac_valid(wav) and not gs.wav_valid(flac)
+    assert env.game.cache.stats()["files"] == 2
+    resolves = len(env.eng.resolve_calls)
+    assert fetch_flac(env, "a1")[0] == 200 and len(env.eng.resolve_calls) == resolves   # cache hit
+    assert fetch_audio(env, "a1")[2] == wav.read_bytes()                                # wav untouched
+
+
+@pytest.mark.parametrize(("tid", "bits", "ch", "rate"), [("a1", 16, 2, 48000), ("m1", 24, 2, 44100),
+                                                         ("a3", 24, 1, 44100), ("a1", 16, 1, 44100)])
+def test_flac_is_the_lossless_twin_of_the_wav(env, seed, tid, bits, ch, rate):
+    q = f"rate={rate}&bits={bits}&channels={ch}"
+    s, h, flac = fetch_flac(env, tid, q=q)
+    assert s == 200 and h["Content-Type"] == "audio/flac" and int(h["Content-Length"]) == len(flac)
+    assert h["Accept-Ranges"] == "bytes" and h["ETag"].startswith('"') and len(h["ETag"]) == 42
+    w = parse_wav(fetch_audio(env, tid, q=q)[2])
+    assert flac_info(flac) == (rate, ch, bits, w["frames"])      # 24-bit stays 24-bit, exact length
+    out = env.tmp / "o.flac"
+    out.write_bytes(flac)
+    assert decode(out, "s16le" if bits == 16 else "s24le") == w["pcm"]   # bit-exact PCM
+    assert len(flac) < len(w["pcm"])
+
+
+def test_flac_normalize_and_trim_match_the_wav_pipeline(env):
+    f = _tone(env.tmp / "pad2.wav", seconds=2, lead_silence=1.5, tail_silence=1.5)
+    env.eng.files["pad"] = f
+    for q in ("trim=1", "normalize=1&trim=1", "normalize=1"):
+        base = "rate=48000&bits=16&channels=2&" + q
+        w = parse_wav(fetch_audio(env, "pad", q=base)[2])
+        flac = fetch_flac(env, "pad", q=base)[2]
+        assert flac_info(flac)[3] == w["frames"], q
+        out = env.tmp / "p.flac"
+        out.write_bytes(flac)
+        assert decode(out, "s16le") == w["pcm"], q
+
+
+def test_flac_range_and_head(env, seed):
+    _s, _h, full = fetch_flac(env, "a1")
+    n = len(full)
+    s, h, part = fetch_flac(env, "a1", headers={"Range": "bytes=10-59"})
+    assert s == 206 and part == full[10:60] and h["Content-Range"] == f"bytes 10-59/{n}"
+    assert h["Content-Type"] == "audio/flac"
+    s, _h, part = fetch_flac(env, "a1", headers={"Range": "bytes=-4"})
+    assert s == 206 and part == full[-4:]
+    s, h, _ = fetch_flac(env, "a1", headers={"Range": f"bytes={n}-"})
+    assert s == 416 and h["Content-Range"] == f"bytes */{n}"
+    req = urllib.request.Request(env.url + "/api/game/audio/local/a1.flac?rate=48000&bits=16&channels=2",
+                                 method="HEAD")
+    with urllib.request.urlopen(req, timeout=30) as r:  # noqa: S310 - loopback
+        assert r.status == 200 and r.read() == b""
+        assert int(r.headers["Content-Length"]) == n and r.headers["Content-Type"] == "audio/flac"
+        assert r.headers["ETag"] == f'"{next(env.game.cache.dir.glob("*.flac")).stem}"'
+
+
+def test_flac_failed_transcode_is_never_cached(env, seed):
+    env.eng.files["broken"] = env.tmp / "broken.wav"
+    env.eng.files["broken"].write_bytes(b"not audio")
+    status, _h, body = fetch_flac(env, "broken")
+    assert status == 502 and json.loads(body)["code"] == "transcode_failed"
+    cache = env.game.cache.dir
+    assert list(cache.glob("*.flac")) == [] and list(cache.glob("*.part")) == []   # incl. the scratch WAV
+
+
+def test_flac_and_wav_share_the_lru_cap(env, seed):
+    fetch_audio(env, "a1")
+    fetch_flac(env, "a2")
+    stats = env.game.cache.stats()
+    assert stats["files"] == 2 and stats["bytes"] == sum(p.stat().st_size for p in env.game.cache.dir.iterdir())

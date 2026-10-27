@@ -19,6 +19,7 @@ just the first intended client.
 - [Concepts](#concepts): sources, profiles, music types, selectors, the bag
 - [Endpoints](#endpoints)
 - [WAV format](#wav-format)
+- [FLAC (lossless, about half the size)](#flac-lossless-about-half-the-size)
 - [Caching, transcoding and 202](#caching-transcoding-and-202)
 - [Range and HEAD](#range-and-head)
 - [Errors](#errors)
@@ -127,7 +128,7 @@ one mod list) wants to hear. Profiles live in Harmony's settings
     "town":    {"artist":   {"service": "ytmusic", "id": "UC1234567890abcdefghij"}},
     "default": {"genre": "Ambient"}
   },
-  "format": {"rate": 48000, "bits": 16, "channels": 2},
+  "format": {"rate": 48000, "bits": 16, "channels": 2, "container": "wav"},
   "normalize": true,
   "trim_silence": false
 }
@@ -140,6 +141,7 @@ one mod list) wants to hear. Profiles live in Harmony's settings
 | `format.rate` | `44100` \| `48000` | `48000` | WAV sample rate (Hz). |
 | `format.bits` | `16` \| `24` | `16` | Bits per sample. |
 | `format.channels` | `1` \| `2` | `2` | Mono or stereo (a stereo source is downmixed for mono). |
+| `format.container` | `"wav"` \| `"flac"` | `"wav"` | File format of the `audio_url` that `next` returns ([FLAC](#flac-lossless-about-half-the-size)). |
 | `normalize` | bool | `false` | Loudness-normalise every track ([details](#loudness-normalisation)). |
 | `trim_silence` | bool | `false` | Cut leading and trailing silence ([details](#silence-trimming)). |
 
@@ -211,7 +213,7 @@ curl -H "$K" $H/api/game/profiles
 ```
 ```json
 {"profiles": [{"name": "skyrim", "sources": "all", "types": {"explore": {"genre": "Ambient"}},
-               "format": {"rate": 48000, "bits": 16, "channels": 2},
+               "format": {"rate": 48000, "bits": 16, "channels": 2, "container": "wav"},
                "normalize": false, "trim_silence": false}]}
 ```
 
@@ -257,6 +259,7 @@ Pick the next track(s) for a music type.
 | `sources` | no | `"library"` or `"all"`; overrides the profile's (default `"all"`, every active source). |
 | `count` | no | 1-10 (default 1): how many tracks to return **and consume**. |
 | `peek` | no | `true` returns the next `count` tracks **without consuming** them (default `false`). |
+| `container` | no | `"wav"` or `"flac"`; overrides the profile's `format.container` (default `"wav"`). It only decides the extension of `audio_url`. |
 
 ```sh
 curl -X POST -H "$K" $H/api/game/next -d '{"profile": "skyrim", "type": "explore", "count": 2}'
@@ -287,14 +290,15 @@ curl -X POST -H "$K" $H/api/game/next -d '{"profile": "skyrim", "type": "explore
   always the format in `audio_url`.
 - `source.from_library` is `true` when a streaming pick was swapped for the
   Library copy.
-- `audio_url` is relative to the server and already carries the profile's WAV
-  format. If your client cannot send headers, append `&key=<personal key>`.
+- `audio_url` is relative to the server and already carries the profile's
+  format (it ends in `.wav` or `.flac` according to `container`).
+  If your client cannot send headers, append `&key=<personal key>`.
 - A pool smaller than `count` repeats tracks within one response (a one-track
   type returns it `count` times).
 
 ### `GET /api/game/audio/{service}/{id}.wav`
 
-Downloads the track as PCM WAV. Query parameters (all optional):
+Downloads the track as PCM WAV (for FLAC, see [`GET /api/game/audio/{service}/{id}.flac`](#get-apigameaudioserviceidflac)). Query parameters (all optional):
 
 | Parameter | Values | Default |
 |-----------|--------|---------|
@@ -315,6 +319,17 @@ Responds `200` with `Content-Type: audio/wav` and an exact `Content-Length`,
 (letters, digits, `_ . : @ + = ~ - [ ]`, at most 200 characters); anything else
 is `400` before the engine is touched. Only tracks the engine can resolve are
 ever fetched: the endpoint takes no URLs.
+
+### `GET /api/game/audio/{service}/{id}.flac`
+
+The same track as lossless FLAC (see [FLAC](#flac-lossless-about-half-the-size)).
+It takes exactly the query parameters, auth, validation, errors, `202`/`Retry-After`
+behaviour, `Range` and `HEAD` of the `.wav` endpoint above and answers `200` with
+`Content-Type: audio/flac`.
+
+```sh
+curl -H "$K" -o track.flac "$H/api/game/audio/local/87fbeaab3e0ef480.flac?rate=48000&bits=16&channels=2"
+```
 
 ### `POST /api/game/playing`
 
@@ -346,6 +361,7 @@ curl -H "$K" $H/api/game/status
 {
   "enabled": true,
   "ffmpeg": true,
+  "containers": ["wav", "flac"],
   "cache": {"bytes": 1291990, "files": 2, "in_progress_bytes": 0, "cap": 2147483648},
   "now_playing": {"profile": "skyrim", "type": "explore", "service": "local", "id": "87fbeaab3e0ef480",
                   "title": "Slow Fog", "age_s": 12.4, "...": "..."},
@@ -356,7 +372,10 @@ curl -H "$K" $H/api/game/status
 ```
 
 `enabled` mirrors the `game_source_enabled` setting, `ffmpeg` says whether
-ffmpeg was found (audio needs it), `cache` is the WAV cache (`bytes` of finished
+ffmpeg was found (audio needs it), `containers` lists the audio file formats this
+server can produce (`.wav` and `.flac` downloads, the `container` option of
+`next`; a server without the field only does WAV, so a client should treat a
+missing `containers` as `["wav"]`), `cache` is the audio cache (`bytes` of finished
 files, `in_progress_bytes` of half-written ones, `cap` in bytes),
 `history` the last 20 `playing` records.
 
@@ -388,6 +407,34 @@ Every download is a **canonical 44-byte-header RIFF/WAVE** file:
   32-bit pipeline. A 24-bit/96 kHz FLAC is resampled to the requested rate and
   depth; nothing is ever served at a rate/depth you did not ask for.
 
+## FLAC (lossless, about half the size)
+
+`.flac` instead of `.wav` returns the **identical audio** as native FLAC: lossless
+compression of exactly the PCM the WAV would hold, so a client that can decode
+FLAC downloads roughly half the bytes (a 133 s 44.1 kHz/16-bit stereo track is
+23 MB as WAV). There is deliberately no lossy container: the sources are lossy
+(YouTube AAC/Opus) already and are never re-encoded a second time.
+
+- Same pipeline as WAV: `normalize`, `trim`, `rate`, `bits` and `channels` behave
+  exactly as described here (the WAV is produced first and then only re-wrapped
+  losslessly), including the 16-bit dither and the 24-bit rule. Decoding the FLAC
+  gives the same samples as the `.wav` of the same query.
+- `bits=16` is a 16-bit FLAC, `bits=24` a 24-bit FLAC (stored in 32-bit sample
+  slots only inside ffmpeg; the file's STREAMINFO says 24 bits). Mono and stereo,
+  44.1 and 48 kHz.
+- Encoded with ffmpeg's `flac` encoder at compression level 1: nearly as small
+  as the slowest settings and fast (a 3-minute stereo track encodes in well under
+  a second).
+- No metadata: the file is the FLAC `fLaC` marker, a STREAMINFO block with the
+  exact total sample count, and frames.
+- `Content-Type: audio/flac`. `Range`/`HEAD` work on the **file as stored**, but
+  a byte offset in a FLAC file is not a sample position (frames are variable
+  size): **WAV is the only container where byte offsets map to sample frames**.
+  Use `Range` on FLAC only to resume or split a download, never to seek.
+- It is cached next to the WAV (a different cache entry, never mixed up with it)
+  and shares the same size cap, single-flight, concurrency limits and `202`
+  behaviour.
+
 ### Loudness normalisation
 
 `normalize=1` runs ffmpeg's EBU R128 `loudnorm` in a single pass at
@@ -409,11 +456,11 @@ full.
 
 Harmony decodes the source (a Library `file://`, a federated peer's stream, or a
 Qobuz/YouTube Music stream URL with the headers it needs) with **ffmpeg** and
-writes the finished WAV into a cache:
+writes the finished WAV (or FLAC) into a cache:
 
 - Location: `<user cache dir>/harmony/game-audio/` (for example
   `~/.cache/harmony/game-audio/`; in the Flatpak, `~/.var/app/io.github.marthofdoom.Harmony/cache/harmony/game-audio/`).
-- Key: `(source actually used, rate, bits, channels, normalize, trim)` (hashed;
+- Key: `(source actually used, rate, bits, channels, normalize, trim, container)` (hashed, so `.wav` and `.flac` of one query are separate entries;
   file names are never derived from request text, so there is no path
   traversal). The source is the one that gets transcoded: when the Library has a
   copy of a streaming track it is the Library copy, and it is cached apart from
@@ -468,7 +515,9 @@ length).
 gets `206 Partial Content` with `Content-Range: bytes a-b/total` and the exact
 `Content-Length` of the slice; an unsatisfiable range gets `416` with
 `Content-Range: bytes */total`; multiple ranges are ignored (full `200`). Seeking
-inside a WAV is a byte offset: `44 + frame * channels * bits/8`. An invalid
+inside a WAV is a byte offset: `44 + frame * channels * bits/8` (a `.flac`
+supports the same `Range` over the file as stored, but its byte offsets are **not**
+sample positions; see [FLAC](#flac-lossless-about-half-the-size)). An invalid
 range such as `bytes=10-5` is ignored (full `200`, RFC 9110). `HEAD` returns
 the headers of the `GET` (`Content-Type`, `Content-Length`, `ETag`) with no body.
 Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`.
@@ -477,9 +526,9 @@ Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`
 
 | HTTP | `code` | When |
 |------|--------|------|
-| 400 | `invalid_profile` | Profile body failed validation (the message names the path). |
+| 400 | `invalid_profile` | Profile body failed validation (the message names the path, e.g. `format.container`). |
 | 400 | `invalid_name` | Bad profile name. |
-| 400 | `bad_request` | Bad `next` / `playing` fields, bad `service` or `id`. |
+| 400 | `bad_request` | Bad `next` / `playing` fields (including a `container` other than `"wav"`/`"flac"`), bad `service` or `id`. |
 | 400 | `bad_format` | Bad `rate` / `bits` / `channels` / `normalize` / `trim` / `wait`. |
 | 400 | `bad_request` | (also) a missing-or-malformed `Content-Length` on a request with a body. |
 | 400 | `too_many_profiles` | More than 32 profiles. |
@@ -489,7 +538,7 @@ Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`
 | 404 | `unknown_type` | Type not in the profile and no `default` type. |
 | 404 | `no_tracks` | The type's selectors matched nothing playable for the chosen `sources`. |
 | 404 | `unknown_service` | The engine has no such service configured. |
-| 404 | `not_found` | Unknown route / not an `<id>.wav` path. |
+| 404 | `not_found` | Unknown route / not an `<id>.wav` or `<id>.flac` path. |
 | 405 | `method_not_allowed` | Wrong method for the route. |
 | 409 | `invalid_profile` | A stored profile (edited by hand) no longer validates; PUT it again. |
 | 411 | `length_required` | A chunked (`Transfer-Encoding`) request body; send `Content-Length`. |
@@ -514,7 +563,7 @@ In Harmony's `settings.json` (managed by the server; edit with the server stoppe
 |-----|---------|---------|
 | `game_source_enabled` | `true` | `false` answers `403 disabled` to everything except `GET /api/game/status`. |
 | `game_profiles` | `{}` | The profiles (use the API rather than editing). |
-| `game_cache_max_mb` | `2048` | WAV cache size cap in MB (minimum 64; in effect never below twice the largest cached file). |
+| `game_cache_max_mb` | `2048` | Audio (WAV and FLAC) cache size cap in MB (minimum 64; in effect never below twice the largest cached file). |
 
 ffmpeg is required: the `.deb` depends on it, and the Flatpak's GNOME runtime
 ships `/usr/bin/ffmpeg` (verified: 7.1 with `loudnorm`, `silenceremove`, and the
