@@ -59,8 +59,8 @@ class NowPlayingPage(Gtk.Box):
         self._artist.add_css_class("dim-label")
         art_col.append(self._title)
         art_col.append(self._artist)
-        # "Playing from …" + source/format (Hi-Res pill), larger than the bar's.
-        self.info = NowPlayingInfo(state, large=True)
+        # Album, then source/format (Hi-Res pill), larger than the bar's.
+        self.info = NowPlayingInfo(state, large=True, show_album=True)
         art_col.append(self.info)
 
         # Shuffle + repeat, acting on the active queue (mirrors the Now Playing bar).

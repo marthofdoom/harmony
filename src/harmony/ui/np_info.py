@@ -1,7 +1,7 @@
-"""The "Playing from <source>" + stream-quality block shared by the Now Playing
-bar and page.
+"""The album + source/stream-quality block shared by the Now Playing bar and page
+(same layout as web and Android; title and artist sit above it).
 
-    Playing from Library
+    Night Air                                           (page only; the bar folds it into the artist line)
     Library · harmony-server · FLAC · 24-bit / 96 kHz   [Hi-Res]
 
 Only libadwaita style classes and named theme colours are used (``dim-label``,
@@ -18,7 +18,6 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import Gdk, Gtk  # noqa: E402
 
 from harmony.ui.playing_info import (  # noqa: E402
-    playing_from_text,
     quality_text,
     tier_pill,
 )
@@ -54,22 +53,21 @@ def install_css() -> None:
 
 
 class NowPlayingInfo(Gtk.Box):
-    """``Playing from <source>``, then the source / format line with a tier pill.
+    """An optional album line, then the source / format line with a tier pill.
     The live local-output readout ("Output: …") is the quality line's tooltip,
     and stands in for the line while the stream's format isn't known yet."""
 
-    def __init__(self, state: AppState, *, large: bool = False) -> None:
+    def __init__(self, state: AppState, *, large: bool = False, show_album: bool = False) -> None:
         super().__init__(orientation=Gtk.Orientation.VERTICAL, spacing=2 if not large else 4)
         self.state = state
         install_css()
         css = "body" if large else "caption"
 
-        self.from_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4, visible=False)
-        self.source = Gtk.Label(xalign=0.0, ellipsize=3)
-        self.source.add_css_class("dim-label")
-        self.source.add_css_class(css)
-        self.from_row.append(self.source)
-        self.append(self.from_row)
+        self.show_album = show_album
+        self.album = Gtk.Label(xalign=0.0, ellipsize=3, visible=False)
+        self.album.add_css_class("dim-label")
+        self.album.add_css_class(css)
+        self.append(self.album)
 
         self.quality_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6, visible=False)
         self.quality = Gtk.Label(xalign=0.0, ellipsize=3)
@@ -83,10 +81,9 @@ class NowPlayingInfo(Gtk.Box):
 
     def update(self) -> None:
         pb = self.state.playback
-        src = playing_from_text(pb.source)
-        self.source.set_label(src)
-        self.source.set_visible(bool(src))
-        self.from_row.set_visible(bool(src))
+        album = (getattr(pb.track, "album", None) or "") if self.show_album else ""
+        self.album.set_label(album)
+        self.album.set_visible(bool(album))
 
         output = self.state.local_audio_label()
         line = quality_text(pb.source, pb.quality) or (output or "")

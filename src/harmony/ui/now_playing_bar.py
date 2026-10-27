@@ -71,8 +71,9 @@ class NowPlayingBar(Gtk.Box):
         self._artist = Gtk.Label(xalign=0.0, ellipsize=3)
         self._artist.add_css_class("dim-label")
         self._artist.add_css_class("caption")
-        # "Playing from …" + the stream's source/format (Hi-Res pill); the live
-        # local-output readout is its tooltip.
+        # The stream's source/format line (Hi-Res pill); the live local-output
+        # readout is its tooltip. The album is folded into the artist line
+        # ("Artist · Album") so the bar stays three lines tall.
         self._info = NowPlayingInfo(state)
         meta.append(self._title)
         meta.append(self._artist)
@@ -277,7 +278,8 @@ class NowPlayingBar(Gtk.Box):
         if key != self._track_key:
             self._track_key = key
             self._title.set_label(track.title or "Unknown")
-            self._artist.set_label(track.artist_name or "")
+            self._artist.set_label(" · ".join(
+                p for p in (track.artist_name, getattr(track, "album", None)) if p))
             self._load_art(getattr(track, "artwork_url", None))
 
         # Show what "This computer" is actually outputting (bit depth / rate),

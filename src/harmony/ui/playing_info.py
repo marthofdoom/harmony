@@ -1,8 +1,7 @@
-"""Text for "Playing from <source>" and the stream-quality line (gi-free, unit-testable).
+"""Text for the source / stream-quality line (gi-free, unit-testable).
 
 Shared by the Now Playing bar and the Now Playing page so both say the same thing:
 
-    Playing from Library  ·  Dark Side of the Moon      (album = a small link)
     Library · harmony-server · FLAC · 24-bit / 96 kHz   [Hi-Res]
 """
 
@@ -19,13 +18,6 @@ def source_name(source: dict[str, Any] | None) -> str:
     if source.get("service") == "local":
         return "Library"
     return str(source.get("label") or source.get("service") or "")
-
-
-def playing_from_text(source: dict[str, Any] | None) -> str:
-    """``"Playing from Library"`` -- the SOURCE of the audio, never the
-    album/playlist it was picked from."""
-    name = source_name(source)
-    return f"Playing from {name}" if name else ""
 
 
 def is_hires(quality: dict[str, Any] | None) -> bool:

@@ -1,11 +1,10 @@
-"""'Playing from <source>' text, the shared info widget, and the Library page pieces."""
+"""Source/quality text, the shared info widget, and the Library page pieces."""
 
 from __future__ import annotations
 
 import pytest
 
 from harmony.ui.playing_info import (
-    playing_from_text,
     quality_text,
     tier_pill,
 )
@@ -15,14 +14,6 @@ HIRES = {"codec": "FLAC", "bit_depth": 24, "sample_rate": 96000, "tier": "hires"
 CD = {"codec": "FLAC", "bit_depth": 16, "sample_rate": 44100, "tier": "lossless",
       "label": "FLAC · 16-bit / 44.1 kHz", "lossless": True}
 LIB = {"service": "local", "label": "Library", "instance": "harmony-server", "own": True}
-
-
-def test_playing_from_names_the_source_never_the_collection() -> None:
-    assert playing_from_text(LIB) == "Playing from Library"
-    assert playing_from_text({"service": "qobuz", "label": "Qobuz"}) == "Playing from Qobuz"
-    assert playing_from_text({"service": "ytmusic", "label": "YouTube Music"}) == \
-        "Playing from YouTube Music"
-    assert playing_from_text(None) == ""
 
 
 def test_quality_line_and_pills() -> None:
@@ -41,6 +32,7 @@ def test_info_widget_renders_source_quality_and_pill(monkeypatch, tmp_path) -> N
     from gi.repository import GObject
 
     from harmony import config as config_module
+    from harmony.models import Service, Track
     from harmony.ui.np_info import NowPlayingInfo
     from harmony.ui.state import AppState
 
@@ -49,21 +41,26 @@ def test_info_widget_renders_source_quality_and_pill(monkeypatch, tmp_path) -> N
     GObject.Object.__init__(state)
     state.settings = config_module.Settings.load()
     state._init_playback()
-    info = NowPlayingInfo(state)
+    info = NowPlayingInfo(state, show_album=True)
     info.update()
-    assert not info.from_row.get_visible() and not info.quality_row.get_visible()
+    assert not info.album.get_visible() and not info.quality_row.get_visible()
 
     pb = state.playback
     pb.source, pb.quality = LIB, HIRES
     pb.context = {"kind": "songs", "title": "Songs"}
     info.update()
-    assert info.source.get_label() == "Playing from Library"
+    pb.track = Track(id="1", service=Service.LOCAL, title="T", album="Night Air")
+    info.update()
+    assert info.album.get_visible() and info.album.get_label() == "Night Air"
+    pb.track = Track(id="2", service=Service.LOCAL, title="T")
+    info.update()
+    assert not info.album.get_visible()
     assert info.quality.get_label() == "Library · harmony-server · FLAC · 24-bit / 96 kHz"
     assert info.pill.get_visible() and info.pill.get_label() == "Hi-Res"
 
     pb.source, pb.quality = {"service": "qobuz", "label": "Qobuz"}, {**CD}
     info.update()
-    assert info.source.get_label() == "Playing from Qobuz"
+    assert info.quality.get_label() == "Qobuz · FLAC · 16-bit / 44.1 kHz"
     assert info.pill.get_label() == "Lossless"
 
 
