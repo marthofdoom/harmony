@@ -1214,9 +1214,18 @@ def test_bad_set_is_bounded_and_expires(tmp_path, monkeypatch):
     assert list(game._bad) == [("ytmusic", "fresh")]                 # the expired ones were dropped
 
 
+def _pins_released(env, timeout=5.0):
+    # the server unpins in a finally after its last write, so a client can finish
+    # reading the body a moment before the release runs
+    deadline = time.time() + timeout
+    while env.game.cache._pins and time.time() < deadline:
+        time.sleep(0.01)
+    return not env.game.cache._pins
+
+
 def test_serving_pins_the_file_and_releases_it_afterwards(env, seed):
     fetch_audio(env, "a1")
-    assert not env.game.cache._pins                                  # GET finished -> unpinned
+    assert _pins_released(env)                                       # GET finished -> unpinned
     resp = env.game.audio("local", "a1.wav", {}, None)
     assert resp.file is not None and env.game.cache._pinned(resp.file.name)
     resp.done()
@@ -1225,7 +1234,7 @@ def test_serving_pins_the_file_and_releases_it_afterwards(env, seed):
     assert call(env, "HEAD", "/api/game/audio/local/a1.wav", raw=True)[0] == 200
     assert call(env, "GET", "/api/game/audio/local/a1.wav", headers={"Range": "bytes=999999999-"},
                 raw=True)[0] == 416
-    assert not env.game.cache._pins                                  # HEAD and 416 released it too
+    assert _pins_released(env)                                       # HEAD and 416 released it too
 
 
 def test_a_cache_file_that_vanishes_is_retried_then_503_never_500(env, seed):
@@ -2538,3 +2547,273 @@ def test_a_locked_playlist_gives_up_without_backing_the_service_off(env):
         _next(env)
         _settle(pool)
     assert len(pool.refs) == 20 and abs(_left(pool) - 3600) < 5 and env.game._bo.get("qobuz") is None
+
+
+# -- review round 3 -----------------------------------------------------------------------------------------
+
+
+def test_ytmusicapi_user_errors_are_auth_only_when_they_are_about_signing_in():
+    from ytmusicapi.exceptions import YTMusicUserError
+
+    from harmony.errors import AuthError, ProviderError
+    from harmony.providers.ytmusic import YTMusicProvider
+
+    def raiser(msg):
+        def fn(*_a):
+            raise YTMusicUserError(msg)
+        return fn
+
+    with pytest.raises(ProviderError) as bad:
+        YTMusicProvider._call(None, raiser("Invalid album browseId provided, must start with MPRE."), "OLAK5uy_x")
+    assert not isinstance(bad.value, AuthError)
+    with pytest.raises(AuthError):
+        YTMusicProvider._call(None, raiser("Please provide authentication before using this function"))
+
+
+def test_a_bad_youtube_music_album_id_gives_up_and_never_backs_the_service_off(env):
+    from ytmusicapi.exceptions import YTMusicUserError
+
+    from harmony.providers.ytmusic import YTMusicProvider
+
+    _streaming_env(env, qobuz={}, yt={"rock music": _songs(Service.YTMUSIC, 0, 20)})
+    _set(game_genre_variants=False)
+
+    def bad_album(aid):
+        def fn(_aid):
+            raise YTMusicUserError("Invalid album browseId provided, must start with MPRE.")
+        return YTMusicProvider._call(None, fn, aid)         # the real error mapping, as get_album_tracks does
+
+    env.eng.yt.get_album_tracks = bad_album
+    # a profile stored before the save-time check existed: the album id is an OLAK playlist id
+    _set(game_profiles={"g": {"types": {"explore": [{"genre": "rock"},
+                                                    {"album": {"service": "ytmusic", "id": "OLAK5uy_abc"}}]}}})
+    assert _next(env)["pool_size"] == 20
+    pool = env.game._pools[("g", "explore", "all")]
+    for _ in range(gs.MAX_PARTIAL_ATTEMPTS - 1):                   # (the first build was the first attempt)
+        pool.expires = 0.0
+        _next(env)
+        _settle(pool)
+    assert pool.attempts == 0 and abs(_left(pool) - 3600) < 5      # gave up: the normal TTL
+    assert env.game._bo.get("ytmusic") is None                     # ...and YT Music was never backed off
+
+
+def test_saving_a_youtube_music_album_id_that_is_not_an_album_browse_id_is_rejected(env):
+    body = {"types": {"explore": [{"genre": "rock"}, {"album": {"service": "ytmusic", "id": "OLAK5uy_abc"}}]}}
+    status, err = call(env, "PUT", "/api/game/profiles/g", body)
+    assert status == 400 and "types.explore[1].album.id" in err["error"] and "MPRE" in err["error"]
+    status, err = call(env, "PUT", "/api/game/profiles/g", {"types": {"x": {"album": {"service": "ytmusic", "id": "abc"}}}})
+    assert status == 400 and "types.x.album.id" in err["error"]
+    ok = {"types": {"explore": [{"album": {"service": "ytmusic", "id": "MPREb_abc"}},
+                                {"album": {"service": "qobuz", "id": "123"}},
+                                {"playlist": {"service": "ytmusic", "id": "OLAK5uy_abc"}}]}}
+    assert call(env, "PUT", "/api/game/profiles/g", ok)[0] == 200
+
+
+def test_a_pool_too_big_for_the_budget_completes_while_every_build_makes_progress(env, monkeypatch):
+    qs = {f"q{i}": _songs(Service.QOBUZ, i * 10, i * 10 + 10) for i in range(10)}
+    _streaming_env(env, qobuz=qs, delay=0.1)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.15)               # ~1-2 queries per build
+    monkeypatch.setattr(gs, "POOL_TTL_S", 0.7)                     # the memo lifetime (600 s), scaled like the budget
+    env.game.put_profile("g", {"types": {"explore": [{"query": f"q{i}"} for i in range(10)]}})
+    for _ in range(30):                                            # far more than the memo lives, in total
+        _next(env)
+        pool = env.game._pools[("g", "explore", "all")]
+        _settle(pool)
+        if len(pool.refs) == 100:
+            break
+        pool.expires = 0.0
+        time.sleep(0.3)
+    assert len(pool.refs) == 100 and pool.memo == {} and abs(_left(pool) - 3600) < 5
+    assert len(env.eng.qobuz.paged) == 10                          # each query fetched once, never again
+
+
+def test_budget_only_builds_that_fetch_nothing_new_give_up_and_serve_the_partial_pool(env, monkeypatch, caplog):
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 100),
+                               "best rock songs": _songs(Service.QOBUZ, 100, 150),
+                               "rock playlist": _songs(Service.QOBUZ, 150, 170)}, delay=0.1)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.25)
+    _put(env)
+    first = _next(env)["pool_size"]
+    assert 0 < first < 170
+    pool = env.game._pools[("g", "explore", "all")]
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.0)                # nothing more can be fetched
+    with caplog.at_level("WARNING", logger="harmony.game_source"):
+        for i in range(1, gs.MAX_PARTIAL_ATTEMPTS + 1):
+            pool.expires = 0.0
+            _next(env)
+            _settle(pool)
+            if i < gs.MAX_PARTIAL_ATTEMPTS:
+                assert pool.stalls == i and pool.memo and abs(_left(pool) - gs.PARTIAL_POOL_RETRY_S) < 2
+    assert len(pool.refs) == first and abs(_left(pool) - 3600) < 5     # accepted as is, the normal TTL
+    assert pool.stalls == 0 and pool.memo == {}
+    assert any("still incomplete" in r.getMessage() for r in caplog.records)
+
+
+def test_progress_resets_the_stall_count_and_a_changed_selector_resets_the_attempts(env, monkeypatch):
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 100),
+                               "best rock songs": _songs(Service.QOBUZ, 100, 150),
+                               "rock playlist": _songs(Service.QOBUZ, 150, 170)}, delay=0.1)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.12)
+    _put(env)
+    _next(env)
+    pool = env.game._pools[("g", "explore", "all")]
+    pool.stalls = gs.MAX_PARTIAL_ATTEMPTS - 1
+    pool.expires = 0.0
+    _next(env)
+    _settle(pool)
+    assert pool.stalls == 0 and pool.memo                          # it fetched something: no give-up
+    # the stored selector changes under the live pool (an edit made elsewhere); the new one fails for good
+    pool.attempts, pool.stalls = gs.MAX_PARTIAL_ATTEMPTS - 1, gs.MAX_PARTIAL_ATTEMPTS - 1
+
+    def dead(query, **kw):
+        raise KeyError("layout")
+
+    env.eng.qobuz.search = dead
+    _set(game_profiles={"g": {"types": {"explore": {"query": "dead"}}}})
+    with pytest.raises(gs.GameError):                                # nothing to play from it
+        _next(env)
+    assert env.game._pools[("g", "explore", "all")] is pool
+    assert pool.attempts == 1 and pool.stalls == 0                  # counted afresh, not 4 + 1 = a give-up
+    assert abs(_left(pool) - gs.PARTIAL_POOL_RETRY_S) < 2
+
+
+def test_a_peek_stays_what_the_next_consume_returns_when_the_pool_grows_in_between():
+    for seed in range(60):
+        bag = gs.Bag(random.Random(seed))
+        base = [("qobuz", str(i)) for i in range(30)]
+        bag.sync(base)
+        peek = bag.take(5, consume=False)
+        bag.sync(base + [("qobuz", f"n{i}") for i in range(40)])   # a partial pool completing
+        assert bag.take(5, consume=False) == peek
+        assert bag.take(5, consume=True) == peek
+        assert len({k for k in bag.take(30, consume=False) if k[1].startswith("n")}) > 0   # newcomers still join
+
+
+def test_a_newcomer_may_land_anywhere_after_the_peeked_prefix():
+    landed = set()
+    for seed in range(200):
+        bag = gs.Bag(random.Random(seed))
+        base = [("qobuz", str(i)) for i in range(10)]
+        bag.sync(base)
+        bag.take(3, consume=False)
+        bag.sync([*base, ("qobuz", "new")])
+        landed.add(list(bag.queue).index(("qobuz", "new")))
+    assert min(landed) == 3 and max(landed) == 10                  # random, but never inside the peeked 3
+
+
+def test_peek_then_consume_after_a_partial_pool_refresh(env, monkeypatch):
+    for seed in range(8):
+        env.game._pools.clear()
+        _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 100),
+                                   "best rock songs": _songs(Service.QOBUZ, 100, 150),
+                                   "rock playlist": _songs(Service.QOBUZ, 150, 170)}, delay=0.05)
+        env.game.rng_factory = lambda s=seed: random.Random(s)
+        monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.12)
+        _put(env)
+        peek = _tids(_next(env, peek=True, count=3))
+        pool = env.game._pools[("g", "explore", "all")]
+        monkeypatch.setattr(gs, "STREAM_BUDGET_S", 60.0)
+        pool.expires = 0.0
+        _next(env, peek=True)                                      # starts the background refresh
+        _settle(pool)
+        assert len(pool.refs) == 170
+        assert _tids(_next(env, count=3)) == peek
+
+
+def test_distinct_library_files_of_one_title_and_artist_are_not_merged(env):
+    env.eng.lib.tracks = [
+        _trk("l1", "Intro", "Band", genre="rock"), _trk("l2", "Intro", "Band", genre="rock"),
+        _trk("l3", "Song", "Band", genre="rock"), _trk("l4", "Song", "Band", genre="rock"),
+    ]
+    env.eng.lib.tracks[1].album = "Second album"
+    env.eng.lib.tracks[3].album = "Live at Wembley"
+    env.game.put_profile("g", {"sources": "library", "types": {"explore": {"genre": "rock"}}})
+    assert _next(env)["pool_size"] == 4
+
+
+def test_a_streaming_twin_still_folds_into_the_library_copies(env):
+    env.eng.lib.tracks = [_trk("l1", "Intro", "Band", genre="rock"), _trk("l2", "Intro", "Band", genre="rock")]
+    _streaming_env(env, qobuz={"rock music": [_trk("q1", "Intro", "Band", Service.QOBUZ),
+                                              _trk("q2", "Other", "Band", Service.QOBUZ)]})
+    env.eng.lib.on = True
+    _set(game_genre_variants=False)
+    env.game.put_profile("g", {"types": {"explore": {"genre": "rock"}}})
+    _next(env)
+    pool = env.game._pools[("g", "explore", "all")]
+    assert sorted(pool.refs) == [("local", "l1"), ("local", "l2"), ("qobuz", "q2")]   # q1 was a twin of Intro
+
+
+def test_forget_skips_malformed_keys_and_persists_even_with_history_off(env):
+    _lib_env(env)
+    _next(env, count=5)
+    path = env.tmp / gs.HISTORY_FILE
+    data = json.loads(path.read_text())
+    data["pools"]["nosep"] = {"fp": "x", "t": 0, "served": ["local:a"]}
+    path.write_text(json.dumps(data))
+    h = gs.History(lambda: path, lambda: True)
+    assert h.forget("nosep", "explore") == 0 and h.forget("g", "other") == 0      # no IndexError; keys kept
+    assert "nosep" in json.loads(path.read_text())["pools"]
+    _set(game_history_enabled=False)                               # recording is off, forgetting still works
+    off = gs.History(lambda: path, lambda: False)
+    assert off.forget("g") == 1
+    assert list(json.loads(path.read_text())["pools"]) == ["nosep"]
+
+
+def test_unknown_or_malformed_excluded_services_are_logged_once(env, caplog):
+    with caplog.at_level("WARNING", logger="harmony.game_source"):
+        _set(game_excluded_services=["qobuz", "spotify"])
+        assert env.game._excluded() == {"qobuz", "spotify"}       # the unknown name matches nothing
+        env.game._excluded()
+        _set(game_excluded_services="qobuz")                       # a string, not a list
+        assert env.game._excluded() == set()
+    msgs = [r.getMessage() for r in caplog.records if "game_excluded_services" in r.getMessage()]
+    assert len(msgs) == 2 and "'spotify'" in msgs[0] and "not a list" in msgs[1]
+
+
+def test_a_single_track_peek_stays_what_the_consume_returns_when_a_second_track_arrives():
+    bag = gs.Bag(random.Random(1))
+    a, b = ("local", "a"), ("local", "b")
+    bag.sync([a])
+    assert bag.pick(2, lambda k: True, repeat_ok=True, consume=False) == [a, a]
+    bag.sync([a, b])                                               # the pool grew: no repeat_ok any more
+    assert bag.pick(2, lambda k: True, repeat_ok=False, consume=True) == [a, a]
+    assert b in bag.pick(2, lambda k: True, repeat_ok=False, consume=False)
+
+
+def test_a_one_track_peek_matches_the_consume_after_the_pool_grows(env):
+    env.eng.lib.tracks[:] = [_trk("a", "Alone", genre="Ambient")]
+    env.game.rng_factory = lambda: random.Random(4)
+    _put(env, selector={"genre": "Ambient"}, sources="library")
+    peek = _tids(_next(env, count=2, peek=True))
+    assert peek == ["a", "a"]
+    env.eng.lib.tracks.append(_trk("b", "Second", genre="Ambient"))
+    env.game._pools[("g", "explore", "library")].expires = 0.0
+    assert _tids(_next(env, count=2)) == peek
+
+
+def test_a_stalled_budget_give_up_keeps_the_bigger_pool_but_moves_to_the_normal_ttl(env, monkeypatch):
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 100),
+                               "best rock songs": _songs(Service.QOBUZ, 100, 150),
+                               "rock playlist": _songs(Service.QOBUZ, 150, 170)}, delay=0.1)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.12)
+    _put(env)
+    small = _next(env)["pool_size"]
+    pool = env.game._pools[("g", "explore", "all")]
+    assert 0 < small < 170 and pool.memo
+    partial_memo = dict(pool.memo)
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 60.0)
+    for _ in range(5):                                             # complete it
+        pool.expires = 0.0
+        _next(env)
+        _settle(pool)
+        if len(pool.refs) == 170:
+            break
+    assert len(pool.refs) == 170
+    # a refresh whose memo only holds the early part and whose budget is spent: partial, nothing new
+    pool.memo, pool.memo_fp, pool.memo_at, pool.stalls = partial_memo, pool.fingerprint, time.monotonic(), 4
+    monkeypatch.setattr(gs, "STREAM_BUDGET_S", 0.0)
+    pool.expires = 0.0
+    _next(env)
+    _settle(pool)
+    assert len(pool.refs) == 170 and pool.stalls == 0 and pool.memo == {}
+    assert abs(_left(pool) - 3600) < 5

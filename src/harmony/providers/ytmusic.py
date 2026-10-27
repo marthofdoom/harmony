@@ -28,6 +28,9 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T")
 
+# YTMusicUserError messages that mean "not signed in / bad credentials" (the rest is bad input)
+_AUTH_HINT = re.compile(r"authenticat|authoriz|oauth|cookie|credential|sign(?:ed)?[ -]?in", re.I)
+
 # search() kind -> ytmusicapi search filter
 _SEARCH_FILTERS = {
     "tracks": "songs",
@@ -264,7 +267,11 @@ class YTMusicProvider(MusicProvider):
         try:
             return fn(*args, **kwargs)
         except YTMusicUserError as exc:
-            raise AuthError(str(exc)) from exc
+            # ytmusicapi raises this for "sign in first" AND for bad input (a malformed
+            # browseId...): only the former is an auth problem, the latter never gets better.
+            if _AUTH_HINT.search(str(exc)):
+                raise AuthError(str(exc)) from exc
+            raise ProviderError(str(exc)) from exc
         except YTMusicServerError as exc:
             message = str(exc)
             if "429" in message:

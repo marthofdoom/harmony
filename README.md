@@ -235,7 +235,7 @@ The [`docs/`](docs/README.md) directory is the map — architecture, design
 
 **HTTP API:** [`docs/api/`](docs/api/README.md) — including the
 [game source API](docs/api/game-source.md), which lets a game engine (e.g. a Skyrim
-music mod) use Harmony as its music source: PCM WAV downloads per music type from
+music mod) use Harmony as its music source: WAV or lossless FLAC downloads per music type from
 your Library, Qobuz or — with no accounts at all — YouTube Music.
 
 The short version: providers normalise each service into shared dataclasses,

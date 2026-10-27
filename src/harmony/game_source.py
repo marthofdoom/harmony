@@ -31,6 +31,7 @@ import array
 import collections
 import contextlib
 import hashlib
+import itertools
 import json
 import logging
 import os
@@ -105,7 +106,7 @@ MIN_STREAM_POOL_TTL_S = 600.0
 MAX_STREAM_POOL_TTL_S = 86400.0
 EMPTY_POOL_RETRY_S = 3.0      # an empty candidate list (Library mid-scan...) is retried this soon
 STREAM_EMPTY_RETRY_S = 30.0   # ... an empty STREAMING list this soon (every try is a web request)
-MAX_PARTIAL_ATTEMPTS = 5      # consecutive partial builds before the fetched-results memo is dropped
+MAX_PARTIAL_ATTEMPTS = 5      # consecutive failing / stalled partial builds before the partial pool is accepted as is
 BACKOFF_MIN_S = 30.0          # per-service back-off after a rate limit / BACKOFF_FAILS failures in a row
 BACKOFF_MAX_S = 600.0
 BACKOFF_FAILS = 3
@@ -295,6 +296,20 @@ def validate_profile(data: Any, name: str | None = None) -> dict[str, Any]:
         "normalize": _flag(data.get("normalize", False), "normalize"),
         "trim_silence": _flag(data.get("trim_silence", False), "trim_silence"),
     }
+
+
+def _check_saved_ids(profile: dict[str, Any]) -> None:
+    """Save-time checks on ids that a shape check cannot catch (not applied to profiles already
+    stored, so an older one with such an id keeps loading): a YouTube Music album id is a
+    browseId ``MPRE...`` -- the ``OLAK5uy_...`` id of the album's playlist is a playlist id."""
+    for tname, sel in profile["types"].items():
+        many = isinstance(sel, list)
+        for i, one in enumerate(selectors_of(sel)):
+            ref = one.get("album")
+            if ref and ref["service"] == "ytmusic" and not ref["id"].startswith("MPRE"):
+                raise _bad(f"types.{tname}{f'[{i}]' if many else ''}.album.id",
+                           'a YouTube Music album id starts with "MPRE" (an "OLAK5uy_..." id is the '
+                           'album\'s playlist: use {"playlist": ...} for that)')
 
 
 def selectors_of(value: Any) -> list[dict[str, Any]]:
@@ -837,6 +852,8 @@ class Bag:
         self.last: tuple[str, str] | None = None      # last key taken off the queue
         self.last_out: tuple[str, str] | None = None  # last key actually handed out
         self.recent: collections.deque[tuple[str, str]] = collections.deque(maxlen=RECENT_MAX)
+        self.peeked = 0   # queue entries already shown by a peek: newcomers never land inside them
+        self.peek_repeat = False   # the ``repeat_ok`` that peek walked with (a single-track pool shows [A, A])
 
     def _avoid_first(self, cycle: list[tuple[str, str]], prior: list[tuple[str, str]]) -> None:
         """Swap ``cycle``'s head so it is not one of the last ``min(50, members // 2)``
@@ -859,7 +876,9 @@ class Bag:
         served first (one full least-recently-served cycle), and never opens with one
         of the last few served. Later, a newcomer that was served before (a pool that
         completes after a partial build) joins after the current cycle in the same
-        least-recently-served order; only a truly unseen one is spliced in at random."""
+        least-recently-served order; only a truly unseen one is spliced in at random, but
+        never into the prefix a peek has already shown (that stays what the next consuming
+        call returns)."""
         old = set(self.members)
         new = set(keys)
         self.members = list(dict.fromkeys(keys))
@@ -874,11 +893,13 @@ class Bag:
             self.queue = collections.deque(cycle)
             return
         kept = [k for k in self.queue if k in new]
+        shown = sum(1 for k in itertools.islice(self.queue, self.peeked) if k in new)
         later = sorted((k for k in self.members if k not in old and k in rank), key=rank.__getitem__)
         for k in self.members:
-            if k not in old and k not in rank:  # unseen newcomers go to a random spot in what's left
-                kept.insert(self.rng.randint(0, len(kept)), k)
+            if k not in old and k not in rank:  # unseen newcomers go to a random spot after the peeked prefix
+                kept.insert(self.rng.randint(shown, len(kept)), k)
         self.queue = collections.deque(kept + later)
+        self.peeked = shown
 
     def _fill(self, n: int) -> None:
         while len(self.queue) < n and self.members:
@@ -891,7 +912,10 @@ class Bag:
     def take(self, n: int, *, consume: bool) -> list[tuple[str, str]]:
         self._fill(n)
         items = list(self.queue)[:n]
-        if consume:
+        if not consume:
+            self.peeked = max(self.peeked, len(items))
+        else:
+            self.peeked = max(0, self.peeked - len(items))
             for _ in items:
                 self.queue.popleft()
             if items:
@@ -911,8 +935,10 @@ class Bag:
         ONE algorithm for peek and consume: it walks a cursor over the (append
         only) materialised queue and keeps its own ``prev``; with ``consume=False``
         nothing is popped and ``last``/``last_out`` stay put, so the same call with
-        ``consume=True`` returns exactly the same keys."""
+        ``consume=True`` returns exactly the same keys. Inside the prefix a peek already
+        showed, a consume keeps the peek's ``repeat_ok`` even if the pool has grown since."""
         out: list[tuple[str, str]] = []
+        shown, shown_repeat = self.peeked, self.peek_repeat
         prev = self.last_out
         limit = (count + 1) * (len(self.members) + 1)
         i = 0
@@ -922,11 +948,17 @@ class Bag:
                 break
             key = self.queue[i]
             i += 1
-            if not playable(key) or (key == prev and not repeat_ok):
+            again = repeat_ok or (consume and i <= shown and shown_repeat)
+            if not playable(key) or (key == prev and not again):
                 continue
             out.append(key)
             prev = key
-        if consume and i:
+        if not consume:
+            if i > self.peeked:
+                self.peek_repeat = repeat_ok
+            self.peeked = max(self.peeked, i)
+        elif i:
+            self.peeked = max(0, self.peeked - i)
             taken = [self.queue.popleft() for _ in range(i)]
             self.last = taken[-1]
             if out:
@@ -948,7 +980,8 @@ class TrackPool:
         self.memo: dict[tuple, list[Any]] = {}
         self.memo_fp = ""
         self.memo_at = 0.0
-        self.attempts = 0                 # consecutive partial builds
+        self.attempts = 0                 # consecutive partial builds with a permanent per-call failure
+        self.stalls = 0                   # consecutive budget-only partial builds that fetched nothing new
         self.expires = 0.0                # monotonic time the candidate list is next refreshed
         self.refreshing = False           # a background refresh is running (single flight)
         self.worker: threading.Thread | None = None
@@ -1033,18 +1066,21 @@ class History:
         """Drop the memory of a profile (or one of its types); the number of pools cleared."""
         with self._lock:
             pools = self._load()
-            gone = [p for p in pools if p.split("/")[0] == profile
-                    and (ttype is None or p.split("/")[1].casefold() == ttype.casefold())]
+            gone = []
+            for p in pools:
+                parts = p.split("/")
+                if len(parts) >= 2 and parts[0] == profile and (ttype is None or parts[1].casefold() == ttype.casefold()):
+                    gone.append(p)   # (a key without a "/" is not ours: skipped)
             for p in gone:
                 del pools[p]
             if gone:
                 self._dirty = True
-        self.flush()
+        self.flush(force=True)   # clearing the memory is persisted even while recording is switched off
         return len(gone)
 
-    def flush(self) -> None:
+    def flush(self, force: bool = False) -> None:
         with self._lock:
-            if not self._dirty or self._pools is None or not self._enabled():
+            if not self._dirty or self._pools is None or not (force or self._enabled()):
                 return
             payload = {"version": HISTORY_VERSION, "pools": {
                 p: {"fp": e["fp"], "t": e["t"], "served": [f"{s}:{i}" for s, i in e["served"]]}
@@ -1134,12 +1170,14 @@ class _Build:
     allowed: frozenset[str] | None = None
     failed: list[str] = field(default_factory=list)   # permanent per-call failures (deleted playlist...)
     transient: bool = False                           # budget, back-off, rate limit, network, 5xx, auth
+    outage: bool = False                              # ...of which a call failed (not just the budget)
+    added: int = 0                                    # calls answered that the memo did not have yet
 
     def failure(self, gsrc: GameSource, what: str) -> None:
         """Record a failed streaming call (``gsrc._stream_call`` just returned ``None``)."""
         self.partial = True
         if getattr(gsrc._tls, "transient", True):
-            self.transient = True
+            self.transient = self.outage = True
         else:
             self.failed.append(what)
 
@@ -1157,6 +1195,7 @@ class _Build:
             self.failure(gsrc, " ".join(str(k) for k in memokey))
             return []
         self.memo[memokey] = got
+        self.added += 1
         return got
 
 
@@ -1188,6 +1227,7 @@ class GameSource:
         self._bad_lock = threading.Lock()
         self._bo_lock = threading.Lock()
         self._bo: dict[str, dict[str, float]] = {}   # per-service back-off state
+        self._excl_warned = ""                       # the last bad game_excluded_services value we logged
         self._bad: collections.OrderedDict[tuple[str, str], float] = collections.OrderedDict()
         self._now: dict[str, Any] | None = None
         self._history: collections.deque[dict[str, Any]] = collections.deque(maxlen=HISTORY_MAX)
@@ -1244,6 +1284,7 @@ class GameSource:
     def put_profile(self, name: str, body: Any) -> dict[str, Any]:
         validate_name(name)
         profile = validate_profile(body, name)
+        _check_saved_ids(profile)
         # The default container is not persisted, so a rollback to an older Harmony (which
         # rejects unknown format keys) still validates every stored profile.
         stored = {**profile, "format": {k: v for k, v in profile["format"].items()
@@ -1347,7 +1388,14 @@ class GameSource:
 
     def _excluded(self) -> set[str]:
         raw = getattr(self._cfg(), "game_excluded_services", None)
-        names = {str(n).strip().lower() for n in raw} if isinstance(raw, (list, tuple, set)) else set()
+        listed = isinstance(raw, (list, tuple, set))
+        names = {str(n).strip().lower() for n in raw} if listed else set()
+        bad = sorted(n for n in names if n not in _SOURCE_SERVICE and n != "local")
+        if (bad or (raw and not listed)) and repr(raw) != self._excl_warned:   # once per distinct value
+            self._excl_warned = repr(raw)
+            log.warning("game source: game_excluded_services: ignoring %s (use a list of: %s)",
+                        f"unknown name(s) {', '.join(map(repr, bad))}" if bad else f"{raw!r}, which is not a list",
+                        ", ".join(SOURCE_NAMES))
         return {_SOURCE_SERVICE.get(n, n) for n in names}
 
     def _services(self, sources: str) -> frozenset[str]:
@@ -1454,9 +1502,13 @@ class GameSource:
                     continue
                 # One song once, even if the Library and a service (or two query variants)
                 # both have it: the Library copy wins, else the first seen, so a "repeat" can't hide as a twin.
+                # Two different Library files are never twins (a live take, a remaster, a second album).
                 song = _song_key(ref["title"], ref["artist"])
                 if song and song in by_song:
                     kept = by_song[song]
+                    if ref["service"] == kept["service"] == "local" and ref["id"] != kept["id"]:
+                        order.append(ref)
+                        continue
                     if _SERVICE_RANK.get(ref["service"], 1) < _SERVICE_RANK.get(kept["service"], 1):
                         kept.update(ref)
                     continue
@@ -1495,14 +1547,26 @@ class GameSource:
         # Builds whose only failures are permanent per-call ones (a deleted playlist...) count
         # towards giving up; transient partials (outage, rate limit, back-off, budget) do not.
         permanent = ctx.partial and not ctx.transient
-        attempts = pool.attempts + 1 if permanent else pool.attempts if ctx.partial else 0
+        before = pool.attempts if same else 0   # a changed selector starts the count over
+        attempts = before + 1 if permanent else before if ctx.partial else 0
+        # A pool too big for the time budget is still being worked through as long as each build
+        # fetches something new; MAX_PARTIAL_ATTEMPTS budget-only builds in a row that fetched
+        # nothing new mean it is not going to finish.
+        budget_only = ctx.partial and ctx.transient and not ctx.outage and not ctx.failed
+        stalls = pool.stalls if same else 0
+        if ctx.added or not ctx.partial:
+            stalls = 0
+        elif budget_only:
+            stalls += 1
         # After MAX_PARTIAL_ATTEMPTS of those in a row: accept the result and use the normal TTL.
-        giveup = permanent and attempts >= MAX_PARTIAL_ATTEMPTS
+        failing = permanent and attempts >= MAX_PARTIAL_ATTEMPTS
+        giveup = failing or (budget_only and stalls >= MAX_PARTIAL_ATTEMPTS)
         if giveup:
             log.warning("game source: pool %s still incomplete after %d builds (%s); using it as is",
-                        "/".join(key), attempts, ", ".join(ctx.failed) or "time budget")
-        # A partial rebuild never shrinks a pool we already have.
-        if refs and ctx.partial and same and len(refs) < len(pool.refs) and not giveup:
+                        "/".join(key), max(attempts, stalls), ", ".join(ctx.failed) or "time budget")
+        # A partial rebuild never shrinks a pool we already have, unless a call failed for good
+        # (a deleted playlist's tracks must go); a stalled budget does not shrink it either.
+        if refs and ctx.partial and same and len(refs) < len(pool.refs) and not failing:
             refs = {}
         got = bool(refs)
         if refs or not same:
@@ -1511,11 +1575,12 @@ class GameSource:
             pool.fingerprint = fp
         # The memo of fetched results lives across consecutive partial builds (so each
         # one finishes what the last could not), but not forever: it is dropped after
-        # MAX_PARTIAL_ATTEMPTS builds or POOL_TTL_S, so a call that keeps failing cannot
-        # freeze the successful ones.
-        pool.attempts = 0 if giveup else attempts
+        # MAX_PARTIAL_ATTEMPTS builds, or POOL_TTL_S after the last build that added anything
+        # (a big pool keeps its memo while it makes progress), so a call that keeps failing
+        # cannot freeze the successful ones.
+        pool.attempts, pool.stalls = (0, 0) if giveup else (attempts, stalls)
         if ctx.partial and not giveup:
-            if ctx.memo is not pool.memo:   # a fresh memo (new, or the old one had expired)
+            if ctx.memo is not pool.memo or ctx.added:   # a fresh memo (new, or the old one had expired), or progress
                 pool.memo_at = now
             pool.memo, pool.memo_fp = ctx.memo, fp
         else:
@@ -1525,7 +1590,7 @@ class GameSource:
         # an empty STREAMING list after 30 s, an empty library list (mid-scan) after a few seconds.
         if ctx.partial and not giveup:
             retry = PARTIAL_POOL_RETRY_S
-        elif not got:
+        elif not got and not (giveup and pool.refs):
             retry = STREAM_EMPTY_RETRY_S if streaming else EMPTY_POOL_RETRY_S
         else:
             retry = ttl

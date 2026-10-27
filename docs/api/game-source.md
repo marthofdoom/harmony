@@ -181,7 +181,10 @@ A selector says which tracks belong to a music type. It is an object with
 | `{"artist": {"service", "id"}}` | The artist's tracks (`service: "local"`). | The artist's top tracks (up to 100). |
 
 `service` is one of `local` (the Library), `qobuz`, `ytmusic`. Ids are the ones
-the apps and `/api/search` return. With `sources=library`, a selector that names
+the apps and `/api/search` return. A YouTube Music **album** id is the album's
+browse id, which starts with `MPRE` (the `OLAK5uy_...` id of its playlist is a
+playlist id: use a `playlist` selector); saving a profile with any other
+`ytmusic` album id is a 400 naming the path. With `sources=library`, a selector that names
 a streaming service contributes nothing (it is skipped, not an error); if a type
 ends up with no tracks at all, `next` answers `404 no_tracks`.
 
@@ -223,17 +226,22 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   requests (a request already running is not interrupted). If the budget runs
   out or a service call fails, the pool is built from what arrived and rebuilt
   after exactly **60 seconds** (instead of the normal TTL), reusing the results
-  already fetched, so it completes over the next refreshes. That reuse stops after
-  5 consecutive partial builds or 10 minutes (the fetched results are dropped and
-  fetched afresh), so one call that keeps failing cannot freeze the rest. After
-  5 partial builds in a row whose only failures are permanent ones of single
-  calls (a deleted playlist, HTTP 404, a private playlist's 403, a malformed
-  payload; outages, rate limits, 5xx, auth errors and
-  the time budget never count, and never shrink a pool) the failure is treated as permanent: the result is accepted even if smaller, the normal TTL applies
-  again and the failing selector is logged as a warning (once per TTL, as long as it stays dead). Until then a
-  partial rebuild never makes an existing pool smaller; tracks that arrive late
-  and were served before the restart are queued behind the current cycle, least
-  recently served first (see [no-repeat memory](#no-repeat-memory)).
+  already fetched, so it completes over the next refreshes. A pool too big for
+  one budget therefore keeps its fetched results (and is completed by the next
+  builds) for as long as builds keep adding something new; the reuse ends **10
+  minutes after the last build that fetched anything new**, and the results are
+  then dropped and fetched afresh. After 5 builds in a row that were cut short
+  only by the budget and fetched nothing new, the partial pool is accepted as it
+  is and the normal TTL applies. The same happens after 5 partial builds in a row
+  whose only failures are permanent ones of single calls (a deleted playlist,
+  HTTP 404, a private playlist's 403, a malformed payload, an album id YouTube
+  Music rejects; outages, rate limits, 5xx and auth errors never count, and never
+  shrink a pool): the result is accepted even if smaller and the failing selector
+  is logged as a warning (once per TTL, as long as it stays dead). Changing the
+  selectors starts the count over. Until then a partial rebuild never makes an
+  existing pool smaller; tracks that arrive late and were served before the
+  restart are queued behind the current cycle, least recently served first (see
+  [no-repeat memory](#no-repeat-memory)).
 - Requests are sequential (never parallel) within a build. **Be aware:** every
   streaming call holds the engine-wide provider lock (the same lock the app's
   own YouTube Music / Qobuz calls take), so while a build runs the UI's provider
@@ -252,6 +260,8 @@ A streaming search used to give about 25 tracks per service. For `genre` and
 
 **One song once.** Within a candidate list, tracks with the same normalised
 (artist, title) collapse to one, preferring the **Library** copy; between two streaming services the one seen first is kept.
+Two different Library files are never merged with each other (a second album's
+version, a live take): only a streaming twin folds into the Library copy.
 Normalisation is conservative: case, punctuation and spacing are ignored, and
 only pure noise tags are dropped: `(Official Video)`, `[Official Audio]`,
 `(Remastered)` / `- 2011 Remaster`, `(feat. X)` / `ft. X`, and a YouTube
@@ -268,7 +278,8 @@ the last one of the previous cycle (when there is more than one track). A type
 with a single playable track simply repeats it. The cycle is
 [remembered across restarts](#no-repeat-memory). When a refresh adds candidates,
 unseen ones are shuffled into the rest of the cycle, ones served before wait
-behind it.
+behind it. Tracks a `peek` has already shown stay where they are: new
+candidates are only inserted after them.
 
 The first track of a reshuffled cycle is also never one of the last
 `min(50, pool_size / 2)` tracks served.
@@ -296,15 +307,17 @@ Editing the selectors (or `sources`) of a music type resets that type's memory
 **Reset it** by `DELETE /api/game/profiles/<name>` (clears the profile's
 memory), by `DELETE /api/game/history?profile=<name>[&type=<type>]`
 (`{"ok": true, "cleared": <pools>}`; `type` is matched case-insensitively; also
-restarts the live bags), by deleting the
-file, or by setting `game_history_enabled` to `false` (no memory is read or
-written).
+restarts the live bags; works with `game_history_enabled` off too), by deleting
+the file, or by setting `game_history_enabled` to `false` (no memory is read or
+written; what the file already holds is kept until reset).
 
 `POST /api/game/next` **advances the bag by `count`** and always returns
 `count` tracks as long as at least one candidate is playable (a small pool wraps
 into the next cycle). To look ahead without using tracks up, pass
 `"peek": true`: the response is exactly what the next consuming call(s) will
-return, including across a cycle boundary.
+return, including across a cycle boundary and when a refresh adds candidates in
+between (those never land inside what the peek showed; a candidate that is
+removed or blocked in between can still change it).
 
 **Blocked tracks.** A streaming track Harmony could not resolve (region- or
 age-blocked, removed...) is skipped for 30 minutes. It is simply passed over, so
@@ -694,7 +707,7 @@ In Harmony's `settings.json` (managed by the server; edit with the server stoppe
 | `game_genre_variants` | `true` | Extra `genre` query variants and YouTube Music mood playlists. |
 | `game_history_enabled` | `true` | Persist the [no-repeat memory](#no-repeat-memory) (`game-history.json`). |
 | `game_stream_pool_ttl_s` | `3600` | Seconds before a candidate list with streaming selectors is refreshed in the background (clamped 600-86400; Library-only lists: 600). |
-| `game_excluded_services` | `[]` | Services removed from `all` and from every `sources` list: any of `"library"`, `"ytmusic"`, `"qobuz"`. |
+| `game_excluded_services` | `[]` | Services removed from `all` and from every `sources` list: any of `"library"`, `"ytmusic"`, `"qobuz"`. Anything else (an unknown name, a value that is not a list) is ignored with a logged warning. |
 
 ffmpeg is required: the `.deb` depends on it, and the Flatpak's GNOME runtime
 ships `/usr/bin/ffmpeg` (verified: 7.1 with `loudnorm`, `silenceremove`, and the
