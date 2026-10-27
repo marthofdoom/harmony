@@ -46,6 +46,23 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.12" date="2026-10-27">
+      <description>
+        <p>Songs no longer end early on a Chromecast or Google TV: when a
+        streaming service's link expired mid-song, the device used to receive
+        the error as if it were audio and stop. Harmony now refreshes links in
+        time, retries an expired one, resumes a dropped stream, and moves to the
+        next song only when the device says the song has finished.</p>
+        <p>The desktop player always shows the right Play/Pause state and Stop
+        always works. It no longer freezes when you stop, skip or seek a track
+        that was still loading.</p>
+        <p>New: a game source API lets a game engine use Harmony as its music
+        source, with tracks per music type served as WAV files. It works out
+        of the box with YouTube Music's public catalogue, and with your
+        Library and Qobuz when available. The playing bar now shows the album,
+        and a Windows (WSL) guide covers running the server on Windows.</p>
+      </description>
+    </release>
     <release version="1.0.11" date="2026-10-19">
       <description>
         <p>Harmony leaves your Chromecast and Google TV alone unless you're
