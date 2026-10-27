@@ -485,7 +485,7 @@ class QobuzProvider(MusicProvider):
     # -- search / browse ----------------------------------------------------
 
     def search(
-        self, query: str, *, kinds: Sequence[str] = ("tracks",), limit: int = 25
+        self, query: str, *, kinds: Sequence[str] = ("tracks",), limit: int = 25, offset: int = 0
     ) -> SearchResults:
         results = SearchResults()
         for kind in kinds:
@@ -493,7 +493,7 @@ class QobuzProvider(MusicProvider):
                 log.warning("Unsupported Qobuz search kind %r; skipping", kind)
                 continue
             data = self._request(
-                "GET", "catalog/search", params={"query": query, "type": kind, "limit": limit, "offset": 0}
+                "GET", "catalog/search", params={"query": query, "type": kind, "limit": limit, "offset": offset}
             )
             items = (data.get(kind) or {}).get("items", [])
             if kind == "tracks":

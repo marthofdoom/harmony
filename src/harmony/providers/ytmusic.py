@@ -498,6 +498,29 @@ class YTMusicProvider(MusicProvider):
         raw = self._call(self._yt.get_playlist, playlist_id, limit=None)
         return self._tracks_from_raw_list(raw.get("tracks", []))
 
+    def genre_playlist_tracks(
+        self, genre: str, *, playlists: int = 3, per_playlist: int = 50
+    ) -> list[Track]:
+        """Tracks of the "Moods & Genres" playlists whose category title is ``genre``
+        (case-insensitive). Both browse calls are public (no sign-in)."""
+        want = genre.strip().casefold()
+        params = None
+        for section in self._call(self._yt.get_mood_categories).values():
+            for cat in section:
+                if (cat.get("title") or "").strip().casefold() == want:
+                    params = cat.get("params")
+                    break
+            if params:
+                break
+        if not params:
+            return []
+        tracks: list[Track] = []
+        for pl in self._call(self._yt.get_mood_playlists, params)[:playlists]:
+            if pl.get("playlistId"):
+                raw = self._call(self._yt.get_playlist, pl["playlistId"], limit=per_playlist)
+                tracks += self._tracks_from_raw_list(raw.get("tracks", []))[:per_playlist]
+        return tracks
+
     def create_playlist(self, title: str, description: str = "", public: bool = False) -> Playlist:
         privacy_status = "PUBLIC" if public else "PRIVATE"
         result = self._call(self._yt.create_playlist, title, description, privacy_status=privacy_status)

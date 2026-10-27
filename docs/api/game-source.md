@@ -16,7 +16,7 @@ just the first intended client.
 
 - [Quick start: no accounts needed](#quick-start-no-accounts-needed)
 - [Auth](#auth)
-- [Concepts](#concepts): sources, profiles, music types, selectors, the bag
+- [Concepts](#concepts): sources, profiles, music types, selectors, candidate depth, the bag, no-repeat memory
 - [Endpoints](#endpoints)
 - [WAV format](#wav-format)
 - [FLAC (lossless, about half the size)](#flac-lossless-about-half-the-size)
@@ -164,8 +164,8 @@ A selector says which tracks belong to a music type. It is an object with
 
 | Selector | Library | `sources=all` |
 |----------|---------|---------------|
-| `{"genre": "Ambient"}` | Library tracks tagged with that genre (case-insensitive, whole-genre match). | Same, **plus** a YouTube Music / Qobuz track search for `"<genre> music"`. |
-| `{"query": "dark ambient"}` | Library track search for the text. | Track search on the Library, YouTube Music and (signed in) Qobuz. |
+| `{"genre": "Ambient"}` | Library tracks tagged with that genre (case-insensitive, whole-genre match). | Same, **plus** deep YouTube Music / Qobuz track searches for `"<genre> music"`, `"best <genre> songs"` and `"<genre> playlist"`, and YouTube Music's Moods & Genres playlists named like the genre ([depth](#candidate-depth)). |
+| `{"query": "dark ambient"}` | Library track search for the text. | Track search on the Library, YouTube Music and (signed in) Qobuz, [deep](#candidate-depth) (no variants). |
 | `{"playlist": {"service", "id"}}` | n/a (the Library has no playlists). | The playlist's tracks on that service (public YouTube Music playlists and albums work without an account). |
 | `{"album": {"service", "id"}}` | The album's tracks (`service: "local"`). | The album's tracks on that service. |
 | `{"artist": {"service", "id"}}` | The artist's tracks (`service: "local"`). | The artist's top tracks (up to 100). |
@@ -180,14 +180,78 @@ when the profile is edited), so a busy game does not search on every request.
 An **empty** list (the Library is still being scanned, a service blipped) is
 only cached for about 3 seconds, so music appears as soon as the scan finishes.
 
+### Candidate depth
+
+A streaming search used to give about 25 tracks per service. For `genre` and
+`query` selectors with `sources=all` Harmony now asks for
+`game_stream_search_limit` tracks (default 100, clamped to 10-300) per query:
+
+- **YouTube Music**: one search with that `limit` (ytmusicapi follows the result
+  continuations itself, verified in its source). Songs-filtered, as before.
+- **Qobuz** (signed in): pages of 50 using the catalogue `offset`.
+- **Genre variants** (`game_genre_variants`, default `true`; `false` turns off
+  both the variants and the mood playlists): `genre` selectors also search
+  `"best <genre> songs"` and `"<genre> playlist"` (half the depth each) and, on
+  YouTube Music, add up to 3 Moods & Genres playlists (50 tracks each) whose
+  category title equals the genre name case-insensitively (`Chill`, `Focus`,
+  `Workout`...; no sign-in needed). Results are merged and de-duplicated.
+- The existing 30 s - 15 min duration filter for streaming tracks still applies;
+  the Library branch is unchanged.
+- **Time budget**: a candidate build spends at most about 8 seconds on streaming
+  requests (a request already running is not interrupted). If the budget runs
+  out or a service call fails, the pool is built from what arrived and rebuilt
+  after **about 60 seconds** (not 10 minutes), reusing the results already
+  fetched, so it completes over the next refreshes. A partial rebuild never
+  makes an existing pool smaller.
+- Requests are sequential and go through the same per-service locks as before; no
+  extra concurrency.
+
+**One song once.** Within a candidate list, tracks with the same normalised
+(artist, title) collapse to one, preferring **Library > Qobuz > YouTube Music**.
+Normalisation is conservative: case, punctuation and spacing are ignored, and
+only pure noise tags are dropped: `(Official Video)`, `[Official Audio]`,
+`(Remastered)` / `- 2011 Remaster`, `(feat. X)` / `ft. X`, and a YouTube
+`- Topic` artist suffix. Anything meaningful stays distinct: `(Live)`, `(Remix)`,
+`(Acoustic)`, `(Instrumental)`, `(Radio Edit)`, `(Part 2)`, a bare year, or a
+different artist. Tracks without a title or artist are never merged.
+
 ### The bag
 
 For every `(profile, music type)` Harmony keeps a **shuffled bag**: each
 candidate track is served once, in random order, before any repeats; when the
 bag is empty it is reshuffled, and the first track of the new cycle is never
 the last one of the previous cycle (when there is more than one track). A type
-with a single playable track simply repeats it. Bags live in server memory and
-reset when the profile is edited or the server restarts.
+with a single playable track simply repeats it. The cycle is
+[remembered across restarts](#no-repeat-memory).
+
+The first track of a reshuffled cycle is also never one of the last
+`min(50, pool_size / 2)` tracks served.
+
+### No-repeat memory
+
+Harmony remembers recently served tracks per `(profile, type, sources)` in
+`game-history.json` next to `settings.json` (`~/.config/harmony/` for a normal
+install). Format: `{"version": 1, "pools": {"<profile>/<type>/<sources>":
+{"fp": "<selector fingerprint>", "t": <unix time>, "served": ["service:id", ...]}}}`,
+oldest first, written atomically after every consuming `next`. Bounds: the last
+**2000** tracks per pool and **20000** in total (the least recently used pools go
+first). A missing, unreadable or corrupt file is ignored (start fresh); a file that
+cannot be written is only logged.
+
+When a pool is (re)built, for example after a restart, its bag starts from the
+candidates **minus the most recently served ones**, as many as leave at least
+`max(10, pool_size / 4)` candidates in play; when everything was served, that
+keeps the *oldest* quarter and replays those first (so a restart mid-way through
+a big pool does not replay what you just heard, even after the first full pass).
+`"peek": true` never writes memory.
+
+Editing the selectors (or `sources`) of a music type resets that type's memory
+(the fingerprint changes); editing other types or the format keeps it.
+**Reset it** by `DELETE /api/game/profiles/<name>` (clears the profile's
+memory), by `DELETE /api/game/history?profile=<name>[&type=<type>]`
+(`{"ok": true, "cleared": <pools>}`; also restarts the live bags), by deleting the
+file, or by setting `game_history_enabled` to `false` (no memory is read or
+written).
 
 `POST /api/game/next` **advances the bag by `count`** and always returns
 `count` tracks as long as at least one candidate is playable (a small pool wraps
@@ -247,6 +311,12 @@ dozen types, a few selectors each) is well under 4 KB.
 ```sh
 curl -X DELETE -H "$K" $H/api/game/profiles/skyrim      # {"ok": true, "deleted": "skyrim"}
 ```
+
+### `DELETE /api/game/history?profile={name}[&type={type}]`
+
+Clears the [no-repeat memory](#no-repeat-memory) of a profile, or of one music
+type, and restarts the live bags: `{"ok": true, "profile": "skyrim", "type": null, "cleared": 3}`.
+`profile` is required.
 
 ### `POST /api/game/next`
 
@@ -568,6 +638,9 @@ In Harmony's `settings.json` (managed by the server; edit with the server stoppe
 | `game_source_enabled` | `true` | `false` answers `403 disabled` to everything except `GET /api/game/status`. |
 | `game_profiles` | `{}` | The profiles (use the API rather than editing). |
 | `game_cache_max_mb` | `2048` | Audio (WAV and FLAC) cache size cap in MB (minimum 64; in effect never below twice the largest cached file). |
+| `game_stream_search_limit` | `100` | Tracks fetched per streaming query for `genre`/`query` selectors (clamped 10-300; [details](#candidate-depth)). |
+| `game_genre_variants` | `true` | Extra `genre` query variants and YouTube Music mood playlists. |
+| `game_history_enabled` | `true` | Persist the [no-repeat memory](#no-repeat-memory) (`game-history.json`). |
 
 ffmpeg is required: the `.deb` depends on it, and the Flatpak's GNOME runtime
 ships `/usr/bin/ffmpeg` (verified: 7.1 with `loudnorm`, `silenceremove`, and the

@@ -221,6 +221,12 @@ class Settings:
     game_source_enabled: bool = True
     game_profiles: dict[str, dict[str, Any]] = field(default_factory=dict)
     game_cache_max_mb: int = 2048
+    # Candidate depth per streaming search for ``genre``/``query`` selectors
+    # (clamped 10-300 when read), the extra "<genre>" query variants + YouTube
+    # Music mood playlists, and the persisted no-repeat history (game-history.json).
+    game_stream_search_limit: int = 100
+    game_genre_variants: bool = True
+    game_history_enabled: bool = True
     # Personal key: a shared secret the user sets identically on all their
     # Harmony instances/apps. In the federated mesh, a signed-out client
     # discovers instances on the LAN and may use one as its backend (sharing its
