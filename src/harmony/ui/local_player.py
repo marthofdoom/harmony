@@ -43,7 +43,12 @@ class LocalStatus(NamedTuple):
     """A device-status-shaped snapshot so the queue poller can treat local
     playback exactly like a remote device."""
 
-    state: str  # playing | paused | stopped
+    # playing | loading | paused | stopped. ``loading`` is "wants to play but the
+    # pipeline is still prerolling / buffering / seeking" -- the UI treats it as
+    # playing. The state follows the *target* (what the user asked for), never
+    # a transient GStreamer state, so a poll that lands mid-transition can't
+    # report "stopped" for audio that's about to start.
+    state: str
     position_s: int | None
     duration_s: int | None
     volume: int | None
@@ -89,10 +94,18 @@ class LocalPlayer:
         self,
         on_eos: Callable[[], None] | None = None,
         on_error: Callable[[str], None] | None = None,
+        on_change: Callable[[], None] | None = None,
     ) -> None:
         _ensure_gst()
         self._on_eos = on_eos
         self._on_error = on_error
+        # Fired (main loop) when the pipeline's real state changes or buffering
+        # starts/ends, so the model follows promptly instead of at the next poll.
+        self._on_change = on_change
+        # What the user asked for: "playing" | "paused" | "stopped". The pipeline
+        # lags this (async state changes, buffering); status() reports the intent.
+        self._intent = "stopped"
+        self._buffering = False
         self._headers: dict[str, str] = {}
         self._sink: object | None = None
         self._logged_format = False
@@ -112,6 +125,7 @@ class LocalPlayer:
         bus.connect("message::eos", self._handle_eos)
         bus.connect("message::error", self._handle_error)
         bus.connect("message::state-changed", self._handle_state_changed)
+        bus.connect("message::buffering", self._handle_buffering)
 
     def _on_source_setup(self, _playbin: Gst.Element, source: Gst.Element) -> None:
         # Pass any CDN request headers (e.g. a YouTube User-Agent) to the HTTP
@@ -122,6 +136,10 @@ class LocalPlayer:
                 structure.set_value(key, value)
             source.set_property("extra-headers", structure)
 
+    def _notify(self) -> None:
+        if self._on_change is not None:
+            self._on_change()
+
     def _handle_eos(self, _bus: Gst.Bus, _msg: Gst.Message) -> None:
         if self._on_eos is not None:
             self._on_eos()
@@ -129,6 +147,8 @@ class LocalPlayer:
     def _handle_error(self, _bus: Gst.Bus, msg: Gst.Message) -> None:
         err, _debug = msg.parse_error()
         log.warning("local player error: %s", err)
+        self._intent = "stopped"
+        self._buffering = False
         self._playbin.set_state(Gst.State.NULL)
         if self._on_error is not None:
             self._on_error(str(err))
@@ -137,15 +157,40 @@ class LocalPlayer:
         # Once the top-level pipeline reaches PLAYING the audio format is
         # negotiated: log the output format once so "highest quality" and any
         # resampling are verifiable from the log (see audio_info()).
-        if msg.src is not self._playbin or self._logged_format:
+        if msg.src is not self._playbin:
             return
+        self._notify()
         _old, new, _pending = msg.parse_state_changed()
-        if new != Gst.State.PLAYING:
+        if new != Gst.State.PLAYING or self._logged_format:
             return
         info = self.audio_info()
         if info is not None:
             self._logged_format = True
             log.info("Local output negotiated: %s", info)
+
+    def _handle_buffering(self, _bus: Gst.Bus, msg: Gst.Message) -> None:
+        """Network buffering: while the queue refills, hold the pipeline in
+        PAUSED (so the sink doesn't underrun) and resume at 100% -- but only if
+        the user still wants playback. The *intent* never changes here, so the
+        UI keeps showing "playing" (as "loading") instead of flickering."""
+        if self._intent == "stopped":
+            return
+        try:
+            mode = msg.parse_buffering_stats().mode
+            if mode == Gst.BufferingMode.LIVE:
+                return  # live streams can't be paused to buffer
+        except Exception:  # noqa: BLE001 - stats are optional
+            pass
+        percent = msg.parse_buffering()
+        was = self._buffering
+        self._buffering = percent < 100
+        if self._intent == "playing":
+            if self._buffering and not was:
+                self._playbin.set_state(Gst.State.PAUSED)
+            elif was and not self._buffering:
+                self._playbin.set_state(Gst.State.PLAYING)
+        if was != self._buffering:
+            self._notify()
 
     def _output_caps(self) -> object | None:
         """The raw-audio caps actually negotiated into the audio sink -- what's
@@ -170,20 +215,35 @@ class LocalPlayer:
 
     # -- transport ----------------------------------------------------------
 
-    def load_and_play(self, url: str, headers: dict[str, str] | None = None) -> None:
+    @property
+    def intent(self) -> str:
+        """What the user last asked for: ``playing`` | ``paused`` | ``stopped``."""
+        return self._intent
+
+    def load_and_play(self, url: str, headers: dict[str, str] | None = None,
+                      paused: bool = False) -> None:
         self._headers = dict(headers or {})
         self._logged_format = False
+        self._buffering = False
         self._playbin.set_state(Gst.State.NULL)
         self._playbin.set_property("uri", url)
-        self._playbin.set_state(Gst.State.PLAYING)
+        self._intent = "paused" if paused else "playing"
+        self._playbin.set_state(Gst.State.PAUSED if paused else Gst.State.PLAYING)
 
     def pause(self) -> None:
+        self._intent = "paused"
         self._playbin.set_state(Gst.State.PAUSED)
 
     def resume(self) -> None:
-        self._playbin.set_state(Gst.State.PLAYING)
+        self._intent = "playing"
+        # Mid-buffering the pipeline is held in PAUSED on purpose; the buffering
+        # handler starts it when the queue is full.
+        if not self._buffering:
+            self._playbin.set_state(Gst.State.PLAYING)
 
     def stop(self) -> None:
+        self._intent = "stopped"
+        self._buffering = False
         self._playbin.set_state(Gst.State.NULL)
 
     def seek(self, position_s: int) -> bool:
@@ -204,11 +264,16 @@ class LocalPlayer:
         self._playbin.set_property("volume", max(0, min(100, int(level))) / 100.0)
 
     def status(self) -> LocalStatus:
-        _ok, gst_state, _pending = self._playbin.get_state(0)
-        state = {
-            Gst.State.PLAYING: "playing",
-            Gst.State.PAUSED: "paused",
-        }.get(gst_state, "stopped")
+        # Report the TARGET, not the instantaneous pipeline state: during an
+        # async transition (new URI, seek, buffering) get_state(0) returns the
+        # *current* state (READY/PAUSED) while PLAYING is merely pending, which
+        # used to read as "stopped" while audio was about to start.
+        if self._intent == "playing":
+            _ok, gst_state, _pending = self._playbin.get_state(0)
+            ready = gst_state == Gst.State.PLAYING and not self._buffering
+            state = "playing" if ready else "loading"
+        else:
+            state = self._intent
         ok_pos, pos = self._playbin.query_position(Gst.Format.TIME)
         ok_dur, dur = self._playbin.query_duration(Gst.Format.TIME)
         volume = int(round(self._playbin.get_property("volume") * 100))

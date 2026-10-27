@@ -181,7 +181,7 @@ class Mpris:
         elif method == "PlayPause":
             st.playback_toggle_pause()
         elif method == "Play":
-            if pb.state != "playing":
+            if pb.state not in ("playing", "loading"):
                 st.playback_toggle_pause()
         elif method == "Pause":
             if pb.state in ("playing", "loading"):

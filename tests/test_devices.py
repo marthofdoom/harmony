@@ -260,7 +260,7 @@ class _FakeRelay:
     def __init__(self) -> None:
         self.registered: list[dict] = []
 
-    def register(self, resolver, *, title=None, artist=None, allow_icy=True) -> str:
+    def register(self, resolver, *, title=None, artist=None, allow_icy=True, refresh=None) -> str:
         self.registered.append({"title": title, "artist": artist, "allow_icy": allow_icy})
         return "tok"
 
@@ -323,7 +323,7 @@ class _FakeLocalPlayer:
         self.loaded: list[str] = []
         self.stopped = 0
 
-    def load_and_play(self, url, headers):
+    def load_and_play(self, url, headers, paused=False):
         self.loaded.append(url)
 
     def stop(self):

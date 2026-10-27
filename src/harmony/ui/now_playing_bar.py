@@ -293,7 +293,7 @@ class NowPlayingBar(Gtk.Box):
         self._play.set_tooltip_text("Pause" if playing else "Play")
         self._prev.set_sensitive(pb.has_prev)
         self._next.set_sensitive(pb.has_next)
-        self._stop.set_sensitive(pb.state in ("playing", "paused", "loading"))
+        self._stop.set_sensitive(self.state.can_stop())
 
         # seek bar (don't fight the user mid-drag). Reconcile the local
         # interpolation baseline to the freshly-polled position so drift from

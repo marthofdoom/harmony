@@ -173,6 +173,21 @@ class AppState(GObject.Object):
         self._seek_target_s = 0
         # The in-app GStreamer player ("This computer"); created on first use.
         self._local_player: Any | None = None
+        # A local track is being resolved (the stream URL fetched off-thread): the
+        # model says "loading" and the player -- still on the previous track, or
+        # idle -- must not be read back over it.
+        self._local_resolving = False
+        # Pause pressed while that resolve was in flight: start the track paused.
+        self._pause_after_resolve = False
+        # The user's last transport intent ("playing" | "paused" | "stopped") is
+        # held for a short settle window: a status poll that was already in
+        # flight when they clicked carries the pre-click state and must not
+        # write it back over the optimistic one (the button would flip twice).
+        self._transport_intent: str | None = None
+        self._transport_until = 0.0
+        # Bumped on every user transport op; a device poll started before the
+        # bump is stale and dropped.
+        self._op_gen = 0
 
     def _open_db(self) -> Any | None:
         """Open the sqlite database, tolerating db.py not existing yet."""
@@ -549,6 +564,7 @@ class AppState(GObject.Object):
             self._local_player = LocalPlayer(
                 on_eos=self._on_local_eos,
                 on_error=self._on_local_error,
+                on_change=self._on_local_changed,
             )
         return self._local_player
 
@@ -793,6 +809,7 @@ class AppState(GObject.Object):
     def _halt_output(self, target: str) -> None:
         if target == LOCAL_HOST:
             self._play_gen += 1  # drop any in-flight resolve
+            self._local_resolving = False
             self._stop_local_player()
             return
         host, via = self.split_target(target)
@@ -809,6 +826,8 @@ class AppState(GObject.Object):
         self._play_gen += 1
         gen = self._play_gen
         self._seek_settle_until = 0.0
+        self._local_resolving = True
+        self._pause_after_resolve = False
         self._mark_now_playing(LOCAL_HOST, track, state="loading")
         # quality/source keep showing until the new stream resolves (no flicker)
         provider = self.provider_for(track.service)
@@ -844,13 +863,21 @@ class AppState(GObject.Object):
                 return  # superseded by a newer play/skip while resolving
             source, self.playback.quality, self.playback.source = resolved
             log.info("Local playback: %s (%s)", getattr(source, "label", "?"), source.mime_type)
-            self._get_local_player().load_and_play(source.url, dict(source.headers))
+            paused = self._pause_after_resolve
+            self._local_resolving = False
+            self._pause_after_resolve = False
+            self._get_local_player().load_and_play(source.url, dict(source.headers),
+                                                   paused=paused)
             self._local_failures = 0
-            self.playback.state = "playing"
+            # "loading" until the pipeline really is playing (preroll / network
+            # buffering): the bar shows it as playing, the player's own status
+            # (read on its state-changed + the poller) promotes it.
+            self.playback.state = "paused" if paused else "loading"
             self.emit("playback-changed")
 
         def failed(exc: BaseException) -> None:
             if gen == self._play_gen:
+                self._local_resolving = False
                 self.playback.quality = None
                 self.playback.source = None
                 self.emit("playback-changed")
@@ -905,6 +932,12 @@ class AppState(GObject.Object):
         if self.playback.active_host == LOCAL_HOST:
             self._local_failed(msg)
 
+    def _on_local_changed(self) -> None:
+        """The pipeline's state or buffering changed (main loop): fold it into
+        the model now rather than at the next 1 s poll."""
+        if self._local_player is not None:
+            self._sync_status_to_playback(LOCAL_HOST, self._local_player.status())
+
     # -- devices (engine-owned queue) ------------------------------------------
 
     def _remote_op(self, op: str, body: dict[str, Any] | None = None,
@@ -912,6 +945,7 @@ class AppState(GObject.Object):
         target = self.playback.active_host
         if not target or target == LOCAL_HOST:
             return
+        self._op_gen += 1  # a poll already in flight predates this op
         host, via = self.split_target(target)
         eng = self._engine()
         run_async(lambda: eng.device_queue_op(host, op, body or {}, via=via),
@@ -977,10 +1011,21 @@ class AppState(GObject.Object):
             pb.track = cur
             self._now_playing[target] = (cur.title, cur.artist_name)
         state = (snap.get("state") or "").lower()
+        if snap.get("error"):
+            self._transport_intent = None  # a failure is news, not a stale read
+        observed: str | None
         if snap.get("playing"):
-            pb.state = "paused" if state == "paused" else "playing"
-        elif pb.state != "loading" or state in ("stopped", "idle"):
-            pb.state = "paused" if state == "paused" else "stopped"
+            observed = "paused" if state == "paused" else "playing"
+        elif state == "playing":
+            # The queue isn't running but the device itself is playing: it IS
+            # playing, so show it (and let Stop work) rather than "stopped".
+            observed = "playing"
+        elif pb.state == "loading" and state not in ("stopped", "idle"):
+            observed = None  # still starting; keep "loading"
+        else:
+            observed = "paused" if state == "paused" else "stopped"
+        if observed is not None:
+            pb.state = self._settle_transport(observed)
         pos = snap.get("position_s")
         if pos is not None and not (time.monotonic() < self._seek_settle_until
                                     and abs(pos - self._seek_target_s) > 5):
@@ -1009,7 +1054,7 @@ class AppState(GObject.Object):
             self._poll_id = None
             return GLib.SOURCE_REMOVE
         if target == LOCAL_HOST:
-            if self._local_player is not None and self.playback.state in ("playing", "paused"):
+            if self._local_player is not None:
                 self._sync_status_to_playback(target, self._local_player.status())
             return GLib.SOURCE_CONTINUE
         self._poll_tick += 1
@@ -1018,9 +1063,12 @@ class AppState(GObject.Object):
         self._poll_inflight = True
         host, via = self.split_target(target)
         eng = self._engine()
+        gen = self._op_gen
 
         def done(snap: dict[str, Any]) -> None:
             self._poll_inflight = False
+            if gen != self._op_gen:
+                return  # a transport op landed while this read was in flight: stale
             self._apply_snapshot(target, snap)
 
         def failed(_exc: BaseException) -> None:
@@ -1056,11 +1104,12 @@ class AppState(GObject.Object):
 
     def _sync_status_to_playback(self, host: str, status: Any) -> None:
         """Fold a local-player status read into the model (main loop)."""
-        if self.playback.active_host != host:
+        if self.playback.active_host != host or self._local_resolving:
             return
         pb = self.playback
-        if pb.state != "loading":
-            pb.state = status.state or pb.state
+        if pb.state == "stopped" and status.state == "stopped":
+            return  # nothing playing: leave the parked position alone
+        pb.state = status.state or pb.state
         if status.position_s is not None:
             # A read that predates a just-issued seek still reports the old
             # position; hold the optimistic one until it converges.
@@ -1084,6 +1133,7 @@ class AppState(GObject.Object):
         """The queue ran out (or was stopped). The queue and the last track stay
         visible so Play starts it again; only the transport resets."""
         if self.playback.active_host == LOCAL_HOST:
+            self._local_resolving = False
             self._stop_local_player()
         self.playback.state = "stopped"
         self.playback.position_s = 0
@@ -1119,9 +1169,18 @@ class AppState(GObject.Object):
         if not host or self.queue.current() is None:
             return
         pb = self.playback
+        if host == LOCAL_HOST and self._local_player is not None and not self._local_resolving:
+            # Heal a stale model first: if the player is actually playing/paused,
+            # the button must act on that, not restart the track from "stopped".
+            self._sync_status_to_playback(host, self._local_player.status())
         if pb.state in ("stopped", "unknown"):
             resume = self._resume_at
             self._resume_at = 0
+            if host != LOCAL_HOST:
+                # Show it straight away; the device's snapshot confirms shortly.
+                self._note_transport("playing")
+                pb.state = "loading"
+                self.emit("playback-changed")
             self.playback_jump(max(self.queue.index, 0))
             if resume > 5:
                 if host == LOCAL_HOST:
@@ -1131,8 +1190,13 @@ class AppState(GObject.Object):
             return
         pausing = pb.state in ("playing", "loading")
         pb.state = "paused" if pausing else "playing"
+        self._note_transport("paused" if pausing else "playing")
         self.emit("playback-changed")
         if host == LOCAL_HOST:
+            if self._local_resolving:
+                self._pause_after_resolve = pausing  # honoured when the stream loads
+                if self._local_player is None:
+                    return
             player = self._get_local_player()
             (player.pause if pausing else player.resume)()
             return
@@ -1148,8 +1212,45 @@ class AppState(GObject.Object):
             self._end_playback()
             return
         self.playback.state = "stopped"
+        self._note_transport("stopped")
         self.emit("playback-changed")
         self._remote_op("stop", error="Couldn't stop playback.")
+
+    def can_stop(self) -> bool:
+        """Whether Stop should be enabled: there's an active output with a
+        current track that isn't *confirmed* stopped. The local player is asked
+        directly, so a stale model can never leave audio un-stoppable."""
+        pb = self.playback
+        if pb.track is None or not pb.active_host:
+            return False
+        if pb.state != "stopped":
+            return True
+        return (pb.active_host == LOCAL_HOST and self._local_player is not None
+                and self._local_player.intent != "stopped")
+
+    #: How long an optimistic play/pause/stop outranks a status read.
+    TRANSPORT_SETTLE_S = 3.0
+
+    def _note_transport(self, intent: str) -> None:
+        """Remember the user's transport intent for a short settle window."""
+        self._transport_intent = intent
+        self._transport_until = time.monotonic() + self.TRANSPORT_SETTLE_S
+        self._op_gen += 1  # any status read already in flight is now stale
+
+    def _settle_transport(self, observed: str) -> str:
+        """The state to show given a device-reported ``observed`` state: inside
+        the settle window a report that disagrees with what the user just asked
+        for is a stale read, so the intent wins; once a report agrees (or the
+        window ends) the device is trusted again."""
+        intent = self._transport_intent
+        if intent is None or time.monotonic() >= self._transport_until:
+            self._transport_intent = None
+            return observed
+        agrees = observed in ("playing", "loading") if intent == "playing" else observed == intent
+        if agrees:
+            self._transport_intent = None
+            return observed
+        return self.playback.state if intent == "playing" else intent
 
     def playback_next(self) -> None:
         if self._is_remote():
