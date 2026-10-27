@@ -110,6 +110,10 @@ class LocalPlayer:
         # A pipeline that prerolled (PAUSED) but never got there has a sink that
         # was never started, and tearing that down hangs (see _to_null).
         self._started = False
+        # A seek asked for while the pipeline sits in PAUSED without ever having
+        # played: seeking it (FLUSH) never returns on pipewiresink, so the target
+        # is held here and applied when the pipeline first reaches PLAYING.
+        self._pending_seek_s: int | None = None
         self._headers: dict[str, str] = {}
         self._sink: object | None = None
         self._logged_format = False
@@ -169,6 +173,7 @@ class LocalPlayer:
         _old, new, _pending = msg.parse_state_changed()
         if new == Gst.State.PLAYING:
             self._started = True
+            self._apply_pending_seek()
         if new != Gst.State.PLAYING or self._logged_format:
             return
         info = self.audio_info()
@@ -230,11 +235,14 @@ class LocalPlayer:
         return self._intent
 
     def load_and_play(self, url: str, headers: dict[str, str] | None = None,
-                      paused: bool = False) -> None:
+                      paused: bool = False, start_s: int = 0) -> None:
+        """Load ``url``. ``start_s`` > 0 starts the track there (applied once it
+        first reaches PLAYING, never against an unstarted pipeline)."""
         self._headers = dict(headers or {})
         self._logged_format = False
         self._buffering = False
         self._to_null()
+        self._pending_seek_s = int(start_s) if start_s and start_s > 0 else None
         self._playbin.set_property("uri", url)
         self._intent = "paused" if paused else "playing"
         self._playbin.set_state(Gst.State.PAUSED if paused else Gst.State.PLAYING)
@@ -274,17 +282,32 @@ class LocalPlayer:
         if not self._started:
             _ret, current, pending = pb.get_state(0)
             needs_start = current == Gst.State.PAUSED or pending == Gst.State.PAUSED
+            if not needs_start and self._sink is not None:
+                # The bin can already read READY/PLAYING-pending while the sink
+                # itself still sits prerolled in PAUSED: that is the hang too.
+                _r, s_cur, s_pend = self._sink.get_state(0)
+                needs_start = s_cur == Gst.State.PAUSED or s_pend == Gst.State.PAUSED
         if needs_start:
+            # Nothing may be heard. Mute AND volume 0: both act upstream of the
+            # sink, so they silence what is decoded from now on; the one buffer
+            # the sink already prerolled with cannot be recalled (flushing it or
+            # shifting its timestamp makes the pipewiresink teardown hang again),
+            # so the exposure is bounded by keeping the start as short as it can
+            # be -- the state change of an already-prerolled sink completes at once.
+            volume = pb.get_property("volume")
             pb.set_property("mute", True)
+            pb.set_property("volume", 0.0)
             try:
                 pb.set_state(Gst.State.PLAYING)
                 pb.get_state(Gst.SECOND // 2)
                 pb.set_state(Gst.State.NULL)
             finally:
+                pb.set_property("volume", volume)
                 pb.set_property("mute", False)
         else:
             pb.set_state(Gst.State.NULL)
         self._started = False
+        self._pending_seek_s = None
 
     def stop(self) -> None:
         self._intent = "stopped"
@@ -295,15 +318,42 @@ class LocalPlayer:
         """Seek to ``position_s``. Returns False when GStreamer refuses (e.g. a
         non-seekable HTTP source that serves no byte ranges), so the caller can
         surface it instead of leaving the bar parked at a position that never
-        took."""
+        took.
+
+        A pipeline that has not played since its load (loaded paused, paused or
+        buffering during preroll) is never seeked directly: a FLUSH seek on a
+        never-started pipewiresink pipeline blocks forever and freezes the UI.
+        The target is held and applied when it first reaches PLAYING (which is
+        reported as the position meanwhile) and True is returned."""
+        position_s = max(0, int(position_s))
+        self._note_started()
+        if self._sink is not None and not self._started and self._intent != "stopped":
+            self._pending_seek_s = position_s
+            return True
+        self._pending_seek_s = None
+        return self._seek_now(position_s)
+
+    def _seek_now(self, position_s: int) -> bool:
         ok = self._playbin.seek_simple(
             Gst.Format.TIME,
             Gst.SeekFlags.FLUSH | Gst.SeekFlags.KEY_UNIT,
-            max(0, int(position_s)) * Gst.SECOND,
+            position_s * Gst.SECOND,
         )
         if not ok:
             log.warning("local seek to %ss refused (stream not seekable)", position_s)
         return bool(ok)
+
+    def _apply_pending_seek(self) -> None:
+        """The pipeline just reached PLAYING: do the seek that was deferred."""
+        target = self._pending_seek_s
+        if target is None:
+            return
+        # The bus message can be stale (a torn-down pipeline's PLAYING): only
+        # seek a pipeline that really is playing now.
+        if self._playbin.get_state(0)[1] != Gst.State.PLAYING:
+            return
+        self._pending_seek_s = None
+        self._seek_now(target)
 
     def set_volume(self, level: int) -> None:
         self._playbin.set_property("volume", max(0, min(100, int(level))) / 100.0)
@@ -320,6 +370,8 @@ class LocalPlayer:
         else:
             state = self._intent
         ok_pos, pos = self._playbin.query_position(Gst.Format.TIME)
+        if self._pending_seek_s is not None:
+            ok_pos, pos = True, self._pending_seek_s * Gst.SECOND  # the deferred target
         ok_dur, dur = self._playbin.query_duration(Gst.Format.TIME)
         volume = int(round(self._playbin.get_property("volume") * 100))
         return LocalStatus(

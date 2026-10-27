@@ -400,15 +400,46 @@ def test_failed_re_resolves_back_off_instead_of_retrying_every_request(monkeypat
     for _ in range(5):  # five chunk requests while the provider is failing
         assert fresh.get() is src
     assert len(calls) == 1
-    # the CDN's own 403/410 honours the same back-off: no forced resolve per chunk
+    # the background failure does NOT block the CDN's own 403/410: one real
+    # forced attempt is made (it fails here too) ...
+    with pytest.raises(RuntimeError, match="yt-dlp down"):
+        fresh.refresh()
+    assert len(calls) == 2
+    # ... and only then does a failed refresh back off the next ones briefly
     for _ in range(5):
         with pytest.raises(RuntimeError, match="backing off"):
             fresh.refresh()
-    assert len(calls) == 1
-    # ... but once the window has passed a refresh is allowed again, and a
-    # success clears the back-off
+    assert len(calls) == 2
+    # once that short window has passed a refresh is allowed again, and a
+    # success clears both back-offs
     ok = StreamSource(url="http://cdn/y", mime_type="audio/flac")
     fresh._resolve = lambda: ok
-    fresh._retry_at = time.monotonic() - 1
+    fresh._refresh_retry_at = time.monotonic() - 1
     assert fresh.refresh() is ok
-    assert fresh._retry_at == 0.0
+    assert fresh._retry_at == 0.0 and fresh._refresh_retry_at == 0.0
+
+
+def test_a_403_inside_a_get_backoff_still_gets_a_real_refresh(relay, monkeypatch) -> None:
+    """A background renewal fails (20 s back-off), then the CDN really expires
+    the URL: the 403 must trigger a real re-resolve and the track completes,
+    instead of a 502 / truncated body."""
+    cdn = _Cdn(ttl=0.9)
+    try:
+        monkeypatch.setattr(castmod, "SOURCE_STALE_S", 0.3)
+        ctl, dev = _controller(relay, cdn, monkeypatch)
+        ctl.cast("127.0.0.1", "qobuz", "1", kind="cast")
+        flaky = {"failed": False}
+
+        def resolve(_svc: str, _tid: str) -> StreamSource:
+            if not flaky["failed"]:
+                flaky["failed"] = True  # get()'s first renewal fails ...
+                raise RuntimeError("provider hiccup")
+            return cdn.mint()  # ... later resolves (the 403 refresh) work
+
+        ctl._resolve_source = resolve
+        got, problem = _fetch_like_a_chromecast(dev.url, pause=0.25)  # ~2 s > ttl
+        assert flaky["failed"]
+        assert problem is None and got == len(PAYLOAD)
+        assert cdn.minted >= 2
+    finally:
+        cdn.close()

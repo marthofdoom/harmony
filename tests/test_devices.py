@@ -323,7 +323,7 @@ class _FakeLocalPlayer:
         self.loaded: list[str] = []
         self.stopped = 0
 
-    def load_and_play(self, url, headers, paused=False):
+    def load_and_play(self, url, headers, paused=False, start_s=0):
         self.loaded.append(url)
 
     def stop(self):

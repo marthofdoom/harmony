@@ -31,6 +31,10 @@ REFRESH_MARGIN_S = 60.0
 # After a failed re-resolve, leave the provider alone this long: otherwise every
 # chunk request the device makes retries a full (slow) extraction.
 FAIL_BACKOFF_S = 20.0
+# A forced refresh (the CDN said 403/410) is never refused because of a failed
+# *background* renewal -- the URL really is dead and one real attempt is owed to
+# the device -- only because a refresh itself failed this recently.
+REFRESH_RETRY_S = 2.5
 
 _EXPIRY_QUERY_KEYS = ("expire", "etsp", "Expires")
 _EXPIRY_PATH = re.compile(r"/expire/(\d+)(?:/|$)")
@@ -75,7 +79,8 @@ class _FreshSource:
     def __init__(self, resolve: Callable[[], Any], source: Any) -> None:
         self._resolve = resolve
         self._lock = threading.Lock()
-        self._retry_at = 0.0
+        self._retry_at = 0.0  # get(): set by any failed re-resolve (20 s)
+        self._refresh_retry_at = 0.0  # refresh(): set only by a failed refresh (short)
         self._set(source)
 
     def _set(self, source: Any) -> None:
@@ -102,14 +107,15 @@ class _FreshSource:
             return self._source
 
     def refresh(self) -> Any:
-        """Force a re-resolve (the CDN said 403/410). Honours the failure
-        back-off like ``get()``: with a dead provider every chunk request would
-        otherwise run a slow forced resolve under the lock. Inside the window it
-        raises (the relay answers 502) without calling the resolver; once the
-        window has passed a refresh is allowed again."""
+        """Force a re-resolve (the CDN said 403/410). The URL is known dead, so
+        a failed *background* renewal (``get()``'s long back-off) must not turn
+        this into a 502 -- it always gets a real attempt. Only a forced refresh
+        that itself failed within the last ``REFRESH_RETRY_S`` is refused (raises,
+        the relay answers 502), so a dead provider isn't hit by every chunk
+        request under the lock."""
         with self._lock:
-            if time.monotonic() < self._retry_at:
-                raise RuntimeError("stream re-resolve is backing off after a failure")
+            if time.monotonic() < self._refresh_retry_at:
+                raise RuntimeError("stream re-resolve is backing off after a failed refresh")
             self._renew(strict=True)
             return self._source
 
@@ -117,9 +123,12 @@ class _FreshSource:
         try:
             self._set(self._resolve())
             self._retry_at = 0.0
+            self._refresh_retry_at = 0.0
         except Exception as exc:  # noqa: BLE001
-            self._retry_at = time.monotonic() + FAIL_BACKOFF_S
+            now = time.monotonic()
+            self._retry_at = now + FAIL_BACKOFF_S
             if strict:
+                self._refresh_retry_at = now + REFRESH_RETRY_S
                 raise
             # Keep serving the old URL (it may still work); retry after a pause.
             log.warning("cast: re-resolving a stale stream failed: %s", exc)

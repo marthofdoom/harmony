@@ -74,7 +74,8 @@ class FakePlaybin:
     def query_duration(self, _fmt):
         return True, 200 * Gst.SECOND
 
-    def seek_simple(self, *_a) -> bool:
+    def seek_simple(self, *a) -> bool:
+        self.seeks = [*getattr(self, "seeks", []), a]
         return True
 
 
@@ -101,6 +102,7 @@ def player() -> LocalPlayer:
     p._intent = "stopped"
     p._buffering = False
     p._started = False
+    p._pending_seek_s = None
     p._headers = {}
     p._sink = None
     p._logged_format = False
@@ -396,6 +398,79 @@ def test_buffering_change_notifies(player: LocalPlayer) -> None:
     assert len(seen) == 2
 
 
+class _Sink(FakePlaybin):
+    """The audio sink inside the fake playbin (no negotiated caps)."""
+
+    def get_static_pad(self, _name):
+        class Pad:
+            def get_current_caps(self):
+                return None
+        return Pad()
+
+
+class _Msg:
+    """A state-changed bus message for the fake playbin."""
+
+    def __init__(self, src, new) -> None:
+        self.src, self._new = src, new
+
+    def parse_state_changed(self):
+        return Gst.State.PAUSED, self._new, Gst.State.VOID_PENDING
+
+
+def test_seek_while_paused_before_first_play_waits_for_playing(player: LocalPlayer) -> None:
+    """A FLUSH seek on a never-started pipewiresink pipeline never returns: it is
+    held, shown as the position, and issued once the pipeline really plays."""
+    player._sink = _Sink()  # a real-sink pipeline (the deadlock needs one)
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+    assert player._playbin.current == Gst.State.PAUSED
+    assert player.seek(90) is True
+    assert getattr(player._playbin, "seeks", []) == []  # not issued against PAUSED
+    assert player.status().position_s == 90
+    player.resume()
+    player._playbin.arrive()
+    player._handle_state_changed(None, _Msg(player._playbin, Gst.State.PLAYING))
+    assert len(player._playbin.seeks) == 1
+    assert player._playbin.seeks[0][2] == 90 * Gst.SECOND
+    assert player._pending_seek_s is None and player.status().position_s == 3
+
+
+def test_seek_during_a_buffering_hold_before_first_play_is_deferred(player: LocalPlayer) -> None:
+    player._sink = _Sink()
+    player.load_and_play("u")
+    player._playbin.current = Gst.State.PAUSED
+    player._handle_buffering(None, FakeBuffering(10))
+    assert player.seek(40) is True and getattr(player._playbin, "seeks", []) == []
+    player._handle_buffering(None, FakeBuffering(100))  # refilled: PLAYING again
+    player._playbin.arrive()
+    player._handle_state_changed(None, _Msg(player._playbin, Gst.State.PLAYING))
+    assert player._playbin.seeks[0][2] == 40 * Gst.SECOND
+
+
+def test_seek_after_the_pipeline_has_played_is_immediate(player: LocalPlayer) -> None:
+    player._sink = _Sink()
+    player.load_and_play("u")
+    player._playbin.current = Gst.State.PLAYING
+    player.pause()  # notes the pipeline started
+    player._playbin.current = Gst.State.PAUSED
+    assert player.seek(10) is True
+    assert len(player._playbin.seeks) == 1 and player._pending_seek_s is None
+
+
+def test_a_pending_seek_dies_with_the_pipeline(player: LocalPlayer) -> None:
+    player._sink = _Sink()
+    player.load_and_play("u", paused=True)
+    player._playbin.arrive()
+    player.seek(30)
+    player.stop()
+    assert player._pending_seek_s is None
+    player.load_and_play("u2")
+    assert player._pending_seek_s is None
+    player.load_and_play("u3", start_s=12)
+    assert player._pending_seek_s == 12
+
+
 # -- AppState + bar ------------------------------------------------------------
 
 
@@ -425,7 +500,8 @@ class FakeLocal:
         self.calls.append("stop")
         self.state = "stopped"
 
-    def load_and_play(self, url, headers=None, paused=False) -> None:
+    def load_and_play(self, url, headers=None, paused=False, start_s=0) -> None:
+        self.start_s = start_s
         self.calls.append(("load", url, paused))
         self.state = "paused" if paused else "loading"
 
@@ -587,6 +663,24 @@ def test_pause_while_resolving_starts_paused(state: AppState, monkeypatch) -> No
     captured["done"](captured["work"]())
     assert fake.calls[-1] == ("load", "http://x/t1", True)
     assert state.playback.state == "paused"
+
+
+def test_resume_position_is_handed_to_the_load_not_a_blind_timer(state: AppState, monkeypatch) -> None:
+    """Play after a restart seeks to the saved position via the player's own
+    start-at, so it is applied once playing -- never a timed seek that can hit an
+    unstarted pipeline."""
+    fake = FakeLocal("stopped")
+    captured = _slow_resolve(state, monkeypatch, fake)
+    state.playback.active_host = LOCAL_HOST
+    state.playback.state = "stopped"
+    state._resume_at = 123
+    state.playback_toggle_pause()
+    captured["done"](captured["work"]())
+    assert fake.start_s == 123
+    # a later, unrelated track does not inherit it
+    state._start_local(1)
+    captured["done"](captured["work"]())
+    assert fake.start_s == 0
 
 
 def _slow_resolve(state: AppState, monkeypatch, fake: FakeLocal) -> dict:

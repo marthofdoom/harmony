@@ -177,6 +177,9 @@ class AppState(GObject.Object):
         # model says "loading" and the player -- still on the previous track, or
         # idle -- must not be read back over it.
         self._local_resolving = False
+        # (play generation, seconds): where a local track resumed from a saved
+        # position starts, applied by the player once it really plays.
+        self._local_start_at: tuple[int, int] = (-1, 0)
         # Pause pressed while that resolve was in flight: start the track paused.
         self._pause_after_resolve = False
         # The user's last transport intent ("playing" | "paused" | "stopped") is
@@ -872,8 +875,9 @@ class AppState(GObject.Object):
             paused = self._pause_after_resolve
             self._local_resolving = False
             self._pause_after_resolve = False
+            start_s = self._local_start_at[1] if self._local_start_at[0] == gen else 0
             self._get_local_player().load_and_play(source.url, dict(source.headers),
-                                                   paused=paused)
+                                                   paused=paused, start_s=start_s)
             self._local_failures = 0
             # "loading" until the pipeline really is playing (preroll / network
             # buffering): the bar shows it as playing, the player's own status
@@ -1192,7 +1196,7 @@ class AppState(GObject.Object):
             self.playback_jump(max(self.queue.index, 0))
             if resume > 5:
                 if host == LOCAL_HOST:
-                    GLib.timeout_add(1500, lambda: (self._get_local_player().seek(resume), False)[1])
+                    self._local_start_at = (self._play_gen, resume)
                 else:
                     GLib.timeout_add(3000, lambda: (self._remote_control("seek", resume), False)[1])
             return
@@ -1452,7 +1456,7 @@ class AppState(GObject.Object):
         if target == LOCAL_HOST:
             self._start_local(index)
             if position > 5:
-                GLib.timeout_add(1500, lambda: (self._get_local_player().seek(position), False)[1])
+                self._local_start_at = (self._play_gen, position)
             return
         self._mark_now_playing(target, tracks[index], state="loading")
         host, via = self.split_target(target)
