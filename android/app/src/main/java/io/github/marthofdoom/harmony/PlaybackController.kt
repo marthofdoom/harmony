@@ -121,7 +121,9 @@ class PlaybackController private constructor(ctx: Context) {
     // volume is the device's).
     @OptIn(UnstableApi::class)
     val exo: ExoPlayer = ExoPlayer.Builder(app,
-            DefaultRenderersFactory(app).setEnableAudioFloatOutput(false))
+            // Float output off only matters for bit-perfect; otherwise stock behaviour.
+            if (Features.BIT_PERFECT) DefaultRenderersFactory(app).setEnableAudioFloatOutput(false)
+            else DefaultRenderersFactory(app))
         .setAudioAttributes(
             AudioAttributes.Builder().setUsage(C.USAGE_MEDIA)
                 .setContentType(C.AUDIO_CONTENT_TYPE_MUSIC).build(),
@@ -129,7 +131,7 @@ class PlaybackController private constructor(ctx: Context) {
         .setHandleAudioBecomingNoisy(true)
         .setWakeMode(C.WAKE_MODE_NETWORK)
         .build().apply {
-            volume = 1f
+            if (Features.BIT_PERFECT) volume = 1f   // bit-perfect: no software volume
             addAnalyticsListener(object : AnalyticsListener {
                 @OptIn(UnstableApi::class)
                 override fun onAudioTrackInitialized(eventTime: AnalyticsListener.EventTime,

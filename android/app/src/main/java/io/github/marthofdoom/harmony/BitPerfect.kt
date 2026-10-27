@@ -137,7 +137,8 @@ fun phoneIndicator(out: PhoneOutput?, src: Quality?): OutputIndicator {
 }
 
 /** The indicator for the current playback state; null when there is nothing to describe. */
-fun outputIndicator(s: PlayerState): OutputIndicator? {
+fun outputIndicator(s: PlayerState, enabled: Boolean = Features.BIT_PERFECT): OutputIndicator? {
+    if (!enabled) return null
     if (s.monitoring || s.current == null) return null
     return if (s.onDevice) {
         if (s.stream == null) null else deviceIndicator(s.stream.output)

@@ -33,11 +33,12 @@ import kotlinx.coroutines.flow.asStateFlow
  *
  * Main-thread only. Below API 34 this only reports the route (never claims bit-perfect).
  */
-class PhoneBitPerfect(ctx: Context) {
-    private val am = ctx.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-    private val handler = Handler(Looper.getMainLooper())
-    private val attrs = AudioAttributes.Builder()
-        .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build()
+class PhoneBitPerfect(private val ctx: Context, private val enabled: Boolean = Features.BIT_PERFECT) {
+    // Lazy so that a disabled instance never touches the platform audio APIs at all.
+    private val am: AudioManager by lazy { ctx.applicationContext.getSystemService(Context.AUDIO_SERVICE) as AudioManager }
+    private val handler by lazy { Handler(Looper.getMainLooper()) }
+    private val attrs by lazy { AudioAttributes.Builder()
+        .setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build() }
 
     private val _output = MutableStateFlow(PhoneOutput())
     val output: StateFlow<PhoneOutput> = _output.asStateFlow()
@@ -58,7 +59,7 @@ class PhoneBitPerfect(ctx: Context) {
 
     /** Begin tracking the route (idempotent). */
     fun start() {
-        if (started) return
+        if (!enabled || started) return
         started = true
         am.registerAudioDeviceCallback(callback, handler)
         if (Build.VERSION.SDK_INT >= 34) listen()
@@ -67,6 +68,7 @@ class PhoneBitPerfect(ctx: Context) {
 
     /** A new phone track is about to be prepared: (re)apply the mixer for its format. */
     fun onTrack(q: Quality?) {
+        if (!enabled) return
         start()
         trackFormat = null
         if (Build.VERSION.SDK_INT >= 34) {
@@ -80,12 +82,14 @@ class PhoneBitPerfect(ctx: Context) {
 
     /** The player opened an AudioTrack: record its real format so a match can be verified. */
     fun onAudioTrack(sampleRate: Int, encoding: Int, channelCount: Int) {
+        if (!enabled) return
         trackFormat = MixerFormat(sampleRate, encoding, channelCount)
         refresh()
     }
 
     /** Playback stopped / ended / the output moved away: give the mixer back. */
     fun release() {
+        if (!enabled) return
         trackFormat = null
         if (Build.VERSION.SDK_INT >= 34) clearPlatform()
         refresh()

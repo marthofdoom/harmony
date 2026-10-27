@@ -213,11 +213,16 @@ function qShort(q) {
 // Tier pill beside the quality text: Hi-Res / Lossless; nothing for lossy.
 const tierLabel = (q) => (!q ? "" : q.tier === "hires" ? "Hi-Res" : (q.tier === "lossless" || q.lossless) ? "Lossless" : "");
 
+// Bit-perfect reporting is ON HOLD: with this off there is no badge, no "→ output"
+// quality and no AudioContext probe. Flip to true to bring it all back.
+const FEATURE_BIT_PERFECT = false;
+
 // What the bytes sent to the output actually are, and whether that is bit-perfect.
 // Browser: never bit-perfect — the page can't pick the sound card's rate, so the
 // browser resamples to the AudioContext rate (probed lazily, no audio goes through it).
 let _browserRate = null;
 function browserSampleRate() {
+  if (!FEATURE_BIT_PERFECT) return 0;
   if (_browserRate !== null) return _browserRate;
   let rate = 0;
   try {
@@ -239,6 +244,7 @@ try {
 
 // -> {quality, state: "yes"|"no"|"unknown", reason, label} or null (no stream to describe).
 function outputInfo() {
+  if (!FEATURE_BIT_PERFECT) return null;
   const t = pq.current();
   if (!t) return null;
   const s = currentStream();

@@ -140,12 +140,37 @@ class BitPerfectTest {
 
     @Test fun indicatorFollowsTheOutput() {
         val src = StreamInfo(flac96, null, OutputInfo(flac96, true, null, "Bit-perfect to device"))
-        assertEquals(BpState.YES, outputIndicator(st(true, src))!!.state)
+        assertEquals(BpState.YES, outputIndicator(st(true, src), enabled = true)!!.state)
         // the server's "output" is ignored for the phone: its own route decides
-        assertEquals(BpState.NO, outputIndicator(st(false, src, PhoneOutput(PhoneSink(SinkKind.BUILTIN, null, 48000))))!!.state)
-        assertNull(outputIndicator(st(false, null)))                    // not resolved yet
-        assertNull(outputIndicator(st(true, src).copy(monitoring = true)))
-        assertNull(outputIndicator(PlayerState()))
+        assertEquals(BpState.NO, outputIndicator(st(false, src, PhoneOutput(PhoneSink(SinkKind.BUILTIN, null, 48000))), enabled = true)!!.state)
+        assertNull(outputIndicator(st(false, null), enabled = true))                    // not resolved yet
+        assertNull(outputIndicator(st(true, src).copy(monitoring = true), enabled = true))
+        assertNull(outputIndicator(PlayerState(), enabled = true))
+    }
+
+    // ── feature flag: bit-perfect is on hold ────────────────────────────────
+    @Test fun flagIsOffByDefault() { assertEquals(false, Features.BIT_PERFECT) }
+
+    @Test fun flagOffProducesNoBadgeNoArrowNoNotificationBadge() {
+        val src = StreamInfo(flac96, null, OutputInfo(flac96, true, null, "Bit-perfect to device"))
+        // default (flag off): no indicator for a device or the phone
+        assertNull(outputIndicator(st(true, src)))
+        assertNull(outputIndicator(st(false, src, PhoneOutput(PhoneSink(SinkKind.USB, "DAC", 96000)))))
+        // with no indicator the source line is just source + quality, with no "->" side or badge text
+        val line = sourceLine(src, flac96, null, outputIndicator(st(true, src)))!!
+        assertTrue(line, !line.contains("→") && !line.contains("bit-perfect", ignoreCase = true))
+        assertTrue(line, line.contains("FLAC"))
+    }
+
+    @Test fun flagOffNeverTouchesTheMixerApi() {
+        // A Context whose every platform lookup throws: a disabled PhoneBitPerfect must not use it.
+        val ctx = object : android.content.ContextWrapper(null) {
+            override fun getApplicationContext(): android.content.Context = throw AssertionError("touched context")
+            override fun getSystemService(name: String): Any = throw AssertionError("touched AudioManager")
+        }
+        val bp = PhoneBitPerfect(ctx)            // default flag: off
+        bp.start(); bp.onTrack(flac96); bp.onAudioTrack(96000, AudioFormat.ENCODING_PCM_24BIT_PACKED, 2); bp.release()
+        assertEquals(PhoneOutput(), bp.output.value)
     }
 
     @Test fun sourceLineHasNoPlayingFromAndNoRepeatedLibrary() {
