@@ -339,7 +339,7 @@ def test_no_audio_reaches_the_sink_during_the_muted_teardown(tmp_path) -> None:
         )
     except subprocess.TimeoutExpired:
         subprocess.call("pactl list short modules | grep harmony_leak_test | cut -f1 | "
-                        "xargs -r -n1 pactl unload-module", shell=True)
+                        "xargs -r -n1 pactl unload-module", shell=True, env=_env())
         pytest.fail("teardown hung")
     if proc.returncode == SKIP_CODE or "pactl" in proc.stderr and "Failure" in proc.stderr:
         pytest.skip("cannot create a PipeWire null sink here")
