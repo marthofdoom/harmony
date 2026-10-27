@@ -1117,6 +1117,7 @@ class _Build:
     memo: dict[tuple, list[Any]] = field(default_factory=dict)
     partial: bool = False
     allowed: frozenset[str] | None = None
+    failed: list[str] = field(default_factory=list)   # what failed (not: what the budget skipped)
 
     def run(self, gsrc: GameSource, memokey: tuple, service: str, call: Callable[[], list[Any]]) -> list[Any]:
         """``call()`` under the provider lock, once per build: a repeat of a key
@@ -1130,6 +1131,7 @@ class _Build:
         got = gsrc._stream_call(service, call)
         if got is None:
             self.partial = True
+            self.failed.append(" ".join(str(k) for k in memokey))
             return []
         self.memo[memokey] = got
         return got
@@ -1288,8 +1290,10 @@ class GameSource:
 
     def _stream_call(self, service: str, fn: Callable[..., Any], *args: Any, **kw: Any) -> Any:
         """:meth:`_guard` for streaming services plus a back-off: after a rate limit, or
-        :data:`BACKOFF_FAILS` failures in a row, the service gets no game-source requests
-        for 30 s, doubling to 10 min; a success resets it. ``None`` = failed or backing off."""
+        :data:`BACKOFF_FAILS` transport failures (network/timeout) in a row, the service gets
+        no game-source requests for 30 s, doubling to 10 min; a success resets it. A failure
+        of one call (a deleted playlist, a changed page layout) never backs the service off.
+        ``None`` = failed or backing off."""
         with self._bo_lock:
             st = self._bo.get(service)
             if st and time.monotonic() < st["until"]:
@@ -1299,6 +1303,9 @@ class GameSource:
                 result = fn(*args, **kw)
         except Exception as exc:  # noqa: BLE001 - one service failing must not sink the pick
             log.info("game source: %s call failed: %s", service, exc)
+            transport = isinstance(exc, (OSError, TimeoutError)) or isinstance(exc.__cause__, OSError)
+            if not (transport or isinstance(exc, RateLimitedError)):
+                return None
             with self._bo_lock:
                 st = self._bo.setdefault(service, {"fails": 0.0, "until": 0.0, "delay": BACKOFF_MIN_S})
                 st["fails"] += 1
@@ -1400,6 +1407,7 @@ class GameSource:
                 got = (self._guard if service == "local" else self._stream_call)(service, fn, item_id)
                 if got is None and service != "local":
                     ctx.partial = True
+                    ctx.failed.append(f"{kind} {service}:{item_id}")
                 tracks += got or []
         return tracks
 
@@ -1458,8 +1466,15 @@ class GameSource:
         """Swap a finished build into ``pool`` (the caller holds ``pool.lock``)."""
         now = time.monotonic()
         same = fp == pool.fingerprint
+        attempts = pool.attempts + 1 if ctx.partial else 0
+        # After MAX_PARTIAL_ATTEMPTS partial builds in a row the failure is treated as
+        # permanent (a deleted playlist...): accept the result and use the normal TTL.
+        giveup = ctx.partial and attempts >= MAX_PARTIAL_ATTEMPTS
+        if giveup:
+            log.warning("game source: pool %s still incomplete after %d builds (%s); using it as is",
+                        "/".join(key), attempts, ", ".join(ctx.failed) or "time budget")
         # A partial rebuild never shrinks a pool we already have.
-        if refs and ctx.partial and same and len(refs) < len(pool.refs):
+        if refs and ctx.partial and same and len(refs) < len(pool.refs) and not giveup:
             refs = {}
         got = bool(refs)
         if refs or not same:
@@ -1470,17 +1485,17 @@ class GameSource:
         # one finishes what the last could not), but not forever: it is dropped after
         # MAX_PARTIAL_ATTEMPTS builds or POOL_TTL_S, so a call that keeps failing cannot
         # freeze the successful ones.
-        pool.attempts = pool.attempts + 1 if ctx.partial else 0
-        if ctx.partial and pool.attempts < MAX_PARTIAL_ATTEMPTS:
+        pool.attempts = 0 if giveup else attempts
+        if ctx.partial and not giveup:
             if pool.memo_fp != fp or not pool.memo:
                 pool.memo_at = now
             pool.memo, pool.memo_fp = ctx.memo, fp
         else:
-            pool.memo, pool.memo_fp, pool.attempts = {}, "", 0
+            pool.memo, pool.memo_fp = {}, ""
         # An empty refresh of an unchanged selector keeps the old pool (a service blip
         # must not silence the game's music). Retries: a partial list after a minute,
         # an empty STREAMING list after 30 s, an empty library list (mid-scan) after a few seconds.
-        if ctx.partial:
+        if ctx.partial and not giveup:
             retry = PARTIAL_POOL_RETRY_S
         elif not got:
             retry = STREAM_EMPTY_RETRY_S if streaming else EMPTY_POOL_RETRY_S

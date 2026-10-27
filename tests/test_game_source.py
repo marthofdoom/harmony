@@ -2184,7 +2184,7 @@ def test_three_consecutive_failures_back_off_and_the_delay_doubles(env, monkeypa
 
     def search(query, **kw):
         calls.append(query)
-        raise RuntimeError("boom")
+        raise OSError("boom")
 
     _streaming_env(env, qobuz={})
     env.eng.qobuz.search = search
@@ -2206,7 +2206,7 @@ def test_backoff_covers_playlist_selectors_too(env):
 
     def boom(pid):
         calls.append(pid)
-        raise RuntimeError("x")
+        raise TimeoutError("x")
 
     env.eng.qobuz.get_playlist_tracks = boom
     _put(env, selector={"playlist": {"service": "qobuz", "id": "p1"}})
@@ -2422,3 +2422,27 @@ def test_status_reports_usable_and_excluded_services(env):
     _set(game_excluded_services=[])
     env.eng.lib.tracks.clear()                                       # an empty Library is not usable
     assert call(env, "GET", "/api/game/status")[1]["services"]["library"] is False
+
+
+def test_a_dead_playlist_does_not_freeze_the_pool_or_back_off_the_service(env, caplog):
+    _streaming_env(env, qobuz={"rock music": _songs(Service.QOBUZ, 0, 20)})
+    _set(game_genre_variants=False)
+    env.eng.qobuz.playlists["p1"] = _songs(Service.QOBUZ, 100, 110, artist="Other")
+    env.game.put_profile("g", {"sources": "all", "types": {"explore": [
+        {"genre": "rock"}, {"playlist": {"service": "qobuz", "id": "p1"}}]}})
+    assert _next(env)["pool_size"] == 30
+    pool = env.game._pools[("g", "explore", "all")]
+    del env.eng.qobuz.playlists["p1"]                              # deleted: KeyError from now on
+    env.eng.qobuz.results["rock music"] = _songs(Service.QOBUZ, 0, 25)
+    with caplog.at_level("WARNING", logger="harmony.game_source"):
+        for i in range(1, gs.MAX_PARTIAL_ATTEMPTS + 1):
+            pool.expires = 0.0
+            _next(env)
+            _settle(pool)
+            if i < gs.MAX_PARTIAL_ATTEMPTS:
+                assert len(pool.refs) == 30 and abs(_left(pool) - gs.PARTIAL_POOL_RETRY_S) < 2
+    assert len(pool.refs) == 25                                    # accepted: the new genre tracks arrived
+    assert abs(_left(pool) - 3600) < 5 and pool.attempts == 0 and pool.memo == {}
+    assert env.game._bo.get("qobuz") is None                       # a per-call failure never backs off the service
+    msgs = [r.getMessage() for r in caplog.records if "still incomplete" in r.getMessage()]
+    assert len(msgs) == 1 and "playlist qobuz:p1" in msgs[0]

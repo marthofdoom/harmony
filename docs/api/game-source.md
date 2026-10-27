@@ -225,7 +225,10 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   after exactly **60 seconds** (instead of the normal TTL), reusing the results
   already fetched, so it completes over the next refreshes. That reuse stops after
   5 consecutive partial builds or 10 minutes (the fetched results are dropped and
-  fetched afresh), so one call that keeps failing cannot freeze the rest. A
+  fetched afresh), so one call that keeps failing cannot freeze the rest. After
+  5 partial builds in a row the failure is treated as permanent (a deleted
+  playlist, say): the result is accepted even if smaller, the normal TTL applies
+  again and the failing selector is logged once as a warning. Until then a
   partial rebuild never makes an existing pool smaller; tracks that arrive late
   and were served before the restart are queued behind the current cycle, least
   recently served first (see [no-repeat memory](#no-repeat-memory)).
@@ -234,8 +237,8 @@ A streaming search used to give about 25 tracks per service. For `genre` and
   own YouTube Music / Qobuz calls take), so while a build runs the UI's provider
   calls wait their turn behind each search; this is why warm refreshes are done in
   the background and spread out by the long TTL.
-- **Back-off and request rate.** After a rate-limit error, or 3 failures in a
-  row, a service gets no game-source requests for 30 s, doubling to 10 minutes
+- **Back-off and request rate.** After a rate-limit error, or 3 network/timeout
+  failures in a row (a failure of one call, such as a deleted playlist, does not count), a service gets no game-source requests for 30 s, doubling to 10 minutes
   on each repeat; one success resets it. This covers every search, playlist,
   album and artist call the game source makes. Worst case without failures:
   one build per pool per TTL, and a build is at most ~3 searches per streaming
