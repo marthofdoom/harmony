@@ -28,7 +28,8 @@ just the first intended client.
 ## Quick start: no accounts needed
 
 You do not need a Qobuz account, a YouTube login or even a music library.
-**Harmony + `sources=all` uses YouTube Music's public catalogue**, which covers
+**By default Harmony uses every active source, and YouTube Music's public
+catalogue is always one of them**; it covers
 almost any music a game could want, with no sign-in at all (public search via
 `ytmusicapi`, playback via `yt-dlp`). Install Harmony, start `harmony serve`
 (or the desktop app), then:
@@ -37,7 +38,6 @@ almost any music a game could want, with no sign-in at all (public search via
 H=http://localhost:8080
 # 1. a profile: "ambient music" while exploring, "epic battle music" in combat
 curl -X PUT $H/api/game/profiles/skyrim -d '{
-  "sources": "all",
   "types": {"explore": {"genre": "ambient"},
             "combat":  {"query": "epic battle music orchestral"},
             "default": {"genre": "ambient"}},
@@ -48,10 +48,12 @@ curl -X POST $H/api/game/next -d '{"profile": "skyrim", "type": "explore"}'
 curl -o track.wav "$H/api/game/audio/ytmusic/<id from the response>.wav?rate=48000&bits=16&channels=2&normalize=1"
 ```
 
-(Add `-H 'X-Harmony-Key: ...'` if you set a [personal key](#auth).) Signed-out
+(Add `-H 'X-Harmony-Key: ...'` if you set a [personal key](#auth).) No
+`sources` is given, so the default applies: **every active source**. Signed-out
 Qobuz and an empty or disabled Library are skipped silently; they never make a
 request fail. Sign in to Qobuz or add a Library later and the same profile
-simply starts mixing them in (Library copies win).
+simply starts mixing them in (Library copies win). To stay inside your own
+Library, pass `"sources": "library"`.
 
 Limits of the no-account route:
 
@@ -92,17 +94,21 @@ K='X-Harmony-Key: my-personal-key'   # omit -H "$K" if no key is set
 
 ## Concepts
 
-### Sources: `library` or `all`
+### Sources: `all` (default) or `library`
 
-Every request can be addressed to one of two source sets:
+**`sources` defaults to every active source** (`all`); pass `sources=library`
+to stay in your Library. Every request can be addressed to one of two source
+sets:
 
 | `sources` | Where tracks come from |
 |-----------|------------------------|
 | `library` | **Only the Library**: this instance's own music folders plus every key-matching federated peer's Library. No streaming service is contacted. |
-| `all`     | The Library **plus** Qobuz (if signed in) and YouTube Music (**signed in or not**: its public catalogue works with no account). A streaming track the Library also has is replaced by the Library copy (the same *library preferred* matching the apps use, `library_preferred` setting), and a song the Library and a service both list appears once. |
+| `all` (default) | Every **active** source: the Library (if there is one), YouTube Music (**signed in or not**: its public catalogue works with no account) and Qobuz (only when signed in). A source that is not usable (no Library, Qobuz signed out) is skipped silently. A streaming track the Library also has is replaced by the Library copy (the same *library preferred* matching the apps use, `library_preferred` setting), and a song the Library and a service both list appears once. |
 
 The value comes from the request's `sources` field if given, else the
-profile's `sources`, else `"library"`.
+profile's `sources`, else `"all"`. (Profiles saved while the default was
+`library` keep the `"library"` they were stored with; PUT them again without
+`sources` to follow the default.)
 
 ### Profiles
 
@@ -112,7 +118,7 @@ one mod list) wants to hear. Profiles live in Harmony's settings
 
 ```json
 {
-  "sources": "library",
+  "sources": "all",
   "types": {
     "explore": {"genre": "Ambient"},
     "combat":  [{"genre": "Metal"}, {"query": "battle drums"}],
@@ -129,7 +135,7 @@ one mod list) wants to hear. Profiles live in Harmony's settings
 
 | Field | Type | Default | Meaning |
 |-------|------|---------|---------|
-| `sources` | `"library"` \| `"all"` | `"library"` | Default source set for this profile. |
+| `sources` | `"library"` \| `"all"` | `"all"` | Default source set for this profile: every active source, or only the Library. |
 | `types` | object | required, 1-64 entries | Music type name -> [selector](#selectors). Names are 1-64 characters of letters, digits, `_`, `-`, `.` (starting with a letter or digit). |
 | `format.rate` | `44100` \| `48000` | `48000` | WAV sample rate (Hz). |
 | `format.bits` | `16` \| `24` | `16` | Bits per sample. |
@@ -169,6 +175,8 @@ ends up with no tracks at all, `next` answers `404 no_tracks`.
 
 Candidate lists are cached in memory for 10 minutes (and rebuilt immediately
 when the profile is edited), so a busy game does not search on every request.
+An **empty** list (the Library is still being scanned, a service blipped) is
+only cached for about 3 seconds, so music appears as soon as the scan finishes.
 
 ### The bag
 
@@ -176,12 +184,20 @@ For every `(profile, music type)` Harmony keeps a **shuffled bag**: each
 candidate track is served once, in random order, before any repeats; when the
 bag is empty it is reshuffled, and the first track of the new cycle is never
 the last one of the previous cycle (when there is more than one track). A type
-with a single track simply repeats it. Bags live in server memory and reset when
-the profile is edited or the server restarts.
+with a single playable track simply repeats it. Bags live in server memory and
+reset when the profile is edited or the server restarts.
 
-`POST /api/game/next` **advances the bag by `count`**. To look ahead without
-using tracks up, pass `"peek": true`: the response is exactly what the next
-consuming call(s) will return.
+`POST /api/game/next` **advances the bag by `count`** and always returns
+`count` tracks as long as at least one candidate is playable (a small pool wraps
+into the next cycle). To look ahead without using tracks up, pass
+`"peek": true`: the response is exactly what the next consuming call(s) will
+return, including across a cycle boundary.
+
+**Blocked tracks.** A streaming track Harmony could not resolve (region- or
+age-blocked, removed...) is skipped for 30 minutes. It is simply passed over, so
+the cycle gets shorter, and in a small pool the remaining tracks come back
+around sooner than "once per cycle of the full pool". Still, the same track is
+never handed out twice in a row unless it is the only playable one left.
 
 ## Endpoints
 
@@ -194,7 +210,7 @@ All bodies are JSON (`Content-Type: application/json`). All errors have the form
 curl -H "$K" $H/api/game/profiles
 ```
 ```json
-{"profiles": [{"name": "skyrim", "sources": "library", "types": {"explore": {"genre": "Ambient"}},
+{"profiles": [{"name": "skyrim", "sources": "all", "types": {"explore": {"genre": "Ambient"}},
                "format": {"rate": 48000, "bits": 16, "channels": 2},
                "normalize": false, "trim_silence": false}]}
 ```
@@ -218,7 +234,11 @@ curl -X PUT -H "$K" -H 'Content-Type: application/json' $H/api/game/profiles/sky
 }'
 ```
 
-Up to 64 profiles; the name is 1-64 characters of letters, digits, `_`, `-`, `.`.
+Up to **32** profiles; the name is 1-64 characters of letters, digits, `_`, `-`, `.`.
+Size limits keep `settings.json` small: one profile may be at most **32 KB**
+serialised and all profiles together at most **256 KB**; beyond that the answer
+is `413` (`profile_too_large` / `profiles_too_large`). A realistic profile (a
+dozen types, a few selectors each) is well under 4 KB.
 
 ### `DELETE /api/game/profiles/{name}`
 
@@ -234,7 +254,7 @@ Pick the next track(s) for a music type.
 |-------|----------|---------|
 | `profile` | yes | Profile name. |
 | `type` | yes | Music type (falls back to the profile's `default`). |
-| `sources` | no | `"library"` or `"all"`; overrides the profile's. |
+| `sources` | no | `"library"` or `"all"`; overrides the profile's (default `"all"`, every active source). |
 | `count` | no | 1-10 (default 1): how many tracks to return **and consume**. |
 | `peek` | no | `true` returns the next `count` tracks **without consuming** them (default `false`). |
 
@@ -244,7 +264,7 @@ curl -X POST -H "$K" $H/api/game/next -d '{"profile": "skyrim", "type": "explore
 ```json
 {
   "profile": "skyrim", "type": "explore", "requested_type": "explore",
-  "sources": "library", "peek": false, "pool_size": 42,
+  "sources": "all", "peek": false, "pool_size": 42,
   "tracks": [
     {
       "service": "local", "id": "87fbeaab3e0ef480",
@@ -326,7 +346,7 @@ curl -H "$K" $H/api/game/status
 {
   "enabled": true,
   "ffmpeg": true,
-  "cache": {"bytes": 1291990, "files": 2, "cap": 2147483648},
+  "cache": {"bytes": 1291990, "files": 2, "in_progress_bytes": 0, "cap": 2147483648},
   "now_playing": {"profile": "skyrim", "type": "explore", "service": "local", "id": "87fbeaab3e0ef480",
                   "title": "Slow Fog", "age_s": 12.4, "...": "..."},
   "history": [{"profile": "skyrim", "type": "explore", "service": "local", "id": "87fbeaab3e0ef480",
@@ -336,7 +356,8 @@ curl -H "$K" $H/api/game/status
 ```
 
 `enabled` mirrors the `game_source_enabled` setting, `ffmpeg` says whether
-ffmpeg was found (audio needs it), `cache` is the WAV cache (`cap` in bytes),
+ffmpeg was found (audio needs it), `cache` is the WAV cache (`bytes` of finished
+files, `in_progress_bytes` of half-written ones, `cap` in bytes),
 `history` the last 20 `playing` records.
 
 ## WAV format
@@ -377,9 +398,12 @@ it is a good "same loudness across a playlist" tool, not a mastering step.
 ### Silence trimming
 
 `trim=1` removes leading and trailing silence (below -50 dB; interior pauses are
-kept). The tail is found by reversing the decoded signal, so trimming buffers the
-decoded track in memory (roughly 23 MB per minute of 48 kHz stereo); it is meant
-for music-length tracks.
+kept). The head is cut by a streaming ffmpeg filter and the tail by scanning the
+finished PCM backwards from the end, so memory stays flat (ffmpeg stays around
+70 MB whatever the track length) and the cost is proportional to the length of
+the silence removed. Whatever the source, at most 2 hours are read: the cap is
+applied to ffmpeg's *input*, so a long or endless stream is never downloaded in
+full.
 
 ## Caching, transcoding and 202
 
@@ -389,10 +413,24 @@ writes the finished WAV into a cache:
 
 - Location: `<user cache dir>/harmony/game-audio/` (for example
   `~/.cache/harmony/game-audio/`; in the Flatpak, `~/.var/app/io.github.marthofdoom.Harmony/cache/harmony/game-audio/`).
-- Key: `(service, id, rate, bits, channels, normalize, trim)` (hashed; file names
-  are never derived from request text, so there is no path traversal).
+- Key: `(source actually used, rate, bits, channels, normalize, trim)` (hashed;
+  file names are never derived from request text, so there is no path
+  traversal). The source is the one that gets transcoded: when the Library has a
+  copy of a streaming track it is the Library copy, and it is cached apart from
+  the streamed one; if that copy turns out to be unavailable and the stream is
+  used instead, the file is stored under the stream's key.
 - **LRU size cap**: `game_cache_max_mb` (default 2048, minimum 64). When the cache
-  grows past it the least-recently-used WAVs are deleted.
+  grows past it the least-recently-used WAVs are deleted. Half-written files
+  count toward the cap. The effective cap is never below twice the largest
+  cached file, so a tiny cap cannot make two conversions evict each other; a
+  file that was made or used in the last 2 minutes, or is being downloaded
+  right now, is never evicted. If the cache is over its cap and nothing can be
+  evicted, new conversions are refused with `503 cache_full` until space frees
+  up (raise `game_cache_max_mb`).
+- **Bounded work**: at most 3 conversions (ffmpeg, plus a yt-dlp resolve for
+  streams) run at once. Requests for further ones wait their turn and get the
+  usual `202` + `Retry-After`; if more than 32 are already waiting, new ones get
+  `503 busy` (with `Retry-After`).
 - **Never partial**: a transcode writes to a temp file and is renamed into place
   only when ffmpeg exited cleanly, so a half-written or failed file is never
   served; a torn or foreign file found in the cache is discarded and rebuilt.
@@ -430,7 +468,8 @@ length).
 gets `206 Partial Content` with `Content-Range: bytes a-b/total` and the exact
 `Content-Length` of the slice; an unsatisfiable range gets `416` with
 `Content-Range: bytes */total`; multiple ranges are ignored (full `200`). Seeking
-inside a WAV is a byte offset: `44 + frame * channels * bits/8`. `HEAD` returns
+inside a WAV is a byte offset: `44 + frame * channels * bits/8`. An invalid
+range such as `bytes=10-5` is ignored (full `200`, RFC 9110). `HEAD` returns
 the headers of the `GET` (`Content-Type`, `Content-Length`, `ETag`) with no body.
 Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`.
 
@@ -442,7 +481,8 @@ Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`
 | 400 | `invalid_name` | Bad profile name. |
 | 400 | `bad_request` | Bad `next` / `playing` fields, bad `service` or `id`. |
 | 400 | `bad_format` | Bad `rate` / `bits` / `channels` / `normalize` / `trim` / `wait`. |
-| 400 | `too_many_profiles` | More than 64 profiles. |
+| 400 | `bad_request` | (also) a missing-or-malformed `Content-Length` on a request with a body. |
+| 400 | `too_many_profiles` | More than 32 profiles. |
 | 401 | (none) | Missing or wrong personal key. |
 | 403 | `disabled` | `game_source_enabled` is false. |
 | 404 | `unknown_profile` | No such profile. |
@@ -452,11 +492,16 @@ Responses carry `ETag: "<cache key>"` and `Cache-Control: private, max-age=3600`
 | 404 | `not_found` | Unknown route / not an `<id>.wav` path. |
 | 405 | `method_not_allowed` | Wrong method for the route. |
 | 409 | `invalid_profile` | A stored profile (edited by hand) no longer validates; PUT it again. |
-| 413 | `too_large` | Request body over 1 MB. |
+| 411 | `length_required` | A chunked (`Transfer-Encoding`) request body; send `Content-Length`. |
+| 413 | `too_large` | Request body over 1 MB (every game `POST`/`PUT`/`DELETE`). |
+| 413 | `profile_too_large` / `profiles_too_large` | One profile over 32 KB serialised, or all profiles over 256 KB. |
 | 416 | (none) | Unsatisfiable `Range`. |
 | 502 | `source_unavailable` | The engine could not resolve the track (signed out, offline, file gone). |
 | 502 | `transcode_failed` / `bad_source` / `too_long` | ffmpeg failed, produced nothing, or the source is not a file / http(s) stream. |
 | 503 | `ffmpeg_missing` | ffmpeg is not installed on the server. |
+| 503 | `busy` | Too many conversions already queued; retry after `Retry-After`. |
+| 503 | `cache_full` | The audio cache is over its cap and nothing can be evicted yet; retry later or raise `game_cache_max_mb`. |
+| 503 | `cache_busy` | The cached file vanished while being served (rare); retry. |
 | 504 | `transcode_timeout` | ffmpeg ran over 15 minutes. |
 
 `202` is not an error: see [above](#blocking-and-202).
@@ -469,7 +514,7 @@ In Harmony's `settings.json` (managed by the server; edit with the server stoppe
 |-----|---------|---------|
 | `game_source_enabled` | `true` | `false` answers `403 disabled` to everything except `GET /api/game/status`. |
 | `game_profiles` | `{}` | The profiles (use the API rather than editing). |
-| `game_cache_max_mb` | `2048` | WAV cache size cap in MB (minimum 64). |
+| `game_cache_max_mb` | `2048` | WAV cache size cap in MB (minimum 64; in effect never below twice the largest cached file). |
 
 ffmpeg is required: the `.deb` depends on it, and the Flatpak's GNOME runtime
 ships `/usr/bin/ffmpeg` (verified: 7.1 with `loudnorm`, `silenceremove`, and the

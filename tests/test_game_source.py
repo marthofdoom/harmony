@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import random
 import shutil
 import struct
@@ -117,6 +118,8 @@ class FakeEngine:
         self.resolve_calls: list[tuple[str, str]] = []
         self.resolve_delay = 0.0
         self.resolve_error: Exception | None = None
+        self.alias: dict[tuple[str, str], tuple[str, str]] = {}  # streaming id -> Library copy
+        self.alias_unavailable = False   # the Library copy fails to resolve -> falls back to the stream
         self.tmp = tmp
 
     # surface used by game_source
@@ -145,13 +148,20 @@ class FakeEngine:
             out.append(hit.id if hit else None)
         return out
 
+    def _prefer_library(self, service, tid):
+        return self.alias.get((service, tid), (service, tid))
+
     def _resolve_preferring_library(self, service, tid):
         self.resolve_calls.append((service, tid))
         if self.resolve_delay:
             time.sleep(self.resolve_delay)
         if self.resolve_error:
             raise self.resolve_error
-        return service, tid, StreamSource(url=self.files[tid].as_uri(), mime_type="audio/x")
+        svc, real = self._prefer_library(service, tid)
+        if (svc, real) != (service, tid) and self.alias_unavailable:
+            svc, real = service, tid
+            self.alias.pop((service, tid), None)  # the stale match is forgotten
+        return svc, real, StreamSource(url=self.files[real].as_uri(), mime_type="audio/x")
 
     def _source_for(self, service, tid):
         return {"service": service, "label": service, "instance": None, "own": service == "local"}
@@ -223,7 +233,7 @@ def seed(env, audio_files):
 
 def test_profile_defaults_filled_in():
     p = gs.validate_profile({"types": {"explore": {"genre": "Ambient"}}})
-    assert p == {"sources": "library", "types": {"explore": {"genre": "Ambient"}},
+    assert p == {"sources": "all", "types": {"explore": {"genre": "Ambient"}},
                  "format": {"rate": 48000, "bits": 16, "channels": 2},
                  "normalize": False, "trim_silence": False}
 
@@ -333,7 +343,7 @@ def test_bag_sync_keeps_cycle_and_adds_removes():
 
 @pytest.mark.parametrize(("hdr", "want"), [
     (None, None), ("bytes=0-9", (0, 9)), ("bytes=5-", (5, 99)), ("bytes=-10", (90, 99)),
-    ("bytes=90-500", (90, 99)), ("bytes=100-", "bad"), ("bytes=50-10", "bad"), ("bytes=-0", "bad"),
+    ("bytes=90-500", (90, 99)), ("bytes=100-", "bad"), ("bytes=50-10", None), ("bytes=10-5", None), ("bytes=-0", "bad"),
     ("bytes=0-1,5-6", None), ("items=0-1", None), ("bytes=", None), ("garbage", None)])
 def test_parse_range(hdr, want):
     assert gs.parse_range(hdr, 100) == want
@@ -380,7 +390,8 @@ def test_profile_save_survives_a_stale_settings_object(env):
 
 def test_next_library_mode_ignores_streaming(env, seed):
     env.eng.qobuz.tracks.append(_trk("q1", "Qobuz Ambient", service=Service.QOBUZ, genre="Ambient"))
-    call(env, "PUT", "/api/game/profiles/g", {"types": {"explore": [{"genre": "Ambient"}, {"query": "Qobuz"}]}})
+    call(env, "PUT", "/api/game/profiles/g", {"sources": "library",
+                                              "types": {"explore": [{"genre": "Ambient"}, {"query": "Qobuz"}]}})
     seen = set()
     for _ in range(6):
         body = call(env, "POST", "/api/game/next", {"profile": "g", "type": "explore"})[1]
@@ -679,16 +690,21 @@ def test_invalid_cache_file_is_rebuilt_not_served(env, seed):
 
 
 def test_lru_eviction_keeps_cache_under_cap(env, seed):
-    # ~380 KB per 2 s stereo 48k/16 WAV; the floor is 64 MB so patch the cap directly
-    env.game.cache._cap = lambda: 600_000
-    fetch_audio(env, "a1")
-    time.sleep(0.05)
-    fetch_audio(env, "a2")
-    time.sleep(0.05)
-    fetch_audio(env, "m2")
+    # ~380 KB per 2 s stereo 48k/16 WAV; the floor is 64 MB so patch the cap directly.
+    # The effective cap never drops below twice the largest file, so two always fit.
+    env.game.cache._cap = lambda: 100_000
+    env.game.cache.min_evict_age_s = 0  # production spares entries used in the last 2 minutes
+    paths, sizes = {}, []
+    for tid in ("a1", "a2", "m2"):
+        fetch_audio(env, tid)
+        paths[tid] = sorted(env.game.cache.dir.glob("*.wav"), key=lambda p: p.stat().st_mtime)[-1]
+        sizes.append(paths[tid].stat().st_size)
+        time.sleep(0.05)
     st = env.game.cache.stats()
-    assert st["bytes"] <= 600_000 and st["files"] == 1  # only the newest fits
-    assert call(env, "GET", "/api/game/status")[1]["cache"]["cap"] == 600_000
+    biggest = max(sizes)
+    assert st["files"] == 2 and st["bytes"] <= 2 * biggest  # oldest evicted, the last two kept
+    assert not paths["a1"].exists() and paths["a2"].exists() and paths["m2"].exists()
+    assert call(env, "GET", "/api/game/status")[1]["cache"]["cap"] == 100_000
 
 
 def test_cache_cap_setting_has_a_floor(env):
@@ -802,7 +818,7 @@ def test_playing_records_now_playing_and_status(env, seed):
     st = call(env, "GET", "/api/game/status")[1]
     assert st["enabled"] is True and st["ffmpeg"] is True and st["profiles"] == ["g"]
     assert st["now_playing"]["id"] == track["id"] and st["now_playing"]["type"] == "explore"
-    assert set(st["cache"]) == {"bytes", "files", "cap"} and st["cache"]["cap"] == 2048 * 1024 * 1024
+    assert set(st["cache"]) == {"bytes", "files", "in_progress_bytes", "cap"} and st["cache"]["cap"] == 2048 * 1024 * 1024
     assert st["history"][0]["id"] == track["id"]
     # a game that went away stops "playing" once the track (+ grace) is over
     env.game._now["started_at"] -= 10_000
@@ -872,7 +888,7 @@ def test_no_accounts_sources_all_serves_youtube_music(env, audio_files):
 
 def test_no_accounts_library_mode_has_nothing_and_says_so(env, audio_files):
     _no_accounts(env, audio_files)
-    call(env, "PUT", "/api/game/profiles/anon", {"types": {"explore": {"genre": "Ambient"}}})
+    call(env, "PUT", "/api/game/profiles/anon", {"sources": "library", "types": {"explore": {"genre": "Ambient"}}})
     status, body = call(env, "POST", "/api/game/next", {"profile": "anon", "type": "explore"})
     assert status == 404 and body["code"] == "no_tracks" and "sources=library" in body["error"]
     ok = call(env, "POST", "/api/game/next", {"profile": "anon", "type": "explore", "sources": "all"})
@@ -889,6 +905,7 @@ def test_signed_out_qobuz_selector_is_skipped_not_an_error(env, audio_files):
 
 def test_blocked_youtube_track_stops_being_offered(env, audio_files):
     _no_accounts(env, audio_files)
+    env.game.rng_factory = lambda: random.Random(11)   # a fixed shuffle: no flakiness
     call(env, "PUT", "/api/game/profiles/anon", {"sources": "all", "types": {"explore": {"genre": "Ambient"}}})
     env.eng.resolve_error = RuntimeError("Video unavailable in your country")
     status, _h, body = call(env, "GET", "/api/game/audio/ytmusic/yBBBBBBBBBB.wav", raw=True)
@@ -915,3 +932,493 @@ def test_streaming_tracks_outside_a_game_friendly_length_are_not_offered(env, au
     body = call(env, "POST", "/api/game/next", {"profile": "anon", "type": "x", "count": 10})[1]
     ids = {t["id"] for t in body["tracks"]}
     assert "yLONG000000" not in ids and "ySHORT00000" not in ids and "yUNKNOWN000" in ids
+
+
+# -- the bag: peek == consume, count honoured (review finding 1) ---------------------------------------
+
+
+def _bare_game(tmp_path, seed, n, bad=()):
+    """A GameSource + one hand-built pool of ``n`` YouTube tracks (``bad`` ones blocked)."""
+    game = gs.GameSource(FakeEngine(tmp_path), cache_dir=tmp_path / "audio", settings=lambda: SimpleNamespace())
+    pool = gs.TrackPool(random.Random(seed))
+    for i in range(n):
+        pool.refs[("ytmusic", f"t{i}")] = {"service": "ytmusic", "id": f"t{i}"}
+    pool.bag.sync(list(pool.refs))
+    for i in bad:
+        game._mark_bad("ytmusic", f"t{i}")
+    return game, pool
+
+
+def _ids(tracks):
+    return [t["id"] for t in tracks]
+
+
+@pytest.mark.parametrize("seed", range(120))
+def test_take_peek_equals_consume_and_honours_count(tmp_path, seed):
+    rng = random.Random(seed * 7919)
+    n = rng.randint(1, 7)
+    bad = rng.sample(range(n), rng.randint(0, n))
+    good = n - len(bad)
+    game, pool = _bare_game(tmp_path, seed, n, bad)
+    emitted: list[str] = []
+    for _ in range(14):
+        count = rng.randint(1, gs.MAX_COUNT)
+        if rng.random() < 0.5 and good:   # sometimes a (repeatable) peek first
+            peek = _ids(game._take(pool, count, consume=False))
+            assert _ids(game._take(pool, count, consume=False)) == peek
+        else:
+            peek = None
+        got = _ids(game._take(pool, count, consume=True))
+        if not good:
+            assert got == [] and peek is None
+            continue
+        if peek is not None:
+            assert got == peek
+        assert len(got) == count            # never short, however many are blocked
+        assert not set(got) & {f"t{i}" for i in bad}
+        emitted += got
+    if good > 1:                            # a track never plays twice in a row...
+        assert all(a != b for a, b in zip(emitted, emitted[1:], strict=False))
+    elif good == 1:                         # ...unless it is the only playable one
+        assert len(set(emitted)) == 1
+
+
+def test_take_reviewer_scenarios_blocked_pool(tmp_path):
+    # 3 tracks, 2 blocked, count 4: used to return fewer / ['A','A','A','A'] diverging from the peek
+    for seed in range(30):
+        game, pool = _bare_game(tmp_path, seed, 3, bad=[1, 2])
+        peek = _ids(game._take(pool, 4, consume=False))
+        assert peek == _ids(game._take(pool, 4, consume=True)) == ["t0"] * 4
+    # 2 playable of 5: peek and consume agree across a cycle boundary, count honoured, no A,A
+    for seed in range(60):
+        game, pool = _bare_game(tmp_path, seed, 5, bad=[0, 1, 2])
+        peek = _ids(game._take(pool, 8, consume=False))
+        got = _ids(game._take(pool, 8, consume=True))
+        assert got == peek and len(got) == 8 and all(a != b for a, b in zip(got, got[1:], strict=False))
+
+
+def test_pick_with_no_playable_returns_empty_and_does_not_spin(tmp_path):
+    game, pool = _bare_game(tmp_path, 1, 3, bad=[0, 1, 2])
+    assert game._take(pool, 5, consume=True) == [] and game._take(pool, 5, consume=False) == []
+    bag = gs.Bag(random.Random(1))
+    assert bag.pick(3, lambda _k: True, repeat_ok=False, consume=True) == []   # empty bag
+
+
+# -- ffmpeg pipeline: bounded memory (review finding 2) -------------------------------------------------
+
+
+def test_input_is_limited_before_dash_i_and_trim_does_not_reverse(monkeypatch, tmp_path):
+    for url in ("file:///music/a.flac", "https://cdn.example/s.m4a"):
+        args = gs.ffmpeg_input_args(url)
+        assert args[args.index("-t") + 1] == str(gs.MAX_AUDIO_S) and args.index("-t") < args.index("-i")
+    seen: dict[str, list[str]] = {}
+
+    def fake_run(cmd, **kw):
+        seen["cmd"] = cmd
+        kw["stdout"].write(b"\x00\x10" * 4000)           # some non-silent PCM
+        return subprocess.CompletedProcess(cmd, 0, b"", b"")
+
+    monkeypatch.setattr(gs.subprocess, "run", fake_run)
+    gs.transcode_to_wav("ffmpeg", gs.ffmpeg_input_args("file:///music/a.flac"), tmp_path / "o.part",
+                        rate=48000, bits=16, channels=2, normalize=True, trim=True)
+    cmd = seen["cmd"]
+    af = cmd[cmd.index("-af") + 1]
+    assert "areverse" not in af and "silenceremove=start_periods=1" in af and "loudnorm" in af
+    assert cmd.index("-t") < cmd.index("-i")                   # input-side cap, before -i
+    assert "-t" in cmd[cmd.index("-i") + 2:]                   # and the output-side one
+    assert gs.wav_valid(tmp_path / "o.part")
+
+
+def test_input_side_cap_really_bounds_what_ffmpeg_reads(env, seed, monkeypatch):
+    monkeypatch.setattr(gs, "MAX_AUDIO_S", 1)                  # the sources are 2 s long
+    wav = parse_wav(fetch_audio(env, "a1", q="rate=48000&bits=16&channels=2&trim=1")[2])
+    assert 0.9 < wav["frames"] / 48000 <= 1.01
+
+
+def _pcm(bits, channels, frames_loud, frames_quiet, loud=8000):
+    width = bits // 8
+    unit = (loud << (8 * (width - 2))) & ((1 << bits) - 1) if bits == 24 else loud
+    frame = int(unit).to_bytes(width, "little", signed=False) * channels
+    quiet = (2).to_bytes(width, "little") * channels                # far under -50 dBFS
+    return frame * frames_loud + quiet * frames_quiet
+
+
+@pytest.mark.parametrize("bits", [16, 24])
+@pytest.mark.parametrize("channels", [1, 2])
+@pytest.mark.parametrize(("loud", "quiet"), [(100, 30), (70_000, 70_000), (1, 0), (65_536, 65_536)])
+def test_trim_tail_silence_keeps_exactly_the_audible_frames(tmp_path, bits, channels, loud, quiet):
+    block = bits // 8 * channels
+    f = tmp_path / "pcm.bin"
+    f.write_bytes(b"HEADER" + _pcm(bits, channels, loud, quiet))
+    with open(f, "rb") as fh:
+        assert gs.trim_tail_silence(fh, 6, (loud + quiet) * block, bits, channels) == loud * block
+
+
+@pytest.mark.parametrize("bits", [16, 24])
+def test_trim_tail_silence_all_silent_is_zero_and_one_channel_loud_counts(tmp_path, bits):
+    f = tmp_path / "pcm.bin"
+    f.write_bytes(_pcm(bits, 2, 0, 500))
+    with open(f, "rb") as fh:
+        assert gs.trim_tail_silence(fh, 0, 500 * bits // 8 * 2, bits, 2) == 0
+    width = bits // 8                                           # loud on the RIGHT channel only
+    loud = (20_000 << (8 * (width - 2)) if bits == 24 else 20_000).to_bytes(width, "little")
+    quiet = (1).to_bytes(width, "little")
+    f.write_bytes((quiet + loud) * 10 + (quiet + quiet) * 30)
+    with open(f, "rb") as fh:
+        assert gs.trim_tail_silence(fh, 0, 40 * width * 2, bits, 2) == 10 * width * 2
+
+
+# -- audio cache: bounded, pinned, honest (review finding 3) --------------------------------------------
+
+
+def _wav_bytes(n_frames: int = 400) -> bytes:
+    pcm = b"\x01\x00" * n_frames
+    return gs.wav_header(len(pcm), 48000, 16, 1) + pcm
+
+
+def _writer(size_frames=400, hold: threading.Event | None = None, started: list | None = None,
+            stored_as: str | None = None):
+    def build(tmp):
+        if started is not None:
+            started.append(tmp.name)
+        if hold is not None:
+            assert hold.wait(30)
+        tmp.write_bytes(_wav_bytes(size_frames))
+        return stored_as
+    return build
+
+
+def test_cache_runs_at_most_max_builds_at_once_and_queues_the_rest(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 10**9, max_builds=2, max_queued=10)
+    hold, running, peak, lock = threading.Event(), [0], [0], threading.Lock()
+
+    def build(tmp):
+        with lock:
+            running[0] += 1
+            peak[0] = max(peak[0], running[0])
+        assert hold.wait(30)
+        tmp.write_bytes(_wav_bytes())
+        with lock:
+            running[0] -= 1
+
+    assert [cache.get(f"k{i}", build, 0) for i in range(6)] == [None] * 6   # all 202, none dropped
+    time.sleep(0.3)
+    assert peak[0] == 2                                                      # only 2 transcoding
+    hold.set()
+    for i in range(6):
+        path = cache.get(f"k{i}", build, 20)
+        assert path is not None and path.exists()
+    assert peak[0] == 2
+
+
+def test_cache_refuses_a_flood_with_503_busy(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 10**9, max_builds=1, max_queued=1)
+    hold = threading.Event()
+    cache.get("k0", _writer(hold=hold), 0)
+    cache.get("k1", _writer(hold=hold), 0)
+    with pytest.raises(gs.GameError) as exc:
+        cache.get("k2", _writer(hold=hold), 0)
+    assert exc.value.status == 503 and exc.value.code == "busy" and exc.value.retry_after
+    assert gs._error(exc.value).headers["Retry-After"] == str(exc.value.retry_after)
+    cache.get("k0", _writer(hold=hold), 0)       # joining an existing job is still fine
+    hold.set()
+    assert cache.get("k1", _writer(), 20) is not None
+
+
+def test_part_files_count_toward_the_cap_and_refuse_new_builds(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 1000, max_builds=1)
+    (tmp_path / "other.1.2.part").write_bytes(b"x" * 5000)      # another job's half-written output
+    with pytest.raises(gs.GameError) as exc:
+        cache.get("new", _writer(), 5)
+    assert exc.value.status == 503 and exc.value.code == "cache_full" and "game_cache_max_mb" in exc.value.message
+    assert exc.value.retry_after and cache.stats()["in_progress_bytes"] == 5000
+    (tmp_path / "other.1.2.part").unlink()
+    assert cache.get("new", _writer(), 5) is not None
+
+
+def test_eviction_spares_pinned_and_recent_entries_and_keeps_two_files(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 1, min_evict_age_s=0)   # absurdly small cap
+    old = time.time() - 1000
+    for i, name in enumerate("abc"):
+        (tmp_path / f"{name}.wav").write_bytes(_wav_bytes())
+        os.utime(tmp_path / f"{name}.wav", (old + i, old + i))
+    size = (tmp_path / "a.wav").stat().st_size
+    cache.pin(tmp_path / "a.wav")                                    # being served right now
+    cache._evict()
+    assert sorted(p.name for p in tmp_path.glob("*.wav")) == ["a.wav", "c.wav"]   # b (oldest unpinned) went
+    assert cache.stats()["bytes"] == 2 * size                        # floor: 2x the largest file, not 1 byte
+    cache.unpin(tmp_path / "a.wav")
+    assert not cache._pins
+    cache.min_evict_age_s = 3600                                     # everything is "recent": spared
+    (tmp_path / "d.wav").write_bytes(_wav_bytes())
+    cache._evict()
+    assert len(list(tmp_path.glob("*.wav"))) == 3
+
+
+def test_two_jobs_do_not_evict_each_other_under_a_tiny_cap(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 1, min_evict_age_s=0)
+    hold = threading.Event()
+    assert cache.get("one", _writer(hold=hold), 0) is None and cache.get("two", _writer(hold=hold), 0) is None
+    hold.set()
+    one, two = cache.get("one", _writer(), 20), cache.get("two", _writer(), 20)
+    assert one is not None and two is not None and one.exists() and two.exists()   # no 202 loop
+
+
+def test_cache_get_pins_the_returned_file_until_released(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 1, min_evict_age_s=0)
+    a = cache.get("a", _writer(), 5)
+    assert cache._pinned(a.name)
+    (tmp_path / "b.wav").write_bytes(_wav_bytes())
+    (tmp_path / "c.wav").write_bytes(_wav_bytes())
+    os.utime(a, (1, 1))                                              # the OLDEST, but pinned
+    cache._evict()
+    assert a.exists() and not (tmp_path / "b.wav").exists()          # b, the oldest UNPINNED, went
+    cache.unpin(a)
+    (tmp_path / "d.wav").write_bytes(_wav_bytes())
+    cache._evict()
+    assert not a.exists()                                            # now a is just the oldest
+
+
+def test_build_may_store_under_the_key_of_the_source_it_really_used(tmp_path):
+    cache = gs.AudioCache(tmp_path, lambda: 10**9)
+    path = cache.get("predicted", _writer(stored_as="actual"), 10)
+    assert path == cache.path_for("actual") and path.exists() and not cache.path_for("predicted").exists()
+
+
+def test_failed_memory_is_bounded_and_expires(tmp_path, monkeypatch):
+    monkeypatch.setattr(gs, "MAX_FAILED", 3)
+    cache = gs.AudioCache(tmp_path, lambda: 10**9)
+
+    def boom(_tmp):
+        raise gs.GameError(502, "source_unavailable", "nope")
+
+    for i in range(8):
+        with pytest.raises(gs.GameError):
+            cache.get(f"f{i}", boom, 10)
+    assert len(cache._failed) <= 3 and "f7" in cache._failed and "f0" not in cache._failed
+
+
+def test_bad_set_is_bounded_and_expires(tmp_path, monkeypatch):
+    game, _pool = _bare_game(tmp_path, 1, 1)
+    monkeypatch.setattr(gs, "MAX_BAD", 5)
+    for i in range(40):
+        game._mark_bad("ytmusic", f"x{i}")
+    assert len(game._bad) == 5 and ("ytmusic", "x39") in game._bad and ("ytmusic", "x0") not in game._bad
+    monkeypatch.setattr(gs, "BAD_TTL_S", 0.05)
+    time.sleep(0.1)
+    game._mark_bad("ytmusic", "fresh")
+    assert list(game._bad) == [("ytmusic", "fresh")]                 # the expired ones were dropped
+
+
+def test_serving_pins_the_file_and_releases_it_afterwards(env, seed):
+    fetch_audio(env, "a1")
+    assert not env.game.cache._pins                                  # GET finished -> unpinned
+    resp = env.game.audio("local", "a1.wav", {}, None)
+    assert resp.file is not None and env.game.cache._pinned(resp.file.name)
+    resp.done()
+    resp.done()                                                      # idempotent
+    assert not env.game.cache._pins
+    assert call(env, "HEAD", "/api/game/audio/local/a1.wav", raw=True)[0] == 200
+    assert call(env, "GET", "/api/game/audio/local/a1.wav", headers={"Range": "bytes=999999999-"},
+                raw=True)[0] == 416
+    assert not env.game.cache._pins                                  # HEAD and 416 released it too
+
+
+def test_a_cache_file_that_vanishes_is_retried_then_503_never_500(env, seed):
+    real_get = env.game.cache.get
+    calls = []
+
+    def vanishing_get(key, build, wait):
+        path = real_get(key, build, wait)
+        calls.append(path)
+        if len(calls) == 1:
+            path.unlink()                                            # evicted between get and stat
+        return path
+
+    env.game.cache.get = vanishing_get
+    status, _h, body = fetch_audio(env, "a1")
+    assert status == 200 and parse_wav(body)["frames"] > 0 and len(calls) == 2   # rebuilt once
+    calls.clear()
+    env.game.cache.get = lambda *a, **k: env.tmp / "gone.wav"        # never exists
+    status, hdrs, body = fetch_audio(env, "a1")
+    assert status == 503 and json.loads(body)["code"] == "cache_busy" and hdrs["Retry-After"]
+    env.game.cache.get = real_get
+
+
+def test_send_response_with_a_vanished_file_is_a_clean_503(tmp_path):
+    class Handler:
+        def __init__(self):
+            self.status, self.sent, self.out = None, [], b""
+            self.wfile = self
+
+        def send_response(self, code):
+            self.status = code
+
+        def send_header(self, k, v):
+            self.sent.append((k, v))
+
+        def end_headers(self):
+            pass
+
+        def write(self, data):
+            self.out += data
+
+    released = []
+    resp = gs.GameResponse(200, None, {"Content-Length": "5"}, file=tmp_path / "gone.wav", length=5,
+                           release=lambda: released.append(1))
+    h = Handler()
+    gs.send_response(h, resp)
+    assert h.status == 503 and json.loads(h.out)["code"] == "cache_busy" and ("Retry-After", "2") in h.sent
+    assert released == [1]
+
+
+def test_cache_key_follows_the_source_actually_used(env, seed):
+    eng = env.eng
+    eng.files["yX"] = eng.files["a1"]
+    stream = fetch_audio(env, "yX", service="ytmusic")
+    assert eng.resolve_calls == [("ytmusic", "yX")]
+    eng.alias[("ytmusic", "yX")] = ("local", "a2")                   # the Library now has a copy
+    lib = fetch_audio(env, "yX", service="ytmusic")
+    assert len(eng.resolve_calls) == 2 and lib[2] != stream[2]       # NOT the cached stream
+    assert fetch_audio(env, "yX", service="ytmusic")[2] == lib[2] and len(eng.resolve_calls) == 2
+    assert fetch_audio(env, "a2")[2] == lib[2] and len(eng.resolve_calls) == 2   # same slot as the local id
+    eng.alias_unavailable = True                                     # copy vanished: falls back to the stream
+    eng.alias[("ytmusic", "yX")] = ("local", "a2")
+    fetch_audio(env, "yX", service="ytmusic", q="rate=44100&bits=16&channels=2")
+    keys = {p.name for p in env.game.cache.dir.glob("*.wav")}
+    assert len(keys) == 3
+    again = fetch_audio(env, "yX", service="ytmusic", q="rate=44100&bits=16&channels=2")
+    assert again[0] == 200                                           # served from the stream-keyed entry
+
+
+# -- profiles: size caps, one Settings load per request (review finding 4) -------------------------------
+
+
+def _fat_profile(n_types: int, queries: int = 16, width: int = 190, tag: str = "x"):
+    return {"types": {f"t{i}": [{"query": f"{tag}{i}-{j}-".ljust(width, "q")} for j in range(queries)]
+                      for i in range(n_types)}}
+
+
+def test_profile_size_is_capped_with_413(env):
+    big = _fat_profile(12)                      # ~40 KB serialised
+    assert gs._size(big) > gs.MAX_PROFILE_BYTES
+    status, body = call(env, "PUT", "/api/game/profiles/big", big)
+    assert status == 413 and body["code"] == "profile_too_large" and str(gs.MAX_PROFILE_BYTES) in body["error"]
+    ok = _fat_profile(8)
+    assert gs._size(ok) < gs.MAX_PROFILE_BYTES
+    assert call(env, "PUT", "/api/game/profiles/ok", ok)[0] == 200
+    assert call(env, "GET", "/api/game/profiles/big")[0] == 404
+
+
+def test_total_profile_storage_is_capped_with_413(env):
+    one = _fat_profile(8)
+    per = gs._size({"sources": "library", "format": {"rate": 48000, "bits": 16, "channels": 2},
+                    "normalize": False, "trim_silence": False, **one})
+    fits = gs.MAX_PROFILES_BYTES // per
+    assert 2 <= fits < gs.MAX_PROFILES                      # the byte budget binds before the count
+    for i in range(fits):
+        assert call(env, "PUT", f"/api/game/profiles/p{i}", _fat_profile(8, tag=f"p{i}"))[0] == 200
+    status, body = call(env, "PUT", "/api/game/profiles/overflow", _fat_profile(8, tag="o"))
+    assert status == 413 and body["code"] == "profiles_too_large"
+    assert call(env, "PUT", "/api/game/profiles/p0", _fat_profile(8, tag="again"))[0] == 200  # replacing is fine
+    assert call(env, "DELETE", "/api/game/profiles/p1")[0] == 200
+    assert call(env, "PUT", "/api/game/profiles/overflow", _fat_profile(8, tag="o"))[0] == 200
+
+
+def test_profile_count_is_capped(env):
+    for i in range(gs.MAX_PROFILES):
+        assert call(env, "PUT", f"/api/game/profiles/c{i}", {"types": {"x": {"genre": "G"}}})[0] == 200
+    status, body = call(env, "PUT", "/api/game/profiles/one-too-many", {"types": {"x": {"genre": "G"}}})
+    assert status == 400 and body["code"] == "too_many_profiles"
+
+
+def test_each_request_loads_settings_once(env, seed, monkeypatch):
+    for i in range(6):
+        call(env, "PUT", f"/api/game/profiles/p{i}", PROFILE)
+    real = env.game._settings
+    loads: list[str] = []
+
+    def counting():
+        loads.append(threading.current_thread().name)
+        return real()
+
+    monkeypatch.setattr(env.game, "_settings", counting)
+    fetch_audio(env, "a1")                                           # also warms the audio cache
+    for method, path, body in [("GET", "/api/game/profiles", None), ("GET", "/api/game/status", None),
+                               ("GET", "/api/game/profiles/p3", None),
+                               ("POST", "/api/game/next", {"profile": "p1", "type": "explore"}),
+                               ("POST", "/api/game/next", {"profile": "p1", "type": "explore", "peek": True}),
+                               ("GET", "/api/game/audio/local/a1.wav", None)]:
+        loads.clear()
+        assert call(env, method, path, body, raw=method == "GET" and "audio" in path)[0] == 200
+        assert len(loads) == 1, (method, path, loads)
+
+
+def test_empty_pool_is_retried_soon_not_cached_for_the_ttl(env, seed, monkeypatch):
+    monkeypatch.setattr(gs, "EMPTY_POOL_RETRY_S", 0.2)
+    saved = list(env.eng.lib.tracks)
+    env.eng.lib.tracks.clear()                                       # the Library is mid-scan
+    call(env, "PUT", "/api/game/profiles/g", PROFILE)
+    assert call(env, "POST", "/api/game/next", {"profile": "g", "type": "explore"})[0] == 404
+    env.eng.lib.tracks.extend(saved)                                 # scan finished
+    time.sleep(0.4)
+    status, body = call(env, "POST", "/api/game/next", {"profile": "g", "type": "explore"})
+    assert status == 200 and body["tracks"]
+
+
+# -- the default scope is every ACTIVE source ----------------------------------------------------------------
+
+
+def _ids_over_cycles(env, profile, extra=None, cycles=8):
+    seen = set()
+    for _ in range(cycles):
+        body = call(env, "POST", "/api/game/next", {"profile": profile, "type": "explore", "count": 10, **(extra or {})})[1]
+        seen |= {(t["service"], t["id"]) for t in body["tracks"]}
+    return seen, body["sources"]
+
+
+def _with_streaming(env):
+    env.eng.qobuz.tracks.append(_trk("q1", "Qobuz Ambient", service=Service.QOBUZ, genre="Ambient"))
+    env.eng.yt = FakeProv(Service.YTMUSIC, [_trk("yAAAAAAAAAA", "Calm Song", service=Service.YTMUSIC,
+                                                  genre="Ambient")])
+    env.eng.yt.is_authenticated = False                        # public catalogue, no account
+    env.eng.files["q1"] = env.eng.files["yAAAAAAAAAA"] = env.eng.files["a1"]
+
+
+def test_default_sources_is_all_active_with_a_library(env, seed):
+    _with_streaming(env)
+    stored = call(env, "PUT", "/api/game/profiles/g", {"types": {"explore": {"genre": "Ambient"}}})[1]
+    assert stored["sources"] == "all"                         # the profile default
+    seen, used = _ids_over_cycles(env, "g")                   # neither request nor profile set it
+    assert used == "all"
+    assert seen == {("local", "a1"), ("local", "a2"), ("local", "a3"),
+                    ("qobuz", "q1"), ("ytmusic", "yAAAAAAAAAA")}
+
+
+def test_default_sources_without_a_library_or_qobuz_login_skips_them_silently(env, audio_files):
+    _no_accounts(env, audio_files)                            # no library, Qobuz signed out, YT public
+    call(env, "PUT", "/api/game/profiles/g", {"types": {"explore": {"genre": "Ambient"}}})
+    seen, used = _ids_over_cycles(env, "g")
+    assert used == "all" and {s for s, _i in seen} == {"ytmusic"} and len(seen) == 3
+    assert env.eng.qobuz.calls == []
+
+
+def test_default_sources_uses_qobuz_only_when_signed_in(env, seed):
+    _with_streaming(env)
+    env.eng.qobuz.is_authenticated = False
+    call(env, "PUT", "/api/game/profiles/g", {"types": {"explore": {"genre": "Ambient"}}})
+    seen, _used = _ids_over_cycles(env, "g")
+    assert ("qobuz", "q1") not in seen and ("ytmusic", "yAAAAAAAAAA") in seen and ("local", "a1") in seen
+
+
+def test_library_only_must_be_asked_for(env, seed):
+    _with_streaming(env)
+    call(env, "PUT", "/api/game/profiles/g", {"types": {"explore": {"genre": "Ambient"}}})        # default: all
+    call(env, "PUT", "/api/game/profiles/lib", {"sources": "library", "types": {"explore": {"genre": "Ambient"}}})
+    only_lib = {("local", "a1"), ("local", "a2"), ("local", "a3")}
+    assert _ids_over_cycles(env, "lib") == (only_lib, "library")             # profile says library
+    assert _ids_over_cycles(env, "g", {"sources": "library"}) == (only_lib, "library")   # request says library
+    seen, used = _ids_over_cycles(env, "lib", {"sources": "all"})            # and the request can widen it
+    assert used == "all" and ("ytmusic", "yAAAAAAAAAA") in seen
+    # the bags are separate per scope: asking for library did not disturb the "all" pool
+    assert _ids_over_cycles(env, "g")[1] == "all"

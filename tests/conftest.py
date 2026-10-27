@@ -1,14 +1,81 @@
-"""Shared test fixtures: a duck-typed fake provider.
+"""Shared test fixtures: a duck-typed fake provider, and the host-isolation guard.
 
 ``harmony.providers.base.MusicProvider`` is owned by another module and may
 not exist yet at import time, so this fake implements the ABC's surface by
 duck typing only — it is never imported as a subclass of anything from
 ``harmony.providers``.
+
+Host isolation: no test may read or write the developer's real Harmony profile
+(``~/.config/harmony``, ``~/.local/share/harmony``, ``~/.cache/harmony``) or
+real keyring. A test that builds an unpatched ``Settings``/``AppState``/
+``Engine`` and saves (e.g. the Qobuz app-id scrape persisting its result) used
+to land in the real ``settings.json``. The autouse fixture below points every
+XDG dir and ``$HOME`` at a per-test temp dir and forces the keyring's null
+backend; ``harmony.config`` resolves its dirs lazily (``platformdirs`` reads
+the environment on every call), so this takes effect for code that is already
+imported. Tests that want specific paths still monkeypatch ``settings_path``
+etc. on top of this.
 """
 
 from __future__ import annotations
 
+import atexit
+import os
+import shutil
+import tempfile
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+
 from harmony.models import Playlist, SearchResults, Service, Track
+
+_ISOLATED_ENV = ("XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "HOME")
+_FAIL_KEYRING = "keyring.backends.fail.Keyring"
+
+
+def _point_at(root: Path) -> dict[str, str]:
+    env = {
+        "HOME": str(root / "home"),
+        "XDG_CONFIG_HOME": str(root / "config"),
+        "XDG_DATA_HOME": str(root / "data"),
+        "XDG_CACHE_HOME": str(root / "cache"),
+        "XDG_STATE_HOME": str(root / "state"),
+        "XDG_RUNTIME_DIR": str(root / "run"),
+        "PYTHON_KEYRING_BACKEND": _FAIL_KEYRING,
+    }
+    for key, value in env.items():
+        os.environ[key] = value
+        if key != "PYTHON_KEYRING_BACKEND":
+            Path(value).mkdir(parents=True, exist_ok=True)
+    return env
+
+
+# Import-time guard: anything that touches a path while pytest is still
+# collecting (module-level code, session fixtures) is isolated too.
+_SESSION_ROOT = Path(tempfile.mkdtemp(prefix="harmony-tests-"))
+atexit.register(shutil.rmtree, _SESSION_ROOT, True)
+_point_at(_SESSION_ROOT)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_host(tmp_path_factory: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Per-test profile dirs + a keyring that stores nothing."""
+    root = tmp_path_factory.mktemp("host")
+    for name, value in _point_at(root).items():
+        monkeypatch.setenv(name, value)  # restores the previous value afterwards
+    for name in _ISOLATED_ENV:
+        assert str(root) in os.environ[name]
+    try:  # the env var only matters the first time keyring picks a backend; pin it explicitly too
+        import keyring
+        from keyring.backends.fail import Keyring as FailKeyring
+    except ImportError:
+        yield
+        return
+    previous = keyring.get_keyring()
+    keyring.set_keyring(FailKeyring())
+    yield
+    keyring.set_keyring(previous)
 
 
 class FakeProvider:

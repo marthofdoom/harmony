@@ -75,6 +75,38 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    #: Request-body cap for the game API (profiles are tiny; nothing legitimate is bigger).
+    GAME_BODY_MAX = 1_000_000
+
+    def _read_body(self, max_bytes: int | None = None) -> bytes | None:
+        """The request body, or ``None`` after answering with an error.
+
+        ``Content-Length`` is validated (non-numeric / negative -> 400; chunked
+        transfer, which this server does not decode -> 411); a missing one means
+        an empty body. ``max_bytes`` caps the size (413). Never reads to EOF, so
+        a bad header cannot hang the handler thread."""
+        raw_len = self.headers.get("Content-Length")
+        if self.headers.get("Transfer-Encoding"):
+            self._send_json({"error": "chunked request bodies are not supported; send Content-Length",
+                             "code": "length_required"}, status=411)
+            self.close_connection = True
+            return None
+        if raw_len is None or not raw_len.strip():
+            return b""
+        try:
+            length = int(raw_len.strip())
+            if length < 0 or not raw_len.strip().isdigit():
+                raise ValueError(raw_len)
+        except ValueError:
+            self._send_json({"error": "invalid Content-Length", "code": "bad_request"}, status=400)
+            self.close_connection = True
+            return None
+        if max_bytes is not None and length > max_bytes:
+            self._send_json({"error": "request body too large", "code": "too_large"}, status=413)
+            self.close_connection = True
+            return None
+        return self.rfile.read(length) if length else b""
+
     def _authorized(self) -> bool:
         """True if the request may touch the API/stream (personal-key gate)."""
         parsed = urlparse(self.path)
@@ -133,8 +165,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json({"error": "personal key required"}, status=401)
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        raw = self.rfile.read(length) if length else b""
+        raw = self._read_body(self.GAME_BODY_MAX if parsed.path.startswith("/api/game/") else None)
+        if raw is None:
+            return
         try:
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
@@ -347,6 +380,13 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self._send_empty(401)
                 return
             self._handle_game("HEAD", parsed)
+        elif parsed.path.startswith("/stream/"):
+            # Headers only. Android's LocalRelay forwards a DLNA renderer's HEAD
+            # upstream, so a HEAD for a stream token must answer like the GET.
+            if not self._authorized():
+                self._send_empty(401)
+                return
+            self._handle_stream(unquote(parsed.path[len("/stream/"):]), head=True)
         else:
             self._send_empty(404)
 
@@ -369,12 +409,9 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
         if not self._authorized():
             self._send_json({"error": "personal key required"}, status=401)
             return
-        length = int(self.headers.get("Content-Length") or 0)
-        if length > 1_000_000:
-            self._send_json({"error": "request body too large", "code": "too_large"}, status=413)
-            self.close_connection = True
+        raw = self._read_body(self.GAME_BODY_MAX)
+        if raw is None:
             return
-        raw = self.rfile.read(length) if length else b""
         try:
             body = json.loads(raw) if raw else {}
         except json.JSONDecodeError:
@@ -585,14 +622,20 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
             except subprocess.TimeoutExpired:
                 proc.kill()
 
-    def _handle_stream(self, token: str) -> None:
+    def _handle_stream(self, token: str, head: bool = False) -> None:
         import requests
 
         from harmony.streamio import is_file_url, open_stream
 
+        def fail(message: str, status: int) -> None:
+            if head:
+                self._send_empty(status)
+            else:
+                self._send_json({"error": message}, status=status)
+
         meta = get_engine().stream_for(token)
         if meta is None:
-            self._send_json({"error": "unknown or expired stream token"}, status=404)
+            fail("unknown or expired stream token", 404)
             return
         client_range = self.headers.get("Range")
 
@@ -615,7 +658,7 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                     upstream = fetch(refreshed)
         except Exception as exc:  # noqa: BLE001
             log.warning("stream upstream failed: %s", exc)
-            self._send_json({"error": "upstream fetch failed"}, status=502)
+            fail("upstream fetch failed", 502)
             return
         with upstream:
             self.send_response(upstream.status_code)
@@ -630,6 +673,8 @@ class HarmonyHTTPRequestHandler(BaseHTTPRequestHandler):
                 self.send_header("Connection", "close")
                 self.close_connection = True
             self.end_headers()
+            if head:
+                return
             try:
                 for chunk in upstream.iter_content(64 * 1024):
                     if chunk:

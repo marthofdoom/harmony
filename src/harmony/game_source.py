@@ -10,7 +10,7 @@ implementation, kept gi-free and independent of the HTTP framework:
 
 * :func:`validate_profile` / :func:`validate_name` -- strict profile schema.
 * :class:`TrackPool` -- candidate tracks for a (profile, type) + the bag.
-* :class:`AudioCache` -- single-flight ffmpeg transcode + LRU WAV cache.
+* :class:`AudioCache` -- bounded, single-flight ffmpeg transcode + LRU WAV cache.
 * :class:`GameSource` -- the request router the web server delegates to
   (:meth:`GameSource.handle`) returning a :class:`GameResponse`;
   :func:`send_response` writes one to a ``BaseHTTPRequestHandler``.
@@ -18,12 +18,16 @@ implementation, kept gi-free and independent of the HTTP framework:
 The engine is used through a small duck-typed surface (all on
 ``harmony.web.api.Engine``): ``_library_provider()``, ``_ensure_providers()``,
 ``_provider(service)``, ``_plock(service)``, ``_library_preferred()``,
-``_match_library(items)``, ``_resolve_preferring_library(service, id)`` and
-``_source_for(service, id)``. Tests substitute a fake with those methods.
+``_match_library(items)``, ``_resolve_preferring_library(service, id)``,
+``_source_for(service, id)`` and (optional) ``_prefer_library(service, id)``, a
+network-free lookup of the Library copy that will be transcoded instead of a
+streaming id, used to pick the audio-cache slot. Tests substitute a fake with
+those methods.
 """
 
 from __future__ import annotations
 
+import array
 import collections
 import contextlib
 import hashlib
@@ -35,6 +39,7 @@ import re
 import shutil
 import struct
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable, Mapping
@@ -50,6 +55,10 @@ log = logging.getLogger(__name__)
 # -- limits / constants -----------------------------------------------------------
 
 SOURCES = ("library", "all")
+#: What a request/profile that sets no ``sources`` means: every ACTIVE source (the
+#: Library when there is one, YouTube Music always, Qobuz only when signed in; an
+#: unusable one is skipped silently). ``"library"`` must be asked for.
+DEFAULT_SOURCES = "all"
 SERVICES = ("local", "qobuz", "ytmusic")
 #: Services usable with no account at all: YouTube Music's public catalogue
 #: (ytmusicapi public search/playlists/albums + a yt-dlp resolve). Qobuz needs a login.
@@ -76,9 +85,12 @@ MAX_TYPES = 64
 MAX_SELECTORS = 16
 MAX_TEXT = 200
 MAX_COUNT = 10
-MAX_PROFILES = 64
+MAX_PROFILES = 32
+MAX_PROFILE_BYTES = 32 * 1024         # one serialised profile
+MAX_PROFILES_BYTES = 256 * 1024       # all stored profiles together
 
 POOL_TTL_S = 600.0            # candidate list refresh interval
+EMPTY_POOL_RETRY_S = 3.0      # an empty candidate list (Library mid-scan...) is retried this soon
 GENRE_CAP = 1000              # library songs pulled for a genre selector
 LIB_SEARCH_LIMIT = 50
 STREAM_SEARCH_LIMIT = 25
@@ -92,23 +104,31 @@ RETRY_AFTER_S = 2
 TRANSCODE_TIMEOUT_S = 900
 MAX_AUDIO_S = 2 * 60 * 60     # longer sources are cut (keeps RIFF sizes < 4 GiB)
 FAIL_TTL_S = 20.0             # a failed transcode is not retried for this long
+MAX_FAILED = 256              # remembered failures (oldest dropped)
+MAX_BAD = 5000                # remembered unresolvable tracks (oldest dropped)
+MAX_BUILDS = 3                # concurrent transcodes (ffmpeg + yt-dlp are heavy)
+MAX_QUEUED_BUILDS = 32        # builds waiting for a slot; beyond this -> 503 busy
+MIN_EVICT_AGE_S = 120.0       # a cache entry used/made this recently is never evicted
+PIN_MAX_S = 3600.0            # a serve pin older than this is treated as leaked
+SILENCE_DB = -50
 HISTORY_MAX = 50
 META_MAX = 5000
 
 #: Loudness normalisation target (EBU R128, single pass ``loudnorm``).
 LOUDNORM = "loudnorm=I=-16:TP=-1.5:LRA=11"
-_SILENCE = "silenceremove=start_periods=1:start_threshold=-50dB:start_duration=0.02"
-_PIPELINE = "v1"              # bump to invalidate the WAV cache when the pipeline changes
+_SILENCE = f"silenceremove=start_periods=1:start_threshold={SILENCE_DB}dB:start_duration=0.02"
+_PIPELINE = "v2"              # bump to invalidate the WAV cache when the pipeline changes
 
 
 class GameError(Exception):
     """A request-level error rendered as ``{"error", "code"}`` JSON."""
 
-    def __init__(self, status: int, code: str, message: str) -> None:
+    def __init__(self, status: int, code: str, message: str, retry_after: int | None = None) -> None:
         super().__init__(message)
         self.status = status
         self.code = code
         self.message = message
+        self.retry_after = retry_after
 
 
 # -- validation -------------------------------------------------------------------
@@ -195,7 +215,7 @@ def validate_profile(data: Any, name: str | None = None) -> dict[str, Any]:
         raise _bad("profile", f"unknown key(s): {', '.join(sorted(map(str, extra)))}")
     if "name" in data and data["name"] != name:
         raise _bad("name", "does not match the profile name in the URL")
-    sources = data.get("sources", "library")
+    sources = data.get("sources", DEFAULT_SOURCES)
     if sources not in SOURCES:
         raise _bad("sources", 'must be "library" or "all"')
     types = data.get("types")
@@ -268,8 +288,11 @@ def ffmpeg_input_args(url: str, headers: Mapping[str, str] | None = None) -> lis
     an http(s) stream with its request headers. Nothing else is accepted, and
     ffmpeg's protocol whitelist stops a playlist/manifest pulling in other
     schemes."""
+    # ``-t`` before ``-i`` is an INPUT limit: ffmpeg stops reading (and downloading) the
+    # source after MAX_AUDIO_S; the output-side ``-t`` alone would not bound the input.
+    cut = ["-t", str(MAX_AUDIO_S)]
     if is_file_url(url):
-        return ["-protocol_whitelist", "file", "-i", str(file_url_path(url))]
+        return ["-protocol_whitelist", "file", *cut, "-i", str(file_url_path(url))]
     if urlsplit(url).scheme.lower() not in ("http", "https"):
         raise GameError(502, "bad_source", "the resolved source is not a file or an http(s) stream")
     args = ["-protocol_whitelist", "file,http,https,tcp,tls,crypto",
@@ -287,13 +310,17 @@ def ffmpeg_input_args(url: str, headers: Mapping[str, str] | None = None) -> lis
         args += ["-user_agent", ua]
     if extra:
         args += ["-headers", "".join(f"{h}\r\n" for h in extra)]
-    return args + ["-i", url]
+    return args + [*cut, "-i", url]
 
 
 def build_filter(rate: int, bits: int, channels: int, normalize: bool, trim: bool) -> str:
+    """The ffmpeg ``-af`` chain. ``trim`` only strips the LEADING silence here (a
+    streaming filter); the tail is trimmed on the finished PCM by
+    :func:`trim_tail_silence`. (``areverse`` would hold the whole decoded source
+    in memory -- tens of MB per minute -- to do the same.)"""
     chain: list[str] = []
-    if trim:  # leading silence, then the same on the reversed signal for the tail
-        chain += [_SILENCE, "areverse", _SILENCE, "areverse"]
+    if trim:
+        chain.append(_SILENCE)
     if normalize:
         chain.append(LOUDNORM)
     if channels == 1:
@@ -303,6 +330,39 @@ def build_filter(rate: int, bits: int, channels: int, normalize: bool, trim: boo
     # The final stage owns the rate/sample-format conversion so 16-bit gets dither.
     chain.append(f"aresample=osr={rate}:osf={'s16' if bits == 16 else 's32'}:dither_method=triangular_hp")
     return ",".join(chain)
+
+
+def trim_tail_silence(f: Any, data_start: int, data_len: int, bits: int, channels: int) -> int:
+    """Length in bytes of the PCM at ``data_start`` once trailing near-silence
+    (below ``SILENCE_DB`` on every channel) is dropped; the file is only read, in
+    chunks from the end, so memory stays flat however long the track is. Returns
+    ``0`` when the whole thing is silent. 24-bit is compared on its top 16 bits."""
+    block = channels * bits // 8
+    thr = int(32768 * 10 ** (SILENCE_DB / 20))
+    chunk_frames = 1 << 16
+    end = data_len // block  # frames not yet ruled out
+    while end > 0:
+        n = min(chunk_frames, end)
+        begin = end - n
+        f.seek(data_start + begin * block)
+        raw = f.read(n * block)
+        if bits == 16:
+            samples = array.array("h")
+            samples.frombytes(raw[: n * block])
+        else:  # keep the high 16 bits of each little-endian 24-bit sample
+            hi = bytearray(2 * n * channels)
+            hi[0::2] = raw[1::3]
+            hi[1::2] = raw[2::3]
+            samples = array.array("h")
+            samples.frombytes(bytes(hi))
+        if sys.byteorder == "big":
+            samples.byteswap()
+        if max(samples) > thr or min(samples) < -thr:
+            for i in range(len(samples) - 1, -1, -1):
+                if abs(samples[i]) > thr:
+                    return (begin + i // channels + 1) * block
+        end = begin
+    return 0
 
 
 _URL_RE = re.compile(r"https?://\S+")
@@ -337,6 +397,9 @@ def transcode_to_wav(ffmpeg: str, in_args: list[str], dest: Path, *, rate: int, 
             raise GameError(502, "transcode_failed", f"ffmpeg failed (rc={proc.returncode}): {tail}")
         data_len = out.seek(0, os.SEEK_END) - 44
         data_len -= data_len % block  # whole frames only
+        if trim and data_len > 0:
+            with open(dest, "rb") as rd:
+                data_len = trim_tail_silence(rd, 44, data_len, bits, channels)
         if data_len <= 0:
             raise GameError(502, "transcode_failed", "ffmpeg produced no audio")
         if data_len >= 0xFFFFFFFF - 64:
@@ -358,6 +421,7 @@ def transcode_to_wav(ffmpeg: str, in_args: list[str], dest: Path, *, rate: int, 
 class _Job:
     done: threading.Event = field(default_factory=threading.Event)
     error: GameError | None = None
+    key: str = ""             # the key the finished file was stored under (see ``build``)
 
 
 class AudioCache:
@@ -368,14 +432,35 @@ class AudioCache:
     transcode) shared by every concurrent caller of the same key, and blocks up
     to ``wait_s`` for it. ``None`` means "still working" (the HTTP layer answers
     202 + Retry-After). Files appear atomically (temp + rename).
+
+    ``build`` may return a different key than it was started for (when the
+    source that actually got used differs from the one predicted, e.g. a
+    Library copy that turned out unavailable); the file is then stored under
+    that key so a cached entry always matches the audio it holds.
+
+    Resource limits: at most ``MAX_BUILDS`` transcodes run at once (the rest
+    wait, their callers get 202) and at most ``MAX_QUEUED_BUILDS`` wait (more ->
+    503 ``busy``). Half-written ``.part`` files count toward the size cap, and a
+    new build is refused (503 ``cache_full``) while the cache is over the cap and
+    nothing can be evicted. An entry that was made/used in the last
+    ``min_evict_age_s`` or is being served (pinned) is never evicted; the
+    effective cap is never below twice the largest cached file, so two jobs
+    cannot keep evicting each other under a tiny cap.
     """
 
-    def __init__(self, directory: Path, cap_bytes: Callable[[], int]) -> None:
+    def __init__(self, directory: Path, cap_bytes: Callable[[], int], *,
+                 max_builds: int = MAX_BUILDS, max_queued: int = MAX_QUEUED_BUILDS,
+                 min_evict_age_s: float = MIN_EVICT_AGE_S) -> None:
         self.dir = Path(directory)
         self._cap = cap_bytes
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._jobs: dict[str, _Job] = {}
-        self._failed: dict[str, tuple[float, GameError]] = {}
+        self._failed: collections.OrderedDict[str, tuple[float, GameError]] = collections.OrderedDict()
+        self._slots = threading.BoundedSemaphore(max_builds)
+        self._max_builds = max_builds
+        self._max_queued = max_queued
+        self.min_evict_age_s = min_evict_age_s
+        self._pins: dict[str, list[float]] = {}
         self.dir.mkdir(parents=True, exist_ok=True)
         self._sweep_parts()
 
@@ -390,13 +475,38 @@ class AudioCache:
                 if p.stat().st_mtime < cutoff:
                     p.unlink()
 
-    def stats(self) -> dict[str, int]:
-        total, files = 0, 0
-        for p in self.dir.glob("*.wav"):
+    def _sizes(self, pattern: str) -> list[tuple[Path, float, int]]:
+        out = []
+        for p in self.dir.glob(pattern):
             with contextlib.suppress(OSError):
-                total += p.stat().st_size
-                files += 1
-        return {"bytes": total, "files": files, "cap": int(self._cap())}
+                st = p.stat()
+                out.append((p, st.st_mtime, st.st_size))
+        return out
+
+    def stats(self) -> dict[str, int]:
+        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        return {"bytes": sum(s for _p, _m, s in wavs), "files": len(wavs),
+                "in_progress_bytes": sum(s for _p, _m, s in parts), "cap": int(self._cap())}
+
+    # -- pinning (a file being served must not be evicted) ---------------------
+
+    def pin(self, path: Path) -> None:
+        with self._lock:
+            self._pins.setdefault(path.name, []).append(time.monotonic())
+
+    def unpin(self, path: Path) -> None:
+        with self._lock:
+            held = self._pins.get(path.name)
+            if held:
+                held.pop(0)
+                if not held:
+                    del self._pins[path.name]
+
+    def _pinned(self, name: str) -> bool:
+        cutoff = time.monotonic() - PIN_MAX_S  # a pin whose release never came expires
+        return any(t > cutoff for t in self._pins.get(name, ()))
+
+    # -- lookup / build ---------------------------------------------------------
 
     def _hit(self, key: str) -> Path | None:
         p = self.path_for(key)
@@ -411,20 +521,24 @@ class AudioCache:
             os.utime(p)  # LRU touch
         return p
 
-    def get(self, key: str, build: Callable[[Path], None], wait_s: float) -> Path | None:
-        hit = self._hit(key)
-        if hit is not None:
-            return hit
+    def get(self, key: str, build: Callable[[Path], str | None], wait_s: float) -> Path | None:
+        """The cached WAV for ``key`` (pinned: the caller must :meth:`unpin` it
+        once it has finished serving), or ``None`` while it is still being built."""
         with self._lock:
-            hit = self._hit(key)  # finished while we waited for the lock
+            hit = self._hit(key)
             if hit is not None:
+                self._pins.setdefault(hit.name, []).append(time.monotonic())
                 return hit
             failed = self._failed.get(key)
             if failed and time.monotonic() - failed[0] < FAIL_TTL_S:
                 raise failed[1]
             job = self._jobs.get(key)
             if job is None:
-                job = self._jobs[key] = _Job()
+                if len(self._jobs) >= self._max_queued + self._max_builds:
+                    raise GameError(503, "busy", "too many audio conversions are queued; retry shortly",
+                                    retry_after=RETRY_AFTER_S)
+                self._check_room()
+                job = self._jobs[key] = _Job(key=key)
                 threading.Thread(target=self._run, args=(key, job, build), daemon=True,
                                  name=f"game-audio-{key[:8]}").start()
         job.done.wait(max(0.0, wait_s))
@@ -432,18 +546,40 @@ class AudioCache:
             return None
         if job.error is not None:
             raise job.error
-        hit = self._hit(key)
-        if hit is None:  # evicted between finishing and now: report as still working
-            return None
-        return hit
+        with self._lock:
+            hit = self._hit(job.key)
+            if hit is None:  # evicted between finishing and now: report as still working
+                return None
+            self._pins.setdefault(hit.name, []).append(time.monotonic())
+            return hit
 
-    def _run(self, key: str, job: _Job, build: Callable[[Path], None]) -> None:
-        final = self.path_for(key)
+    def _effective_cap(self, wavs: list[tuple[Path, float, int]]) -> int:
+        largest = max((s for _p, _m, s in wavs), default=0)
+        return max(int(self._cap()), 2 * largest)
+
+    def _check_room(self) -> None:
+        """Refuse a new build while the cache (finished files + in-progress
+        ``.part`` files) is over its cap and nothing more can be evicted."""
+        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        if sum(s for _p, _m, s in wavs) + sum(s for _p, _m, s in parts) <= self._effective_cap(wavs):
+            return
+        self._evict(extra=sum(s for _p, _m, s in parts))
+        wavs, parts = self._sizes("*.wav"), self._sizes("*.part")
+        if sum(s for _p, _m, s in wavs) + sum(s for _p, _m, s in parts) > self._effective_cap(wavs):
+            raise GameError(503, "cache_full",
+                            "the game audio cache is full of files in use or made moments ago and cannot "
+                            "take another conversion yet; retry shortly or raise game_cache_max_mb",
+                            retry_after=RETRY_AFTER_S * 5)
+
+    def _run(self, key: str, job: _Job, build: Callable[[Path], str | None]) -> None:
         tmp = self.dir / f"{key}.{os.getpid()}.{threading.get_ident()}.part"
         try:
-            build(tmp)
-            os.replace(tmp, final)
-            self._evict(keep=final)
+            with self._slots:
+                actual = build(tmp) or key
+                final = self.path_for(actual)
+                os.replace(tmp, final)
+                job.key = actual
+                self._evict(keep=final)
         except GameError as exc:
             job.error = exc
         except Exception as exc:  # noqa: BLE001 - never lose the job
@@ -456,29 +592,36 @@ class AudioCache:
                 self._jobs.pop(key, None)
                 if job.error is not None:
                     self._failed[key] = (time.monotonic(), job.error)
+                    self._failed.move_to_end(key)
+                    self._trim_failed()
                 else:
                     self._failed.pop(key, None)
             job.done.set()
 
-    def _evict(self, keep: Path | None = None) -> None:
-        cap = int(self._cap())
-        files: list[tuple[float, int, Path]] = []
-        total = 0
-        for p in self.dir.glob("*.wav"):
-            try:
-                st = p.stat()
-            except OSError:
-                continue
-            files.append((st.st_mtime, st.st_size, p))
-            total += st.st_size
-        for _mtime, size, p in sorted(files):
-            if total <= cap:
-                break
-            if keep is not None and p == keep:
-                continue
-            with contextlib.suppress(OSError):
-                p.unlink()  # an open serve keeps its fd; later requests re-transcode
-                total -= size
+    def _trim_failed(self) -> None:
+        cutoff = time.monotonic() - FAIL_TTL_S
+        for k in [k for k, (at, _e) in self._failed.items() if at < cutoff]:
+            del self._failed[k]
+        while len(self._failed) > MAX_FAILED:
+            self._failed.popitem(last=False)
+
+    def _evict(self, keep: Path | None = None, extra: int = 0) -> None:
+        """Delete least-recently-used finished files until the cache (plus
+        ``extra`` bytes of in-progress work) is under the cap. Pinned, just-used
+        and ``keep`` entries are spared."""
+        with self._lock:
+            wavs = self._sizes("*.wav")
+            cap = self._effective_cap(wavs)
+            total = sum(s for _p, _m, s in wavs) + extra
+            now = time.time()
+            for p, mtime, size in sorted(wavs, key=lambda w: w[1]):
+                if total <= cap:
+                    break
+                if p == keep or self._pinned(p.name) or now - mtime < self.min_evict_age_s:
+                    continue
+                with contextlib.suppress(OSError):
+                    p.unlink()
+                    total -= size
 
 
 # -- candidate pools + bag ------------------------------------------------------------
@@ -511,14 +654,15 @@ class Bag:
     """A shuffled bag over a set of keys: every key once per cycle, no key
     twice in a row across a cycle boundary (when there is more than one).
 
-    The upcoming order is materialised, so :meth:`take` with ``consume=False``
-    (peek) returns exactly what a later consuming call will return."""
+    The upcoming order is materialised ahead of time, so a peek returns exactly
+    what a later consuming call will return (see :meth:`pick`)."""
 
     def __init__(self, rng: random.Random | None = None) -> None:
         self.rng = rng or random.Random()  # noqa: S311 - shuffling music, not crypto
         self.members: list[tuple[str, str]] = []
         self.queue: collections.deque[tuple[str, str]] = collections.deque()
-        self.last: tuple[str, str] | None = None
+        self.last: tuple[str, str] | None = None      # last key taken off the queue
+        self.last_out: tuple[str, str] | None = None  # last key actually handed out
 
     def sync(self, keys: list[tuple[str, str]]) -> None:
         """Adopt a (possibly changed) candidate set without restarting the cycle."""
@@ -550,19 +694,53 @@ class Bag:
             for _ in items:
                 self.queue.popleft()
             if items:
-                self.last = items[-1]
+                self.last = self.last_out = items[-1]
         return items
+
+    def pick(self, count: int, playable: Callable[[tuple[str, str]], bool], *, repeat_ok: bool,
+             consume: bool) -> list[tuple[str, str]]:
+        """The next ``count`` keys for which ``playable`` holds, walking the
+        queue in order. A key equal to the one handed out just before it is
+        skipped unless ``repeat_ok`` (the pool has a single playable track), so
+        a small pool still never repeats a track back to back. Stops after
+        ``(count + 1) * (members + 1)`` queue entries, which always suffices when
+        something is playable (a partial cycle plus ``count`` full ones).
+
+        ONE algorithm for peek and consume: it walks a cursor over the (append
+        only) materialised queue and keeps its own ``prev``; with ``consume=False``
+        nothing is popped and ``last``/``last_out`` stay put, so the same call with
+        ``consume=True`` returns exactly the same keys."""
+        out: list[tuple[str, str]] = []
+        prev = self.last_out
+        limit = (count + 1) * (len(self.members) + 1)
+        i = 0
+        while len(out) < count and i < limit:
+            self._fill(i + 1)
+            if i >= len(self.queue):  # no members at all
+                break
+            key = self.queue[i]
+            i += 1
+            if not playable(key) or (key == prev and not repeat_ok):
+                continue
+            out.append(key)
+            prev = key
+        if consume and i:
+            taken = [self.queue.popleft() for _ in range(i)]
+            self.last = taken[-1]
+            if out:
+                self.last_out = out[-1]
+        return out
 
 
 class TrackPool:
     """Candidate tracks for one (profile, type, sources) + its bag."""
 
-    def __init__(self) -> None:
+    def __init__(self, rng: random.Random | None = None) -> None:
         self.lock = threading.Lock()
         self.fingerprint = ""
         self.built = 0.0
         self.refs: dict[tuple[str, str], dict[str, Any]] = {}
-        self.bag = Bag()
+        self.bag = Bag(rng)
 
 
 # -- the router ---------------------------------------------------------------------
@@ -576,6 +754,13 @@ class GameResponse:
     file: Path | None = None              # served (a byte range of) as audio/wav
     start: int = 0
     length: int = 0
+    #: Called once the response has been written (or dropped): unpins the cache file.
+    release: Callable[[], None] | None = None
+
+    def done(self) -> None:
+        release, self.release = self.release, None
+        if release is not None:
+            release()
 
 
 def _json(body: Any, status: int = 200, **headers: str) -> GameResponse:
@@ -583,18 +768,22 @@ def _json(body: Any, status: int = 200, **headers: str) -> GameResponse:
 
 
 def _error(exc: GameError) -> GameResponse:
-    return _json({"error": exc.message, "code": exc.code}, exc.status)
+    extra = {"Retry-After": str(exc.retry_after)} if exc.retry_after else {}
+    return _json({"error": exc.message, "code": exc.code}, exc.status, **extra)
 
 
 def parse_range(header: str | None, size: int) -> tuple[int, int] | str | None:
     """``(start, end)`` inclusive for a satisfiable single range, ``"bad"`` when
-    unsatisfiable (416), ``None`` to ignore (no/invalid/multi range -> full body)."""
+    unsatisfiable (416), ``None`` to ignore (no/invalid/multi range, or
+    ``bytes=10-5`` -> full 200 body)."""
     if not header:
         return None
     m = re.match(r"^\s*bytes\s*=\s*(\d*)\s*-\s*(\d*)\s*$", header)
     if not m or not (m.group(1) or m.group(2)):
         return None
     first, last = m.group(1), m.group(2)
+    if first and last and int(last) < int(first):
+        return None  # RFC 9110 14.1.2: last < first is an invalid spec -> ignore the header
     if first:
         start = int(first)
         end = min(int(last), size - 1) if last else size - 1
@@ -618,6 +807,8 @@ class GameSource:
         self.engine = engine
         self._ffmpeg = ffmpeg
         self._settings = settings or _load_settings
+        self._tls = threading.local()      # one Settings load per request (see handle())
+        self.rng_factory: Callable[[], random.Random] = random.Random  # tests seed this
         self.wait_s = wait_s
         if cache_dir is None:
             from harmony.config import cache_dir as _cache_dir
@@ -629,24 +820,31 @@ class GameSource:
         self._pools_lock = threading.Lock()
         self._meta: collections.OrderedDict[tuple[str, str], dict[str, Any]] = collections.OrderedDict()
         self._meta_lock = threading.Lock()
-        self._bad: dict[tuple[str, str], float] = {}
+        self._bad_lock = threading.Lock()
+        self._bad: collections.OrderedDict[tuple[str, str], float] = collections.OrderedDict()
         self._now: dict[str, Any] | None = None
         self._history: collections.deque[dict[str, Any]] = collections.deque(maxlen=HISTORY_MAX)
 
     # -- settings ---------------------------------------------------------------
 
+    def _cfg(self) -> Any:
+        """The Settings for this request: loaded once by :meth:`handle`, not once
+        per question asked of it (``enabled()``, ``_stored()``, the cache cap...)."""
+        snap = getattr(self._tls, "settings", None)
+        return snap if snap is not None else self._settings()
+
     def _cap_bytes(self) -> int:
         try:
-            mb = int(getattr(self._settings(), "game_cache_max_mb", DEFAULT_CACHE_MB))
+            mb = int(getattr(self._cfg(), "game_cache_max_mb", DEFAULT_CACHE_MB))
         except (TypeError, ValueError):
             mb = DEFAULT_CACHE_MB
         return max(MIN_CACHE_MB, mb) * 1024 * 1024
 
     def enabled(self) -> bool:
-        return bool(getattr(self._settings(), "game_source_enabled", True))
+        return bool(getattr(self._cfg(), "game_source_enabled", True))
 
     def _stored(self) -> dict[str, Any]:
-        raw = getattr(self._settings(), "game_profiles", None)
+        raw = getattr(self._cfg(), "game_profiles", None)
         return raw if isinstance(raw, dict) else {}
 
     def get_profile(self, name: str) -> dict[str, Any]:
@@ -661,9 +859,10 @@ class GameSource:
 
     def list_profiles(self) -> list[dict[str, Any]]:
         out = []
-        for name in sorted(self._stored()):
+        stored = self._stored()
+        for name in sorted(stored):
             try:
-                out.append({"name": name, **validate_profile(self._stored()[name])})
+                out.append({"name": name, **validate_profile(stored[name])})
             except GameError as exc:
                 log.warning("game profile %r is invalid: %s", name, exc.message)
         return out
@@ -678,6 +877,15 @@ class GameSource:
             profiles = dict(s.game_profiles) if isinstance(s.game_profiles, dict) else {}
             if name not in profiles and len(profiles) >= MAX_PROFILES:
                 raise GameError(400, "too_many_profiles", f"at most {MAX_PROFILES} profiles")
+            own = _size(profile)
+            if own > MAX_PROFILE_BYTES:
+                raise GameError(413, "profile_too_large",
+                                f"profile is {own} bytes serialised; the limit is {MAX_PROFILE_BYTES}")
+            others = sum(_size(v) for k, v in profiles.items() if k != name)
+            if others + own > MAX_PROFILES_BYTES:
+                raise GameError(413, "profiles_too_large",
+                                f"all profiles together may take at most {MAX_PROFILES_BYTES} bytes "
+                                f"serialised ({others + own} with this one); delete or shrink some")
             profiles[name] = profile
             s.game_profiles = profiles  # assignment, so save() merges it
             s.save()
@@ -794,7 +1002,9 @@ class GameSource:
     def _pool(self, name: str, ttype: str, sources: str, selectors: list[dict[str, Any]]) -> TrackPool:
         key = (name, ttype, sources)
         with self._pools_lock:
-            pool = self._pools.setdefault(key, TrackPool())
+            pool = self._pools.get(key)
+            if pool is None:
+                pool = self._pools[key] = TrackPool(self.rng_factory())
         fp = hashlib.sha256(json.dumps([selectors, sources], sort_keys=True).encode()).hexdigest()
         with pool.lock:
             stale = fp != pool.fingerprint or time.monotonic() - pool.built > POOL_TTL_S
@@ -806,8 +1016,9 @@ class GameSource:
                     pool.fingerprint = fp
                 # An empty refresh of an unchanged selector keeps the old pool
                 # (a service blip must not silence the game's music).
-                # (Retry an empty pool after 30 s rather than on every request.)
-                pool.built = time.monotonic() if refs else time.monotonic() - POOL_TTL_S + 30.0
+                # (An empty list -- Library mid-scan, a service blip -- is retried after
+                # a few seconds rather than being cached for the full TTL.)
+                pool.built = time.monotonic() if refs else time.monotonic() - POOL_TTL_S + EMPTY_POOL_RETRY_S
         return pool
 
     # -- next ---------------------------------------------------------------------
@@ -827,33 +1038,37 @@ class GameSource:
 
     def _mark_bad(self, service: str, item_id: str) -> None:
         if service != "local":
-            self._bad[(service, item_id)] = time.monotonic()
+            now = time.monotonic()
+            with self._bad_lock:
+                self._bad.pop((service, item_id), None)
+                self._bad[(service, item_id)] = now
+                while self._bad and (len(self._bad) > MAX_BAD
+                                     or now - next(iter(self._bad.values())) > BAD_TTL_S):
+                    self._bad.popitem(last=False)
 
     def _is_bad(self, key: tuple[str, str]) -> bool:
-        at = self._bad.get(key)
-        if at is None:
-            return False
-        if time.monotonic() - at > BAD_TTL_S:
-            self._bad.pop(key, None)
-            return False
-        return True
+        with self._bad_lock:
+            at = self._bad.get(key)
+            if at is None:
+                return False
+            if time.monotonic() - at > BAD_TTL_S:
+                self._bad.pop(key, None)
+                return False
+            return True
 
     def _take(self, pool: TrackPool, count: int, consume: bool) -> list[dict[str, Any]]:
         """The next ``count`` playable candidates, skipping tracks that recently
-        failed to resolve (region/age-blocked on YouTube...). Peeking skips the
-        same ones, so a peek always equals the next consuming call."""
-        if not consume:
-            extra = sum(1 for k in pool.refs if self._is_bad(k))
-            keys = [k for k in pool.bag.take(count + extra, consume=False) if not self._is_bad(k)]
-            return [pool.refs[k] for k in keys[:count] if k in pool.refs]
-        out: list[dict[str, Any]] = []
-        for _ in range(count + len(pool.refs)):
-            if len(out) >= count:
-                break
-            for k in pool.bag.take(1, consume=True):
-                if k in pool.refs and not self._is_bad(k):
-                    out.append(pool.refs[k])
-        return out
+        failed to resolve (region/age-blocked on YouTube...). Peek and consume are
+        the same :meth:`Bag.pick` walk (consume just pops what it walked), so a
+        peek always equals the next consuming call; you get ``count`` tracks
+        whenever at least one is playable, never the same one twice in a row
+        unless it is the only playable one."""
+        good = sum(1 for k in pool.refs if not self._is_bad(k))
+        if not good:
+            return []
+        keys = pool.bag.pick(count, lambda k: k in pool.refs and not self._is_bad(k),
+                             repeat_ok=good == 1, consume=consume)
+        return [pool.refs[k] for k in keys]
 
     def _remember(self, track: dict[str, Any]) -> None:
         with self._meta_lock:
@@ -1025,16 +1240,24 @@ class GameSource:
             except ValueError as exc:
                 raise GameError(400, "bad_format", "wait must be a number of seconds") from exc
         ffmpeg = self._ffmpeg()
-        key = hashlib.sha256(
-            f"{_PIPELINE}|{service}|{item_id}|{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}"
-            .encode()).hexdigest()[:40]
+        fmt = f"{rate}|{bits}|{channels}|{int(normalize)}|{int(trim)}"
+
+        def key_of(svc: str, tid: str) -> str:
+            return hashlib.sha256(f"{_PIPELINE}|{svc}|{tid}|{fmt}".encode()).hexdigest()[:40]
+
+        # The cache is keyed by the source that will actually be transcoded, not by
+        # the id asked for: asking for a streaming id whose Library copy is known
+        # means the Library file (a better, offline source) and must not be mixed up
+        # with a cached stream of the same song (nor with it once the copy is gone).
+        psvc, pid = self._predict_source(service, item_id)
+        key = key_of(psvc, pid)
         if ffmpeg is None and not self.cache.path_for(key).exists():
             raise GameError(503, "ffmpeg_missing", "ffmpeg is not installed on this Harmony server")
 
-        def build(tmp: Path) -> None:
+        def build(tmp: Path) -> str:
             assert ffmpeg is not None
             try:
-                _svc, _id, source = self.engine._resolve_preferring_library(service, item_id)
+                svc, tid, source = self.engine._resolve_preferring_library(service, item_id)
             except KeyError as exc:
                 raise GameError(404, "unknown_service", f"service {exc} is not available") from exc
             except GameError:
@@ -1044,25 +1267,52 @@ class GameSource:
                 raise GameError(502, "source_unavailable", _scrub(f"could not resolve the track: {exc}")) from exc
             transcode_to_wav(ffmpeg, ffmpeg_input_args(source.url, source.headers), tmp, rate=rate,
                              bits=bits, channels=channels, normalize=normalize, trim=trim)
+            return key_of(svc, tid)  # stored under what was really used
 
-        path = self.cache.get(key, build, wait)
+        path: Path | None = None
+        size = 0
+        for _attempt in range(2):  # a file evicted/replaced under us once -> rebuild once
+            path = self.cache.get(key, build, wait)
+            if path is None:
+                return _json({"status": "transcoding", "retry_after_s": RETRY_AFTER_S}, 202,
+                             **{"Retry-After": str(RETRY_AFTER_S)})
+            try:
+                size = path.stat().st_size
+                break
+            except OSError:
+                self.cache.unpin(path)
+                path = None
         if path is None:
-            return _json({"status": "transcoding", "retry_after_s": RETRY_AFTER_S}, 202,
-                         **{"Retry-After": str(RETRY_AFTER_S)})
-        size = path.stat().st_size
-        headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes", "ETag": f'"{key}"',
+            raise GameError(503, "cache_busy", "the audio cache entry vanished; retry shortly",
+                            retry_after=RETRY_AFTER_S)
+        release = lambda p=path: self.cache.unpin(p)  # noqa: E731
+        headers = {"Content-Type": "audio/wav", "Accept-Ranges": "bytes", "ETag": f'"{path.stem}"',
                    "Cache-Control": "private, max-age=3600"}
         rng = parse_range(range_header, size)
         if rng == "bad":
+            release()
             return GameResponse(416, None, {**headers, "Content-Range": f"bytes */{size}",
                                             "Content-Length": "0"})
         if isinstance(rng, tuple):
             start, end = rng
             return GameResponse(206, None, {**headers, "Content-Range": f"bytes {start}-{end}/{size}",
                                             "Content-Length": str(end - start + 1)},
-                                file=path, start=start, length=end - start + 1)
+                                file=path, start=start, length=end - start + 1, release=release)
         return GameResponse(200, None, {**headers, "Content-Length": str(size)},
-                            file=path, start=0, length=size)
+                            file=path, start=0, length=size, release=release)
+
+    def _predict_source(self, service: str, item_id: str) -> tuple[str, str]:
+        """The (service, id) the engine will transcode for a request: the Library
+        copy when one is already matched (``_prefer_library``, a lookup -- no
+        network), else the id itself. Engines without it just use the id."""
+        prefer = getattr(self.engine, "_prefer_library", None)
+        if prefer is None:
+            return service, item_id
+        try:
+            svc, tid = prefer(service, item_id)
+            return str(svc), str(tid)
+        except Exception:  # noqa: BLE001 - a prediction only picks the cache slot
+            return service, item_id
 
     # -- dispatch ---------------------------------------------------------------------------
 
@@ -1071,12 +1321,15 @@ class GameSource:
         """Route ``method`` + decoded path segments (``["api", "game", ...]``).
         The caller has already enforced the personal-key gate."""
         try:
+            self._tls.settings = self._settings()
             return self._route(method, parts[2:], query, body, headers)
         except GameError as exc:
             return _error(exc)
         except Exception as exc:  # noqa: BLE001 - JSON, not a dropped connection
             log.warning("game source error on %s /%s: %s", method, "/".join(parts), exc)
             return _json({"error": _scrub(str(exc)) or "internal error", "code": "internal"}, 500)
+        finally:
+            self._tls.settings = None
 
     def _route(self, method: str, p: list[str], query: Mapping[str, list[str]], body: Any,
                headers: Any) -> GameResponse:
@@ -1114,9 +1367,14 @@ class GameSource:
                 if head and resp.file is not None:
                     resp.file = None
                     resp.length = 0
+                    resp.done()
                 return resp
             raise GameError(405, "method_not_allowed", "use GET or HEAD")
         raise GameError(404, "not_found", "unknown game API route")
+
+
+def _size(value: Any) -> int:
+    return len(json.dumps(value, separators=(",", ":")).encode("utf-8"))
 
 
 def _check_track_ref(service: Any, item_id: Any) -> tuple[str, str]:
@@ -1152,7 +1410,8 @@ _INIT_LOCK = threading.Lock()
 
 def send_response(handler: Any, resp: GameResponse, *, head: bool = False) -> None:
     """Write ``resp`` to a ``BaseHTTPRequestHandler``. JSON bodies carry an exact
-    Content-Length; audio streams the file range from disk."""
+    Content-Length; audio streams the file range from disk. Always releases the
+    response's cache pin when finished."""
     try:
         if resp.file is None:
             raw = b"" if resp.body is None else json.dumps(resp.body).encode("utf-8")
@@ -1169,13 +1428,23 @@ def send_response(handler: Any, resp: GameResponse, *, head: bool = False) -> No
             if not head:
                 handler.wfile.write(raw)
             return
-        handler.send_response(resp.status)
-        for k, v in resp.headers.items():
-            handler.send_header(k, v)
-        handler.end_headers()
-        if head:
-            return
-        with open(resp.file, "rb") as fh:
+        fh = None
+        if not head:
+            try:  # open BEFORE the headers: a vanished file is a clean 503, not a torn response
+                fh = open(resp.file, "rb")  # noqa: SIM115 - closed in the finally below
+            except OSError:
+                fail = _error(GameError(503, "cache_busy", "the audio cache entry vanished; retry shortly",
+                                        retry_after=RETRY_AFTER_S))
+                resp.done()
+                send_response(handler, fail)
+                return
+        try:
+            handler.send_response(resp.status)
+            for k, v in resp.headers.items():
+                handler.send_header(k, v)
+            handler.end_headers()
+            if fh is None:
+                return
             fh.seek(resp.start)
             left = resp.length
             while left > 0:
@@ -1184,5 +1453,10 @@ def send_response(handler: Any, resp: GameResponse, *, head: bool = False) -> No
                     break
                 handler.wfile.write(chunk)
                 left -= len(chunk)
+        finally:
+            if fh is not None:
+                fh.close()
     except (BrokenPipeError, ConnectionResetError):
         handler.close_connection = True  # the game dropped the download; nothing to do
+    finally:
+        resp.done()
