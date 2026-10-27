@@ -27,6 +27,8 @@ POLL_S = 2.0
 # After a track starts, a device reports transitional stop/idle status for a
 # few seconds; ignore end-detection during that window (mirrors the desktop).
 SETTLE_S = 6.0
+# Devices that can't say "I finished this track" (WiiM/LinkPlay) are advanced
+# when their own position gets this close to their own reported duration.
 END_EPSILON_S = 2
 # Consecutive tracks that fail to start before the queue gives up (each try is a
 # real connection attempt to the device).
@@ -403,6 +405,14 @@ class DeviceQueues:
                 dq.clock += now - dq.clock_at
             dq.clock_at = now
             pos, dur = st.get("position_s"), st.get("duration_s")
+            # Only a duration the DEVICE reports may declare "near the end": the
+            # track metadata's can be shorter than the real file (YouTube) and
+            # would cut the tail off.
+            dev_dur = dur
+            # A device that reports its own natural end (Chromecast: IDLE +
+            # FINISHED) is advanced on that, never on a guess from the position.
+            reports_end = st.get("ended") is not None
+            dev_ended = st.get("ended") is True
             if not dur:
                 cur = dq.q.current() or {}
                 dur = cur.get("duration_s") if isinstance(cur, dict) else None
@@ -420,11 +430,21 @@ class DeviceQueues:
             # Only the device's own clock may declare "near the end": the play
             # clock runs ahead while a cast buffers, so a clock-driven track ends
             # on the device going idle instead (the branch below).
-            near_end = has_dur and not clocked and pos >= dur - END_EPSILON_S
+            near_end = (has_dur and not clocked and not reports_end
+                        and bool(dev_dur and dev_dur > 0) and pos >= dev_dur - END_EPSILON_S)
             if has_dur and not near_end and state == "playing":
                 dq.armed = True
             ended = False
-            if near_end and dq.armed:
+            if dev_ended:
+                dq.armed = False
+                ended = True
+            elif st.get("idle_reason") == "ERROR" and state in ("stopped", "idle"):
+                # The receiver gave up on the stream (a stalled/refused relay
+                # fetch): say so, rather than sit "playing" a silent device.
+                dq.error = f"{host} couldn't play {(dq.q.current() or {}).get('title') or 'the track'}"
+                dq.halt()
+                return None
+            elif near_end and dq.armed:
                 dq.armed = False
                 ended = True
             elif dq.armed and state in ("stopped", "idle") and prev == "playing":

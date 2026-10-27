@@ -43,6 +43,13 @@ log = logging.getLogger(__name__)
 # time-limited and often signed/IP-bound).
 Resolver = Callable[[], StreamSource]
 
+# A provider/CDN URL that has expired answers 403 (signed URLs) or 410 (gone).
+_EXPIRED_STATUSES = (403, 410)
+
+# How many times a body that dies mid-stream is resumed (by byte offset) before
+# the connection is dropped. A Chromecast treats a short body as "end of media".
+_MAX_RESUMES = 3
+
 # Cap on how many outstanding tokens we remember, so a long-running instance
 # that keeps registering new tracks doesn't grow the registry without bound.
 # Old tokens simply 404 once evicted -- fine, since a device only ever plays
@@ -79,6 +86,9 @@ class _Entry:
     title: str | None = None
     artist: str | None = None
     allow_icy: bool = True
+    # Forces a fresh resolve (a new signed URL), used to retry once when the
+    # upstream refuses the current one as expired (403/410). None = no retry.
+    refresh: Resolver | None = None
 
 
 def _icy_stream_title(title: str | None, artist: str | None) -> str:
@@ -102,6 +112,21 @@ def _icy_metadata_block(title: str | None, artist: str | None) -> bytes:
 def _is_aac_mp4(source: StreamSource) -> bool:
     """True for AAC-in-MP4 (e.g. YouTube itag 140): a file a renderer won't ICY-tag."""
     return source.container == "m4a" or "mp4" in (source.mime_type or "").lower()
+
+
+def _int_or_none(value: object) -> int | None:
+    try:
+        return int(value)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return None
+
+
+def _range_start(upstream: requests.Response) -> int | None:
+    """First byte offset of a 206 reply (``Content-Range: bytes a-b/total``)."""
+    header = upstream.headers.get("Content-Range", "")
+    if header.startswith("bytes "):
+        return _int_or_none(header[6:].split("-", 1)[0])
+    return None
 
 
 def _read_chunks(stream: IO[bytes], size: int = _CHUNK_SIZE) -> Iterator[bytes]:
@@ -206,8 +231,13 @@ class RelayServer:
         title: str | None = None,
         artist: str | None = None,
         allow_icy: bool = True,
+        refresh: Resolver | None = None,
     ) -> str:
         """Register a resolver (with optional now-playing text) and return a token.
+
+        ``refresh`` re-resolves unconditionally; the relay calls it (once per
+        request) when the upstream answers 403/410, i.e. the signed URL expired
+        while the device was still fetching the track in chunks.
 
         ``title``/``artist`` are handed to a device via ICY stream metadata when
         it asks for it, so the renderer can show what's playing for a bare URL.
@@ -216,7 +246,8 @@ class RelayServer:
         """
         token = secrets.token_urlsafe(16)
         with self._lock:
-            self._entries[token] = _Entry(resolver=resolver, title=title, artist=artist, allow_icy=allow_icy)
+            self._entries[token] = _Entry(resolver=resolver, title=title, artist=artist,
+                                          allow_icy=allow_icy, refresh=refresh)
             while len(self._entries) > _MAX_TOKENS:
                 self._entries.popitem(last=False)  # evict oldest
         return token
@@ -324,24 +355,99 @@ class _Handler(BaseHTTPRequestHandler):
             self._reply_adts_icy(source, entry, send_body=send_body)
             return
 
-        request_headers = dict(source.headers)
-        if not wants_icy:
-            range_header = self.headers.get("Range")
-            if range_header:
-                request_headers["Range"] = range_header
-
-        upstream = self._open_upstream(source.url, request_headers, token)
-        if upstream is None:
+        client_range = None if wants_icy else self.headers.get("Range")
+        opened = self._open_checked(entry, source, client_range, token)
+        if opened is None:
             return
+        upstream, source = opened
         with upstream:
             try:
                 if wants_icy:
                     self._reply_icy(upstream, source, entry, send_body=send_body)
                 else:
-                    self._reply(upstream, source, send_body=send_body)
+                    self._reply(upstream, source, send_body=send_body,
+                                reopen=lambda rng: self._reopen(entry, source, rng, token))
             except (BrokenPipeError, ConnectionResetError):
                 # Device seeked or stopped mid-stream; nothing to do.
                 pass
+
+    @staticmethod
+    def _fetch(source: StreamSource, range_header: str | None) -> requests.Response:
+        headers = dict(source.headers)
+        if range_header:
+            headers["Range"] = range_header
+        if is_file_url(source.url):
+            # A local-library track: serve the file itself (Range-aware).
+            return open_stream(source.url, headers)  # type: ignore[no-any-return]
+        return requests.get(
+            source.url, headers=headers, stream=True, timeout=_UPSTREAM_TIMEOUT_S, allow_redirects=True
+        )
+
+    def _open_checked(
+        self, entry: _Entry, source: StreamSource, range_header: str | None, token: str
+    ) -> tuple[requests.Response, StreamSource] | None:
+        """Open the upstream; re-resolve and retry once if its URL has expired.
+
+        Replies with an error (and returns None) when the upstream can't be
+        reached or answers an error status: that must never be relayed to the
+        device as a 200 whose body is an error page (it would decode it as
+        audio and end the track)."""
+        try:
+            upstream = self._fetch(source, range_header)
+        except OSError as exc:
+            if is_file_url(source.url):
+                log.exception("relay: local file unavailable for token %s", token)
+                self.send_error(404, "Library file is missing")
+            else:
+                log.warning("relay: upstream fetch failed for token %s: %s", token, exc)
+                self.send_error(502, "Failed to fetch upstream stream")
+            return None
+        if upstream.status_code in _EXPIRED_STATUSES and entry.refresh is not None \
+                and not is_file_url(source.url):
+            log.info("relay: upstream said %s for token %s; re-resolving once", upstream.status_code, token)
+            upstream.close()
+            try:
+                source = entry.refresh()
+                upstream = self._fetch(source, range_header)
+            except Exception as exc:  # noqa: BLE001 - report as a bad upstream below
+                log.warning("relay: refresh for token %s failed: %s", token, exc)
+                self.send_error(502, "Failed to refresh upstream stream")
+                return None
+        if upstream.status_code == 416:
+            # Range past the end: tell the device so (it asked for a bad range).
+            with upstream:
+                self.send_response(416)
+                if "Content-Range" in upstream.headers:
+                    self.send_header("Content-Range", upstream.headers["Content-Range"])
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            return None
+        if upstream.status_code >= 400:
+            log.warning("relay: upstream answered %s for token %s", upstream.status_code, token)
+            upstream.close()
+            self.send_error(502, f"Upstream stream refused ({upstream.status_code})")
+            return None
+        return upstream, source
+
+    def _reopen(self, entry: _Entry, source: StreamSource, range_header: str,
+                token: str) -> requests.Response | None:
+        """Re-fetch the rest of a body that died mid-stream (no reply is sent).
+
+        Tries the current URL, then a freshly resolved one; only a 206 that
+        honours the range is usable."""
+        attempts: list[Callable[[], StreamSource]] = [lambda: source]
+        if entry.refresh is not None and not is_file_url(source.url):
+            attempts.append(entry.refresh)
+        for get_source in attempts:
+            try:
+                upstream = self._fetch(get_source(), range_header)
+            except Exception as exc:  # noqa: BLE001
+                log.debug("relay: resume fetch failed for token %s: %s", token, exc)
+                continue
+            if upstream.status_code == 206:
+                return upstream
+            upstream.close()
+        return None
 
     def _open_upstream(
         self, url: str, headers: dict[str, str], token: str
@@ -457,7 +563,8 @@ class _Handler(BaseHTTPRequestHandler):
                 self.wfile.write(bytes(view))
                 remaining -= len(view)
 
-    def _reply(self, upstream: requests.Response, source: StreamSource, *, send_body: bool) -> None:
+    def _reply(self, upstream: requests.Response, source: StreamSource, *, send_body: bool,
+               reopen: Callable[[str], requests.Response | None] | None = None) -> None:
         status = upstream.status_code if upstream.status_code in (200, 206) else 200
         self.send_response(status)
         self.send_header("Content-Type", source.mime_type or upstream.headers.get("Content-Type", "application/octet-stream"))
@@ -480,9 +587,36 @@ class _Handler(BaseHTTPRequestHandler):
         if not send_body:
             return
 
-        for chunk in upstream.iter_content(_CHUNK_SIZE):
-            if chunk:
-                self.wfile.write(chunk)
+        expected = _int_or_none(upstream.headers.get("Content-Length"))
+        start = _range_start(upstream) if status == 206 else 0
+        sent = 0
+        resumes = 0
+        while True:
+            try:
+                for chunk in upstream.iter_content(_CHUNK_SIZE):
+                    if chunk:
+                        self.wfile.write(chunk)
+                        sent += len(chunk)
+            except (BrokenPipeError, ConnectionResetError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - upstream dropped the body mid-stream
+                log.warning("relay: upstream body broke after %d bytes: %s", sent, exc)
+            if expected is None or start is None or sent >= expected:
+                return
+            # The body ended short of its Content-Length (a CDN dropping a long
+            # connection). The device frames by length, so a short body makes it
+            # give up on the track: fetch the remainder by byte offset instead.
+            if reopen is None or resumes >= _MAX_RESUMES:
+                self.close_connection = True
+                return
+            resumes += 1
+            upstream.close()
+            nxt = reopen(f"bytes={start + sent}-{start + expected - 1}")
+            if nxt is None:
+                self.close_connection = True
+                return
+            log.info("relay: resumed a truncated body at byte %d (%d/%d)", start + sent, resumes, _MAX_RESUMES)
+            upstream = nxt
 
     def _token_from_path(self) -> str | None:
         path = urlsplit(self.path).path

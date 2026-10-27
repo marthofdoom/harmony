@@ -338,6 +338,48 @@ def _forget(host: str) -> None:
         _disconnect(cast)
 
 
+class _EndWatch:
+    """Latches the receiver's own "this track finished" report.
+
+    The default receiver pushes ``IDLE`` with ``idleReason=FINISHED`` when a
+    track plays to its natural end, but pychromecast clears ``idle_reason`` on
+    the next status message that lacks one, so a poll can miss it. Listening
+    to every status message keeps the fact until the next load or playback."""
+
+    def __init__(self, seed: bool = False) -> None:
+        self.ended = seed
+
+    def new_media_status(self, status: Any) -> None:
+        state = getattr(status, "player_state", None)
+        if state == "IDLE":
+            if getattr(status, "idle_reason", None) == "FINISHED":
+                self.ended = True
+        elif state in ("PLAYING", "BUFFERING", "PAUSED", "LOADING"):
+            self.ended = False
+
+
+def _end_watch(cast: Any) -> _EndWatch | None:
+    """The cast connection's end-of-track watcher (registered once), or None when
+    the controller can't take listeners."""
+    watch = getattr(cast, "_harmony_end_watch", None)
+    if isinstance(watch, _EndWatch):
+        return watch
+    mc = cast.media_controller
+    register = getattr(mc, "register_status_listener", None)
+    if register is None:
+        return None
+    live = getattr(mc, "status", None)
+    # A connection opened after the track already finished still reports it.
+    watch = _EndWatch(seed=(getattr(live, "player_state", None) == "IDLE"
+                            and getattr(live, "idle_reason", None) == "FINISHED"))
+    try:
+        register(watch)
+        cast._harmony_end_watch = watch
+    except Exception:  # noqa: BLE001
+        return None
+    return watch
+
+
 class ChromecastDevice(PlaybackDevice):
     """A Chromecast/Google TV renderer, controlled over CASTV2."""
 
@@ -364,7 +406,14 @@ class ChromecastDevice(PlaybackDevice):
     def play_url(self, url: str, *, mime: str | None = "audio/mpeg", title: str | None = None,
                  artist: str | None = None, album: str | None = None, art_url: str | None = None,
                  duration_s: int | None = None, **_extra: Any) -> None:
-        mc = self._mc()
+        cast = self._cast()
+        mc = cast.media_controller
+        watch = _end_watch(cast)
+        if watch is not None:
+            # A new load: forget the previous track's "finished" (the controller
+            # still holds its stale status, which is why status() reads the latch
+            # and not the controller's own idle_reason).
+            watch.ended = False
         # MusicTrackMediaMetadata (type 3) → the device's now-playing card shows
         # title/artist/album + cover art.
         metadata: dict[str, Any] = {"metadataType": 3}
@@ -410,6 +459,12 @@ class ChromecastDevice(PlaybackDevice):
             state_map = {"PLAYING": "playing", "PAUSED": "paused", "IDLE": "stopped",
                          "BUFFERING": "playing"}
             vol = int(round((cs.volume_level or 0) * 100)) if cs else None
+            idle_reason = getattr(mc, "idle_reason", None)
+            watch = _end_watch(cast)
+            if watch is not None:
+                ended = watch.ended
+            else:  # no listener support: read the live status only
+                ended = getattr(mc, "player_state", "") == "IDLE" and idle_reason == "FINISHED"
             return PlaybackStatus(
                 state=state_map.get(getattr(mc, "player_state", ""), "unknown"),
                 volume=vol,
@@ -418,6 +473,7 @@ class ChromecastDevice(PlaybackDevice):
                 duration_s=int(mc.duration) if getattr(mc, "duration", None) else None,
                 title=getattr(mc, "title", None),
                 artist=None,
+                raw={"idle_reason": idle_reason, "ended": bool(ended)},
             )
         except Exception as exc:  # noqa: BLE001
             raise ProviderError(f"Chromecast status failed: {exc}") from exc
