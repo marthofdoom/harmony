@@ -156,6 +156,30 @@ keep it on a trusted network (LAN/Tailnet) or behind an authenticating proxy, an
 set a personal key to gate credential sharing. The desktop app runs this same
 server automatically, so a desktop install is already a hub.
 
+### Windows (WSL) — quick start
+
+Run the server inside WSL 2 and use the web app from any Windows browser:
+
+```powershell
+wsl --install -d Ubuntu          # PowerShell as Administrator; reboot if asked
+```
+
+Then, inside Ubuntu, with `harmony-server_<version>_all.deb` from the
+[latest release](https://github.com/marthofdoom/harmony/releases/latest):
+
+```bash
+sudo apt update && sudo apt install ./harmony-server_*_all.deb
+systemctl status harmony         # active (running)
+```
+
+Open **http://localhost:8080**. Your Windows music is at `/mnt/c/Users/<you>/Music`
+(add it under Accounts → Library).
+
+Reaching it from your phone, or casting, needs WSL's **mirrored networking**
+(Windows 11), because the default NAT keeps other devices out. Systemd, the
+networking setup, keeping it running at logon, and updates are covered in the
+**[full WSL guide](docs/install-wsl.md)**.
+
 ## Accounts
 
 Connect your accounts in **Preferences → Accounts** (desktop) or the **Accounts**
