@@ -235,6 +235,10 @@ class TestYTMusicNormalisation:
         assert playlist.id == "PL1"
         assert playlist.track_count == 5
 
+    def test_playlist_from_raw_search_result_uses_browse_id(self, yt_provider: YTMusicProvider) -> None:
+        raw = {"playlistId": None, "browseId": "VLPLBzh", "title": "Skyrim Calm", "resultType": "playlist"}
+        assert yt_provider._playlist_from_raw(raw).id == "PLBzh"
+
     def test_playlist_from_raw_header(self, yt_provider: YTMusicProvider) -> None:
         raw = {
             "id": "PL2",

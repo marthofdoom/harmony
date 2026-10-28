@@ -46,6 +46,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.14" date="2026-10-28">
+      <description>
+        <p>YouTube Music playlists found by search have an id again, so they
+        show up in search and open, play and sync.</p>
+      </description>
+    </release>
     <release version="1.0.13" date="2026-10-27">
       <description>
         <p>The game source API can now serve lossless FLAC files, about half

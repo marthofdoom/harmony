@@ -365,6 +365,9 @@ class YTMusicProvider(MusicProvider):
 
     def _playlist_from_raw(self, raw: dict[str, Any]) -> Playlist:
         playlist_id = raw.get("playlistId") or raw.get("id")
+        if not playlist_id:  # search results carry only the browse id ("VL" + playlist id)
+            browse_id = raw.get("browseId") or ""
+            playlist_id = browse_id[2:] if browse_id.startswith("VL") else browse_id or None
         author = raw.get("author")
         if isinstance(author, list):
             owner = ", ".join(_artist_names(author)) or None
