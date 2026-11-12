@@ -26,6 +26,16 @@ from harmony.ui.state import AppState  # noqa: E402
 log = logging.getLogger(__name__)
 
 
+def _slider_to_volume(pos: float) -> int:
+    """Slider position (0-100) to volume (0-100) on a square curve: half way is 25."""
+    pos = max(0.0, min(100.0, pos))
+    return round(pos * pos / 100)
+
+
+def _volume_to_slider(volume: float) -> float:
+    return (max(0.0, min(100.0, float(volume))) * 100) ** 0.5
+
+
 def _fmt(seconds: int | None) -> str:
     if not seconds or seconds < 0:
         return "0:00"
@@ -141,7 +151,9 @@ class NowPlayingBar(Gtk.Box):
         self._vol_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
         vol_icon = Gtk.Image.new_from_icon_name("audio-volume-high-symbolic")
         self._vol_box.append(vol_icon)
-        self._volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
+        # The slider runs on a square curve (see _slider_to_volume): the quiet end,
+        # where each step is loudest to the ear, gets most of the travel.
+        self._volume = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 0.5)
         self._volume.set_size_request(90, -1)
         self._volume.set_draw_value(False)
         self._volume.connect("change-value", self._on_volume_change)
@@ -253,7 +265,7 @@ class NowPlayingBar(Gtk.Box):
 
     def _on_volume_change(self, _scale: Gtk.Scale, _scroll: object, value: float) -> bool:
         if not self._syncing:
-            self.state.playback_set_volume(int(value))
+            self.state.playback_set_volume(_slider_to_volume(value))
         return False
 
     def _on_shuffle_toggled(self, button: Gtk.ToggleButton) -> None:
@@ -337,7 +349,7 @@ class NowPlayingBar(Gtk.Box):
         self._vol_box.set_visible(pb.volume_supported)
         if pb.volume_supported and pb.volume is not None and not self._syncing:
             self._syncing = True
-            self._volume.set_value(pb.volume)
+            self._volume.set_value(_volume_to_slider(pb.volume))
             self._syncing = False
 
         # keep the device selector in sync with the active host

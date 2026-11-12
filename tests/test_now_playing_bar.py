@@ -62,6 +62,18 @@ def test_volume_hidden_until_supported(state: AppState) -> None:
     assert bar._vol_box.get_visible() is True
 
 
+def test_volume_slider_gives_the_quiet_end_most_of_the_travel(state: AppState, monkeypatch) -> None:
+    bar = NowPlayingBar(state)
+    _play(state, volume_supported=True, volume=25)
+    bar._render()
+    assert bar._volume.get_value() == 50                             # volume 25 sits half way
+    sent = []
+    monkeypatch.setattr(state, "playback_set_volume", sent.append)
+    for pos in (10, 30, 50, 100):
+        bar._on_volume_change(bar._volume, None, pos)
+    assert sent == [1, 9, 25, 100]
+
+
 def test_repeat_button_cycles_state(state: AppState) -> None:
     bar = NowPlayingBar(state)
     _play(state)
