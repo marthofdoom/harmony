@@ -46,6 +46,12 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.15" date="2026-11-12">
+      <description>
+        <p>The tray icon's menu works again: Show Harmony and Quit now do what
+        they say on KDE Plasma and other StatusNotifier panels.</p>
+      </description>
+    </release>
     <release version="1.0.14" date="2026-10-28">
       <description>
         <p>YouTube Music playlists found by search have an id again, so they
