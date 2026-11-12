@@ -142,9 +142,10 @@ class Tray:
 
     def _menu_method(self, _conn, _sender, _path, _iface, method, params, invocation):
         if method == "GetLayout":
-            # The `av` children are variants; the (ia{sv}av) root slots take raw
-            # Python values (a pre-wrapped GLib.Variant here is a nesting error).
-            children = [GLib.Variant("v", _menu_item_variant(i, label)) for i, label in _MENU_ITEMS]
+            # Each `av` element IS the variant: pass the (ia{sv}av) value itself.
+            # Wrapping it in another "v" sends <<item>>, which KDE can't decode --
+            # the menu drew but its clicks never reached Event with the right id.
+            children = [_menu_item_variant(i, label) for i, label in _MENU_ITEMS]
             root = (0, {"children-display": GLib.Variant("s", "submenu")}, children)
             invocation.return_value(GLib.Variant("(u(ia{sv}av))", (1, root)))
         elif method == "GetGroupProperties":
