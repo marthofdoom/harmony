@@ -46,6 +46,20 @@
   <content_rating type="oars-1.1"/>
 
   <releases>
+    <release version="1.0.16" date="2026-11-17">
+      <description>
+        <p>New: bit-perfect mode on Linux. One switch (Preferences, Audio)
+        locks Harmony's volume at 100% and sends each track to your DAC at its
+        own sample rate and bit depth, with no mixing, resampling or dither. A
+        pill in the playing bar turns green only when PipeWire really runs the
+        device at the track's format, and otherwise says what is changing the
+        sound.</p>
+        <p>Streaming from another Harmony instance or Qobuz no longer drops out
+        on a busy network: the whole track is fetched ahead while it plays,
+        and playback still starts within about a second.</p>
+        <p>The volume slider gives finer control at low volume.</p>
+      </description>
+    </release>
     <release version="1.0.15" date="2026-11-12">
       <description>
         <p>The tray icon's menu works again: Show Harmony and Quit now do what
