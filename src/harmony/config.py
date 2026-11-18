@@ -242,6 +242,13 @@ class Settings:
     # takes effect on next launch.
     server_port: int = 8080
 
+    # Audio output (this computer). Bit-perfect: no software volume, no
+    # resampling, no mixing -- the PipeWire stream opens at each track's own rate
+    # and the level is left to the DAC/amp. ``bit_perfect_saved_volume`` is the
+    # app volume (0-100) to restore when it's turned off again.
+    bit_perfect: bool = False
+    bit_perfect_saved_volume: int = 100
+
     # UI
     window_width: int = 1280
     window_height: int = 820

@@ -500,7 +500,7 @@ class FakeLocal:
         self.calls.append("stop")
         self.state = "stopped"
 
-    def load_and_play(self, url, headers=None, paused=False, start_s=0) -> None:
+    def load_and_play(self, url, headers=None, paused=False, start_s=0, **_kw) -> None:
         self.start_s = start_s
         self.calls.append(("load", url, paused))
         self.state = "paused" if paused else "loading"

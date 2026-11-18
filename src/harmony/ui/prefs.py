@@ -17,9 +17,10 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Gtk  # noqa: E402
 
 from harmony import config  # noqa: E402
+from harmony.audio.bitperfect import ALLOWED_RATES_COMMAND  # noqa: E402
 from harmony.models import Service  # noqa: E402
 from harmony.tasks import run_async  # noqa: E402
 from harmony.ui.state import AppState  # noqa: E402
@@ -47,6 +48,7 @@ class PreferencesDialog(Adw.PreferencesDialog):
         self._status_ui: dict[Service, tuple[Adw.ActionRow, Gtk.Spinner, Gtk.Button]] = {}
 
         self.add(self._build_appearance_page())
+        self.add(self._build_audio_page())
         self.add(self._build_accounts_page())
         self.add(self._build_integrations_page())
         self.add(self._build_sync_page())
@@ -259,6 +261,79 @@ class PreferencesDialog(Adw.PreferencesDialog):
         theme_id = _THEME_IDS[row.get_selected()]
         self._set_setting("theme", theme_id)
         apply_theme(theme_id)
+
+    # -- audio ---------------------------------------------------------------------
+
+    def _build_audio_page(self) -> Adw.PreferencesPage:
+        page = Adw.PreferencesPage(title="Audio", name="audio", icon_name="audio-speakers-symbolic")
+        group = Adw.PreferencesGroup(
+            title="This computer",
+            description="Playing to “This computer” goes through PipeWire.",
+        )
+        self.bit_perfect_row = Adw.SwitchRow(
+            title="Bit-perfect output",
+            subtitle="No software volume, resampling or mixing. Each track opens the output at "
+            "its own sample rate and format; the volume is left to your DAC or amp.",
+            active=self.settings.bit_perfect,
+        )
+        self.bit_perfect_row.connect("notify::active", self._on_bit_perfect_toggled)
+        group.add(self.bit_perfect_row)
+
+        self.bit_perfect_status_row = Adw.ActionRow(title="Output", subtitle_lines=0)
+        self.bit_perfect_status_row.add_css_class("property")
+        group.add(self.bit_perfect_status_row)
+        page.add(group)
+
+        rates = Adw.PreferencesGroup(
+            title="Sample rates",
+            description="PipeWire only switches its output rate to match a track when that rate is "
+            "in its allowed list; otherwise the track is resampled (the indicator says so). "
+            "Harmony never edits your PipeWire configuration; run this once in a terminal to "
+            "allow the common rates:",
+        )
+        # Adw rows parse their subtitle as Pango markup: the command has & and <<.
+        cmd_row = Adw.ActionRow(title="Allow 44.1 – 192 kHz",
+                                subtitle=GLib.markup_escape_text(ALLOWED_RATES_COMMAND))
+        cmd_row.set_subtitle_selectable(True)
+        cmd_row.set_subtitle_lines(0)
+        copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER,
+                          tooltip_text="Copy the command")
+        copy.add_css_class("flat")
+        copy.connect("clicked", self._on_copy_rates_command)
+        cmd_row.add_suffix(copy)
+        rates.add(cmd_row)
+        page.add(rates)
+
+        # The switch can also be flipped from the Now Playing bar, and the
+        # status follows the playing track: mirror the app state while open.
+        self._bp_handler = self.state.connect("playback-changed", lambda *_a: self._refresh_audio_page())
+        self.connect("closed", lambda *_a: self.state.disconnect(self._bp_handler))
+        self._refresh_audio_page()
+        return page
+
+    def _refresh_audio_page(self) -> None:
+        self._syncing_bit_perfect = True
+        self.bit_perfect_row.set_active(self.state.bit_perfect)
+        self._syncing_bit_perfect = False
+        if not self.state.bit_perfect:
+            text = "Bit-perfect is off."
+        elif not self.state.local_output_active():
+            text = "On. Checked while a track plays on “This computer”."
+        else:
+            status = self.state.bit_perfect_status()
+            text = f"{status.label}: {status.detail}" if status.level != "verified" else status.detail
+        self.bit_perfect_status_row.set_subtitle(GLib.markup_escape_text(text))
+
+    def _on_bit_perfect_toggled(self, row: Adw.SwitchRow, _param: object) -> None:
+        if getattr(self, "_syncing_bit_perfect", False):
+            return
+        self.state.set_bit_perfect(row.get_active())
+
+    def _on_copy_rates_command(self, button: Gtk.Button) -> None:
+        display = Gdk.Display.get_default()
+        if display is not None:
+            display.get_clipboard().set(ALLOWED_RATES_COMMAND)
+            self.add_toast(Adw.Toast.new("Command copied"))
 
     # -- accounts ---------------------------------------------------------------
 

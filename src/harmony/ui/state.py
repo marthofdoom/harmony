@@ -191,6 +191,18 @@ class AppState(GObject.Object):
         # Bumped on every user transport op; a device poll started before the
         # bump is stale and dropped.
         self._op_gen = 0
+        # Bit-perfect verification: what PipeWire's graph says about our stream
+        # (read off the main loop by ``pw-dump``), when we last asked, and the
+        # (track, decoded format) it was read for -- a new key re-probes.
+        self._bp_report: Any | None = None
+        self._bp_probed = False
+        self._bp_inflight = False
+        self._bp_next = 0.0
+        self._bp_key: Any = None
+        self._bp_waits = 0  # consecutive reads that found the stream not linked yet
+        # The app volume to apply when the local player is next created (set when
+        # bit-perfect is turned off before it ever existed).
+        self._pending_local_volume: int | None = None
 
     def _open_db(self) -> Any | None:
         """Open the sqlite database, tolerating db.py not existing yet."""
@@ -569,7 +581,145 @@ class AppState(GObject.Object):
                 on_error=self._on_local_error,
                 on_change=self._on_local_changed,
             )
+            self._local_player.set_bit_perfect(self.settings.bit_perfect)
+            if self._pending_local_volume is not None and not self.settings.bit_perfect:
+                self._local_player.set_volume(self._pending_local_volume)
+            self._pending_local_volume = None
         return self._local_player
+
+    # -- bit-perfect output (this computer) --------------------------------------
+
+    @property
+    def bit_perfect(self) -> bool:
+        return bool(self.settings.bit_perfect)
+
+    def local_output_active(self) -> bool:
+        """"This computer" is the output of what's playing (so the bit-perfect
+        indicator and the volume lock apply)."""
+        return self.playback.active_host == LOCAL_HOST and self.playback.track is not None
+
+    def bit_perfect_locks_volume(self) -> bool:
+        """Software volume is fixed at 100% (bit-perfect on, playing here)."""
+        return self.bit_perfect and self.playback.active_host == LOCAL_HOST
+
+    def set_bit_perfect(self, enabled: bool) -> None:
+        """Turn bit-perfect output on/off (persisted). On: the app volume is
+        pinned to 100% (the user's level is remembered); off: it is restored.
+        A track already playing here restarts at the same position through the
+        normal play path (the PipeWire stream is configured when it connects)."""
+        enabled = bool(enabled)
+        if enabled == self.settings.bit_perfect:
+            return
+        player = self._local_player
+        if enabled:
+            level = self.playback.volume if self.playback.active_host == LOCAL_HOST else None
+            if level is None and player is not None:
+                level = player.status().volume
+            if level is not None:  # unknown (never played here): keep what was saved
+                self.settings.bit_perfect_saved_volume = max(0, min(100, int(round(level))))
+        self.settings.bit_perfect = enabled
+        self.settings.save()
+        saved = self.settings.bit_perfect_saved_volume
+        saved = 100 if saved is None else int(saved)  # 0 is a real level, not "unset"
+        restart = False
+        if player is not None:
+            restart = bool(player.set_bit_perfect(enabled))
+            if not enabled:
+                player.set_volume(saved)
+        elif not enabled:
+            self._pending_local_volume = saved
+        if self.playback.active_host == LOCAL_HOST:
+            self.playback.volume = 100 if enabled else saved
+        self._bp_reset()
+        self.emit("playback-changed")
+        if restart and self.playback.active_host == LOCAL_HOST and self.queue.current() is not None:
+            self._restart_local_here(player)
+
+    def _restart_local_here(self, player: Any) -> None:
+        """Re-play the current local track at its current position (and paused if
+        it was) through ``_start_local``: a fresh stream URL, since the one the
+        player holds may have expired."""
+        position = int(player.current_position_s())
+        paused = self.playback.state == "paused"
+        self._start_local(self.queue.index)
+        self._pause_after_resolve = paused
+        if position > 0:
+            self._local_start_at = (self._play_gen, position)
+
+    def bit_perfect_status(self) -> Any:
+        """The honest indicator state for the local output (see
+        ``harmony.audio.bitperfect``): green only when verified."""
+        from harmony.audio import bitperfect
+
+        if not self.settings.bit_perfect:
+            return bitperfect.evaluate(enabled=False, decoded=None, at_sink=None, report=None,
+                                       probed=False, volume=None)
+        player = self._local_player
+        decoded = at_sink = None
+        volume: int | None = None
+        if player is not None and self.playback.active_host == LOCAL_HOST:
+            try:
+                decoded, at_sink = player.decoded_format(), player.sink_format()
+                volume = player.status().volume
+            except Exception:  # noqa: BLE001 - a caps read must never break the bar
+                log.debug("bit-perfect caps read failed", exc_info=True)
+        # A reading belongs to the track/format it was taken for: until the 1 s poll
+        # notices a new one, don't judge it against the previous track's graph.
+        current = (self.playback.track_key(), decoded) == self._bp_key
+        return bitperfect.evaluate(
+            enabled=True, decoded=decoded, at_sink=at_sink,
+            report=self._bp_report if current else None,
+            probed=self._bp_probed and current, volume=volume, quality=self.playback.quality)
+
+    def _bp_reset(self) -> None:
+        self._bp_report, self._bp_probed, self._bp_key, self._bp_next = None, False, None, 0.0
+        self._bp_waits = 0
+
+    def _bp_tick(self) -> None:
+        """Called from the 1 s poll while playing locally with bit-perfect on:
+        (re)read PipeWire's graph for a new track, then every few seconds so a
+        change (another app grabbing the output) shows up."""
+        player = self._local_player
+        if player is None:
+            return
+        try:
+            key = (self.playback.track_key(), player.decoded_format())
+        except Exception:  # noqa: BLE001
+            return
+        now = time.monotonic()
+        if key != self._bp_key:
+            self._bp_key, self._bp_report, self._bp_probed = key, None, False
+            self._bp_waits = 0
+            self._bp_next = now + 0.6  # let the stream connect first
+        if self._bp_inflight or now < self._bp_next or key[1] is None:
+            return
+        self._bp_inflight = True
+        generation = key
+
+        def work() -> Any:
+            from harmony.audio.pipewire import inspect_stream
+
+            return inspect_stream()
+
+        def done(report: Any) -> None:
+            self._bp_inflight = False
+            if generation != self._bp_key:
+                return  # a different track/format since: this read is stale
+            changed = (report != self._bp_report) or not self._bp_probed
+            self._bp_report, self._bp_probed = report, True
+            settled = report is not None and getattr(report, "linked", False)
+            self._bp_waits = 0 if settled else self._bp_waits + 1
+            # Quick re-reads while the stream connects; back off if it never does
+            # (e.g. it feeds something that is not an output device).
+            self._bp_next = time.monotonic() + (1.0 if self._bp_waits and self._bp_waits <= 3 else 5.0)
+            if changed:
+                self.emit("playback-changed")
+
+        def failed(_exc: BaseException) -> None:
+            self._bp_inflight = False
+            self._bp_next = time.monotonic() + 5.0
+
+        run_async(work, done, failed)
 
     def local_audio_label(self) -> str | None:
         """Negotiated output format of the in-app player while it's the active,
@@ -877,7 +1027,9 @@ class AppState(GObject.Object):
             self._pause_after_resolve = False
             start_s = self._local_start_at[1] if self._local_start_at[0] == gen else 0
             self._get_local_player().load_and_play(source.url, dict(source.headers),
-                                                   paused=paused, start_s=start_s)
+                                                   paused=paused, start_s=start_s,
+                                                   mime=getattr(source, "mime_type", None),
+                                                   quality=getattr(source, "quality", None))
             self._local_failures = 0
             # "loading" until the pipeline really is playing (preroll / network
             # buffering): the bar shows it as playing, the player's own status
@@ -1065,6 +1217,8 @@ class AppState(GObject.Object):
         if target == LOCAL_HOST:
             if self._local_player is not None:
                 self._sync_status_to_playback(target, self._local_player.status())
+                if self.settings.bit_perfect and self.playback.state in ("playing", "loading"):
+                    self._bp_tick()
             return GLib.SOURCE_CONTINUE
         self._poll_tick += 1
         if self._poll_tick % 2 or self._poll_inflight:
@@ -1422,6 +1576,12 @@ class AppState(GObject.Object):
         if not host:
             return
         level = max(0, min(100, int(level)))
+        if host == LOCAL_HOST and self.settings.bit_perfect:
+            # Bit-perfect: the level belongs to the DAC/amp. Whoever asked (the
+            # bar's slider, MPRIS, a media key) is told it stays at 100%.
+            self.playback.volume = 100
+            self.emit("playback-changed")
+            return
         self.playback.volume = level
         if host == LOCAL_HOST:
             self._get_local_player().set_volume(level)

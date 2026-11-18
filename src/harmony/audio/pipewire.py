@@ -11,7 +11,9 @@ from __future__ import annotations
 import atexit
 import json
 import logging
+import os
 import pathlib
+import re
 import shutil
 import subprocess
 import time
@@ -99,6 +101,213 @@ def list_sources() -> list[AudioNode]:
 
 
 # --------------------------------------------------------------------------
+# What PipeWire is really doing with a stream: ``pw-dump`` -> StreamReport
+# --------------------------------------------------------------------------
+#
+# The bit-perfect indicator must be *truthful*, so it asks the PipeWire graph --
+# not GStreamer's caps, which only say what the app handed over -- what the
+# output node is actually running at. ``pw-dump`` ships with PipeWire (and in the
+# Flatpak runtime) and prints the whole graph as JSON, including each node's
+# negotiated ``Format`` and the links between them.
+
+#: The node name Harmony's local player gives its ``pipewiresink`` stream, so the
+#: probe can find it in the graph. (Set via the sink's ``stream-properties``.)
+STREAM_NODE_NAME = "harmony-local"
+
+_EPS = 1e-4
+
+
+@dataclass(frozen=True)
+class StreamReport:
+    """One playing stream's path through the PipeWire graph."""
+
+    #: The stream node was found and is linked to an output (sink) node.
+    linked: bool = False
+    stream_rate: int | None = None
+    stream_format: str | None = None
+    stream_channels: int | None = None
+    #: ``node.dont-remix`` as PipeWire holds it for the stream (no up/down-mix).
+    dont_remix: bool = False
+    sink_name: str = ""
+    sink_description: str = ""
+    #: What the output node is: ``alsa`` (a real device -- the only kind whose
+    #: state can verify bit-perfect), ``bluetooth`` (always re-encoded) or
+    #: ``virtual`` (an effects chain, loopback, combine or null sink: whatever it
+    #: does downstream can't be seen).
+    sink_kind: str = ""
+    sink_rate: int | None = None
+    sink_format: str | None = None
+    sink_channels: int | None = None
+    #: The graph's ``clock.allowed-rates`` (empty when unknown) and a forced rate (0 = none).
+    allowed_rates: tuple[int, ...] = ()
+    force_rate: int = 0
+    #: Other running streams feeding the same sink (names): they are mixed in.
+    others: tuple[str, ...] = ()
+    #: Software gain PipeWire applies to this stream, as ``(what, factor)`` pairs
+    #: that differ from unity (stream volume, sink software volume, soft mute).
+    gains: tuple[tuple[str, float], ...] = ()
+
+
+def _first(params: dict, name: str) -> dict:
+    items = params.get(name) or []
+    return items[0] if items and isinstance(items[0], dict) else {}
+
+
+def _node_label(props: dict) -> str:
+    return str(props.get("application.name") or props.get("node.description")
+               or props.get("node.name") or "another app")
+
+
+def _gains(what: str, params: dict, *, stream: bool) -> list[tuple[str, float]]:
+    """Software scaling in a node's ``Props``. A hardware mixer's level lives in a
+    sink's ``channelVolumes`` and is *not* processing, so for a sink only the
+    software ``volume``/``softVolumes``/``softMute`` count; a stream has no
+    hardware, so its ``channelVolumes`` count too."""
+    props = _first(params, "Props")
+    out: list[tuple[str, float]] = []
+    factors = [float(props.get("volume", 1.0))]
+    factors += [float(v) for v in props.get("softVolumes") or []]
+    if stream:
+        factors += [float(v) for v in props.get("channelVolumes") or []]
+    low = min(factors) if factors else 1.0
+    if abs(low - 1.0) > _EPS:
+        out.append((what, low))
+    if props.get("softMute"):
+        out.append((f"{what} (muted)", 0.0))
+    if stream and props.get("mute"):
+        out.append((f"{what} (muted)", 0.0))
+    return out
+
+
+#: Test-only: a comma-separated list of ``node.name``s to treat as real devices
+#: (the throw-away null sink of ``scripts/e2e_bit_perfect.py``). Never set by the app.
+TEST_SINKS_ENV = "HARMONY_BITPERFECT_TEST_SINKS"
+
+
+def sink_kind(props: dict, test_sinks: tuple[str, ...] = ()) -> str:
+    """Classify an ``Audio/Sink`` node: ``alsa`` | ``bluetooth`` | ``virtual``."""
+    name = str(props.get("node.name") or "")
+    if name in test_sinks:
+        return "alsa"
+    if str(props.get("node.virtual", "")).lower() in ("true", "1"):
+        return "virtual"
+    api = str(props.get("device.api") or "")
+    keys = [str(k) for k in props]
+    if api == "bluez5" or any(k.startswith("api.bluez5.") for k in keys) or name.startswith("bluez_output"):
+        return "bluetooth"
+    if (api == "alsa" or any(k.startswith("api.alsa.") for k in keys)
+            or props.get("factory.name") == "api.alsa.pcm.sink"):
+        return "alsa"
+    return "virtual"
+
+
+def parse_graph(dump: object, node_name: str = STREAM_NODE_NAME,
+                test_sinks: tuple[str, ...] = ()) -> StreamReport:
+    """Reduce a ``pw-dump`` document to the path ``node_name``'s stream takes.
+
+    Pure (no I/O): ``dump`` is the decoded JSON list. A stream that isn't in the
+    graph, or isn't linked to anything yet (still connecting), yields
+    ``StreamReport(linked=False)`` -- "nothing to verify yet", not a failure."""
+    objects = [o for o in dump if isinstance(o, dict)] if isinstance(dump, list) else []
+    nodes: dict[int, dict] = {}
+    links: list[tuple[int, int]] = []
+    allowed: tuple[int, ...] = ()
+    force_rate = 0
+    for obj in objects:
+        kind = obj.get("type", "")
+        info = obj.get("info") or {}
+        if kind == "PipeWire:Interface:Node" and isinstance(obj.get("id"), int):
+            nodes[obj["id"]] = {"props": info.get("props") or {}, "params": info.get("params") or {},
+                                "state": info.get("state")}
+        elif kind == "PipeWire:Interface:Link":
+            a, b = info.get("output-node-id"), info.get("input-node-id")
+            if isinstance(a, int) and isinstance(b, int):
+                links.append((a, b))
+        elif kind == "PipeWire:Interface:Metadata" and (obj.get("props") or {}).get("metadata.name") == "settings":
+            for entry in obj.get("metadata") or []:
+                key, value = entry.get("key"), entry.get("value")
+                if key == "clock.allowed-rates":
+                    nums = value if isinstance(value, list) else re.findall(r"\d+", str(value))
+                    allowed = tuple(int(n) for n in nums)
+                elif key == "clock.force-rate":
+                    try:
+                        force_rate = int(value)
+                    except (TypeError, ValueError):
+                        force_rate = 0
+
+    ours = [i for i, n in nodes.items() if n["props"].get("node.name") == node_name]
+    # Newest instance wins (a torn-down stream's node can linger a moment).
+    ours.sort(key=lambda i: (nodes[i]["state"] == "running", i), reverse=True)
+    stream_id = next((i for i in ours if any(a == i for a, _b in links)), None)
+    if stream_id is None:
+        return StreamReport(allowed_rates=allowed, force_rate=force_rate)
+    stream = nodes[stream_id]
+
+    # Every output the stream feeds, following links through anything that is not
+    # itself a sink or a stream (a recorder -- OBS capturing this app -- is a
+    # *stream*, never the device). Real devices are preferred over virtual ones.
+    found: list[int] = []
+    frontier, seen = [stream_id], {stream_id}
+    for _hop in range(4):
+        nxt_frontier: list[int] = []
+        for cur in frontier:
+            for a_id, b_id in links:
+                if a_id != cur or b_id in seen or b_id not in nodes:
+                    continue
+                seen.add(b_id)
+                klass = str(nodes[b_id]["props"].get("media.class", ""))
+                if klass == "Audio/Sink":
+                    found.append(b_id)
+                elif not klass.startswith("Stream/"):
+                    nxt_frontier.append(b_id)
+        frontier = nxt_frontier
+        if not frontier:
+            break
+    rank = {"alsa": 0, "bluetooth": 1, "virtual": 2}
+    found.sort(key=lambda i: rank[sink_kind(nodes[i]["props"], test_sinks)])
+    sink_id = found[0] if found else None
+    sink = nodes.get(sink_id) if sink_id is not None else None
+    if sink is None:
+        return StreamReport(allowed_rates=allowed, force_rate=force_rate)
+
+    s_fmt, k_fmt = _first(stream["params"], "Format"), _first(sink["params"], "Format")
+    sink_props = sink["props"]
+    others = tuple(sorted({
+        _node_label(n["props"]) for i, n in nodes.items()
+        if i != stream_id and n["state"] == "running"
+        and str(n["props"].get("media.class", "")).startswith("Stream/Output/Audio")
+        and any(a == i and b == sink_id for a, b in links)
+    }))
+    gains = _gains("stream volume", stream["params"], stream=True) + _gains(
+        "output device software volume", sink["params"], stream=False)
+    return StreamReport(
+        linked=True,
+        stream_rate=s_fmt.get("rate"), stream_format=s_fmt.get("format"),
+        stream_channels=s_fmt.get("channels"),
+        dont_remix=str(stream["props"].get("node.dont-remix", "")).lower() in ("true", "1"),
+        sink_name=str(sink_props.get("node.name") or ""),
+        sink_kind=sink_kind(sink_props, test_sinks),
+        sink_description=str(sink_props.get("node.description") or sink_props.get("node.nick")
+                             or sink_props.get("node.name") or ""),
+        sink_rate=k_fmt.get("rate"), sink_format=k_fmt.get("format"), sink_channels=k_fmt.get("channels"),
+        allowed_rates=allowed, force_rate=force_rate, others=others, gains=tuple(gains),
+    )
+
+
+def inspect_stream(node_name: str = STREAM_NODE_NAME, *, timeout: float = _TIMEOUT_S) -> StreamReport | None:
+    """Ask the running PipeWire (``pw-dump``) how ``node_name`` reaches its output.
+
+    Returns None when the graph can't be read at all (no ``pw-dump``, no
+    daemon): the caller says "can't verify" instead of guessing. Never raises.
+    """
+    try:
+        result = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=timeout, check=True)
+        dump = json.loads(result.stdout)
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
+        log.debug("pw-dump failed: %s", exc)
+        return None
+    test_sinks = tuple(n for n in os.environ.get(TEST_SINKS_ENV, "").split(",") if n)
+    return parse_graph(dump, node_name, test_sinks)
 
 
 # --------------------------------------------------------------------------

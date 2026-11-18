@@ -17,6 +17,7 @@ gi.require_version("Gtk", "4.0")
 
 from gi.repository import Gdk, Gtk  # noqa: E402
 
+from harmony.audio.bitperfect import VERIFIED, WARNING  # noqa: E402
 from harmony.ui.playing_info import (  # noqa: E402
     quality_text,
     tier_pill,
@@ -32,6 +33,13 @@ _CSS = """
 }
 .tier-pill.hires { background: alpha(@accent_bg_color, 0.25); color: @accent_color; }
 .hires-badge { border-radius: 99px; padding: 1px 7px; font-size: 0.75em; font-weight: bold; }
+.bp-pill {
+  border-radius: 99px; padding: 0 8px; min-height: 0; min-width: 0;
+  font-size: 0.8em; font-weight: bold; border: none; box-shadow: none;
+  background: alpha(@window_fg_color, 0.1); color: alpha(@window_fg_color, 0.55);
+}
+.bp-pill.bp-verified { background: alpha(@success_color, 0.2); color: @success_color; }
+.bp-pill.bp-warning { background: alpha(@warning_color, 0.22); color: @warning_color; }
 """
 _css_installed = False
 
@@ -77,6 +85,15 @@ class NowPlayingInfo(Gtk.Box):
         self.pill.add_css_class("tier-pill")
         self.quality_row.append(self.quality)
         self.quality_row.append(self.pill)
+        # Bit-perfect indicator + switch for the local output: green only when
+        # the output is verified unmodified, amber with the reason otherwise, grey
+        # when off. The same widget on the bar and the Now Playing page.
+        self.bp = Gtk.Button(visible=False, valign=Gtk.Align.CENTER)
+        self.bp.add_css_class("bp-pill")
+        self.bp_label = Gtk.Label(label="Bit-perfect")  # never ellipsised: the quality text yields first
+        self.bp.set_child(self.bp_label)
+        self.bp.connect("clicked", self._on_bp_clicked)
+        self.quality_row.append(self.bp)
         self.append(self.quality_row)
 
     def update(self) -> None:
@@ -96,5 +113,33 @@ class NowPlayingInfo(Gtk.Box):
                 self.pill.add_css_class(c)
             else:
                 self.pill.remove_css_class(c)
-        self.quality_row.set_visible(bool(line))
+        self._update_bit_perfect()
+        self.quality_row.set_visible(bool(line) or self.bp.get_visible())
         self.quality_row.set_tooltip_text(f"Output: {output}" if output else None)
+
+    def _on_bp_clicked(self, _button: Gtk.Button) -> None:
+        # Off is one click away. On is not: it pins the volume to 100% (a jump of
+        # ~14 dB from a quiet 20%), so the pill opens the Audio settings, where the
+        # switch and its explanation are, instead of enabling on a stray click.
+        if self.state.bit_perfect:
+            self.state.set_bit_perfect(False)
+        else:
+            from harmony.ui.widgets import open_preferences
+
+            open_preferences(self, "audio")
+
+    def _update_bit_perfect(self) -> None:
+        show = self.state.local_output_active()
+        self.bp.set_visible(show)
+        if not show:
+            return
+        status = self.state.bit_perfect_status()
+        self.bp_label.set_label(f"● {status.label}")
+        for css, level in (("bp-verified", VERIFIED), ("bp-warning", WARNING)):
+            if status.level == level:
+                self.bp.add_css_class(css)
+            else:
+                self.bp.remove_css_class(css)
+        action = "Click to turn bit-perfect mode off." if self.state.bit_perfect \
+            else "Click to open the audio settings, where bit-perfect mode is switched on."
+        self.bp.set_tooltip_text(f"{status.detail}\n\n{action}")

@@ -1,5 +1,9 @@
 # Playback: play-to-device, not in-app decode
 
+> The desktop app also has an in-app player for "This computer" (GStreamer ->
+> PipeWire): see [local-playback.md](local-playback.md) for its buffering and
+> bit-perfect mode.
+
 **Status: Device control — Built & verified. Play-to-device (passive relay) —
 Built; end-to-end verification against real hardware pending.**
 

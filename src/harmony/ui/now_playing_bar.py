@@ -345,11 +345,17 @@ class NowPlayingBar(Gtk.Box):
             self._repeat.add_css_class("accent")
         self._repeat.set_tooltip_text(f"Repeat: {pb.repeat}")
 
-        # volume (only when the device reports it)
+        # volume (only when the device reports it). Bit-perfect locks the app's
+        # level at 100% for this computer: the slider stays visible but dead, and
+        # says whose job the volume is.
         self._vol_box.set_visible(pb.volume_supported)
+        locked = self.state.bit_perfect_locks_volume()
+        self._volume.set_sensitive(not locked)
+        self._vol_box.set_tooltip_text(
+            "Volume is controlled by your DAC/amp (bit-perfect mode)" if locked else None)
         if pb.volume_supported and pb.volume is not None and not self._syncing:
             self._syncing = True
-            self._volume.set_value(_volume_to_slider(pb.volume))
+            self._volume.set_value(_volume_to_slider(100 if locked else pb.volume))
             self._syncing = False
 
         # keep the device selector in sync with the active host

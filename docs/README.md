@@ -27,6 +27,9 @@ This directory is the map. Start with whichever matches what you're doing.
   token/WebKit story, and where credentials live.
 - [`design/playback.md`](design/playback.md) — device control (shipped) and the
   passive-relay play-to-device design (WiiM, UPnP) rather than in-app decode.
+- [`design/local-playback.md`](design/local-playback.md) — the desktop's "This
+  computer" player: network buffering (download-ahead) and bit-perfect output on
+  PipeWire, with the honest indicator and how to enable rate switching.
 
 ## HTTP API
 
